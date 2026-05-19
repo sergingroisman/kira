@@ -1,0 +1,12 @@
+{
+  "name": "sergin-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["agent", "shared"],
+  "scripts": {
+    "test": "npm test --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present"
+  },
+  "engines": { "node": ">=20.0.0" }
+}

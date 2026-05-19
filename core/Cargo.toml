@@ -1,0 +1,61 @@
+[package]
+name = "kira-core"
+version = "0.1.0"
+edition = "2024"
+description = "Kira harness — Rust core daemon (axum HTTP+SSE)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "kira-cored"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Errors (v0 catch-all)
+anyhow = "1"
+
+# CLI args
+clap = { version = "4", features = ["derive", "env"] }
+
+# Config / env
+dotenvy = "0.15"
+
+# IDs
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Permissive for v0 — tighten later
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
