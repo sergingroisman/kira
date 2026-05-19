@@ -7,6 +7,7 @@ import { InputBar } from "./InputBar.js";
 import { StreamingOutput } from "./StreamingOutput.js";
 import { Spinner } from "./Spinner.js";
 import { ToolCallPanel } from "./ToolCallPanel.js";
+import { Logo } from "./components/index.js";
 
 interface Message {
   role: "user" | "assistant";
@@ -174,12 +175,15 @@ export function App({ sessionId, systemPrompt }: AppProps) {
 
   return (
     <Box flexDirection="column" paddingX={1}>
+      {/* KIRA Logo */}
+      <Logo size="small" color="magenta" showText={true} />
+      
       {/* Static renders completed history without re-rendering previous items */}
       <Static items={history}>
         {(msg, i) => (
           <Box key={i} flexDirection="column" marginBottom={1}>
             <Text color={msg.role === "user" ? "green" : "white"} bold={msg.role === "user"}>
-              {msg.role === "user" ? "You" : "Sergin"}
+              {msg.role === "user" ? "You" : "KIRA"}
             </Text>
             <Text>{msg.content}</Text>
           </Box>
