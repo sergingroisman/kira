@@ -1,0 +1,6 @@
+//! Wire types — JSON schemas for `/v1/*` endpoints.
+//!
+//! v0.5+: annotate with `#[derive(TS)]` to generate `.d.ts` for the Bun REPL.
+
+pub mod bash;
+pub mod chat;
