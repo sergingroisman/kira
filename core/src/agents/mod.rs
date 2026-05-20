@@ -5,3 +5,7 @@
 
 pub mod mailbox;
 pub mod ownership;
+pub mod spawn;
+pub mod store;
+
+pub use spawn::AgentManager;

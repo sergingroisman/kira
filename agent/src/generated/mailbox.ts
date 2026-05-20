@@ -9,6 +9,12 @@ export type Message = { id: string, from: string, to: string, kind: string, payl
  */
 created_at: string, };
 
+export type Message = { id: string, from: string, to: string, kind: string, payload: JsonValue, 
+/**
+ * ISO 8601 UTC.
+ */
+created_at: string, };
+
 export type SendRequest = { 
 /**
  * Sender's agent id (or "core" for daemon-originated messages).
@@ -22,5 +28,7 @@ kind: string,
  * Opaque payload (caller-defined JSON).
  */
 payload: JsonValue, };
+
+export type SendResponse = { id: string, path: string, };
 
 export type SendResponse = { id: string, path: string, };

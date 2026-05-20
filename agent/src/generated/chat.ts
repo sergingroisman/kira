@@ -14,6 +14,13 @@ model: string | null, messages: Array<ChatMessage>, };
 
 export type ChatResponse = { content: string, model: string, tokens_in: number, tokens_out: number, finish_reason: string | null, };
 
+export type ChatResponse = { content: string, model: string, tokens_in: number, tokens_out: number, finish_reason: string | null, };
+
+/**
+ * SSE event payloads (server → client streaming).
+ */
+export type StreamEvent = { "type": "token", delta: string, } | { "type": "done", model: string, finish_reason: string | null, } | { "type": "error", message: string, };
+
 /**
  * SSE event payloads (server → client streaming).
  */

@@ -1,5 +1,6 @@
 //! HTTP+SSE server: app state, router, handlers.
 
+pub mod agents_api;
 pub mod chat;
 pub mod error;
 pub mod health;
@@ -17,19 +18,19 @@ use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::agents::{mailbox::MailboxFs, ownership::OwnershipRegistry};
+use crate::agents::{mailbox::MailboxFs, ownership::OwnershipRegistry, AgentManager};
 use crate::llm::{dashscope, deepseek, LlmProvider};
 use crate::router::budget::{BudgetConfig, BudgetGuard};
 use crate::router::Router;
 use crate::worktree::WorktreeManager;
 
-/// Shared application state passed to handlers via `axum::extract::State`.
 #[derive(Clone)]
 pub struct AppState {
     pub router: Router,
     pub worktrees: WorktreeManager,
     pub mailbox: MailboxFs,
     pub ownership: OwnershipRegistry,
+    pub agents: AgentManager,
 }
 
 impl AppState {
@@ -55,17 +56,23 @@ impl AppState {
         let repo_root = crate::worktree::git::toplevel(&cwd).await?;
         let mailbox = MailboxFs::new(repo_root);
         let ownership = OwnershipRegistry::new();
+        let agents = AgentManager::new(
+            router.clone(),
+            worktrees.clone(),
+            mailbox.clone(),
+            ownership.clone(),
+        );
 
         Ok(Self {
             router,
             worktrees,
             mailbox,
             ownership,
+            agents,
         })
     }
 }
 
-/// Build the axum router with all `/v1/*` routes attached.
 pub fn router(state: AppState) -> AxumRouter {
     AxumRouter::new()
         // chat
@@ -90,6 +97,11 @@ pub fn router(state: AppState) -> AxumRouter {
         .route("/v1/ownership/claim", post(ownership_api::claim))
         .route("/v1/ownership/check", get(ownership_api::check))
         .route("/v1/ownership/:agent_id", delete(ownership_api::release))
+        // agents
+        .route("/v1/agents", get(agents_api::list))
+        .route("/v1/agents/spawn", post(agents_api::spawn))
+        .route("/v1/agents/:id", get(agents_api::get_one))
+        .route("/v1/agents/:id/cancel", post(agents_api::cancel))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
