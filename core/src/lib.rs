@@ -11,6 +11,7 @@ use tracing::info;
 
 pub mod llm;
 pub mod proto;
+pub mod router;
 pub mod safety;
 pub mod server;
 
