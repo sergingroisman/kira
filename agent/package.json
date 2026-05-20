@@ -1,15 +1,17 @@
 {
-  "name": "sergin-agent",
+  "name": "kira-agent",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "./src/cli/index.tsx",
+  "main": "./src/cli/kira.tsx",
   "bin": {
-    "sergin": "./bin/sergin.js"
+    "kira": "./bin/kira.js"
   },
   "scripts": {
-    "start": "tsx src/cli/index.tsx",
-    "dev": "tsx --watch src/cli/index.tsx",
+    "start": "bun run src/cli/kira.tsx",
+    "dev": "bun run --watch src/cli/kira.tsx",
+    "build": "bun build src/cli/kira.tsx --compile --outfile=../dist/kira-repl",
+    "legacy": "tsx src/cli/index.tsx",
     "test": "vitest run",
     "test:watch": "vitest"
   },

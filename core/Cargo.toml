@@ -42,6 +42,9 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# TypeScript bindings export (generates .d.ts for agent/src/generated/)
+ts-rs = "10"
+
 # LLM clients (OpenAI-compatible — works with DashScope, DeepSeek, SiliconFlow, Ollama)
 async-openai = "0.27"
 

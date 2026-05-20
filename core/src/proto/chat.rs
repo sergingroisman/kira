@@ -1,11 +1,14 @@
-//! Chat wire types.
+//! Chat wire types — exported to TypeScript via `ts-rs`.
+//!
+//! Running `cargo test` regenerates `agent/src/generated/chat.ts`.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, TS)]
+#[ts(export, export_to = "../../agent/src/generated/chat.ts")]
 pub struct ChatRequest {
-    /// Tier hint — "heavy" | "standard" (default) | "light".
-    /// Router (Sem 4-5) will use this to select model + fallback chain.
+    /// Tier hint — "heavy" | "standard" (default) | "light" | "long_context".
     #[serde(default = "default_tier")]
     pub tier: String,
 
@@ -19,13 +22,15 @@ fn default_tier() -> String {
     "standard".to_string()
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, TS)]
+#[ts(export, export_to = "../../agent/src/generated/chat.ts")]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../agent/src/generated/chat.ts")]
 pub struct ChatResponse {
     pub content: String,
     pub model: String,
@@ -35,19 +40,11 @@ pub struct ChatResponse {
 }
 
 /// SSE event payloads (server → client streaming).
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../agent/src/generated/chat.ts")]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     Token { delta: String },
     Done { model: String, finish_reason: Option<String> },
     Error { message: String },
-}
-
-/// Map a tier hint to the v0 hardcoded model. M01 Router (Sem 4-5) replaces this.
-pub fn tier_to_model(tier: &str) -> &'static str {
-    match tier {
-        "heavy" => "qwen-max",
-        "light" => "qwen-flash",
-        _ => "qwen-plus", // standard default
-    }
 }

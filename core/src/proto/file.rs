@@ -1,8 +1,10 @@
-//! File tool wire types.
+//! File tool wire types — exported to TypeScript via `ts-rs`.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, TS)]
+#[ts(export, export_to = "../../agent/src/generated/file.ts")]
 pub struct FileReadRequest {
     pub path: String,
     pub base_dir: String,
@@ -14,7 +16,8 @@ fn default_max_read_bytes() -> usize {
     crate::safety::FILE_READ_MAX_BYTES_DEFAULT
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../agent/src/generated/file.ts")]
 pub struct FileReadResponse {
     pub content: String,
     pub bytes_read: usize,
@@ -22,7 +25,8 @@ pub struct FileReadResponse {
     pub canonical_path: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, TS)]
+#[ts(export, export_to = "../../agent/src/generated/file.ts")]
 pub struct FileWriteRequest {
     pub path: String,
     pub base_dir: String,
@@ -37,7 +41,8 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../agent/src/generated/file.ts")]
 pub struct FileWriteResponse {
     pub bytes_written: usize,
     pub canonical_path: String,
