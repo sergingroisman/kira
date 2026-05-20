@@ -127,6 +127,62 @@ impl Router {
         )
     }
 
+    /// Route a tool-calling chat. Mirrors `route_chat` but accepts prebuilt
+    /// async-openai messages (so agent loops can include `Tool` result messages
+    /// between turns) and exposes function schemas to the model.
+    pub async fn route_chat_with_tools(
+        &self,
+        tier: &str,
+        model_override: Option<&str>,
+        messages: Vec<async_openai::types::ChatCompletionRequestMessage>,
+        tools: Vec<async_openai::types::ChatCompletionTool>,
+    ) -> Result<(async_openai::types::CreateChatCompletionResponse, String, String)> {
+        self.budget.check()?;
+
+        let pseudo_req = ChatRequest {
+            tier: tier.to_string(),
+            model: model_override.map(str::to_string),
+            messages: Vec::new(),
+        };
+        let candidates = self.candidates(&pseudo_req);
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for cand in candidates {
+            let key = cand.key();
+            let breaker = self.breaker_for(&key);
+            if breaker.is_open() {
+                warn!(candidate = %key, "skipping — breaker Open");
+                continue;
+            }
+            let Some(provider) = self.providers.get(&cand.provider).cloned() else {
+                continue;
+            };
+
+            match provider
+                .chat_with_tools(&cand.model, messages.clone(), tools.clone())
+                .await
+            {
+                Ok(resp) => {
+                    breaker.record_success();
+                    if let Some(u) = resp.usage.as_ref() {
+                        self.budget
+                            .track_call(&cand.model, u.prompt_tokens, u.completion_tokens);
+                    }
+                    return Ok((resp, cand.provider.clone(), cand.model.clone()));
+                }
+                Err(e) => {
+                    warn!(candidate = %key, error = ?e, "tool-call candidate failed, trying next");
+                    breaker.record_failure();
+                    last_err = Some(e);
+                    continue;
+                }
+            }
+        }
+
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("all tool-call candidates exhausted (tier {})", tier)))
+    }
+
     /// Convenience: full route + chat (non-streaming). Iterates fallback on failure.
     /// Returns (response, provider_name, model).
     pub async fn route_chat(

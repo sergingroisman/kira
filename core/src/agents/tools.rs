@@ -1,0 +1,344 @@
+//! Tools exposed to agents via OpenAI function-calling.
+//!
+//! Schemas are emitted to the LLM; dispatch executes the call against our
+//! existing internal modules (bash, file_read, file_write) and returns the
+//! tool's JSON payload as a string for re-injection into the chat history.
+//!
+//! The `done(final_result)` tool is the agent's signal that the task is
+//! complete — the loop terminates and `final_result` becomes the agent's
+//! `result` field.
+
+use anyhow::{anyhow, Context, Result};
+use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::{debug, instrument, warn};
+
+use crate::safety::cmd_allowlist::{
+    validate_argv, BASH_OUTPUT_MAX_BYTES, BASH_TIMEOUT_DEFAULT_SECS, BASH_TIMEOUT_MAX_SECS,
+};
+use crate::safety::{path_guard, FILE_WRITE_MAX_BYTES_HARD};
+
+/// Build the OpenAI tool schemas exposed to agents.
+/// `worktree_path` is injected so we can document the implicit `base_dir`.
+pub fn agent_tools(worktree_path: &str) -> Vec<ChatCompletionTool> {
+    vec![
+        tool_done(),
+        tool_bash(worktree_path),
+        tool_file_read(worktree_path),
+        tool_file_write(worktree_path),
+    ]
+}
+
+fn tool_done() -> ChatCompletionTool {
+    ChatCompletionTool {
+        r#type: ChatCompletionToolType::Function,
+        function: FunctionObject {
+            name: "done".into(),
+            description: Some(
+                "Signal that the task is complete. Provide the final result/answer."
+                    .into(),
+            ),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "final_result": {
+                        "type": "string",
+                        "description": "Final answer or summary to return to the caller."
+                    }
+                },
+                "required": ["final_result"]
+            })),
+            strict: Some(true),
+        },
+    }
+}
+
+fn tool_bash(worktree_path: &str) -> ChatCompletionTool {
+    ChatCompletionTool {
+        r#type: ChatCompletionToolType::Function,
+        function: FunctionObject {
+            name: "bash".into(),
+            description: Some(format!(
+                "Execute a shell command. cwd defaults to {worktree_path}. \
+                 Executable allowlist applies (ls/cat/git/cargo/bun/npm/etc). \
+                 No shell metacharacters in args."
+            )),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "argv vector. argv[0] = executable from allowlist."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "default": BASH_TIMEOUT_DEFAULT_SECS,
+                        "description": format!("Hard timeout. Max {BASH_TIMEOUT_MAX_SECS}s.")
+                    }
+                },
+                "required": ["argv"]
+            })),
+            strict: None,
+        },
+    }
+}
+
+fn tool_file_read(worktree_path: &str) -> ChatCompletionTool {
+    ChatCompletionTool {
+        r#type: ChatCompletionToolType::Function,
+        function: FunctionObject {
+            name: "file_read".into(),
+            description: Some(format!(
+                "Read a file. `path` resolves under base_dir={worktree_path}. \
+                 Returns UTF-8 lossy content, truncated to 5 MiB."
+            )),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path under the worktree." }
+                },
+                "required": ["path"]
+            })),
+            strict: None,
+        },
+    }
+}
+
+fn tool_file_write(worktree_path: &str) -> ChatCompletionTool {
+    ChatCompletionTool {
+        r#type: ChatCompletionToolType::Function,
+        function: FunctionObject {
+            name: "file_write".into(),
+            description: Some(format!(
+                "Write a file atomically (.tmp+rename). `path` resolves under \
+                 base_dir={worktree_path}. Max 5 MiB. Ownership check enforced."
+            )),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path under the worktree." },
+                    "content": { "type": "string", "description": "Full file content (UTF-8)." },
+                    "create_dirs": { "type": "boolean", "default": true },
+                    "overwrite": { "type": "boolean", "default": true }
+                },
+                "required": ["path", "content"]
+            })),
+            strict: None,
+        },
+    }
+}
+
+/// Result of a tool dispatch — payload to feed back, plus a "done" signal flag.
+pub struct ToolResult {
+    /// JSON serialized into the tool message back to the LLM.
+    pub payload: String,
+    /// If Some, the agent loop should terminate with this as the final result.
+    pub done: Option<String>,
+}
+
+/// Execute a tool call by name. `worktree_path` is the agent's base_dir
+/// (FS sandbox). All tool calls are scoped under it.
+#[instrument(skip(arguments), fields(tool = %name))]
+pub async fn dispatch(
+    name: &str,
+    arguments: &str,
+    worktree_path: &PathBuf,
+) -> ToolResult {
+    let parsed: Value = match serde_json::from_str(arguments) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_payload(format!("invalid JSON arguments: {e}"));
+        }
+    };
+
+    let outcome: Result<Value> = match name {
+        "done" => {
+            let final_result = parsed
+                .get("final_result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            return ToolResult {
+                payload: serde_json::to_string(&json!({"acknowledged": true})).unwrap(),
+                done: Some(final_result),
+            };
+        }
+        "bash" => run_bash(&parsed, worktree_path).await,
+        "file_read" => run_file_read(&parsed, worktree_path).await,
+        "file_write" => run_file_write(&parsed, worktree_path).await,
+        other => Err(anyhow!("unknown tool: {other}")),
+    };
+
+    match outcome {
+        Ok(v) => ToolResult {
+            payload: serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
+            done: None,
+        },
+        Err(e) => error_payload(e.to_string()),
+    }
+}
+
+fn error_payload(message: String) -> ToolResult {
+    warn!(message = %message, "tool dispatch error");
+    let v = json!({ "error": message });
+    ToolResult {
+        payload: serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
+        done: None,
+    }
+}
+
+// ============================================================================
+// Per-tool runners
+// ============================================================================
+
+async fn run_bash(args: &Value, worktree_path: &PathBuf) -> Result<Value> {
+    let argv: Vec<String> = args
+        .get("argv")
+        .and_then(|v| v.as_array())
+        .context("missing argv array")?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    if argv.is_empty() {
+        anyhow::bail!("argv empty");
+    }
+
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(BASH_TIMEOUT_DEFAULT_SECS)
+        .min(BASH_TIMEOUT_MAX_SECS);
+
+    let (exe, parsed_args) = validate_argv(&argv)?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(&parsed_args);
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("USER", std::env::var("USER").unwrap_or_default())
+        .env(
+            "LANG",
+            std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()),
+        );
+    cmd.current_dir(worktree_path);
+    cmd.kill_on_drop(true);
+
+    let start = std::time::Instant::now();
+    let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .with_context(|| format!("bash timed out after {timeout_secs}s"))?
+        .context("spawn failed")?;
+    let elapsed = start.elapsed();
+
+    let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut truncated = false;
+    if stdout.len() > BASH_OUTPUT_MAX_BYTES {
+        stdout.truncate(BASH_OUTPUT_MAX_BYTES);
+        truncated = true;
+    }
+    if stderr.len() > BASH_OUTPUT_MAX_BYTES {
+        stderr.truncate(BASH_OUTPUT_MAX_BYTES);
+        truncated = true;
+    }
+
+    Ok(json!({
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": output.status.code(),
+        "duration_ms": elapsed.as_millis() as u64,
+        "truncated": truncated,
+    }))
+}
+
+async fn run_file_read(args: &Value, worktree_path: &PathBuf) -> Result<Value> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("missing path")?;
+    let resolved =
+        path_guard::resolve_within(path, worktree_path.to_str().context("non-utf8 path")?)?;
+    let metadata = std::fs::metadata(&resolved)
+        .with_context(|| format!("stat failed: {}", resolved.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("target is not a regular file: {}", resolved.display());
+    }
+    let bytes = std::fs::read(&resolved)?;
+    let total = bytes.len();
+    let max = 5 * 1024 * 1024;
+    let mut content = String::from_utf8_lossy(&bytes).into_owned();
+    let mut truncated = false;
+    if content.len() > max {
+        content.truncate(max);
+        truncated = true;
+    }
+    debug!(path = %resolved.display(), bytes = total, "file_read");
+    Ok(json!({
+        "content": content,
+        "bytes_read": total,
+        "truncated": truncated,
+        "canonical_path": resolved.display().to_string(),
+    }))
+}
+
+async fn run_file_write(args: &Value, worktree_path: &PathBuf) -> Result<Value> {
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("missing path")?;
+    let content = args
+        .get("content")
+        .and_then(|v| v.as_str())
+        .context("missing content")?;
+    let bytes = content.as_bytes();
+    if bytes.len() > FILE_WRITE_MAX_BYTES_HARD {
+        anyhow::bail!(
+            "file too large: {} > cap {}",
+            bytes.len(),
+            FILE_WRITE_MAX_BYTES_HARD
+        );
+    }
+    let create_dirs = args
+        .get("create_dirs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let overwrite = args
+        .get("overwrite")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let resolved =
+        path_guard::resolve_within(path, worktree_path.to_str().context("non-utf8 path")?)?;
+    if create_dirs {
+        if let Some(parent) = resolved.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir parent failed: {}", parent.display()))?;
+        }
+    }
+    let exists = resolved.exists();
+    if exists && !overwrite {
+        anyhow::bail!("file exists and overwrite=false: {}", resolved.display());
+    }
+    let parent = resolved.parent().context("no parent")?;
+    let file_name = resolved
+        .file_name()
+        .context("no file_name")?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = parent.join(format!(".{file_name}.kira-{}.tmp", uuid::Uuid::now_v7()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, &resolved).with_context(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename failed: {} → {}", tmp.display(), resolved.display())
+    })?;
+
+    debug!(path = %resolved.display(), bytes = bytes.len(), "file_write");
+    Ok(json!({
+        "bytes_written": bytes.len(),
+        "canonical_path": resolved.display().to_string(),
+        "created": !exists,
+    }))
+}

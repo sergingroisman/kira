@@ -7,5 +7,6 @@ pub mod mailbox;
 pub mod ownership;
 pub mod spawn;
 pub mod store;
+pub mod tools;
 
 pub use spawn::AgentManager;

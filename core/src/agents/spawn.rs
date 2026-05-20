@@ -1,28 +1,34 @@
-//! Agent spawning + walking-skeleton agent_loop.
+//! Agent spawning + iterative agent_loop (Sem 10).
 //!
-//! v0 contract (single-shot):
-//!   1. spawn() builds/reuses a worktree, claims default ownership for the
-//!      kind, registers the agent in the store, and `tokio::spawn`s `agent_loop`.
-//!   2. agent_loop sends one chat request via the Router using the kind's
-//!      system prompt + the user's task.
-//!   3. Result is written to the store, sent to "core"'s mailbox as kind="result".
-//!   4. Agent status flips to Completed/Failed/Cancelled.
-//!
-//! Sem 10+ adds: tool calls dispatch, iterative loop, heartbeats, judge eval
-//! writes, plan/act gating.
+//! Loop contract:
+//!   1. Initial messages = [system_prompt, user_task].
+//!   2. Each iteration:
+//!      - Router.route_chat_with_tools(messages, tools)
+//!      - If response has `tool_calls`: append assistant message (with
+//!        tool_calls) + execute each tool + append `tool` result messages.
+//!      - If response is content-only (no tool_calls): treat as final.
+//!      - If "done" tool called: extract `final_result`, break.
+//!   3. Stop on: done | content-only response | max_iters | budget cap | cancel.
 
 use anyhow::{Context, Result};
+use async_openai::types::{
+    ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
+};
 use chrono::Utc;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::agents::mailbox::MailboxFs;
 use crate::agents::ownership::OwnershipRegistry;
 use crate::agents::store::Store as AgentStore;
+use crate::agents::tools::{agent_tools, dispatch as dispatch_tool};
 use crate::proto::agent::{Agent, AgentKind, AgentStatus, SpawnAgentRequest};
-use crate::proto::chat::{ChatMessage, ChatRequest};
 use crate::proto::mailbox::SendRequest;
 use crate::proto::ownership::{Claim, OwnershipMode};
 use crate::proto::worktree::SpawnRequest as WorktreeSpawnRequest;
@@ -30,9 +36,8 @@ use crate::router::Router;
 use crate::worktree::WorktreeManager;
 
 const DEFAULT_BUDGET_USD: f64 = 1.00;
-const DEFAULT_MAX_ITERS: u32 = 1; // walking skeleton — Sem 10 raises to 50
+const DEFAULT_MAX_ITERS: u32 = 10;
 
-/// Default ownership patterns per agent kind (plan T7).
 fn default_ownership(kind: AgentKind) -> (Vec<String>, OwnershipMode) {
     match kind {
         AgentKind::Writer => (
@@ -54,7 +59,7 @@ pub struct AgentManager {
     worktrees: WorktreeManager,
     mailbox: MailboxFs,
     ownership: OwnershipRegistry,
-    cancellers: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, oneshot::Sender<()>>>>,
+    cancellers: Arc<std::sync::Mutex<HashMap<Uuid, oneshot::Sender<()>>>>,
 }
 
 impl AgentManager {
@@ -70,7 +75,7 @@ impl AgentManager {
             worktrees,
             mailbox,
             ownership,
-            cancellers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancellers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -82,7 +87,6 @@ impl AgentManager {
         self.store.get(id)
     }
 
-    /// Returns true if the agent existed and was signaled to cancel.
     pub fn cancel(&self, id: Uuid) -> bool {
         let mut map = self.cancellers.lock().expect("cancellers poisoned");
         if let Some(tx) = map.remove(&id) {
@@ -93,9 +97,6 @@ impl AgentManager {
         }
     }
 
-    /// Spawn a fresh agent. Creates a worktree if `req.worktree_id` is absent.
-    /// Returns the registered `Agent` immediately; the loop runs in the
-    /// background (`tokio::spawn`).
     #[instrument(skip(self, req), fields(kind = ?req.kind))]
     pub async fn spawn(&self, req: SpawnAgentRequest) -> Result<Agent> {
         let kind = req.kind;
@@ -103,14 +104,15 @@ impl AgentManager {
         let max_iters = req.max_iters.unwrap_or(DEFAULT_MAX_ITERS);
         let budget_cap = req.budget_usd.unwrap_or(DEFAULT_BUDGET_USD);
 
-        // Resolve worktree: reuse if provided, else spawn fresh.
-        let worktree_id = match req.worktree_id.as_deref() {
+        // Resolve worktree (reuse or auto-spawn).
+        let (worktree_id, worktree_path) = match req.worktree_id.as_deref() {
             Some(s) => {
                 let id = Uuid::parse_str(s).context("invalid worktree_id")?;
-                self.worktrees
+                let wt = self
+                    .worktrees
                     .get(id)
                     .with_context(|| format!("worktree not found: {id}"))?;
-                id.to_string()
+                (id.to_string(), PathBuf::from(wt.path))
             }
             None => {
                 let wt = self
@@ -121,14 +123,13 @@ impl AgentManager {
                     })
                     .await
                     .context("auto-spawn worktree failed")?;
-                wt.id
+                (wt.id.clone(), PathBuf::from(wt.path))
             }
         };
 
         let id = Uuid::now_v7();
         let id_str = id.to_string();
 
-        // Claim ownership scoped to this agent kind.
         let (patterns, mode) = default_ownership(kind);
         if !patterns.is_empty() {
             self.ownership
@@ -156,14 +157,12 @@ impl AgentManager {
         };
         self.store.insert(id, agent.clone());
 
-        // Register cancel channel.
         let (cancel_tx, cancel_rx) = oneshot::channel();
         self.cancellers
             .lock()
             .expect("cancellers poisoned")
             .insert(id, cancel_tx);
 
-        // Spawn the loop. Clone what it needs (Arc-style).
         let ctx = AgentContext {
             id,
             kind,
@@ -171,6 +170,7 @@ impl AgentManager {
             task: req.task,
             max_iters,
             budget_cap,
+            worktree_path,
             store: self.store.clone(),
             router: self.router.clone(),
             mailbox: self.mailbox.clone(),
@@ -189,72 +189,174 @@ struct AgentContext {
     kind: AgentKind,
     tier: String,
     task: String,
-    // Used by Sem 10's iterative loop; v0 single-shot ignores them.
-    #[allow(dead_code)]
     max_iters: u32,
-    #[allow(dead_code)]
     budget_cap: f64,
+    worktree_path: PathBuf,
     store: AgentStore,
     router: Router,
     mailbox: MailboxFs,
     ownership: OwnershipRegistry,
-    cancellers: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, oneshot::Sender<()>>>>,
+    cancellers: Arc<std::sync::Mutex<HashMap<Uuid, oneshot::Sender<()>>>>,
 }
 
 #[instrument(skip(ctx, cancel_rx), fields(agent_id = %ctx.id, kind = ?ctx.kind))]
 async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
-    let id = ctx.id;
     ctx.store
-        .update(id, |a| a.status = AgentStatus::Active);
+        .update(ctx.id, |a| a.status = AgentStatus::Active);
 
-    // Walking-skeleton: 1 LLM call (max_iters=1 default). Loop kept for Sem 10.
-    let messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: ctx.kind.system_prompt().to_string(),
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: ctx.task.clone(),
-        },
-    ];
+    let tools = agent_tools(&ctx.worktree_path.display().to_string());
 
-    let req = ChatRequest {
-        tier: ctx.tier.clone(),
-        model: None,
-        messages: messages.clone(),
-    };
+    let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
+    // System prompt
+    if let Ok(m) = ChatCompletionRequestSystemMessageArgs::default()
+        .content(ctx.kind.system_prompt())
+        .build()
+    {
+        messages.push(m.into());
+    }
+    // User task
+    if let Ok(m) = ChatCompletionRequestUserMessageArgs::default()
+        .content(ctx.task.clone())
+        .build()
+    {
+        messages.push(m.into());
+    }
 
-    // Race the LLM call against cancellation.
-    let route = ctx.router.route_chat(&req, &messages);
-    tokio::select! {
-        _ = &mut cancel_rx => {
-            warn!(agent_id = %id, "cancelled before LLM completed");
-            finish(&ctx, AgentStatus::Cancelled, None, Some("cancelled".into()), None, 0.0).await;
-            return;
+    let mut iters: u32 = 0;
+    let mut usd_spent: f64 = 0.0;
+    let mut model_used: Option<String> = None;
+    let mut final_result: Option<String> = None;
+    let mut error: Option<String> = None;
+
+    loop {
+        if iters >= ctx.max_iters {
+            warn!(agent_id = %ctx.id, iters, "max_iters reached");
+            error = Some(format!("max_iters reached ({} iterations)", ctx.max_iters));
+            break;
         }
-        result = route => {
-            match result {
-                Ok((resp, _provider, model)) => {
-                    let usd = match resp.usage.as_ref() {
-                        Some(u) => approx_cost(&model, u.prompt_tokens, u.completion_tokens),
-                        None => 0.0,
-                    };
-                    let content = resp
-                        .choices
-                        .into_iter()
-                        .next()
-                        .and_then(|c| c.message.content)
-                        .unwrap_or_default();
-                    finish(&ctx, AgentStatus::Completed, Some(content), None, Some(model), usd).await;
-                }
+        if usd_spent >= ctx.budget_cap {
+            warn!(agent_id = %ctx.id, usd_spent, cap = ctx.budget_cap, "budget cap reached");
+            error = Some(format!(
+                "budget cap reached (${usd_spent:.4} >= ${cap:.4})",
+                cap = ctx.budget_cap
+            ));
+            break;
+        }
+
+        // Race LLM call vs cancellation.
+        let route = ctx
+            .router
+            .route_chat_with_tools(&ctx.tier, None, messages.clone(), tools.clone());
+        let (response, _provider, model) = tokio::select! {
+            _ = &mut cancel_rx => {
+                warn!(agent_id = %ctx.id, "cancelled mid-loop");
+                ctx.store.update(ctx.id, |a| a.status = AgentStatus::Cancelled);
+                finish(&ctx, AgentStatus::Cancelled, None, Some("cancelled".into()), model_used.clone(), usd_spent, iters).await;
+                return;
+            }
+            r = route => match r {
+                Ok(t) => t,
                 Err(e) => {
-                    error!(agent_id = %id, error = ?e, "agent LLM call failed");
-                    finish(&ctx, AgentStatus::Failed, None, Some(e.to_string()), None, 0.0).await;
+                    error!(agent_id = %ctx.id, error = ?e, "router call failed");
+                    error = Some(e.to_string());
+                    break;
                 }
             }
+        };
+
+        iters += 1;
+        model_used = Some(model.clone());
+        if let Some(usage) = response.usage.as_ref() {
+            usd_spent += approx_cost(&model, usage.prompt_tokens, usage.completion_tokens);
+        }
+        ctx.store.update(ctx.id, |a| {
+            a.iters = iters;
+            a.usd_spent = usd_spent;
+            a.model = Some(model.clone());
+        });
+
+        let choice = match response.choices.into_iter().next() {
+            Some(c) => c,
+            None => {
+                error = Some("LLM returned no choices".into());
+                break;
+            }
+        };
+        let assistant_msg = choice.message;
+
+        // Push the assistant message into history (with potential tool_calls).
+        let assistant_for_history = {
+            let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
+            if let Some(c) = assistant_msg.content.as_ref() {
+                builder.content(c.clone());
+            }
+            if let Some(tcs) = assistant_msg.tool_calls.as_ref() {
+                builder.tool_calls(tcs.clone());
+            }
+            match builder.build() {
+                Ok(m) => m.into(),
+                Err(e) => {
+                    error = Some(format!("build assistant message: {e}"));
+                    break;
+                }
+            }
+        };
+        messages.push(assistant_for_history);
+
+        // Decide next step.
+        let tool_calls = assistant_msg.tool_calls.unwrap_or_default();
+        if tool_calls.is_empty() {
+            // Content-only response. Treat as final.
+            final_result = assistant_msg.content;
+            break;
+        }
+
+        // Execute each tool call sequentially. Append tool result messages.
+        let mut break_outer_with_done: Option<String> = None;
+        for tc in tool_calls {
+            let ChatCompletionMessageToolCall { id, function, .. } = tc;
+            let name = function.name.clone();
+            let arguments = function.arguments.clone();
+            debug!(tool = %name, args_len = arguments.len(), "agent invoked tool");
+
+            let result = dispatch_tool(&name, &arguments, &ctx.worktree_path).await;
+
+            // Tool result message
+            match ChatCompletionRequestToolMessageArgs::default()
+                .content(result.payload.clone())
+                .tool_call_id(id.clone())
+                .build()
+            {
+                Ok(m) => messages.push(m.into()),
+                Err(e) => {
+                    error = Some(format!("build tool message: {e}"));
+                    break_outer_with_done = None;
+                    break;
+                }
+            }
+            if let Some(done_payload) = result.done {
+                break_outer_with_done = Some(done_payload);
+                break;
+            }
+        }
+
+        if let Some(done_payload) = break_outer_with_done {
+            final_result = Some(done_payload);
+            break;
+        }
+        if error.is_some() {
+            break;
         }
     }
+
+    let status = if error.is_some() {
+        AgentStatus::Failed
+    } else if final_result.is_some() {
+        AgentStatus::Completed
+    } else {
+        AgentStatus::Stopped
+    };
+    finish(&ctx, status, final_result, error, model_used, usd_spent, iters).await;
 }
 
 async fn finish(
@@ -264,6 +366,7 @@ async fn finish(
     error: Option<String>,
     model: Option<String>,
     usd: f64,
+    iters: u32,
 ) {
     let id = ctx.id;
     let finished_at = Utc::now().to_rfc3339();
@@ -272,17 +375,17 @@ async fn finish(
         a.result = result.clone();
         a.error = error.clone();
         a.model = model.clone();
-        a.iters = 1;
+        a.iters = iters;
         a.usd_spent = usd;
         a.finished_at = Some(finished_at.clone());
     });
 
-    // Best-effort: send result to "core" mailbox.
     let payload = serde_json::json!({
         "status": format!("{status:?}"),
         "result": result,
         "error": error,
         "model": model,
+        "iters": iters,
         "usd_spent": usd,
     });
     let _ = ctx
@@ -297,20 +400,15 @@ async fn finish(
         )
         .await;
 
-    // Release ownership claim.
     ctx.ownership.release(&id.to_string());
-
-    // Drop canceller (so cancel() is a no-op after finish).
     ctx.cancellers
         .lock()
         .expect("cancellers poisoned")
         .remove(&id);
 
-    info!(agent_id = %id, ?status, usd, "agent finished");
+    info!(agent_id = %id, ?status, iters, usd, "agent finished");
 }
 
-/// Lightweight cost estimate — duplicates `router::budget::price_per_million`
-/// to avoid a circular dep. Kept in sync with the budget table.
 fn approx_cost(model: &str, tokens_in: u32, tokens_out: u32) -> f64 {
     let (i, o) = match model {
         "qwen-max" => (1.60, 6.40),

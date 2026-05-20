@@ -4,12 +4,6 @@ export type FileReadRequest = { path: string, base_dir: string, max_bytes: numbe
 
 export type FileReadResponse = { content: string, bytes_read: number, truncated: boolean, canonical_path: string, };
 
-export type FileReadResponse = { content: string, bytes_read: number, truncated: boolean, canonical_path: string, };
-
 export type FileWriteRequest = { path: string, base_dir: string, content: string, create_dirs: boolean, overwrite: boolean, };
-
-export type FileWriteRequest = { path: string, base_dir: string, content: string, create_dirs: boolean, overwrite: boolean, };
-
-export type FileWriteResponse = { bytes_written: number, canonical_path: string, created: boolean, };
 
 export type FileWriteResponse = { bytes_written: number, canonical_path: string, created: boolean, };

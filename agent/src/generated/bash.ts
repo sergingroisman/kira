@@ -3,5 +3,3 @@
 export type BashRequest = { argv: Array<string>, cwd: string | null, timeout_secs: number, };
 
 export type BashResponse = { stdout: string, stderr: string, exit_code: number | null, duration_ms: number, truncated: boolean, };
-
-export type BashResponse = { stdout: string, stderr: string, exit_code: number | null, duration_ms: number, truncated: boolean, };

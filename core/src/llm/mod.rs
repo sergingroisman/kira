@@ -15,7 +15,7 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs,
+        ChatCompletionTool, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
     },
     Client,
 };
@@ -67,6 +67,28 @@ impl LlmProvider {
             .create(request)
             .await
             .with_context(|| format!("{} chat failed (model={model})", self.name))
+    }
+
+    /// Chat with tool-calling enabled. Accepts pre-built request messages
+    /// (so agent loops can include `Tool` result messages between turns) and
+    /// a list of tool schemas exposed to the model.
+    pub async fn chat_with_tools(
+        &self,
+        model: &str,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: Vec<ChatCompletionTool>,
+    ) -> Result<CreateChatCompletionResponse> {
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder.model(model).messages(messages);
+        if !tools.is_empty() {
+            builder.tools(tools);
+        }
+        let request = builder.build()?;
+        self.client
+            .chat()
+            .create(request)
+            .await
+            .with_context(|| format!("{} chat_with_tools failed (model={model})", self.name))
     }
 
     /// Streaming chat. Returns a `Stream` of chunks.

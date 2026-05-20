@@ -4,29 +4,9 @@ export type Agent = { id: string, kind: AgentKind, status: AgentStatus, worktree
 
 export type AgentKind = "writer" | "deployer" | "judge";
 
-export type AgentKind = "writer" | "deployer" | "judge";
-
-export type AgentStatus = "spawning" | "active" | "stale" | "completed" | "failed" | "stopped" | "cancelled";
-
 export type AgentStatus = "spawning" | "active" | "stale" | "completed" | "failed" | "stopped" | "cancelled";
 
 export type CancelResponse = { cancelled: boolean, id: string, };
-
-export type CancelResponse = { cancelled: boolean, id: string, };
-
-export type SpawnAgentRequest = { kind: AgentKind, task: string, 
-/**
- * Existing worktree to attach. If absent, daemon spawns a new one from `base` (default "main").
- */
-worktree_id: string | null, base: string | null, 
-/**
- * Per-task budget cap in USD. Defaults from server config.
- */
-budget_usd: number | null, 
-/**
- * Max iterations of the agent loop. Defaults to 1 in v0 (single-shot).
- */
-max_iters: number | null, };
 
 export type SpawnAgentRequest = { kind: AgentKind, task: string, 
 /**
