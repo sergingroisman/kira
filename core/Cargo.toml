@@ -36,6 +36,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # Config / env
 dotenvy = "0.15"
 
+# TOML parsing (hooks config)
+toml = "0.8"
+
 # IDs
 uuid = { version = "1", features = ["v7", "serde"] }
 

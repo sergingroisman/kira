@@ -1,0 +1,14 @@
+{
+  "id": "019e4592-a5a1-7f52-a549-3b448938466b",
+  "from": "019e4592-93c0-7520-b08d-da8367861371",
+  "to": "core",
+  "kind": "result",
+  "payload": {
+    "error": null,
+    "model": "deepseek-v4-pro",
+    "result": "Rust oferece execução assíncrona baseada no modelo de futures, permitindo operações não bloqueantes sem a sobrecarga de um runtime de threading pesado.",
+    "status": "Completed",
+    "usd_spent": 0.00013539
+  },
+  "created_at": "2026-05-20T13:28:19.105075+00:00"
+}

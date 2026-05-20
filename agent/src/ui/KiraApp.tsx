@@ -1,30 +1,56 @@
 /**
- * KiraApp — slim Ink REPL talking to the Rust core daemon.
+ * KiraApp — Ink REPL talking to the Rust core daemon.
  *
- * v0 capabilities:
+ * v0 capabilities (Sem 6 + 10):
  *   - User types a prompt → POST /v1/chat/stream → tokens stream in
- *   - Conversation history maintained in component state
- *   - /health and /quit slash commands
- *   - Tier selector (default: standard)
- *
- * No LangGraph, no local tools. Tools dispatch comes when sub-agents land
- * (Phase 2). For now REPL is a faithful streaming chat client.
+ *   - /agent <kind> <task>  → spawn agent + live-poll updates
+ *   - /agents               → list all agents (status + cost)
+ *   - /cancel <id-prefix>   → cancel a running agent
+ *   - /health, /tier <h|s|l>, /quit
  */
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Box, Text, useApp, useInput } from "ink";
-import { CoreClient, CoreError, type ChatMessage } from "../core-client/client.js";
+import {
+  CoreClient,
+  CoreError,
+  type Agent,
+  type AgentKind,
+  type ChatMessage,
+} from "../core-client/client.js";
 
 const TIERS = ["heavy", "standard", "light"] as const;
 type Tier = (typeof TIERS)[number];
 
-interface Turn {
-  user: string;
+const AGENT_KINDS: ReadonlyArray<AgentKind> = ["writer", "deployer", "judge"];
+
+// -- Turn modelling -----------------------------------------------------------
+
+type TurnBase = { user: string; inFlight: boolean; error?: string };
+
+interface ChatTurn extends TurnBase {
+  kind: "chat";
   assistant: string;
   model?: string;
-  inFlight: boolean;
-  error?: string;
 }
+
+interface AgentTurn extends TurnBase {
+  kind: "agent";
+  agentId?: string;
+  agentKind: AgentKind;
+  status?: string;
+  iters?: number;
+  usd?: number;
+  model?: string;
+  result?: string;
+}
+
+interface InfoTurn extends TurnBase {
+  kind: "info";
+  body: string;
+}
+
+type Turn = ChatTurn | AgentTurn | InfoTurn;
 
 export interface KiraAppProps {
   client?: CoreClient;
@@ -42,7 +68,11 @@ export function KiraApp({
   const [coreUp, setCoreUp] = useState<boolean | null>(null);
   const [coreVersion, setCoreVersion] = useState<string | null>(null);
 
-  // Health probe on mount.
+  // Active agent pollers — keyed by agent id, cleared on completion.
+  const agentPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
+    new Map(),
+  );
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -61,12 +91,211 @@ export function KiraApp({
     };
   }, [client]);
 
+  // Clean up pollers on unmount
+  useEffect(
+    () => () => {
+      for (const t of agentPollers.current.values()) clearInterval(t);
+      agentPollers.current.clear();
+    },
+    [],
+  );
+
+  // -- Helpers ---------------------------------------------------------------
+
+  const pushInfo = useCallback((user: string, body: string, error?: string) => {
+    setTurns((t) => [
+      ...t,
+      { kind: "info", user, body, inFlight: false, error },
+    ]);
+  }, []);
+
+  const startAgentPoller = useCallback(
+    (turnIdx: number, agent: Agent) => {
+      const id = agent.id;
+      const interval = setInterval(async () => {
+        try {
+          const fresh = await client.getAgent(id);
+          setTurns((t) => {
+            const next = [...t];
+            const cur = next[turnIdx];
+            if (cur && cur.kind === "agent") {
+              next[turnIdx] = {
+                ...cur,
+                status: fresh.status,
+                iters: fresh.iters,
+                usd: fresh.usd_spent,
+                model: fresh.model ?? cur.model,
+                result: fresh.result ?? cur.result,
+                error: fresh.error ?? cur.error,
+                inFlight:
+                  fresh.status !== "completed" &&
+                  fresh.status !== "failed" &&
+                  fresh.status !== "cancelled" &&
+                  fresh.status !== "stopped",
+              };
+            }
+            return next;
+          });
+          if (
+            fresh.status === "completed" ||
+            fresh.status === "failed" ||
+            fresh.status === "cancelled" ||
+            fresh.status === "stopped"
+          ) {
+            const t = agentPollers.current.get(id);
+            if (t) {
+              clearInterval(t);
+              agentPollers.current.delete(id);
+            }
+          }
+        } catch (e) {
+          setTurns((t) => {
+            const next = [...t];
+            const cur = next[turnIdx];
+            if (cur && cur.kind === "agent") {
+              next[turnIdx] = { ...cur, error: String(e), inFlight: false };
+            }
+            return next;
+          });
+          const t = agentPollers.current.get(id);
+          if (t) {
+            clearInterval(t);
+            agentPollers.current.delete(id);
+          }
+        }
+      }, 2000);
+      agentPollers.current.set(id, interval);
+    },
+    [client],
+  );
+
+  // -- Slash command dispatch ------------------------------------------------
+
+  const handleAgentCmd = useCallback(
+    async (raw: string) => {
+      // /agent <kind> <task...>
+      const rest = raw.slice("/agent".length).trim();
+      const space = rest.indexOf(" ");
+      if (space < 0) {
+        pushInfo(raw, "", `usage: /agent <writer|deployer|judge> <task>`);
+        return;
+      }
+      const kindStr = rest.slice(0, space).toLowerCase() as AgentKind;
+      const task = rest.slice(space + 1).trim();
+      if (!AGENT_KINDS.includes(kindStr)) {
+        pushInfo(
+          raw,
+          "",
+          `unknown kind '${kindStr}'. Valid: ${AGENT_KINDS.join(", ")}`,
+        );
+        return;
+      }
+      if (!task) {
+        pushInfo(raw, "", `task is empty`);
+        return;
+      }
+      const turnIdx = turns.length;
+      setTurns((t) => [
+        ...t,
+        {
+          kind: "agent",
+          user: raw,
+          agentKind: kindStr,
+          inFlight: true,
+        },
+      ]);
+      try {
+        const agent = await client.spawnAgent({
+          kind: kindStr,
+          task,
+          worktree_id: null,
+          base: null,
+          budget_usd: null,
+          max_iters: null,
+        });
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "agent") {
+            next[turnIdx] = {
+              ...cur,
+              agentId: agent.id,
+              status: agent.status,
+              iters: agent.iters,
+              usd: agent.usd_spent,
+              model: agent.model ?? undefined,
+            };
+          }
+          return next;
+        });
+        startAgentPoller(turnIdx, agent);
+      } catch (e) {
+        const msg = e instanceof CoreError ? e.message : String(e);
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "agent") {
+            next[turnIdx] = { ...cur, error: msg, inFlight: false };
+          }
+          return next;
+        });
+      }
+    },
+    [client, turns.length, pushInfo, startAgentPoller],
+  );
+
+  const handleAgentsList = useCallback(
+    async (raw: string) => {
+      try {
+        const all = await client.listAgents();
+        if (all.length === 0) {
+          pushInfo(raw, "(no agents)");
+          return;
+        }
+        const body = all
+          .map(
+            (a) =>
+              `${a.id.slice(0, 8)} ${a.kind.padEnd(8)} ${a.status.padEnd(9)} iters=${a.iters} $${a.usd_spent.toFixed(4)}`,
+          )
+          .join("\n");
+        pushInfo(raw, body);
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  const handleCancel = useCallback(
+    async (raw: string) => {
+      const prefix = raw.slice("/cancel".length).trim();
+      if (!prefix) {
+        pushInfo(raw, "", "usage: /cancel <id-prefix>");
+        return;
+      }
+      try {
+        const all = await client.listAgents();
+        const match = all.find((a) => a.id.startsWith(prefix));
+        if (!match) {
+          pushInfo(raw, "", `no agent with prefix '${prefix}'`);
+          return;
+        }
+        const r = await client.cancelAgent(match.id);
+        pushInfo(raw, `cancelled=${r.cancelled} id=${match.id.slice(0, 8)}`);
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  // -- Main send -------------------------------------------------------------
+
   const send = useCallback(
     async (raw: string) => {
       const text = raw.trim();
       if (!text) return;
 
-      // Slash commands
       if (text === "/quit" || text === "/exit") {
         exit();
         return;
@@ -74,19 +303,9 @@ export function KiraApp({
       if (text === "/health") {
         try {
           const h = await client.health();
-          setTurns((t) => [
-            ...t,
-            {
-              user: "/health",
-              assistant: `core ${h.version} • uptime ${h.uptime_secs}s`,
-              inFlight: false,
-            },
-          ]);
+          pushInfo(text, `core ${h.version} • uptime ${h.uptime_secs}s`);
         } catch (e) {
-          setTurns((t) => [
-            ...t,
-            { user: "/health", assistant: "", error: String(e), inFlight: false },
-          ]);
+          pushInfo(text, "", String(e));
         }
         return;
       }
@@ -94,42 +313,57 @@ export function KiraApp({
         const next = text.slice(6).trim() as Tier;
         if ((TIERS as readonly string[]).includes(next)) {
           setTier(next);
-          setTurns((t) => [
-            ...t,
-            { user: text, assistant: `tier → ${next}`, inFlight: false },
-          ]);
+          pushInfo(text, `tier → ${next}`);
         } else {
-          setTurns((t) => [
-            ...t,
-            {
-              user: text,
-              assistant: "",
-              error: `unknown tier '${next}'. Valid: ${TIERS.join(", ")}`,
-              inFlight: false,
-            },
-          ]);
+          pushInfo(
+            text,
+            "",
+            `unknown tier '${next}'. Valid: ${TIERS.join(", ")}`,
+          );
         }
         return;
       }
-
-      // Build messages from history (each turn = user+assistant pair).
-      const messages: ChatMessage[] = [];
-      for (const t of turns) {
-        messages.push({ role: "user", content: t.user });
-        if (t.assistant) messages.push({ role: "assistant", content: t.assistant });
+      if (text.startsWith("/agent ")) {
+        await handleAgentCmd(text);
+        return;
       }
-      messages.push({ role: "user", content: text });
+      if (text === "/agents") {
+        await handleAgentsList(text);
+        return;
+      }
+      if (text.startsWith("/cancel ")) {
+        await handleCancel(text);
+        return;
+      }
+
+      // Free chat — streamed against current tier.
+      const history: ChatMessage[] = [];
+      for (const t of turns) {
+        if (t.kind === "chat") {
+          history.push({ role: "user", content: t.user });
+          if (t.assistant)
+            history.push({ role: "assistant", content: t.assistant });
+        }
+      }
+      history.push({ role: "user", content: text });
 
       const turnIdx = turns.length;
-      setTurns((t) => [...t, { user: text, assistant: "", inFlight: true }]);
+      setTurns((t) => [
+        ...t,
+        { kind: "chat", user: text, assistant: "", inFlight: true },
+      ]);
 
       try {
-        for await (const ev of client.chatStream({ tier, model: null, messages })) {
+        for await (const ev of client.chatStream({
+          tier,
+          model: null,
+          messages: history,
+        })) {
           if (ev.type === "token") {
             setTurns((t) => {
               const next = [...t];
               const cur = next[turnIdx];
-              if (cur) {
+              if (cur && cur.kind === "chat") {
                 next[turnIdx] = { ...cur, assistant: cur.assistant + ev.delta };
               }
               return next;
@@ -138,7 +372,7 @@ export function KiraApp({
             setTurns((t) => {
               const next = [...t];
               const cur = next[turnIdx];
-              if (cur) {
+              if (cur && cur.kind === "chat") {
                 next[turnIdx] = { ...cur, model: ev.model, inFlight: false };
               }
               return next;
@@ -147,7 +381,7 @@ export function KiraApp({
             setTurns((t) => {
               const next = [...t];
               const cur = next[turnIdx];
-              if (cur) {
+              if (cur && cur.kind === "chat") {
                 next[turnIdx] = { ...cur, error: ev.message, inFlight: false };
               }
               return next;
@@ -159,14 +393,14 @@ export function KiraApp({
         setTurns((t) => {
           const next = [...t];
           const cur = next[turnIdx];
-          if (cur) {
+          if (cur && cur.kind === "chat") {
             next[turnIdx] = { ...cur, error: msg, inFlight: false };
           }
           return next;
         });
       }
     },
-    [client, tier, turns, exit],
+    [client, tier, turns, exit, pushInfo, handleAgentCmd, handleAgentsList, handleCancel],
   );
 
   useInput((ch, key) => {
@@ -204,7 +438,8 @@ export function KiraApp({
       </Box>
       <Box marginTop={1}>
         <Text dimColor>
-          /health · /tier {"<heavy|standard|light>"} · /quit · Ctrl+C
+          chat · /agent {"<kind> <task>"} · /agents · /cancel {"<id>"} · /health
+          · /tier · /quit
         </Text>
       </Box>
     </Box>
@@ -236,6 +471,73 @@ function Header({
 }
 
 function TurnView({ turn }: { turn: Turn }) {
+  if (turn.kind === "info") {
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <Box>
+          <Text color="cyan">❯ </Text>
+          <Text>{turn.user}</Text>
+        </Box>
+        {turn.error ? (
+          <Box>
+            <Text color="red">error: </Text>
+            <Text color="red">{turn.error}</Text>
+          </Box>
+        ) : (
+          <Box>
+            <Text color="yellow">ℹ </Text>
+            <Text>{turn.body}</Text>
+          </Box>
+        )}
+      </Box>
+    );
+  }
+  if (turn.kind === "agent") {
+    const statusColor =
+      turn.status === "completed"
+        ? "green"
+        : turn.status === "failed"
+          ? "red"
+          : turn.status === "cancelled"
+            ? "yellow"
+            : "cyan";
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <Box>
+          <Text color="cyan">❯ </Text>
+          <Text>{turn.user}</Text>
+        </Box>
+        {turn.error ? (
+          <Box>
+            <Text color="red">error: </Text>
+            <Text color="red">{turn.error}</Text>
+          </Box>
+        ) : (
+          <>
+            <Box>
+              <Text color="magenta">▸ </Text>
+              <Text dimColor>
+                {turn.agentKind} {turn.agentId?.slice(0, 8) ?? "..."}{" "}
+              </Text>
+              <Text color={statusColor}>{turn.status ?? "spawning"}</Text>
+              <Text dimColor>
+                {" "}
+                iters={turn.iters ?? 0} ${(turn.usd ?? 0).toFixed(4)}
+                {turn.model ? ` (${turn.model})` : ""}
+              </Text>
+              {turn.inFlight ? <Text color="yellow"> ▍</Text> : null}
+            </Box>
+            {turn.result ? (
+              <Box marginLeft={2}>
+                <Text>{truncate(turn.result, 500)}</Text>
+              </Box>
+            ) : null}
+          </>
+        )}
+      </Box>
+    );
+  }
+  // chat turn
   return (
     <Box flexDirection="column" marginBottom={1}>
       <Box>
@@ -257,4 +559,9 @@ function TurnView({ turn }: { turn: Turn }) {
       )}
     </Box>
   );
+}
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max) + "…";
 }

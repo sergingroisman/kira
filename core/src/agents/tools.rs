@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{debug, instrument, warn};
 
+use crate::hooks::{HookContext, HookEvent, HookOutcome, HookRunner};
 use crate::safety::cmd_allowlist::{
     validate_argv, BASH_OUTPUT_MAX_BYTES, BASH_TIMEOUT_DEFAULT_SECS, BASH_TIMEOUT_MAX_SECS,
 };
@@ -139,8 +140,51 @@ pub struct ToolResult {
     pub done: Option<String>,
 }
 
+/// Execute a tool call by name + dispatch hooks around it.
+/// `PreToolUse` may block; `PostToolUse` is fire-and-log.
+#[instrument(skip(arguments, hooks), fields(tool = %name, agent_id = %agent_id))]
+pub async fn dispatch_with_hooks(
+    name: &str,
+    arguments: &str,
+    worktree_path: &PathBuf,
+    hooks: &HookRunner,
+    agent_id: &str,
+    worktree_id: &str,
+) -> ToolResult {
+    // Build hook context from the tool call.
+    let parsed_args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let path = parsed_args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let ctx = HookContext {
+        tool_name: Some(name.to_string()),
+        tool_args: Some(arguments.to_string()),
+        path: path.clone(),
+        agent_id: Some(agent_id.to_string()),
+        worktree_id: Some(worktree_id.to_string()),
+        ..Default::default()
+    };
+
+    // PreToolUse may block.
+    if let HookOutcome::Blocked { reason, hook_idx } =
+        hooks.dispatch(HookEvent::PreToolUse, ctx.clone()).await
+    {
+        warn!(reason = %reason, hook_idx, "tool call blocked by hook");
+        return error_payload(format!("BLOCKED by hook #{hook_idx}: {reason}"));
+    }
+
+    let result = dispatch(name, arguments, worktree_path).await;
+
+    // PostToolUse is fire-and-forget (any block on Post is logged but ignored).
+    let _ = hooks.dispatch(HookEvent::PostToolUse, ctx).await;
+
+    result
+}
+
 /// Execute a tool call by name. `worktree_path` is the agent's base_dir
-/// (FS sandbox). All tool calls are scoped under it.
+/// (FS sandbox). All tool calls are scoped under it. No hooks fired here —
+/// callers should prefer `dispatch_with_hooks`.
 #[instrument(skip(arguments), fields(tool = %name))]
 pub async fn dispatch(
     name: &str,

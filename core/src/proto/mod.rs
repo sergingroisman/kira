@@ -8,4 +8,5 @@ pub mod chat;
 pub mod file;
 pub mod mailbox;
 pub mod ownership;
+pub mod plan;
 pub mod worktree;

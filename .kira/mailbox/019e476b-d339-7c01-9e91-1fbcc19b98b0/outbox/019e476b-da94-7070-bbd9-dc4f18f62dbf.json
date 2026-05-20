@@ -1,0 +1,15 @@
+{
+  "id": "019e476b-da94-7070-bbd9-dc4f18f62dbf",
+  "from": "019e476b-d339-7c01-9e91-1fbcc19b98b0",
+  "to": "core",
+  "kind": "result",
+  "payload": {
+    "error": null,
+    "iters": 1,
+    "model": "deepseek-v4-flash",
+    "result": "The command `rm` is not on the executable allowlist. I cannot execute `rm -rf /tmp/test`. Need: rm command added to the allowlist.",
+    "status": "Completed",
+    "usd_spent": 0.00017346
+  },
+  "created_at": "2026-05-20T22:05:11.189007+00:00"
+}

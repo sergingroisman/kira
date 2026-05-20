@@ -1,0 +1,15 @@
+{
+  "id": "019e45ae-b068-7d51-a73f-cd38bc453930",
+  "from": "019e45ae-7db9-71c1-83c9-f0e48b93828e",
+  "to": "core",
+  "kind": "result",
+  "payload": {
+    "error": null,
+    "iters": 6,
+    "model": "qwen-max",
+    "result": "{\"score\": 9, \"rationale\": \"Os arquivos são tecnicamente precisos, concisos e usam um português idiomático. A informação é clara e relevante para o leitor interessado em Rust e programação assíncrona.\", \"suggestions\": []}",
+    "status": "Completed",
+    "usd_spent": 0.011607770000000002
+  },
+  "created_at": "2026-05-20T13:58:56.872795+00:00"
+}

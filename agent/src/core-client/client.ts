@@ -20,6 +20,12 @@ import type {
   FileWriteRequest,
   FileWriteResponse,
 } from "../generated/file";
+import type {
+  Agent,
+  AgentKind,
+  CancelResponse,
+  SpawnAgentRequest,
+} from "../generated/agent";
 
 export interface CoreClientConfig {
   baseUrl: string; // default http://127.0.0.1:7777
@@ -153,6 +159,34 @@ export class CoreClient {
   }
 
   // -----------------------------------------------------------------
+  // Agents
+  // -----------------------------------------------------------------
+
+  async spawnAgent(req: SpawnAgentRequest): Promise<Agent> {
+    return this.postJson<Agent>("/v1/agents/spawn", req);
+  }
+
+  async listAgents(): Promise<Agent[]> {
+    const res = await fetch(`${this.config.baseUrl}/v1/agents`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<Agent[]>;
+  }
+
+  async getAgent(id: string): Promise<Agent> {
+    const res = await fetch(`${this.config.baseUrl}/v1/agents/${id}`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<Agent>;
+  }
+
+  async cancelAgent(id: string): Promise<CancelResponse> {
+    return this.postJson<CancelResponse>(`/v1/agents/${id}/cancel`, {});
+  }
+
+  // -----------------------------------------------------------------
   // Internals
   // -----------------------------------------------------------------
 
@@ -202,4 +236,8 @@ export type {
   FileReadResponse,
   FileWriteRequest,
   FileWriteResponse,
+  Agent,
+  AgentKind,
+  CancelResponse,
+  SpawnAgentRequest,
 };

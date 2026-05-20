@@ -80,6 +80,9 @@ pub struct Agent {
     pub error: Option<String>,
     pub created_at: String,
     pub finished_at: Option<String>,
+    /// ISO 8601 of the most recent iters increment. Used by the
+    /// heartbeat watchdog to detect stalled agents.
+    pub last_progress_at: Option<String>,
 }
 
 #[derive(Serialize, TS)]

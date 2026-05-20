@@ -1,0 +1,16 @@
+# Kira hooks v0 — declarative subprocess hooks.
+
+# Block bash calls that look like dangerous rm.
+[[hooks]]
+event = "pre_tool_use"
+matcher.tool = "bash"
+matcher.regex = "rm.*-rf"
+command = ["sh", "-c", "echo 'BLOCKED: rm -rf detected' >&2 && exit 1"]
+timeout_secs = 3
+
+# Log every file_write (PostToolUse, allowed always).
+[[hooks]]
+event = "post_tool_use"
+matcher.tool = "file_write"
+command = ["sh", "-c", "echo \"[hook] file_write done: tool=$KIRA_HOOK_TOOL agent=$KIRA_HOOK_AGENT_ID\" >&2"]
+timeout_secs = 3

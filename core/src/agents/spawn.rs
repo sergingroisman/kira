@@ -27,7 +27,8 @@ use uuid::Uuid;
 use crate::agents::mailbox::MailboxFs;
 use crate::agents::ownership::OwnershipRegistry;
 use crate::agents::store::Store as AgentStore;
-use crate::agents::tools::{agent_tools, dispatch as dispatch_tool};
+use crate::agents::tools::{agent_tools, dispatch_with_hooks};
+use crate::hooks::HookRunner;
 use crate::proto::agent::{Agent, AgentKind, AgentStatus, SpawnAgentRequest};
 use crate::proto::mailbox::SendRequest;
 use crate::proto::ownership::{Claim, OwnershipMode};
@@ -59,6 +60,7 @@ pub struct AgentManager {
     worktrees: WorktreeManager,
     mailbox: MailboxFs,
     ownership: OwnershipRegistry,
+    hooks: HookRunner,
     cancellers: Arc<std::sync::Mutex<HashMap<Uuid, oneshot::Sender<()>>>>,
 }
 
@@ -68,6 +70,7 @@ impl AgentManager {
         worktrees: WorktreeManager,
         mailbox: MailboxFs,
         ownership: OwnershipRegistry,
+        hooks: HookRunner,
     ) -> Self {
         Self {
             store: AgentStore::new(),
@@ -75,6 +78,7 @@ impl AgentManager {
             worktrees,
             mailbox,
             ownership,
+            hooks,
             cancellers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -95,6 +99,24 @@ impl AgentManager {
         } else {
             false
         }
+    }
+
+    /// Watchdog hook: flip a non-terminal agent to `Stale`.
+    /// No-op if the agent is already in a terminal state or missing.
+    pub fn mark_stale(&self, id: Uuid) {
+        self.store.update(id, |a| {
+            if matches!(a.status, AgentStatus::Active | AgentStatus::Spawning) {
+                a.status = AgentStatus::Stale;
+                a.finished_at = Some(Utc::now().to_rfc3339());
+            }
+        });
+        // Also drop the canceller so /cancel doesn't try to signal a stale agent.
+        self.cancellers
+            .lock()
+            .expect("cancellers poisoned")
+            .remove(&id);
+        // Release ownership so other agents can write to the same scope.
+        self.ownership.release(&id.to_string());
     }
 
     #[instrument(skip(self, req), fields(kind = ?req.kind))]
@@ -152,8 +174,9 @@ impl AgentManager {
             usd_spent: 0.0,
             result: None,
             error: None,
-            created_at: now,
+            created_at: now.clone(),
             finished_at: None,
+            last_progress_at: Some(now),
         };
         self.store.insert(id, agent.clone());
 
@@ -171,10 +194,12 @@ impl AgentManager {
             max_iters,
             budget_cap,
             worktree_path,
+            worktree_id: worktree_id.clone(),
             store: self.store.clone(),
             router: self.router.clone(),
             mailbox: self.mailbox.clone(),
             ownership: self.ownership.clone(),
+            hooks: self.hooks.clone(),
             cancellers: Arc::clone(&self.cancellers),
         };
         tokio::spawn(agent_loop(ctx, cancel_rx));
@@ -192,10 +217,12 @@ struct AgentContext {
     max_iters: u32,
     budget_cap: f64,
     worktree_path: PathBuf,
+    worktree_id: String,
     store: AgentStore,
     router: Router,
     mailbox: MailboxFs,
     ownership: OwnershipRegistry,
+    hooks: HookRunner,
     cancellers: Arc<std::sync::Mutex<HashMap<Uuid, oneshot::Sender<()>>>>,
 }
 
@@ -269,10 +296,12 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
         if let Some(usage) = response.usage.as_ref() {
             usd_spent += approx_cost(&model, usage.prompt_tokens, usage.completion_tokens);
         }
+        let now_iter = Utc::now().to_rfc3339();
         ctx.store.update(ctx.id, |a| {
             a.iters = iters;
             a.usd_spent = usd_spent;
             a.model = Some(model.clone());
+            a.last_progress_at = Some(now_iter.clone());
         });
 
         let choice = match response.choices.into_iter().next() {
@@ -319,7 +348,15 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
             let arguments = function.arguments.clone();
             debug!(tool = %name, args_len = arguments.len(), "agent invoked tool");
 
-            let result = dispatch_tool(&name, &arguments, &ctx.worktree_path).await;
+            let result = dispatch_with_hooks(
+                &name,
+                &arguments,
+                &ctx.worktree_path,
+                &ctx.hooks,
+                &ctx.id.to_string(),
+                &ctx.worktree_id,
+            )
+            .await;
 
             // Tool result message
             match ChatCompletionRequestToolMessageArgs::default()

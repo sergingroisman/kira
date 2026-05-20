@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::agents::{mailbox::MailboxFs, ownership::OwnershipRegistry, AgentManager};
+use crate::hooks::HookRunner;
 use crate::llm::{dashscope, deepseek, LlmProvider};
 use crate::router::budget::{BudgetConfig, BudgetGuard};
 use crate::router::Router;
@@ -31,6 +32,7 @@ pub struct AppState {
     pub mailbox: MailboxFs,
     pub ownership: OwnershipRegistry,
     pub agents: AgentManager,
+    pub hooks: HookRunner,
 }
 
 impl AppState {
@@ -54,13 +56,18 @@ impl AppState {
         let cwd = std::env::current_dir().context("cwd unavailable")?;
         let worktrees = WorktreeManager::new(cwd.clone()).await?;
         let repo_root = crate::worktree::git::toplevel(&cwd).await?;
-        let mailbox = MailboxFs::new(repo_root);
+        let mailbox = MailboxFs::new(repo_root.clone());
         let ownership = OwnershipRegistry::new();
+        let hooks = HookRunner::load(&repo_root).unwrap_or_else(|e| {
+            warn!(error = ?e, "hooks load failed — running with no hooks");
+            HookRunner::empty()
+        });
         let agents = AgentManager::new(
             router.clone(),
             worktrees.clone(),
             mailbox.clone(),
             ownership.clone(),
+            hooks.clone(),
         );
 
         Ok(Self {
@@ -69,6 +76,7 @@ impl AppState {
             mailbox,
             ownership,
             agents,
+            hooks,
         })
     }
 }
