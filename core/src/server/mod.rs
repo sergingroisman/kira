@@ -35,6 +35,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat", post(chat::chat))
         .route("/v1/chat/stream", post(chat::chat_stream))
         .route("/v1/tool/bash", post(tool::tool_bash))
+        .route("/v1/tool/file_read", post(tool::tool_file_read))
+        .route("/v1/tool/file_write", post(tool::tool_file_write))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

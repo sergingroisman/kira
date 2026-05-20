@@ -4,3 +4,4 @@
 
 pub mod bash;
 pub mod chat;
+pub mod file;
