@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use tracing::info;
 
+pub mod agents;
 pub mod llm;
 pub mod proto;
 pub mod router;

@@ -46,16 +46,65 @@ pub struct WorktreeManager {
 
 impl WorktreeManager {
     /// Build a manager rooted at the toplevel of `start` (commonly `cwd`).
+    /// Reconciles existing `kira/*` worktrees found on disk into the store as `Stale`.
     pub async fn new(start: PathBuf) -> Result<Self> {
         let repo_root = git::toplevel(&start)
             .await
             .with_context(|| format!("not inside a git repo: {}", start.display()))?;
         info!(repo_root = %repo_root.display(), "WorktreeManager rooted");
-        Ok(Self {
-            repo_root,
+
+        let mgr = Self {
+            repo_root: repo_root.clone(),
             store: Store::new(),
             semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_PARALLEL)),
-        })
+        };
+        mgr.reconcile().await?;
+        Ok(mgr)
+    }
+
+    /// Scan `git worktree list` for `kira/*` worktrees the daemon doesn't know
+    /// about (e.g. survived a crash) and import them as `Stale`. Each consumes
+    /// a semaphore permit so we don't overcommit concurrency.
+    async fn reconcile(&self) -> Result<()> {
+        let rows = git::worktree_list(&self.repo_root).await?;
+        let mut imported = 0_usize;
+        for row in rows {
+            let Some(branch) = row.branch.as_deref() else {
+                continue;
+            };
+            // Branch is reported as "refs/heads/kira/wt-..." in porcelain output.
+            let branch_short = branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch)
+                .to_string();
+            if !branch_short.starts_with(BRANCH_PREFIX) {
+                continue;
+            }
+            // Try to grab a permit; if max already reached, skip (warn).
+            let permit = self.semaphore.clone().try_acquire_owned();
+            if permit.is_err() {
+                warn!(branch = %branch_short, "reconcile: semaphore full, skipping orphan");
+                continue;
+            }
+            std::mem::forget(permit);
+
+            let id = Uuid::now_v7();
+            let wt = Worktree {
+                id: id.to_string(),
+                branch: branch_short,
+                path: row.path.clone(),
+                base_branch: "unknown".to_string(),
+                status: WorktreeStatus::Stale,
+                agent_kind: None,
+                created_at: Utc::now().to_rfc3339(),
+            };
+            self.store.insert(id, wt);
+            imported += 1;
+        }
+        if imported > 0 {
+            info!(imported, "reconciled orphan kira/* worktrees as Stale");
+        }
+        Ok(())
     }
 
     /// Number of currently registered worktrees (cheap).

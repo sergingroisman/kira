@@ -5,4 +5,6 @@
 pub mod bash;
 pub mod chat;
 pub mod file;
+pub mod mailbox;
+pub mod ownership;
 pub mod worktree;
