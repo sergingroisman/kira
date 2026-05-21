@@ -19,8 +19,14 @@ pub const BASH_ALLOWLIST: &[&str] = &[
 
 /// Forbidden metacharacters (documented; enforced via regex below).
 /// `& | ; $ > < \ ! ' " ( ) backtick` plus whitespace within args.
+///
+/// Allowed extras beyond alnum/`_./@:=,-+`:
+/// - `~`  — git refs (`HEAD~1`) and home (`~/x`). Safe under `args(&[...])`
+///   because there is no shell expansion.
+/// - `*`  — glob patterns for `find -name '*.ts'`, `grep`, etc. The tool
+///   itself interprets the glob; the OS sees a literal `*`.
 pub static SAFE_ARG_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_./@:=,\-+]+$").expect("hardcoded regex"));
+    Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_./@:=,\-+~*]+$").expect("hardcoded regex"));
 
 pub const BASH_TIMEOUT_DEFAULT_SECS: u64 = 30;
 pub const BASH_TIMEOUT_MAX_SECS: u64 = 300;

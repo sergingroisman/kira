@@ -1,0 +1,15 @@
+{
+  "id": "019e4b5c-3681-7490-8b6d-ab1b779158c9",
+  "from": "019e4b5b-cc5d-7d81-9bfe-8de9ac46f655",
+  "to": "core",
+  "kind": "result",
+  "payload": {
+    "error": null,
+    "iters": 1,
+    "model": "qwen-max",
+    "result": "{\"dimension\":\"security\",\"highlight\":\"The diff introduces a new .kira/hooks.toml file that adds security by blocking dangerous bash commands and logging file_write actions.\",\"findings\":[],\"coverage\":{\"rules_evaluated\":0,\"files_evaluated\":16,\"pct_evaluated\":100}}",
+    "status": "Completed",
+    "usd_spent": 0.041288000000000005
+  },
+  "created_at": "2026-05-21T16:26:35.009883+00:00"
+}

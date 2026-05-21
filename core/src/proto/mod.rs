@@ -5,8 +5,13 @@
 pub mod agent;
 pub mod bash;
 pub mod chat;
+pub mod embed;
+pub mod eval;
 pub mod file;
+pub mod gate;
+pub mod lesson;
 pub mod mailbox;
 pub mod ownership;
 pub mod plan;
+pub mod review;
 pub mod worktree;

@@ -1,0 +1,15 @@
+{
+  "id": "019e4b40-c0b8-74d0-bf85-71d815d5a080",
+  "from": "019e4b40-49b2-7df3-ae78-b9ee76ade647",
+  "to": "core",
+  "kind": "result",
+  "payload": {
+    "error": null,
+    "iters": 1,
+    "model": "qwen-plus",
+    "result": "{\"dimension\":\"performance\",\"highlight\":\"The async streaming implementation using AsyncIterable is well-structured and follows modern JavaScript async patterns.\",\"findings\":[{\"rule_id\":\"PERF-001\",\"rule_source\":\"best_practices:timeout_policy\",\"file\":\"agent/src/core-client/client.ts\",\"line_start\":123,\"line_end\":128,\"severity\":\"performance\",\"confidence\":0.95,\"claim\":\"The chatStream method lacks a timeout signal, risking indefinite hanging on network failures\",\"evidence_quote\":\"const res = await fetch(`${this.config.baseUrl}/v1/chat/stream`, {\\n      method: \\\"POST\\\",\\n      headers: { \\\"Content-Type\\\": \\\"application/json\\\" },\\n      body: JSON.stringify(req),\\n    });\",\"recommendation\":\"Add timeout signal similar to other methods: signal: AbortSignal.timeout(this.config.timeoutMs)\"}],\"coverage\":{\"rules_evaluated\":1,\"files_evaluated\":1,\"pct_evaluated\":100}}",
+    "status": "Completed",
+    "usd_spent": 0.016694
+  },
+  "created_at": "2026-05-21T15:56:35.384779+00:00"
+}

@@ -26,6 +26,21 @@ import type {
   CancelResponse,
   SpawnAgentRequest,
 } from "../generated/agent";
+import type {
+  ApproveResponse,
+  CancelPlanResponse,
+  DraftRequest,
+  Plan,
+} from "../generated/plan";
+import type {
+  CreateLessonRequest,
+  DeleteLessonResponse,
+  Lesson,
+  PromoteResponse,
+} from "../generated/lesson";
+import type { RunGatesRequest, RunGatesResponse } from "../generated/gate";
+import type { RunEvalRequest, RunEvalResponse } from "../generated/eval";
+import type { RunReviewRequest, RunReviewResponse } from "../generated/review";
 
 export interface CoreClientConfig {
   baseUrl: string; // default http://127.0.0.1:7777
@@ -187,6 +202,110 @@ export class CoreClient {
   }
 
   // -----------------------------------------------------------------
+  // Plans (plan/act split)
+  // -----------------------------------------------------------------
+
+  async draftPlan(req: DraftRequest): Promise<Plan> {
+    return this.postJson<Plan>("/v1/plan/draft", req);
+  }
+
+  async listPlans(): Promise<Plan[]> {
+    const res = await fetch(`${this.config.baseUrl}/v1/plan`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<Plan[]>;
+  }
+
+  async getPlan(id: string): Promise<Plan> {
+    const res = await fetch(`${this.config.baseUrl}/v1/plan/${id}`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<Plan>;
+  }
+
+  async approvePlan(id: string): Promise<ApproveResponse> {
+    return this.postJson<ApproveResponse>(`/v1/plan/${id}/approve`, {});
+  }
+
+  async cancelPlan(id: string): Promise<CancelPlanResponse> {
+    return this.postJson<CancelPlanResponse>(`/v1/plan/${id}/cancel`, {});
+  }
+
+  // -----------------------------------------------------------------
+  // Lessons
+  // -----------------------------------------------------------------
+
+  async listLessons(): Promise<Lesson[]> {
+    const res = await fetch(`${this.config.baseUrl}/v1/lessons`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<Lesson[]>;
+  }
+
+  async createLesson(req: CreateLessonRequest): Promise<Lesson> {
+    return this.postJson<Lesson>("/v1/lessons", req);
+  }
+
+  async deleteLesson(id: string): Promise<DeleteLessonResponse> {
+    const res = await fetch(`${this.config.baseUrl}/v1/lessons/${id}`, {
+      method: "DELETE",
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<DeleteLessonResponse>;
+  }
+
+  async promoteLesson(id: string): Promise<PromoteResponse> {
+    return this.postJson<PromoteResponse>(`/v1/lessons/${id}/promote`, {});
+  }
+
+  // -----------------------------------------------------------------
+  // Gates
+  // -----------------------------------------------------------------
+
+  async runGates(req: RunGatesRequest): Promise<RunGatesResponse> {
+    return this.postJson<RunGatesResponse>("/v1/gates/run", req);
+  }
+
+  // -----------------------------------------------------------------
+  // Eval framework
+  // -----------------------------------------------------------------
+
+  async runEval(req: RunEvalRequest): Promise<RunEvalResponse> {
+    // Eval can take a long time (N tasks × M models × judge); bump timeout.
+    const res = await fetch(`${this.config.baseUrl}/v1/eval/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(this.config.timeoutMs * 5),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<RunEvalResponse>;
+  }
+
+  // -----------------------------------------------------------------
+  // Multi-dim PR review (TRUST-inspired)
+  // -----------------------------------------------------------------
+
+  async runReview(req: RunReviewRequest): Promise<RunReviewResponse> {
+    // Review fans out N reviewer agents in parallel; full run can hit 5-8min
+    // on Heavy tier. Hard timeout matches server-side default (300s) + slack.
+    const serverTimeout = (req.timeout_secs ?? 300) * 1000;
+    const slack = 90_000;
+    const res = await fetch(`${this.config.baseUrl}/v1/review`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(serverTimeout + slack),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<RunReviewResponse>;
+  }
+
+  // -----------------------------------------------------------------
   // Internals
   // -----------------------------------------------------------------
 
@@ -240,4 +359,18 @@ export type {
   AgentKind,
   CancelResponse,
   SpawnAgentRequest,
+  Plan,
+  DraftRequest,
+  ApproveResponse,
+  CancelPlanResponse,
+  Lesson,
+  CreateLessonRequest,
+  DeleteLessonResponse,
+  PromoteResponse,
+  RunGatesRequest,
+  RunGatesResponse,
+  RunEvalRequest,
+  RunEvalResponse,
+  RunReviewRequest,
+  RunReviewResponse,
 };

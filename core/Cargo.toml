@@ -39,6 +39,12 @@ dotenvy = "0.15"
 # TOML parsing (hooks config)
 toml = "0.8"
 
+# YAML parsing (workflows .kira/workflows/*.yaml)
+serde_yaml = "0.9"
+
+# Embedded ACID DB for durable state (worktrees, agents, plans, etc).
+redb = "2"
+
 # IDs
 uuid = { version = "1", features = ["v7", "serde"] }
 

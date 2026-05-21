@@ -10,13 +10,19 @@ use std::net::SocketAddr;
 use tracing::info;
 
 pub mod agents;
+pub mod eval;
+pub mod gates;
 pub mod hooks;
+pub mod lessons;
 pub mod llm;
+pub mod plans;
 pub mod proto;
 pub mod router;
 pub mod safety;
 pub mod server;
+pub mod state;
 pub mod watchdogs;
+pub mod workflows;
 pub mod worktree;
 
 use server::AppState;

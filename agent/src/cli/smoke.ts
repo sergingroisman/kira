@@ -58,4 +58,23 @@ console.log({
   error: last.error,
 });
 
+console.log("\n=== plan draft+approve ===");
+const plan = await client.draftPlan({
+  goal: "Write src/content/smoke.md with 1 sentence about Kira's plan/act split.",
+  agent_kind: "writer",
+  ttl_secs: null,
+});
+console.log("drafted:", plan.id, "steps:", plan.steps.length, "status:", plan.status);
+
+const apr = await client.approvePlan(plan.id);
+console.log("approved → executor:", apr.executor_agent_id);
+
+let planLast = await client.getPlan(plan.id);
+for (let i = 0; i < 30; i++) {
+  await new Promise((r) => setTimeout(r, 2000));
+  planLast = await client.getPlan(plan.id);
+  console.log(`  [${i}] plan=${planLast.status}`);
+  if (["done", "failed", "cancelled", "expired"].includes(planLast.status)) break;
+}
+
 console.log("\nall good ✓");

@@ -8,6 +8,28 @@ use crate::proto::agent::AgentKind;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, TS)]
 #[ts(export, export_to = "../../agent/src/generated/plan.ts")]
 #[serde(rename_all = "snake_case")]
+pub enum PlanScope {
+    /// ≤3 files, ≤1 sentence change. Skip design/tasks formally.
+    Quick,
+    /// ≤3 files, clear feature, no new patterns. 1-3 steps.
+    Small,
+    /// Multi-file feature, recognizable pattern. 3-7 steps.
+    Medium,
+    /// Multi-component or new domain. 7-10 steps.
+    Large,
+    /// High ambiguity. Same as Large but executor should pause for UAT.
+    Complex,
+}
+
+impl Default for PlanScope {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, TS)]
+#[ts(export, export_to = "../../agent/src/generated/plan.ts")]
+#[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     /// Emitted by planner; awaiting human approval.
     Draft,
@@ -50,6 +72,9 @@ pub struct Plan {
     pub id: String,
     pub goal: String,
     pub agent_kind: AgentKind,
+    /// Planner-detected scope. Drives executor budget + max_iters defaults.
+    #[serde(default)]
+    pub scope: PlanScope,
     pub steps: Vec<PlanStep>,
     pub status: PlanStatus,
     /// ISO 8601 UTC.
@@ -62,9 +87,6 @@ pub struct Plan {
     /// When approved, the executor agent id.
     #[serde(default)]
     pub executor_agent_id: Option<String>,
-    /// Raw model output (for debugging).
-    #[serde(default)]
-    pub raw_planner_output: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }

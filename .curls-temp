@@ -1,0 +1,42 @@
+curl -X POST http://127.0.0.1:7777/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tier": "standard",
+    "messages": [{"role": "user", "content": "diga oi em 5 palavras"}]
+  }' | jq
+
+Pra testar /v1/tool/bash
+Daemon roda (kill old, fresh start). Em outro terminal:
+
+1. Caso feliz — git status no kira repo
+curl -s -X POST http://127.0.0.1:7777/v1/tool/bash \
+  -H "Content-Type: application/json" \
+  -d '{
+    "argv": ["git", "status", "--short"],
+    "cwd": "/Users/avanade/Workspace/kira"
+  }' | jq
+Esperado: stdout com git status output, exit_code: 0, duration_ms curto.
+
+2. Allowlist block — executável proibido
+curl -s -X POST http://127.0.0.1:7777/v1/tool/bash \
+  -H "Content-Type: application/json" \
+  -d '{"argv": ["rm", "-rf", "/"]}' | jq
+Esperado: HTTP 500 com erro: "executable 'rm' not in allowlist (SC3)".
+
+3. Arg regex block — metacaracter
+curl -s -X POST http://127.0.0.1:7777/v1/tool/bash \
+  -H "Content-Type: application/json" \
+  -d '{"argv": ["ls", "; cat /etc/passwd"]}' | jq
+Esperado: erro: "arg #0 '; cat /etc/passwd' contains forbidden chars".
+
+4. Timeout
+curl -s -X POST http://127.0.0.1:7777/v1/tool/bash \
+  -H "Content-Type: application/json" \
+  -d '{"argv": ["find", "/"], "timeout_secs": 2}' | jq
+Esperado: erro: "bash tool timed out after 2s" (find / não termina em 2s).
+
+5. Path traversal protegido (cwd canonicalize)
+curl -s -X POST http://127.0.0.1:7777/v1/tool/bash \
+  -H "Content-Type: application/json" \
+  -d '{"argv": ["pwd"], "cwd": "/etc/../etc/passwd"}' | jq
+Esperado: erro porque /etc/passwd é arquivo (canonicalize falha em cd).

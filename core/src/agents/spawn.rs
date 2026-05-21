@@ -28,7 +28,11 @@ use crate::agents::mailbox::MailboxFs;
 use crate::agents::ownership::OwnershipRegistry;
 use crate::agents::store::Store as AgentStore;
 use crate::agents::tools::{agent_tools, dispatch_with_hooks};
+use crate::gates::run_cascade;
 use crate::hooks::HookRunner;
+use crate::lessons::{generator, render_inject_snippet, LessonRegistry};
+use crate::llm::embed_cache::EmbedCache;
+use crate::proto::gate::{GateOutcome, RunGatesRequest};
 use crate::proto::agent::{Agent, AgentKind, AgentStatus, SpawnAgentRequest};
 use crate::proto::mailbox::SendRequest;
 use crate::proto::ownership::{Claim, OwnershipMode};
@@ -38,6 +42,27 @@ use crate::worktree::WorktreeManager;
 
 const DEFAULT_BUDGET_USD: f64 = 1.00;
 const DEFAULT_MAX_ITERS: u32 = 10;
+
+/// Stall detection: if the same tool call (name + args) repeats this many
+/// times in a row, the agent is considered stuck and the loop breaks.
+const STALL_SAME_TOOL_THRESHOLD: usize = 3;
+const TOOL_HISTORY_CAP: usize = 5;
+
+fn tool_call_signature(name: &str, arguments: &str) -> String {
+    // FNV-1a 64-bit over name + args.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in name.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= u64::from(b':');
+    hash = hash.wrapping_mul(0x100000001b3);
+    for b in arguments.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{name}::{hash:016x}")
+}
 
 fn default_ownership(kind: AgentKind) -> (Vec<String>, OwnershipMode) {
     match kind {
@@ -50,6 +75,7 @@ fn default_ownership(kind: AgentKind) -> (Vec<String>, OwnershipMode) {
             OwnershipMode::Exclusive,
         ),
         AgentKind::Judge => (vec![], OwnershipMode::ReadOnly),
+        AgentKind::Reviewer => (vec![], OwnershipMode::ReadOnly),
     }
 }
 
@@ -61,6 +87,8 @@ pub struct AgentManager {
     mailbox: MailboxFs,
     ownership: OwnershipRegistry,
     hooks: HookRunner,
+    lessons: LessonRegistry,
+    embed_cache: EmbedCache,
     cancellers: Arc<std::sync::Mutex<HashMap<Uuid, oneshot::Sender<()>>>>,
 }
 
@@ -71,14 +99,23 @@ impl AgentManager {
         mailbox: MailboxFs,
         ownership: OwnershipRegistry,
         hooks: HookRunner,
+        db: Option<crate::state::KiraDb>,
+        lessons: LessonRegistry,
+        embed_cache: EmbedCache,
     ) -> Self {
+        let store = match db.clone() {
+            Some(d) => AgentStore::with_db(d),
+            None => AgentStore::new(),
+        };
         Self {
-            store: AgentStore::new(),
+            store,
             router,
             worktrees,
             mailbox,
             ownership,
             hooks,
+            lessons,
+            embed_cache,
             cancellers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -155,7 +192,7 @@ impl AgentManager {
         let (patterns, mode) = default_ownership(kind);
         if !patterns.is_empty() {
             self.ownership
-                .claim(Claim::now(id_str.clone(), patterns, mode))
+                .claim(Claim::now(id_str.clone(), patterns.clone(), mode))
                 .context("ownership claim failed")?;
         }
 
@@ -186,6 +223,10 @@ impl AgentManager {
             .expect("cancellers poisoned")
             .insert(id, cancel_tx);
 
+        // Inject active lessons matching this kind into the agent's system prompt.
+        let lesson_snippet =
+            render_inject_snippet(&self.lessons.inject_for(kind));
+
         let ctx = AgentContext {
             id,
             kind,
@@ -195,11 +236,16 @@ impl AgentManager {
             budget_cap,
             worktree_path,
             worktree_id: worktree_id.clone(),
+            lesson_snippet,
+            owned_globs: patterns.clone(),
+            touched: Arc::new(std::sync::Mutex::new(Vec::new())),
             store: self.store.clone(),
             router: self.router.clone(),
             mailbox: self.mailbox.clone(),
             ownership: self.ownership.clone(),
             hooks: self.hooks.clone(),
+            lessons: self.lessons.clone(),
+            embed_cache: self.embed_cache.clone(),
             cancellers: Arc::clone(&self.cancellers),
         };
         tokio::spawn(agent_loop(ctx, cancel_rx));
@@ -218,11 +264,20 @@ struct AgentContext {
     budget_cap: f64,
     worktree_path: PathBuf,
     worktree_id: String,
+    /// Lesson snippet pre-built at spawn time, appended to the kind's system prompt.
+    lesson_snippet: String,
+    /// Owned globs the agent claimed (used by post-finish gates).
+    owned_globs: Vec<String>,
+    /// Canonical paths the agent actually wrote to (populated by file_write
+    /// dispatches). Read by post-finish gates for L2 file_integrity.
+    touched: Arc<std::sync::Mutex<Vec<String>>>,
     store: AgentStore,
     router: Router,
     mailbox: MailboxFs,
     ownership: OwnershipRegistry,
     hooks: HookRunner,
+    lessons: LessonRegistry,
+    embed_cache: EmbedCache,
     cancellers: Arc<std::sync::Mutex<HashMap<Uuid, oneshot::Sender<()>>>>,
 }
 
@@ -234,9 +289,13 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
     let tools = agent_tools(&ctx.worktree_path.display().to_string());
 
     let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
-    // System prompt
+    // System prompt + (optional) lessons snippet.
+    let mut system = ctx.kind.system_prompt().to_string();
+    if !ctx.lesson_snippet.is_empty() {
+        system.push_str(&ctx.lesson_snippet);
+    }
     if let Ok(m) = ChatCompletionRequestSystemMessageArgs::default()
-        .content(ctx.kind.system_prompt())
+        .content(system)
         .build()
     {
         messages.push(m.into());
@@ -254,6 +313,9 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
     let mut model_used: Option<String> = None;
     let mut final_result: Option<String> = None;
     let mut error: Option<String> = None;
+    // Stall detector — tracks recent tool call signatures.
+    let mut tool_history: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(TOOL_HISTORY_CAP);
 
     loop {
         if iters >= ctx.max_iters {
@@ -342,11 +404,41 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
 
         // Execute each tool call sequentially. Append tool result messages.
         let mut break_outer_with_done: Option<String> = None;
+        let mut break_outer_with_stall = false;
         for tc in tool_calls {
             let ChatCompletionMessageToolCall { id, function, .. } = tc;
             let name = function.name.clone();
             let arguments = function.arguments.clone();
             debug!(tool = %name, args_len = arguments.len(), "agent invoked tool");
+
+            // Stall detection (G6 SameToolLoop).
+            // `done` is excluded from stall detection — it's the legitimate exit.
+            if name != "done" {
+                let sig = tool_call_signature(&name, &arguments);
+                tool_history.push_back(sig.clone());
+                if tool_history.len() > TOOL_HISTORY_CAP {
+                    tool_history.pop_front();
+                }
+                let recent_same = tool_history
+                    .iter()
+                    .rev()
+                    .take(STALL_SAME_TOOL_THRESHOLD)
+                    .filter(|s| s.as_str() == sig.as_str())
+                    .count();
+                if recent_same >= STALL_SAME_TOOL_THRESHOLD {
+                    warn!(
+                        agent_id = %ctx.id,
+                        tool = %name,
+                        repeats = recent_same,
+                        "stall detected: same tool+args repeated"
+                    );
+                    error = Some(format!(
+                        "stall: tool '{name}' called {recent_same} times in a row with identical args"
+                    ));
+                    break_outer_with_stall = true;
+                    break;
+                }
+            }
 
             let result = dispatch_with_hooks(
                 &name,
@@ -355,6 +447,7 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
                 &ctx.hooks,
                 &ctx.id.to_string(),
                 &ctx.worktree_id,
+                Some(&ctx.touched),
             )
             .await;
 
@@ -381,15 +474,24 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
             final_result = Some(done_payload);
             break;
         }
-        if error.is_some() {
+        if break_outer_with_stall || error.is_some() {
             break;
         }
     }
 
-    let status = if error.is_some() {
-        AgentStatus::Failed
-    } else if final_result.is_some() {
+    // Stall is a defense, not a failure — mark Stopped so watchdog/cleanup
+    // policies treat it gently. Real bugs still flow into Failed via the
+    // error.is_some() path below (which discriminates).
+    let stall_only = error
+        .as_deref()
+        .map(|e| e.starts_with("stall:"))
+        .unwrap_or(false);
+    let status = if final_result.is_some() {
         AgentStatus::Completed
+    } else if stall_only {
+        AgentStatus::Stopped
+    } else if error.is_some() {
+        AgentStatus::Failed
     } else {
         AgentStatus::Stopped
     };
@@ -444,6 +546,137 @@ async fn finish(
         .remove(&id);
 
     info!(agent_id = %id, ?status, iters, usd, "agent finished");
+
+    // Stall path: defense triggered (status=Stopped + error starts with "stall:").
+    // Fire a lesson directly so future agents learn to avoid the pattern.
+    if matches!(status, AgentStatus::Stopped)
+        && error
+            .as_deref()
+            .map(|e| e.starts_with("stall:"))
+            .unwrap_or(false)
+    {
+        let router = ctx.router.clone();
+        let lessons = ctx.lessons.clone();
+        let task = ctx.task.clone();
+        let err_text = error.clone().unwrap_or_default();
+        let kind = ctx.kind;
+        let aid = id;
+        tokio::spawn(async move {
+            warn!(agent_id = %aid, "stall: generating lesson");
+            let context = format!(
+                "Agent {kind:?} stalled.\nError: {err_text}\nTask (first 400 chars): {t}",
+                t = task.chars().take(400).collect::<String>(),
+            );
+            crate::lessons::generator::fire_and_forget(router, lessons, context, Some(kind));
+        });
+    }
+
+    // Flywheel: if Completed with a result, fire gates async. Any failure feeds
+    // a lesson via fire-and-forget. Bounded cost: at most 1 embed + 1 judge call.
+    if matches!(status, AgentStatus::Completed) {
+        if let Some(output) = result.clone() {
+            let router = ctx.router.clone();
+            let lessons = ctx.lessons.clone();
+            let embed_cache = ctx.embed_cache.clone();
+            let spec = ctx.task.clone();
+            let owned = ctx.owned_globs.clone();
+            // Snapshot the canonical paths the agent wrote during its run.
+            // Map each absolute path to its repo-relative form (after the
+            // worktree root) — ownership globs are usually repo-relative.
+            let touched: Vec<String> = ctx
+                .touched
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| relativize(&p, &ctx.worktree_path))
+                .collect();
+            let kind = ctx.kind;
+            let aid = id;
+            tokio::spawn(async move {
+                let req = RunGatesRequest {
+                    spec: spec.clone(),
+                    output: output.clone(),
+                    owned_paths: owned,
+                    touched_paths: touched,
+                    estimated_loc: None,
+                    actual_loc: None,
+                    skip_embedding: false,
+                    skip_judge: false,
+                    haystack: String::new(),
+                    skip_meta_review: true,
+                };
+                let resp = run_cascade(&router, Some(&embed_cache), &req).await;
+                if resp.overall == GateOutcome::Fail {
+                    if let Some(failed) =
+                        resp.results.iter().find(|r| r.outcome == GateOutcome::Fail)
+                    {
+                        let reason = failed.reason.clone().unwrap_or_default();
+                        warn!(
+                            agent_id = %aid,
+                            gate = ?failed.gate,
+                            reason = %reason,
+                            "post-finish gate failed — generating lesson"
+                        );
+                        let context = format!(
+                            "Agent {kind:?} task gate fail.\n\
+                             Gate: {gate:?}\nReason: {reason}\n\
+                             Spec: {s}\nOutput (first 400 chars): {o}",
+                            gate = failed.gate,
+                            s = spec.chars().take(400).collect::<String>(),
+                            o = output.chars().take(400).collect::<String>(),
+                        );
+                        generator::fire_and_forget(router, lessons, context, Some(kind));
+                    }
+                } else {
+                    info!(agent_id = %aid, "post-finish gates passed");
+                }
+            });
+        }
+    }
+}
+
+/// Strip the worktree root prefix so the path matches owned globs
+/// (which are usually written as `src/content/**`, not absolute).
+fn relativize(absolute: &str, worktree_root: &PathBuf) -> String {
+    let root_str = worktree_root.display().to_string();
+    if let Some(rest) = absolute.strip_prefix(&root_str) {
+        rest.trim_start_matches('/').to_string()
+    } else {
+        absolute.to_string()
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::tool_call_signature;
+
+    #[test]
+    fn signature_stable() {
+        let a = tool_call_signature("file_write", r#"{"path":"a.md","content":"x"}"#);
+        let b = tool_call_signature("file_write", r#"{"path":"a.md","content":"x"}"#);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn signature_differs_on_args() {
+        let a = tool_call_signature("file_write", r#"{"path":"a.md"}"#);
+        let b = tool_call_signature("file_write", r#"{"path":"b.md"}"#);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn signature_differs_on_name() {
+        let a = tool_call_signature("bash", "{}");
+        let b = tool_call_signature("file_read", "{}");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn signature_includes_name_prefix() {
+        let s = tool_call_signature("bash", "{}");
+        assert!(s.starts_with("bash::"));
+    }
 }
 
 fn approx_cost(model: &str, tokens_in: u32, tokens_out: u32) -> f64 {

@@ -130,6 +130,14 @@ impl Router {
     /// Route a tool-calling chat. Mirrors `route_chat` but accepts prebuilt
     /// async-openai messages (so agent loops can include `Tool` result messages
     /// between turns) and exposes function schemas to the model.
+    ///
+    /// **Tool-call ordering note**: when `tools` is non-empty, DeepSeek
+    /// candidates are demoted to the end of the fallback chain. Reason: the
+    /// `deepseek-v4-*` family runs in thinking mode by default and returns
+    /// `reasoning_content` in the assistant message that the API requires us
+    /// to echo back on the next turn. async-openai 0.27 does not surface
+    /// `reasoning_content` in request types, so iter≥2 of any agent loop
+    /// would fail and fall back. Demoting upfront skips the wasted call.
     pub async fn route_chat_with_tools(
         &self,
         tier: &str,
@@ -144,7 +152,17 @@ impl Router {
             model: model_override.map(str::to_string),
             messages: Vec::new(),
         };
-        let candidates = self.candidates(&pseudo_req);
+        let candidates = if tools.is_empty() {
+            self.candidates(&pseudo_req)
+        } else {
+            // Demote deepseek when tools are in play (see doc-comment above).
+            let all = self.candidates(&pseudo_req);
+            let (deepseek, others): (Vec<_>, Vec<_>) =
+                all.into_iter().partition(|c| c.provider == "deepseek");
+            let mut out = others;
+            out.extend(deepseek);
+            out
+        };
         let mut last_err: Option<anyhow::Error> = None;
 
         for cand in candidates {

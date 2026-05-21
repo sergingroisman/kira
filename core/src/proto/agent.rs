@@ -10,6 +10,7 @@ pub enum AgentKind {
     Writer,
     Deployer,
     Judge,
+    Reviewer,
 }
 
 impl AgentKind {
@@ -19,14 +20,39 @@ impl AgentKind {
             Self::Writer => "standard",
             Self::Deployer => "light",
             Self::Judge => "heavy",
+            Self::Reviewer => "heavy",
         }
     }
 
     pub fn system_prompt(self) -> &'static str {
+        // Shared principles + kind-specific instructions, glued at compile time.
+        const SEPARATOR: &str = "\n\n---\n\n";
+        const WRITER: &str = concat!(
+            include_str!("../agents/prompts/_principles.md"),
+            "\n\n---\n\n",
+            include_str!("../agents/prompts/writer.md"),
+        );
+        const DEPLOYER: &str = concat!(
+            include_str!("../agents/prompts/_principles.md"),
+            "\n\n---\n\n",
+            include_str!("../agents/prompts/deployer.md"),
+        );
+        const JUDGE: &str = concat!(
+            include_str!("../agents/prompts/_principles.md"),
+            "\n\n---\n\n",
+            include_str!("../agents/prompts/judge.md"),
+        );
+        const REVIEWER: &str = concat!(
+            include_str!("../agents/prompts/_principles.md"),
+            "\n\n---\n\n",
+            include_str!("../agents/prompts/reviewer.md"),
+        );
+        let _ = SEPARATOR; // documentation marker
         match self {
-            Self::Writer => include_str!("../agents/prompts/writer.md"),
-            Self::Deployer => include_str!("../agents/prompts/deployer.md"),
-            Self::Judge => include_str!("../agents/prompts/judge.md"),
+            Self::Writer => WRITER,
+            Self::Deployer => DEPLOYER,
+            Self::Judge => JUDGE,
+            Self::Reviewer => REVIEWER,
         }
     }
 }

@@ -9,6 +9,7 @@
 
 pub mod dashscope;
 pub mod deepseek;
+pub mod embed_cache;
 
 use anyhow::{Context, Result};
 use async_openai::{
@@ -16,6 +17,7 @@ use async_openai::{
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
         ChatCompletionTool, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateEmbeddingRequestArgs, EmbeddingInput,
     },
     Client,
 };
@@ -89,6 +91,29 @@ impl LlmProvider {
             .create(request)
             .await
             .with_context(|| format!("{} chat_with_tools failed (model={model})", self.name))
+    }
+
+    /// Compute embeddings for a list of inputs. Returns vectors per input.
+    pub async fn embed(
+        &self,
+        model: &str,
+        inputs: Vec<String>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let request = CreateEmbeddingRequestArgs::default()
+            .model(model)
+            .input(EmbeddingInput::StringArray(inputs))
+            .build()?;
+        let response = self
+            .client
+            .embeddings()
+            .create(request)
+            .await
+            .with_context(|| format!("{} embed failed (model={model})", self.name))?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|d| d.embedding)
+            .collect())
     }
 
     /// Streaming chat. Returns a `Stream` of chunks.

@@ -17,7 +17,9 @@ import {
   type Agent,
   type AgentKind,
   type ChatMessage,
+  type Plan,
 } from "../core-client/client.js";
+import { LogoKira } from "./components/index.js";
 
 const TIERS = ["heavy", "standard", "light"] as const;
 type Tier = (typeof TIERS)[number];
@@ -50,7 +52,19 @@ interface InfoTurn extends TurnBase {
   body: string;
 }
 
-type Turn = ChatTurn | AgentTurn | InfoTurn;
+interface PlanTurn extends TurnBase {
+  kind: "plan";
+  planId?: string;
+  planStatus?: string;
+  goal?: string;
+  agentKind?: AgentKind;
+  scope?: string;
+  steps?: { idx: number; description: string; tool?: string | null }[];
+  executorAgentId?: string;
+  note?: string; // "drafted", "approved", "cancelled"
+}
+
+type Turn = ChatTurn | AgentTurn | InfoTurn | PlanTurn;
 
 export interface KiraAppProps {
   client?: CoreClient;
@@ -70,6 +84,11 @@ export function KiraApp({
 
   // Active agent pollers — keyed by agent id, cleared on completion.
   const agentPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
+    new Map(),
+  );
+
+  // Active plan pollers — keyed by plan id, cleared on terminal status.
+  const planPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
     new Map(),
   );
 
@@ -96,6 +115,8 @@ export function KiraApp({
     () => () => {
       for (const t of agentPollers.current.values()) clearInterval(t);
       agentPollers.current.clear();
+      for (const t of planPollers.current.values()) clearInterval(t);
+      planPollers.current.clear();
     },
     [],
   );
@@ -165,6 +186,55 @@ export function KiraApp({
         }
       }, 2000);
       agentPollers.current.set(id, interval);
+    },
+    [client],
+  );
+
+  const startPlanPoller = useCallback(
+    (turnIdx: number, plan: Plan) => {
+      const id = plan.id;
+      const interval = setInterval(async () => {
+        try {
+          const fresh = await client.getPlan(id);
+          setTurns((t) => {
+            const next = [...t];
+            const cur = next[turnIdx];
+            if (cur && cur.kind === "plan") {
+              next[turnIdx] = {
+                ...cur,
+                planStatus: fresh.status,
+                executorAgentId: fresh.executor_agent_id ?? cur.executorAgentId,
+                inFlight: !["done", "failed", "cancelled", "expired"].includes(
+                  fresh.status,
+                ),
+              };
+            }
+            return next;
+          });
+          if (["done", "failed", "cancelled", "expired"].includes(fresh.status)) {
+            const t = planPollers.current.get(id);
+            if (t) {
+              clearInterval(t);
+              planPollers.current.delete(id);
+            }
+          }
+        } catch (e) {
+          const t = planPollers.current.get(id);
+          if (t) {
+            clearInterval(t);
+            planPollers.current.delete(id);
+          }
+          setTurns((t) => {
+            const next = [...t];
+            const cur = next[turnIdx];
+            if (cur && cur.kind === "plan") {
+              next[turnIdx] = { ...cur, error: String(e), inFlight: false };
+            }
+            return next;
+          });
+        }
+      }, 2000);
+      planPollers.current.set(id, interval);
     },
     [client],
   );
@@ -289,6 +359,444 @@ export function KiraApp({
     [client, pushInfo],
   );
 
+  // /plan draft <kind> <goal>
+  const handlePlanDraft = useCallback(
+    async (raw: string) => {
+      const rest = raw.slice("/plan draft".length).trim();
+      const space = rest.indexOf(" ");
+      if (space < 0) {
+        pushInfo(raw, "", `usage: /plan draft <writer|deployer|judge> <goal>`);
+        return;
+      }
+      const kindStr = rest.slice(0, space).toLowerCase() as AgentKind;
+      const goal = rest.slice(space + 1).trim();
+      if (!AGENT_KINDS.includes(kindStr)) {
+        pushInfo(raw, "", `unknown kind '${kindStr}'`);
+        return;
+      }
+      if (!goal) {
+        pushInfo(raw, "", `goal is empty`);
+        return;
+      }
+      const turnIdx = turns.length;
+      setTurns((t) => [
+        ...t,
+        {
+          kind: "plan",
+          user: raw,
+          agentKind: kindStr,
+          goal,
+          note: "drafting…",
+          inFlight: true,
+        },
+      ]);
+      try {
+        const plan = await client.draftPlan({
+          goal,
+          agent_kind: kindStr,
+          ttl_secs: null,
+        });
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "plan") {
+            next[turnIdx] = {
+              ...cur,
+              planId: plan.id,
+              planStatus: plan.status,
+              scope: plan.scope,
+              steps: plan.steps.map((s) => ({
+                idx: s.idx,
+                description: s.description,
+                tool: s.tool,
+              })),
+              note: `drafted — /plan approve ${plan.id.slice(0, 8)}`,
+              inFlight: false,
+            };
+          }
+          return next;
+        });
+      } catch (e) {
+        const msg = e instanceof CoreError ? e.message : String(e);
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "plan") {
+            next[turnIdx] = { ...cur, error: msg, inFlight: false };
+          }
+          return next;
+        });
+      }
+    },
+    [client, turns.length, pushInfo],
+  );
+
+  // /plan approve <id-prefix>
+  const handlePlanApprove = useCallback(
+    async (raw: string) => {
+      const prefix = raw.slice("/plan approve".length).trim();
+      if (!prefix) {
+        pushInfo(raw, "", "usage: /plan approve <id-prefix>");
+        return;
+      }
+      try {
+        const all = await client.listPlans();
+        const match = all.find((p) => p.id.startsWith(prefix));
+        if (!match) {
+          pushInfo(raw, "", `no plan with prefix '${prefix}'`);
+          return;
+        }
+        const turnIdx = turns.length;
+        setTurns((t) => [
+          ...t,
+          {
+            kind: "plan",
+            user: raw,
+            planId: match.id,
+            planStatus: "approving…",
+            agentKind: match.agent_kind,
+            scope: match.scope,
+            goal: match.goal,
+            note: "approving…",
+            inFlight: true,
+          },
+        ]);
+        const r = await client.approvePlan(match.id);
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "plan") {
+            next[turnIdx] = {
+              ...cur,
+              planStatus: "executing",
+              executorAgentId: r.executor_agent_id,
+              note: `executor: ${r.executor_agent_id.slice(0, 8)}`,
+              inFlight: true,
+            };
+          }
+          return next;
+        });
+        const planFresh = await client.getPlan(match.id);
+        startPlanPoller(turnIdx, planFresh);
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, turns.length, pushInfo, startPlanPoller],
+  );
+
+  // /plan cancel <id-prefix>
+  const handlePlanCancel = useCallback(
+    async (raw: string) => {
+      const prefix = raw.slice("/plan cancel".length).trim();
+      if (!prefix) {
+        pushInfo(raw, "", "usage: /plan cancel <id-prefix>");
+        return;
+      }
+      try {
+        const all = await client.listPlans();
+        const match = all.find((p) => p.id.startsWith(prefix));
+        if (!match) {
+          pushInfo(raw, "", `no plan with prefix '${prefix}'`);
+          return;
+        }
+        const r = await client.cancelPlan(match.id);
+        pushInfo(raw, `cancelled=${r.cancelled} plan=${match.id.slice(0, 8)}`);
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  // /plans
+  const handlePlansList = useCallback(
+    async (raw: string) => {
+      try {
+        const all = await client.listPlans();
+        if (all.length === 0) {
+          pushInfo(raw, "(no plans)");
+          return;
+        }
+        const body = all
+          .map(
+            (p) =>
+              `${p.id.slice(0, 8)} ${p.agent_kind.padEnd(8)} ${p.status.padEnd(9)} ${p.scope.padEnd(7)} steps=${p.steps.length} ${p.goal.slice(0, 34)}`,
+          )
+          .join("\n");
+        pushInfo(raw, body);
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  // /lessons (list)
+  const handleLessonsList = useCallback(
+    async (raw: string) => {
+      try {
+        const all = await client.listLessons();
+        if (all.length === 0) {
+          pushInfo(raw, "(no lessons)");
+          return;
+        }
+        const body = all
+          .map((l) => {
+            const scope =
+              l.scope.kind === "global"
+                ? "global"
+                : l.scope.kind === "agent_kind"
+                  ? `kind=${l.scope.agent_kind}`
+                  : `wf=${l.scope.workflow}`;
+            return `${l.id.slice(0, 8)} ${l.status.padEnd(8)} ${l.priority.padEnd(6)} x${l.recurrence} ${scope.padEnd(14)} ${l.anti_pattern.slice(0, 60)}`;
+          })
+          .join("\n");
+        pushInfo(raw, body);
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  // /lessons promote <id-prefix>
+  const handleLessonPromote = useCallback(
+    async (raw: string) => {
+      const prefix = raw.slice("/lessons promote".length).trim();
+      if (!prefix) {
+        pushInfo(raw, "", "usage: /lessons promote <id-prefix>");
+        return;
+      }
+      try {
+        const all = await client.listLessons();
+        const match = all.find((l) => l.id.startsWith(prefix));
+        if (!match) {
+          pushInfo(raw, "", `no lesson with prefix '${prefix}'`);
+          return;
+        }
+        const r = await client.promoteLesson(match.id);
+        pushInfo(
+          raw,
+          r.promoted
+            ? `promoted ${match.id.slice(0, 8)} → ${r.written_to}`
+            : `already promoted ${match.id.slice(0, 8)}`,
+        );
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  // /lessons delete <id-prefix>
+  const handleLessonDelete = useCallback(
+    async (raw: string) => {
+      const prefix = raw.slice("/lessons delete".length).trim();
+      if (!prefix) {
+        pushInfo(raw, "", "usage: /lessons delete <id-prefix>");
+        return;
+      }
+      try {
+        const all = await client.listLessons();
+        const match = all.find((l) => l.id.startsWith(prefix));
+        if (!match) {
+          pushInfo(raw, "", `no lesson with prefix '${prefix}'`);
+          return;
+        }
+        const r = await client.deleteLesson(match.id);
+        pushInfo(raw, `deleted=${r.deleted} ${match.id.slice(0, 8)}`);
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  // /eval run <models-csv> | <task-spec>
+  const handleEvalRun = useCallback(
+    async (raw: string) => {
+      const rest = raw.slice("/eval run".length).trim();
+      const bar = rest.indexOf("|");
+      if (bar < 0) {
+        pushInfo(
+          raw,
+          "",
+          "usage: /eval run <model1,model2,...> | <task-spec>",
+        );
+        return;
+      }
+      const modelsCsv = rest.slice(0, bar).trim();
+      const taskSpec = rest.slice(bar + 1).trim();
+      if (!modelsCsv || !taskSpec) {
+        pushInfo(raw, "", "models or task is empty");
+        return;
+      }
+      const models = modelsCsv
+        .split(",")
+        .map((m) => m.trim())
+        .filter(Boolean);
+      if (models.length === 0) {
+        pushInfo(raw, "", "no valid models");
+        return;
+      }
+
+      const turnIdx = turns.length;
+      setTurns((t) => [
+        ...t,
+        {
+          kind: "info",
+          user: raw,
+          body: `running eval: 1 task × ${models.length} models (judge enabled, may take 30-60s)…`,
+          inFlight: true,
+        },
+      ]);
+
+      try {
+        const r = await client.runEval({
+          tasks: [{ id: "ad_hoc", spec: taskSpec, expected_topic: null, models: null }],
+          models,
+          skip_embedding: false,
+          skip_judge: false,
+        });
+        const lines = [
+          `${r.n_tasks} task × ${r.n_models} models · total $${r.total_cost_usd.toFixed(5)} · ${r.total_duration_ms}ms`,
+          "",
+          "model               score  faith   cost      ms     pass",
+          "─".repeat(58),
+        ];
+        for (const m of r.summary_by_model) {
+          const score = m.avg_judge_score?.toFixed(1) ?? "—";
+          const faith = m.avg_faithfulness?.toFixed(3) ?? "—";
+          const pass = (m.pass_rate * 100).toFixed(0) + "%";
+          lines.push(
+            `${m.model.padEnd(19)} ${score.padStart(5)}  ${faith.padStart(5)}  $${m.total_cost_usd.toFixed(5)}  ${m.avg_duration_ms.toFixed(0).padStart(5)}  ${pass}`,
+          );
+        }
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: false };
+          }
+          return next;
+        });
+      } catch (e) {
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, error: String(e), inFlight: false };
+          }
+          return next;
+        });
+      }
+    },
+    [client, turns.length, pushInfo],
+  );
+
+  // /gates run <spec> | <output>
+  const handleGatesRun = useCallback(
+    async (raw: string) => {
+      const rest = raw.slice("/gates run".length).trim();
+      const bar = rest.indexOf("|");
+      if (bar < 0) {
+        pushInfo(raw, "", "usage: /gates run <spec> | <output>");
+        return;
+      }
+      const spec = rest.slice(0, bar).trim();
+      const output = rest.slice(bar + 1).trim();
+      if (!spec || !output) {
+        pushInfo(raw, "", "spec or output is empty");
+        return;
+      }
+      try {
+        const r = await client.runGates({
+          spec,
+          output,
+          owned_paths: [],
+          touched_paths: [],
+          estimated_loc: null,
+          actual_loc: null,
+          skip_embedding: false,
+          skip_judge: true, // fast UX path; user can curl for judge
+        });
+        const lines = [`overall=${r.overall}  failed_at=${r.failed_at ?? "—"}  ${r.duration_ms}ms`];
+        for (const g of r.results) {
+          const sc = g.score !== null && g.score !== undefined ? ` score=${g.score.toFixed(3)}` : "";
+          lines.push(`  ${g.outcome.padEnd(7)} ${g.gate.padEnd(24)}${sc}  ${g.reason ?? ""}`);
+        }
+        pushInfo(raw, lines.join("\n"));
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  // /review <head> [base]    — TRUST-inspired multi-dim PR review
+  const handleReview = useCallback(
+    async (raw: string) => {
+      const rest = raw.slice("/review".length).trim();
+      const parts = rest.split(/\s+/).filter(Boolean);
+      if (parts.length === 0) {
+        pushInfo(raw, "", "usage: /review <head-branch> [base-branch]");
+        return;
+      }
+      const head = parts[0];
+      const base = parts[1] ?? "main";
+      const turnIdx = turns.length;
+      setTurns((t) => [
+        ...t,
+        {
+          kind: "info",
+          user: raw,
+          body: `spawning 6 reviewers against ${head}…${base} (~60-180s)…`,
+          inFlight: true,
+        },
+      ]);
+      try {
+        const r = await client.runReview({
+          head,
+          base,
+          workflow: null,
+          timeout_secs: null,
+        });
+        const lines = [
+          `run ${r.run_id.slice(0, 8)} · workflow=${r.workflow} · ${r.duration_ms}ms`,
+          `findings (post anti-hallucination): ${r.total_findings}`,
+          `report: ${r.review_md_path}`,
+          "",
+          "dim          status      gate    fail-at        kept  drop",
+          "─".repeat(64),
+        ];
+        for (const o of r.agents) {
+          lines.push(
+            `${o.dimension.padEnd(12)} ${o.status.padEnd(11)} ${o.gate_overall.padEnd(7)} ${(o.gate_failed_at ?? "—").padEnd(14)} ${String(o.findings_kept).padStart(3)}   ${String(o.findings_dropped).padStart(3)}`,
+          );
+        }
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: false };
+          }
+          return next;
+        });
+      } catch (e) {
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, error: String(e), inFlight: false };
+          }
+          return next;
+        });
+      }
+    },
+    [client, turns.length, pushInfo],
+  );
+
   // -- Main send -------------------------------------------------------------
 
   const send = useCallback(
@@ -333,6 +841,46 @@ export function KiraApp({
       }
       if (text.startsWith("/cancel ")) {
         await handleCancel(text);
+        return;
+      }
+      if (text.startsWith("/plan draft ")) {
+        await handlePlanDraft(text);
+        return;
+      }
+      if (text.startsWith("/plan approve ")) {
+        await handlePlanApprove(text);
+        return;
+      }
+      if (text.startsWith("/plan cancel ")) {
+        await handlePlanCancel(text);
+        return;
+      }
+      if (text === "/plans") {
+        await handlePlansList(text);
+        return;
+      }
+      if (text === "/lessons") {
+        await handleLessonsList(text);
+        return;
+      }
+      if (text.startsWith("/lessons promote ")) {
+        await handleLessonPromote(text);
+        return;
+      }
+      if (text.startsWith("/lessons delete ")) {
+        await handleLessonDelete(text);
+        return;
+      }
+      if (text.startsWith("/gates run ")) {
+        await handleGatesRun(text);
+        return;
+      }
+      if (text.startsWith("/eval run ")) {
+        await handleEvalRun(text);
+        return;
+      }
+      if (text.startsWith("/review ") || text === "/review") {
+        await handleReview(text);
         return;
       }
 
@@ -400,7 +948,26 @@ export function KiraApp({
         });
       }
     },
-    [client, tier, turns, exit, pushInfo, handleAgentCmd, handleAgentsList, handleCancel],
+    [
+      client,
+      tier,
+      turns,
+      exit,
+      pushInfo,
+      handleAgentCmd,
+      handleAgentsList,
+      handleCancel,
+      handlePlanDraft,
+      handlePlanApprove,
+      handlePlanCancel,
+      handlePlansList,
+      handleLessonsList,
+      handleLessonPromote,
+      handleLessonDelete,
+      handleGatesRun,
+      handleEvalRun,
+      handleReview,
+    ],
   );
 
   useInput((ch, key) => {
@@ -438,8 +1005,27 @@ export function KiraApp({
       </Box>
       <Box marginTop={1}>
         <Text dimColor>
-          chat · /agent {"<kind> <task>"} · /agents · /cancel {"<id>"} · /health
-          · /tier · /quit
+          chat · /agent {"<kind> <task>"} · /agents · /cancel {"<id>"}
+        </Text>
+      </Box>
+      <Box>
+        <Text dimColor>
+          /plan draft {"<kind> <goal>"} · /plan approve {"<id>"} · /plan cancel · /plans
+        </Text>
+      </Box>
+      <Box>
+        <Text dimColor>
+          /lessons · /lessons promote {"<id>"} · /lessons delete {"<id>"}
+        </Text>
+      </Box>
+      <Box>
+        <Text dimColor>
+          /gates run {"<spec> | <output>"} · /eval run {"<models-csv> | <task>"}
+        </Text>
+      </Box>
+      <Box>
+        <Text dimColor>
+          /review {"<head> [base]"} · /health · /tier · /quit
         </Text>
       </Box>
     </Box>
@@ -459,18 +1045,77 @@ function Header({
     coreUp === null ? "probing…" : coreUp ? `core ${coreVersion}` : "core DOWN";
   const color = coreUp === null ? "gray" : coreUp ? "green" : "red";
   return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Text bold color="cyan">
-        Kira REPL
-      </Text>
-      <Text dimColor>
-        <Text color={color}>{status}</Text> · tier={tier}
-      </Text>
+    <Box flexDirection="column" alignItems="center" marginBottom={1}>
+      <LogoKira text="KIRA" />
+      <Box marginTop={1}>
+        <Text dimColor>
+          <Text color={color}>{status}</Text> · tier={tier}
+        </Text>
+      </Box>
     </Box>
   );
 }
 
 function TurnView({ turn }: { turn: Turn }) {
+  if (turn.kind === "plan") {
+    const statusColor =
+      turn.planStatus === "done"
+        ? "green"
+        : turn.planStatus === "failed"
+          ? "red"
+          : turn.planStatus === "cancelled" || turn.planStatus === "expired"
+            ? "yellow"
+            : "cyan";
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        <Box>
+          <Text color="cyan">❯ </Text>
+          <Text>{turn.user}</Text>
+        </Box>
+        {turn.error ? (
+          <Box>
+            <Text color="red">error: </Text>
+            <Text color="red">{turn.error}</Text>
+          </Box>
+        ) : (
+          <>
+            <Box>
+              <Text color="magenta">▸ </Text>
+              <Text dimColor>
+                plan {turn.planId?.slice(0, 8) ?? "..."}{" "}
+              </Text>
+              <Text color={statusColor}>{turn.planStatus ?? "draft"}</Text>
+              {turn.scope ? (
+                <Text color={scopeColor(turn.scope)}> [{turn.scope}]</Text>
+              ) : null}
+              {turn.executorAgentId ? (
+                <Text dimColor> exec={turn.executorAgentId.slice(0, 8)}</Text>
+              ) : null}
+              {turn.inFlight ? <Text color="yellow"> ▍</Text> : null}
+            </Box>
+            {turn.note ? (
+              <Box marginLeft={2}>
+                <Text dimColor>{turn.note}</Text>
+              </Box>
+            ) : null}
+            {turn.steps && turn.steps.length > 0 ? (
+              <Box marginLeft={2} flexDirection="column">
+                {turn.steps.map((s) => (
+                  <Box key={s.idx}>
+                    <Text color="gray">{s.idx}. </Text>
+                    <Text>{s.description}</Text>
+                    {s.tool ? (
+                      <Text dimColor> [{s.tool}]</Text>
+                    ) : null}
+                  </Box>
+                ))}
+              </Box>
+            ) : null}
+          </>
+        )}
+      </Box>
+    );
+  }
   if (turn.kind === "info") {
     return (
       <Box flexDirection="column" marginBottom={1}>
@@ -564,4 +1209,21 @@ function TurnView({ turn }: { turn: Turn }) {
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, max) + "…";
+}
+
+function scopeColor(scope: string): string {
+  switch (scope) {
+    case "quick":
+      return "green";
+    case "small":
+      return "cyan";
+    case "medium":
+      return "yellow";
+    case "large":
+      return "magenta";
+    case "complex":
+      return "red";
+    default:
+      return "gray";
+  }
 }

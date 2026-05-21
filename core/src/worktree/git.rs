@@ -34,6 +34,13 @@ pub async fn toplevel(start: &Path) -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(out.trim()))
 }
 
+/// `git diff <base>...<head>` — three-dot form: diff against the merge-base.
+/// Returns the patch text (utf-8 lossy).
+pub async fn diff_three_dot(repo_root: &Path, base: &str, head: &str) -> Result<String> {
+    let range = format!("{base}...{head}");
+    run_git(repo_root, &["diff", &range]).await
+}
+
 /// `git worktree add -b <branch> <path> <base>`
 pub async fn worktree_add(
     repo_root: &Path,

@@ -47,15 +47,20 @@ pub struct WorktreeManager {
 impl WorktreeManager {
     /// Build a manager rooted at the toplevel of `start` (commonly `cwd`).
     /// Reconciles existing `kira/*` worktrees found on disk into the store as `Stale`.
-    pub async fn new(start: PathBuf) -> Result<Self> {
+    /// `db` is optional — when present, store is durable.
+    pub async fn new(start: PathBuf, db: Option<crate::state::KiraDb>) -> Result<Self> {
         let repo_root = git::toplevel(&start)
             .await
             .with_context(|| format!("not inside a git repo: {}", start.display()))?;
-        info!(repo_root = %repo_root.display(), "WorktreeManager rooted");
+        info!(repo_root = %repo_root.display(), durable = db.is_some(), "WorktreeManager rooted");
 
+        let store = match db {
+            Some(d) => Store::with_db(d),
+            None => Store::new(),
+        };
         let mgr = Self {
             repo_root: repo_root.clone(),
-            store: Store::new(),
+            store,
             semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_PARALLEL)),
         };
         mgr.reconcile().await?;
@@ -65,14 +70,33 @@ impl WorktreeManager {
     /// Scan `git worktree list` for `kira/*` worktrees the daemon doesn't know
     /// about (e.g. survived a crash) and import them as `Stale`. Each consumes
     /// a semaphore permit so we don't overcommit concurrency.
+    ///
+    /// On startup with a persistent store, also accounts for known worktrees
+    /// (so concurrent permits stay accurate). Skips paths the store already tracks.
     async fn reconcile(&self) -> Result<()> {
         let rows = git::worktree_list(&self.repo_root).await?;
+        let known_paths: std::collections::HashSet<String> = self
+            .store
+            .list()
+            .into_iter()
+            .map(|w| w.path)
+            .collect();
+
+        // First, account for permits already held by known worktrees so
+        // total in-flight permits match reality.
+        for _ in 0..known_paths.len() {
+            let permit = self.semaphore.clone().try_acquire_owned();
+            if permit.is_err() {
+                break;
+            }
+            std::mem::forget(permit);
+        }
+
         let mut imported = 0_usize;
         for row in rows {
             let Some(branch) = row.branch.as_deref() else {
                 continue;
             };
-            // Branch is reported as "refs/heads/kira/wt-..." in porcelain output.
             let branch_short = branch
                 .strip_prefix("refs/heads/")
                 .unwrap_or(branch)
@@ -80,7 +104,10 @@ impl WorktreeManager {
             if !branch_short.starts_with(BRANCH_PREFIX) {
                 continue;
             }
-            // Try to grab a permit; if max already reached, skip (warn).
+            // Dedup: skip if redb store already knows this path.
+            if known_paths.contains(&row.path) {
+                continue;
+            }
             let permit = self.semaphore.clone().try_acquire_owned();
             if permit.is_err() {
                 warn!(branch = %branch_short, "reconcile: semaphore full, skipping orphan");

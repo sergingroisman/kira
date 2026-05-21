@@ -7,7 +7,7 @@ export type Agent = { id: string, kind: AgentKind, status: AgentStatus, worktree
  */
 last_progress_at: string | null, };
 
-export type AgentKind = "writer" | "deployer" | "judge";
+export type AgentKind = "writer" | "deployer" | "judge" | "reviewer";
 
 export type AgentStatus = "spawning" | "active" | "stale" | "completed" | "failed" | "stopped" | "cancelled";
 

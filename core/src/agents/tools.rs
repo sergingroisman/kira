@@ -142,7 +142,11 @@ pub struct ToolResult {
 
 /// Execute a tool call by name + dispatch hooks around it.
 /// `PreToolUse` may block; `PostToolUse` is fire-and-log.
-#[instrument(skip(arguments, hooks), fields(tool = %name, agent_id = %agent_id))]
+///
+/// `touched_paths`: when `Some`, successful `file_write` calls push their
+/// `canonical_path` into the shared Vec so the agent's post-finish gates
+/// (L2 file_integrity) can validate against the ownership claim.
+#[instrument(skip(arguments, hooks, touched_paths), fields(tool = %name, agent_id = %agent_id))]
 pub async fn dispatch_with_hooks(
     name: &str,
     arguments: &str,
@@ -150,6 +154,7 @@ pub async fn dispatch_with_hooks(
     hooks: &HookRunner,
     agent_id: &str,
     worktree_id: &str,
+    touched_paths: Option<&std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> ToolResult {
     // Build hook context from the tool call.
     let parsed_args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
@@ -175,6 +180,23 @@ pub async fn dispatch_with_hooks(
     }
 
     let result = dispatch(name, arguments, worktree_path).await;
+
+    // Record touched path on successful file_write for L2 file_integrity gate.
+    if name == "file_write" && result.done.is_none() {
+        if let Some(bag) = touched_paths {
+            if let Ok(v) = serde_json::from_str::<Value>(&result.payload) {
+                // Only record on success (no "error" field).
+                if v.get("error").is_none() {
+                    if let Some(canonical) = v.get("canonical_path").and_then(|p| p.as_str()) {
+                        if let Ok(mut bag) = bag.lock() {
+                            bag.push(canonical.to_string());
+                            debug!(canonical, "touched_path recorded");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // PostToolUse is fire-and-forget (any block on Post is logged but ignored).
     let _ = hooks.dispatch(HookEvent::PostToolUse, ctx).await;
