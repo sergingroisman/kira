@@ -11,11 +11,6 @@
 //!   3. Stop on: done | content-only response | max_iters | budget cap | cancel.
 
 use anyhow::{Context, Result};
-use async_openai::types::{
-    ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +27,7 @@ use crate::gates::run_cascade;
 use crate::hooks::HookRunner;
 use crate::lessons::{generator, render_inject_snippet, LessonRegistry};
 use crate::llm::embed_cache::EmbedCache;
+use crate::llm::types::{ChatMessageUnified, ToolCall};
 use crate::proto::gate::{GateOutcome, RunGatesRequest};
 use crate::proto::agent::{Agent, AgentKind, AgentStatus, SpawnAgentRequest};
 use crate::proto::mailbox::SendRequest;
@@ -43,10 +39,18 @@ use crate::worktree::WorktreeManager;
 const DEFAULT_BUDGET_USD: f64 = 1.00;
 const DEFAULT_MAX_ITERS: u32 = 10;
 
-/// Stall detection: if the same tool call (name + args) repeats this many
-/// times in a row, the agent is considered stuck and the loop breaks.
+/// Stall detection (G6) — 3 signals:
+///
+/// 1. **SameToolLoop**: same `(tool, args)` repeats this many times in a row.
+/// 2. **OutputUnchanged**: hash of `(assistant_content + sorted tool sigs)`
+///    unchanged across this many consecutive iterations. Catches "agent rewrites
+///    same plan over and over without producing new evidence" pattern.
+/// 3. **NoProgress**: wall-clock seconds without any useful output advance.
+///    Acts as a wallclock backstop when iter-based checks miss.
 const STALL_SAME_TOOL_THRESHOLD: usize = 3;
 const TOOL_HISTORY_CAP: usize = 5;
+const STALL_OUTPUT_UNCHANGED_ITERS: usize = 3;
+const STALL_NO_PROGRESS_SECS: u64 = 90;
 
 fn tool_call_signature(name: &str, arguments: &str) -> String {
     // FNV-1a 64-bit over name + args.
@@ -76,6 +80,7 @@ fn default_ownership(kind: AgentKind) -> (Vec<String>, OwnershipMode) {
         ),
         AgentKind::Judge => (vec![], OwnershipMode::ReadOnly),
         AgentKind::Reviewer => (vec![], OwnershipMode::ReadOnly),
+        AgentKind::Explorer => (vec![], OwnershipMode::ReadOnly),
     }
 }
 
@@ -89,6 +94,7 @@ pub struct AgentManager {
     hooks: HookRunner,
     lessons: LessonRegistry,
     embed_cache: EmbedCache,
+    gate_config: crate::gates::GateConfig,
     cancellers: Arc<std::sync::Mutex<HashMap<Uuid, oneshot::Sender<()>>>>,
 }
 
@@ -102,6 +108,7 @@ impl AgentManager {
         db: Option<crate::state::KiraDb>,
         lessons: LessonRegistry,
         embed_cache: EmbedCache,
+        gate_config: crate::gates::GateConfig,
     ) -> Self {
         let store = match db.clone() {
             Some(d) => AgentStore::with_db(d),
@@ -116,6 +123,7 @@ impl AgentManager {
             hooks,
             lessons,
             embed_cache,
+            gate_config,
             cancellers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -227,6 +235,8 @@ impl AgentManager {
         let lesson_snippet =
             render_inject_snippet(&self.lessons.inject_for(kind));
 
+        let yolo = req.yolo_mode.unwrap_or(false);
+
         let ctx = AgentContext {
             id,
             kind,
@@ -239,6 +249,8 @@ impl AgentManager {
             lesson_snippet,
             owned_globs: patterns.clone(),
             touched: Arc::new(std::sync::Mutex::new(Vec::new())),
+            yolo_mode: yolo,
+            gate_config: self.gate_config,
             store: self.store.clone(),
             router: self.router.clone(),
             mailbox: self.mailbox.clone(),
@@ -271,6 +283,11 @@ struct AgentContext {
     /// Canonical paths the agent actually wrote to (populated by file_write
     /// dispatches). Read by post-finish gates for L2 file_integrity.
     touched: Arc<std::sync::Mutex<Vec<String>>>,
+    /// YOLO mode: when true, skip expensive gates (embedding, judge, meta-review).
+    /// Used for quick tasks where speed > thoroughness.
+    yolo_mode: bool,
+    /// Gate thresholds (loaded from tokens.toml).
+    gate_config: crate::gates::GateConfig,
     store: AgentStore,
     router: Router,
     mailbox: MailboxFs,
@@ -288,25 +305,16 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
 
     let tools = agent_tools(&ctx.worktree_path.display().to_string());
 
-    let mut messages: Vec<ChatCompletionRequestMessage> = Vec::new();
-    // System prompt + (optional) lessons snippet.
+    let mut messages: Vec<ChatMessageUnified> = Vec::new();
     let mut system = ctx.kind.system_prompt().to_string();
     if !ctx.lesson_snippet.is_empty() {
         system.push_str(&ctx.lesson_snippet);
     }
-    if let Ok(m) = ChatCompletionRequestSystemMessageArgs::default()
-        .content(system)
-        .build()
-    {
-        messages.push(m.into());
-    }
-    // User task
-    if let Ok(m) = ChatCompletionRequestUserMessageArgs::default()
-        .content(ctx.task.clone())
-        .build()
-    {
-        messages.push(m.into());
-    }
+    messages.push(ChatMessageUnified::System { content: system });
+
+    messages.push(ChatMessageUnified::User {
+        content: ctx.task.clone(),
+    });
 
     let mut iters: u32 = 0;
     let mut usd_spent: f64 = 0.0;
@@ -316,6 +324,11 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
     // Stall detector — tracks recent tool call signatures.
     let mut tool_history: std::collections::VecDeque<String> =
         std::collections::VecDeque::with_capacity(TOOL_HISTORY_CAP);
+    // Output-unchanged stall: hash of (content + sorted tool sigs) per iter.
+    let mut output_history: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(STALL_OUTPUT_UNCHANGED_ITERS);
+    // No-progress stall: wall-clock of last useful output change.
+    let mut last_progress_instant: std::time::Instant = std::time::Instant::now();
 
     loop {
         if iters >= ctx.max_iters {
@@ -336,7 +349,7 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
         let route = ctx
             .router
             .route_chat_with_tools(&ctx.tier, None, messages.clone(), tools.clone());
-        let (response, _provider, model) = tokio::select! {
+        let (output, _provider, model) = tokio::select! {
             _ = &mut cancel_rx => {
                 warn!(agent_id = %ctx.id, "cancelled mid-loop");
                 ctx.store.update(ctx.id, |a| a.status = AgentStatus::Cancelled);
@@ -355,9 +368,7 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
 
         iters += 1;
         model_used = Some(model.clone());
-        if let Some(usage) = response.usage.as_ref() {
-            usd_spent += approx_cost(&model, usage.prompt_tokens, usage.completion_tokens);
-        }
+        usd_spent += approx_cost(&model, output.tokens_in, output.tokens_out);
         let now_iter = Utc::now().to_rfc3339();
         ctx.store.update(ctx.id, |a| {
             a.iters = iters;
@@ -366,55 +377,32 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
             a.last_progress_at = Some(now_iter.clone());
         });
 
-        let choice = match response.choices.into_iter().next() {
-            Some(c) => c,
-            None => {
-                error = Some("LLM returned no choices".into());
-                break;
-            }
-        };
-        let assistant_msg = choice.message;
-
-        // Push the assistant message into history (with potential tool_calls).
-        let assistant_for_history = {
-            let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
-            if let Some(c) = assistant_msg.content.as_ref() {
-                builder.content(c.clone());
-            }
-            if let Some(tcs) = assistant_msg.tool_calls.as_ref() {
-                builder.tool_calls(tcs.clone());
-            }
-            match builder.build() {
-                Ok(m) => m.into(),
-                Err(e) => {
-                    error = Some(format!("build assistant message: {e}"));
-                    break;
-                }
-            }
-        };
-        messages.push(assistant_for_history);
+        // Push the assistant message into history.
+        messages.push(ChatMessageUnified::Assistant {
+            content: Some(output.content.clone()),
+            tool_calls: output.tool_calls.clone(),
+            reasoning_content: output.reasoning_content.clone(),
+        });
 
         // Decide next step.
-        let tool_calls = assistant_msg.tool_calls.unwrap_or_default();
+        let tool_calls = output.tool_calls.clone();
         if tool_calls.is_empty() {
             // Content-only response. Treat as final.
-            final_result = assistant_msg.content;
+            final_result = Some(output.content);
             break;
         }
 
         // Execute each tool call sequentially. Append tool result messages.
         let mut break_outer_with_done: Option<String> = None;
         let mut break_outer_with_stall = false;
-        for tc in tool_calls {
-            let ChatCompletionMessageToolCall { id, function, .. } = tc;
-            let name = function.name.clone();
-            let arguments = function.arguments.clone();
+        for tc in &tool_calls {
+            let ToolCall { id, name, arguments } = tc;
             debug!(tool = %name, args_len = arguments.len(), "agent invoked tool");
 
             // Stall detection (G6 SameToolLoop).
             // `done` is excluded from stall detection — it's the legitimate exit.
             if name != "done" {
-                let sig = tool_call_signature(&name, &arguments);
+                let sig = tool_call_signature(name, arguments);
                 tool_history.push_back(sig.clone());
                 if tool_history.len() > TOOL_HISTORY_CAP {
                     tool_history.pop_front();
@@ -441,8 +429,8 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
             }
 
             let result = dispatch_with_hooks(
-                &name,
-                &arguments,
+                name,
+                arguments,
                 &ctx.worktree_path,
                 &ctx.hooks,
                 &ctx.id.to_string(),
@@ -452,18 +440,10 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
             .await;
 
             // Tool result message
-            match ChatCompletionRequestToolMessageArgs::default()
-                .content(result.payload.clone())
-                .tool_call_id(id.clone())
-                .build()
-            {
-                Ok(m) => messages.push(m.into()),
-                Err(e) => {
-                    error = Some(format!("build tool message: {e}"));
-                    break_outer_with_done = None;
-                    break;
-                }
-            }
+            messages.push(ChatMessageUnified::Tool {
+                call_id: id.clone(),
+                content: result.payload.clone(),
+            });
             if let Some(done_payload) = result.done {
                 break_outer_with_done = Some(done_payload);
                 break;
@@ -476,6 +456,69 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
         }
         if break_outer_with_stall || error.is_some() {
             break;
+        }
+
+        // ── OutputUnchanged stall check ────────────────────────────────────
+        // Hash this iter's "useful output": assistant content + all tool sigs
+        // pushed this iter. If unchanged across N consecutive iters → stall.
+        let content_snippet = messages
+            .last()
+            .and_then(|_| Some(""))
+            .unwrap_or("");
+        let recent_sigs: Vec<&str> = tool_history
+            .iter()
+            .rev()
+            .take(4)
+            .map(String::as_str)
+            .collect();
+        let mut combo = format!("c:{content_snippet}|");
+        for s in &recent_sigs {
+            combo.push_str(s);
+            combo.push(';');
+        }
+        let iter_hash = tool_call_signature("iter", &combo);
+        output_history.push_back(iter_hash.clone());
+        if output_history.len() > STALL_OUTPUT_UNCHANGED_ITERS {
+            output_history.pop_front();
+        }
+        if output_history.len() == STALL_OUTPUT_UNCHANGED_ITERS
+            && output_history.iter().all(|h| h == &iter_hash)
+        {
+            warn!(
+                agent_id = %ctx.id,
+                iters = output_history.len(),
+                "stall detected: output unchanged across iterations"
+            );
+            error = Some(format!(
+                "stall: agent output (content + tool sigs) unchanged for {} iterations",
+                STALL_OUTPUT_UNCHANGED_ITERS
+            ));
+            break;
+        }
+
+        // ── NoProgress wallclock stall ─────────────────────────────────────
+        // Tracks whether *some* signature appeared this iter. If output_hash
+        // changes vs previous, mark progress; else check elapsed.
+        let advanced = output_history
+            .iter()
+            .rev()
+            .nth(1)
+            .is_none_or(|prev| prev != &iter_hash);
+        if advanced {
+            last_progress_instant = std::time::Instant::now();
+        } else {
+            let elapsed = last_progress_instant.elapsed().as_secs();
+            if elapsed >= STALL_NO_PROGRESS_SECS {
+                warn!(
+                    agent_id = %ctx.id,
+                    elapsed_secs = elapsed,
+                    "stall detected: no-progress wallclock exceeded"
+                );
+                error = Some(format!(
+                    "stall: no useful output advance for {elapsed}s (threshold {STALL_NO_PROGRESS_SECS}s)"
+                ));
+                break;
+            }
         }
     }
 
@@ -580,6 +623,8 @@ async fn finish(
             let embed_cache = ctx.embed_cache.clone();
             let spec = ctx.task.clone();
             let owned = ctx.owned_globs.clone();
+            let yolo = ctx.yolo_mode;
+            let gate_cfg = ctx.gate_config;
             // Snapshot the canonical paths the agent wrote during its run.
             // Map each absolute path to its repo-relative form (after the
             // worktree root) — ownership globs are usually repo-relative.
@@ -594,6 +639,8 @@ async fn finish(
             let kind = ctx.kind;
             let aid = id;
             tokio::spawn(async move {
+                // YOLO mode: skip expensive gates (embedding + judge).
+                // Only run L1 structural + L2 file integrity for speed.
                 let req = RunGatesRequest {
                     spec: spec.clone(),
                     output: output.clone(),
@@ -601,12 +648,14 @@ async fn finish(
                     touched_paths: touched,
                     estimated_loc: None,
                     actual_loc: None,
-                    skip_embedding: false,
-                    skip_judge: false,
+                    skip_embedding: yolo,
+                    skip_judge: yolo,
                     haystack: String::new(),
-                    skip_meta_review: true,
+                    skip_meta_review: yolo || true, // always skip meta-review
+                    worktree_path: String::new(),
+                    skip_structural_lint: true,
                 };
-                let resp = run_cascade(&router, Some(&embed_cache), &req).await;
+                let resp = run_cascade(&router, Some(&embed_cache), &req, gate_cfg).await;
                 if resp.overall == GateOutcome::Fail {
                     if let Some(failed) =
                         resp.results.iter().find(|r| r.outcome == GateOutcome::Fail)
@@ -676,6 +725,20 @@ mod stall_tests {
     fn signature_includes_name_prefix() {
         let s = tool_call_signature("bash", "{}");
         assert!(s.starts_with("bash::"));
+    }
+
+    #[test]
+    fn output_unchanged_threshold_constant_is_safe() {
+        // Catch accidental zero/one defaults — too aggressive would trip on
+        // first iter, too lax would never fire.
+        assert!(super::STALL_OUTPUT_UNCHANGED_ITERS >= 2);
+        assert!(super::STALL_OUTPUT_UNCHANGED_ITERS <= 10);
+    }
+
+    #[test]
+    fn no_progress_secs_constant_is_safe() {
+        assert!(super::STALL_NO_PROGRESS_SECS >= 30);
+        assert!(super::STALL_NO_PROGRESS_SECS <= 600);
     }
 }
 

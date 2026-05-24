@@ -7,7 +7,7 @@ export type Agent = { id: string, kind: AgentKind, status: AgentStatus, worktree
  */
 last_progress_at: string | null, };
 
-export type AgentKind = "writer" | "deployer" | "judge" | "reviewer";
+export type AgentKind = "writer" | "deployer" | "judge" | "reviewer" | "explorer";
 
 export type AgentStatus = "spawning" | "active" | "stale" | "completed" | "failed" | "stopped" | "cancelled";
 
@@ -25,4 +25,9 @@ budget_usd: number | null,
 /**
  * Max iterations of the agent loop. Defaults to 1 in v0 (single-shot).
  */
-max_iters: number | null, };
+max_iters: number | null, 
+/**
+ * YOLO mode: bypass plan gates, use reduced gate cascade (L1+L2 only).
+ * Faster, cheaper, but less thorough evaluation.
+ */
+yolo_mode: boolean | null, };

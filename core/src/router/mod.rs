@@ -11,6 +11,7 @@
 
 pub mod budget;
 pub mod circuit;
+pub mod failure;
 pub mod tier;
 
 use anyhow::Result;
@@ -19,12 +20,51 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::{info, instrument, warn};
 
+use crate::llm::types::{ChatMessageUnified, ChatOutput, ToolDef};
 use crate::llm::LlmProvider;
 use crate::proto::chat::{ChatMessage, ChatRequest};
 
 use self::budget::BudgetGuard;
 use self::circuit::CircuitBreaker;
-use self::tier::{candidates_for, Candidate, Tier};
+use self::tier::{Candidate, Tier, TierMap};
+
+/// Per-model aggregate usage tracked for the REPL stats endpoint.
+#[derive(Debug, Clone, Default)]
+pub struct ModelUsage {
+    pub model: String,
+    pub requests: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+/// Shared state for per-model token tracking.
+#[derive(Debug, Default)]
+struct ModelUsageTracker {
+    entries: Mutex<HashMap<String, ModelUsage>>,
+}
+
+impl ModelUsageTracker {
+    fn record(&self, model: &str, tokens_in: u32, tokens_out: u32) {
+        let mut map = self.entries.lock().expect("model usage mutex poisoned");
+        let entry = map.entry(model.to_string()).or_default();
+        entry.model = model.to_string();
+        entry.requests += 1;
+        entry.tokens_in += u64::from(tokens_in);
+        entry.tokens_out += u64::from(tokens_out);
+    }
+
+    fn snapshot(&self) -> Vec<crate::server::stats_api::ModelUsage> {
+        let map = self.entries.lock().expect("model usage mutex poisoned");
+        map.values()
+            .map(|e| crate::server::stats_api::ModelUsage {
+                model: e.model.clone(),
+                requests: e.requests,
+                tokens_in: e.tokens_in,
+                tokens_out: e.tokens_out,
+            })
+            .collect()
+    }
+}
 
 /// The selected route for a chat call (provider name, model name, provider handle).
 pub struct Selection {
@@ -38,23 +78,37 @@ pub struct Router {
     providers: HashMap<String, Arc<LlmProvider>>,
     breakers: Arc<Mutex<HashMap<String, Arc<CircuitBreaker>>>>,
     pub budget: Arc<BudgetGuard>,
+    model_usage: Arc<ModelUsageTracker>,
+    tiers: TierMap,
 }
 
 impl Router {
-    pub fn new(providers: Vec<LlmProvider>, budget: Arc<BudgetGuard>) -> Self {
-        let providers: HashMap<String, Arc<LlmProvider>> = providers
-            .into_iter()
-            .map(|p| (p.name.clone(), Arc::new(p)))
-            .collect();
+    pub fn new(
+        providers: HashMap<String, Arc<LlmProvider>>,
+        budget: Arc<BudgetGuard>,
+        tiers: TierMap,
+    ) -> Self {
         Self {
             providers,
             breakers: Arc::new(Mutex::new(HashMap::new())),
             budget,
+            model_usage: Arc::new(ModelUsageTracker::default()),
+            tiers,
         }
+    }
+
+    /// Returns a snapshot of per-model token usage for the stats endpoint.
+    pub fn model_usage(&self) -> Vec<crate::server::stats_api::ModelUsage> {
+        self.model_usage.snapshot()
     }
 
     pub fn known_providers(&self) -> Vec<String> {
         self.providers.keys().cloned().collect()
+    }
+
+    /// Public accessor for tier candidates.
+    pub fn tier_candidates(&self, tier: Tier) -> Vec<Candidate> {
+        self.tiers.candidates_for(tier).to_vec()
     }
 
     fn breaker_for(&self, key: &str) -> Arc<CircuitBreaker> {
@@ -77,7 +131,6 @@ impl Router {
     /// Resolve candidates to try, honoring explicit model override.
     fn candidates(&self, req: &ChatRequest) -> Vec<Candidate> {
         if let Some(model) = req.model.as_deref() {
-            // Caller forced a model — try every known provider with this model name.
             return self
                 .providers
                 .keys()
@@ -85,7 +138,7 @@ impl Router {
                 .collect();
         }
         let tier = Tier::from_str_lossy(&req.tier);
-        candidates_for(tier)
+        self.tiers.candidates_for(tier).to_vec()
     }
 
     /// Pick a non-broken candidate. Returns selection + the breaker handle to
@@ -99,7 +152,7 @@ impl Router {
             anyhow::bail!("no candidates for tier {}", req.tier);
         }
 
-        for cand in candidates {
+        for cand in &candidates {
             let key = cand.key();
             let breaker = self.breaker_for(&key);
             if breaker.is_open() {
@@ -127,36 +180,36 @@ impl Router {
         )
     }
 
-    /// Route a tool-calling chat. Mirrors `route_chat` but accepts prebuilt
-    /// async-openai messages (so agent loops can include `Tool` result messages
-    /// between turns) and exposes function schemas to the model.
+    /// Route a tool‑calling chat.  Accepts `ChatMessageUnified` messages
+    /// (so agent loops can include `Tool` result messages between turns)
+    /// and `ToolDef` schemas.
     ///
-    /// **Tool-call ordering note**: when `tools` is non-empty, DeepSeek
+    /// **Tool‑call ordering note**: when `tools` is non-empty, DeepSeek
     /// candidates are demoted to the end of the fallback chain. Reason: the
     /// `deepseek-v4-*` family runs in thinking mode by default and returns
     /// `reasoning_content` in the assistant message that the API requires us
-    /// to echo back on the next turn. async-openai 0.27 does not surface
+    /// to echo back on the next turn. async‑openai 0.27 does not surface
     /// `reasoning_content` in request types, so iter≥2 of any agent loop
     /// would fail and fall back. Demoting upfront skips the wasted call.
     pub async fn route_chat_with_tools(
         &self,
         tier: &str,
         model_override: Option<&str>,
-        messages: Vec<async_openai::types::ChatCompletionRequestMessage>,
-        tools: Vec<async_openai::types::ChatCompletionTool>,
-    ) -> Result<(async_openai::types::CreateChatCompletionResponse, String, String)> {
+        messages: Vec<ChatMessageUnified>,
+        tools: Vec<ToolDef>,
+    ) -> Result<(ChatOutput, String, String)> {
         self.budget.check()?;
 
         let pseudo_req = ChatRequest {
             tier: tier.to_string(),
             model: model_override.map(str::to_string),
             messages: Vec::new(),
+            mode: None,
         };
+        let all = self.candidates(&pseudo_req);
         let candidates = if tools.is_empty() {
-            self.candidates(&pseudo_req)
+            all
         } else {
-            // Demote deepseek when tools are in play (see doc-comment above).
-            let all = self.candidates(&pseudo_req);
             let (deepseek, others): (Vec<_>, Vec<_>) =
                 all.into_iter().partition(|c| c.provider == "deepseek");
             let mut out = others;
@@ -180,16 +233,17 @@ impl Router {
                 .chat_with_tools(&cand.model, messages.clone(), tools.clone())
                 .await
             {
-                Ok(resp) => {
+                Ok(output) => {
                     breaker.record_success();
-                    if let Some(u) = resp.usage.as_ref() {
-                        self.budget
-                            .track_call(&cand.model, u.prompt_tokens, u.completion_tokens);
-                    }
-                    return Ok((resp, cand.provider.clone(), cand.model.clone()));
+                    self.budget
+                        .track_call(&cand.model, output.tokens_in, output.tokens_out);
+                    self.model_usage
+                        .record(&cand.model, output.tokens_in, output.tokens_out);
+                    return Ok((output, cand.provider.clone(), cand.model.clone()));
                 }
                 Err(e) => {
-                    warn!(candidate = %key, error = ?e, "tool-call candidate failed, trying next");
+                    let err_msg = format!("{e:#}");
+                    warn!(candidate = %key, error = %err_msg, "tool-call candidate failed, trying next");
                     breaker.record_failure();
                     last_err = Some(e);
                     continue;
@@ -202,12 +256,12 @@ impl Router {
     }
 
     /// Convenience: full route + chat (non-streaming). Iterates fallback on failure.
-    /// Returns (response, provider_name, model).
+    /// Returns (ChatOutput, provider_name, model).
     pub async fn route_chat(
         &self,
         req: &ChatRequest,
         messages: &[ChatMessage],
-    ) -> Result<(async_openai::types::CreateChatCompletionResponse, String, String)> {
+    ) -> Result<(ChatOutput, String, String)> {
         self.budget.check()?;
 
         let candidates = self.candidates(req);
@@ -225,16 +279,17 @@ impl Router {
             };
 
             match provider.chat(&cand.model, messages).await {
-                Ok(resp) => {
+                Ok(output) => {
                     breaker.record_success();
-                    if let Some(u) = resp.usage.as_ref() {
-                        self.budget
-                            .track_call(&cand.model, u.prompt_tokens, u.completion_tokens);
-                    }
-                    return Ok((resp, cand.provider.clone(), cand.model.clone()));
+                    self.budget
+                        .track_call(&cand.model, output.tokens_in, output.tokens_out);
+                    self.model_usage
+                        .record(&cand.model, output.tokens_in, output.tokens_out);
+                    return Ok((output, cand.provider.clone(), cand.model.clone()));
                 }
                 Err(e) => {
-                    warn!(candidate = %key, error = ?e, "candidate failed, trying next");
+                    let err_msg = format!("{e:#}");
+                    warn!(candidate = %key, error = %err_msg, "candidate failed, trying next");
                     breaker.record_failure();
                     last_err = Some(e);
                     continue;
@@ -253,7 +308,13 @@ mod tests {
     use super::*;
 
     fn mk_router() -> Router {
-        Router::new(vec![], Arc::new(BudgetGuard::new(Default::default())))
+        let tiers = TierMap::from_config(&crate::config::TiersConfig {
+            heavy: crate::config::TierEntry { candidates: vec![] },
+            standard: crate::config::TierEntry { candidates: vec![] },
+            light: crate::config::TierEntry { candidates: vec![] },
+            long_context: crate::config::TierEntry { candidates: vec![] },
+        });
+        Router::new(HashMap::new(), Arc::new(BudgetGuard::new(Default::default())), tiers)
     }
 
     #[test]
@@ -269,12 +330,19 @@ mod tests {
             warn_pct: 50.0,
         };
         let budget = Arc::new(BudgetGuard::new(cfg));
-        budget.track_call("deepseek-v4-pro", 100, 100); // a fraction of a cent
-        let r = Router::new(vec![], budget);
+        budget.track_call("deepseek-v4-pro", 100, 100);
+        let tiers = TierMap::from_config(&crate::config::TiersConfig {
+            heavy: crate::config::TierEntry { candidates: vec!["fake:model".into()] },
+            standard: crate::config::TierEntry { candidates: vec!["fake:model".into()] },
+            light: crate::config::TierEntry { candidates: vec![] },
+            long_context: crate::config::TierEntry { candidates: vec![] },
+        });
+        let r = Router::new(HashMap::new(), budget, tiers);
         let req = ChatRequest {
             tier: "standard".to_string(),
             model: None,
             messages: vec![],
+            mode: None,
         };
         assert!(r.select(&req).is_err());
     }

@@ -23,5 +23,5 @@ const SYSTEM_PROMPT = `You are Sergin, an autonomous agent with access to the fo
 
 Use tools proactively when tasks require it. After tool results, incorporate them into your response. Always respond in the same language as the user's question.`;
 
-const { waitUntilExit } = render(<App systemPrompt={SYSTEM_PROMPT} />, { exitOnCtrlC: true });
+const { waitUntilExit } = render(<App systemPrompt={SYSTEM_PROMPT} />);
 await waitUntilExit();

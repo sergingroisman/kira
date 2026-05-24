@@ -26,6 +26,7 @@ pub const TBL_WORKTREES: TableDefinition<&str, &str> = TableDefinition::new("wor
 pub const TBL_AGENTS: TableDefinition<&str, &str> = TableDefinition::new("agents");
 pub const TBL_PLANS: TableDefinition<&str, &str> = TableDefinition::new("plans");
 pub const TBL_LESSONS: TableDefinition<&str, &str> = TableDefinition::new("lessons");
+pub const TBL_SDD: TableDefinition<&str, &str> = TableDefinition::new("sdd_runs");
 pub const TBL_EMBED_CACHE: TableDefinition<&str, &str> =
     TableDefinition::new("embed_cache");
 pub const TBL_META: TableDefinition<&str, &str> = TableDefinition::new("meta");
@@ -56,6 +57,7 @@ impl KiraDb {
             txn.open_table(TBL_AGENTS)?;
             txn.open_table(TBL_PLANS)?;
             txn.open_table(TBL_LESSONS)?;
+            txn.open_table(TBL_SDD)?;
             txn.open_table(TBL_EMBED_CACHE)?;
             {
                 let mut meta = txn.open_table(TBL_META)?;

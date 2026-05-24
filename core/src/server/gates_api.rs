@@ -17,7 +17,18 @@ pub async fn run(
     State(state): State<AppState>,
     Json(req): Json<RunGatesRequest>,
 ) -> Json<RunGatesResponse> {
-    let resp = run_cascade(&state.router, Some(&state.embed_cache), &req).await;
+    let cfg = state.tokens.as_ref().map_or_else(
+        crate::gates::GateConfig::default,
+        |t| crate::gates::GateConfig {
+            faithfulness_pass_threshold: t.thresholds.faithfulness_pass_below,
+            faithfulness_escalate_threshold: t.thresholds.faithfulness_escalate,
+            judge_pass_score: t.thresholds.judge_pass_score,
+            change_suff_min: t.thresholds.change_sufficiency_min,
+            change_suff_max: t.thresholds.change_sufficiency_max,
+            meta_review_coverage_min: t.thresholds.meta_review_coverage,
+        },
+    );
+    let resp = run_cascade(&state.router, Some(&state.embed_cache), &req, cfg).await;
 
     // Flywheel: any failure produces a lesson, fire-and-forget.
     if resp.overall == GateOutcome::Fail {

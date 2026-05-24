@@ -11,6 +11,7 @@ pub enum AgentKind {
     Deployer,
     Judge,
     Reviewer,
+    Explorer,
 }
 
 impl AgentKind {
@@ -21,6 +22,7 @@ impl AgentKind {
             Self::Deployer => "light",
             Self::Judge => "heavy",
             Self::Reviewer => "heavy",
+            Self::Explorer => "standard",
         }
     }
 
@@ -47,12 +49,18 @@ impl AgentKind {
             "\n\n---\n\n",
             include_str!("../agents/prompts/reviewer.md"),
         );
+        const EXPLORER: &str = concat!(
+            include_str!("../agents/prompts/_principles.md"),
+            "\n\n---\n\n",
+            include_str!("../agents/prompts/explorer.md"),
+        );
         let _ = SEPARATOR; // documentation marker
         match self {
             Self::Writer => WRITER,
             Self::Deployer => DEPLOYER,
             Self::Judge => JUDGE,
             Self::Reviewer => REVIEWER,
+            Self::Explorer => EXPLORER,
         }
     }
 }
@@ -86,6 +94,10 @@ pub struct SpawnAgentRequest {
     /// Max iterations of the agent loop. Defaults to 1 in v0 (single-shot).
     #[serde(default)]
     pub max_iters: Option<u32>,
+    /// YOLO mode: bypass plan gates, use reduced gate cascade (L1+L2 only).
+    /// Faster, cheaper, but less thorough evaluation.
+    #[serde(default)]
+    pub yolo_mode: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, TS)]

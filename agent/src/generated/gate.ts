@@ -48,6 +48,17 @@ haystack: string,
 /**
  * Skip the meta-review gate.
  */
-skip_meta_review: boolean, };
+skip_meta_review: boolean, 
+/**
+ * Optional worktree path for L1 to run real lint/typecheck.
+ * When empty, L1 falls back to structural heuristics (regex truncation
+ * + brace balance). When provided + project type detected, L1 runs
+ * `cargo check` / `bun lint` / `tsc --noEmit`.
+ */
+worktree_path: string, 
+/**
+ * Skip the structural lint check (force heuristic-only L1).
+ */
+skip_structural_lint: boolean, };
 
 export type RunGatesResponse = { results: Array<GateResult>, overall: GateOutcome, failed_at: GateKind | null, duration_ms: bigint, };

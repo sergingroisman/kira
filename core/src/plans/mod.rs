@@ -13,11 +13,9 @@
 pub mod store;
 
 use anyhow::{Context, Result};
-use async_openai::types::{
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestUserMessageArgs,
-};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+
+use crate::llm::types::ChatMessageUnified;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::{info, instrument};
@@ -129,12 +127,16 @@ impl PlanManager {
         kind: AgentKind,
         ttl_secs: Option<u64>,
     ) -> Result<Plan> {
-        let messages = vec![
-            sys_msg(PLANNER_SYSTEM_PROMPT)?,
-            user_msg(&format!(
-                "Goal: {goal}\nTarget agent kind: {kind_str}\nEmit the plan as JSON now.",
-                kind_str = format!("{kind:?}").to_lowercase(),
-            ))?,
+        let messages: Vec<ChatMessageUnified> = vec![
+            ChatMessageUnified::System {
+                content: PLANNER_SYSTEM_PROMPT.to_string(),
+            },
+            ChatMessageUnified::User {
+                content: format!(
+                    "Goal: {goal}\nTarget agent kind: {kind_str}\nEmit the plan as JSON now.",
+                    kind_str = format!("{kind:?}").to_lowercase(),
+                ),
+            },
         ];
 
         let (response, _provider, model) = self
@@ -143,12 +145,7 @@ impl PlanManager {
             .await
             .context("planner LLM call failed")?;
 
-        let raw = response
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content)
-            .unwrap_or_default();
+        let raw = response.content;
 
         let (scope, steps) =
             parse_planner_output(&raw).context("could not parse planner output")?;
@@ -232,6 +229,7 @@ impl PlanManager {
                 base: None,
                 budget_usd: None,
                 max_iters: Some(derived_max_iters),
+                yolo_mode: None,
             })
             .await
             .context("executor agent spawn failed")?;
@@ -272,19 +270,7 @@ impl PlanManager {
     }
 }
 
-fn sys_msg(content: &str) -> Result<ChatCompletionRequestMessage> {
-    let m = ChatCompletionRequestSystemMessageArgs::default()
-        .content(content)
-        .build()?;
-    Ok(m.into())
-}
 
-fn user_msg(content: &str) -> Result<ChatCompletionRequestMessage> {
-    let m = ChatCompletionRequestUserMessageArgs::default()
-        .content(content)
-        .build()?;
-    Ok(m.into())
-}
 
 fn is_expired(plan: &Plan) -> bool {
     let Some(expires) = DateTime::parse_from_rfc3339(&plan.expires_at).ok() else {

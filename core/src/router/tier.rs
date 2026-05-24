@@ -1,8 +1,11 @@
-//! Tier enum + canonical mapping to (provider, model) candidates.
+//! Tier enum + config‑driven candidate lists.
 //!
-//! v0: hardcoded mapping per the plan. v0.5 reads from `tokens.toml`.
+//! The actual mapping lives in `tokens.toml [tiers.*]`.  `TierMap` is
+//! populated at startup and passed to the `Router`.
 
 use serde::{Deserialize, Serialize};
+
+use crate::config::TiersConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -47,34 +50,79 @@ impl Candidate {
     }
 }
 
-/// Return the ordered list of candidates for a tier.
-/// First = primary, rest = fallback chain.
-pub fn candidates_for(tier: Tier) -> Vec<Candidate> {
-    match tier {
-        Tier::Heavy => vec![
-            Candidate::new("deepseek", "deepseek-v4-pro"),
-            Candidate::new("dashscope", "qwen-max"),
-            Candidate::new("dashscope", "qwen-plus"),
-        ],
-        Tier::Standard => vec![
-            Candidate::new("deepseek", "deepseek-v4-pro"),
-            Candidate::new("dashscope", "qwen-plus"),
-            Candidate::new("deepseek", "deepseek-v4-flash"),
-        ],
-        Tier::Light => vec![
-            Candidate::new("deepseek", "deepseek-v4-flash"),
-            Candidate::new("dashscope", "qwen-flash"),
-        ],
-        Tier::LongContext => vec![
-            Candidate::new("deepseek", "deepseek-v4-pro"),
-            Candidate::new("dashscope", "qwen-max"),
-        ],
+/// Ordered candidate lists loaded from `tokens.toml` at startup.
+#[derive(Debug, Clone)]
+pub struct TierMap {
+    heavy: Vec<Candidate>,
+    standard: Vec<Candidate>,
+    light: Vec<Candidate>,
+    long_context: Vec<Candidate>,
+}
+
+impl TierMap {
+    /// Build from config.  Each `"provider:model"` string is split on the
+    /// first `:`.  Malformed entries are skipped with a warning.
+    pub fn from_config(cfg: &TiersConfig) -> Self {
+        fn parse_list(list: &[String]) -> Vec<Candidate> {
+            list.iter()
+                .filter_map(|s| {
+                    let (provider, model) = s.split_once(':')?;
+                    Some(Candidate::new(provider.to_string(), model.to_string()))
+                })
+                .collect()
+        }
+
+        Self {
+            heavy: parse_list(&cfg.heavy.candidates),
+            standard: parse_list(&cfg.standard.candidates),
+            light: parse_list(&cfg.light.candidates),
+            long_context: parse_list(&cfg.long_context.candidates),
+        }
+    }
+
+    /// Return the ordered candidates for a tier.
+    pub fn candidates_for(&self, tier: Tier) -> &[Candidate] {
+        match tier {
+            Tier::Heavy => &self.heavy,
+            Tier::Standard => &self.standard,
+            Tier::Light => &self.light,
+            Tier::LongContext => &self.long_context,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_config() -> TiersConfig {
+        TiersConfig {
+            heavy: crate::config::TierEntry {
+                candidates: vec![
+                    "deepseek:deepseek-v4-pro".into(),
+                    "dashscope:qwen-max".into(),
+                ],
+            },
+            standard: crate::config::TierEntry {
+                candidates: vec![
+                    "deepseek:deepseek-v4-pro".into(),
+                    "dashscope:qwen-plus".into(),
+                ],
+            },
+            light: crate::config::TierEntry {
+                candidates: vec![
+                    "deepseek:deepseek-v4-flash".into(),
+                    "dashscope:qwen-flash".into(),
+                ],
+            },
+            long_context: crate::config::TierEntry {
+                candidates: vec![
+                    "deepseek:deepseek-v4-pro".into(),
+                    "dashscope:qwen-max".into(),
+                ],
+            },
+        }
+    }
 
     #[test]
     fn tier_parses_common_inputs() {
@@ -87,15 +135,16 @@ mod tests {
 
     #[test]
     fn each_tier_has_candidates() {
+        let map = TierMap::from_config(&sample_config());
         for t in [Tier::Heavy, Tier::Standard, Tier::Light, Tier::LongContext] {
-            let c = candidates_for(t);
-            assert!(!c.is_empty(), "tier {t:?} has no candidates");
+            assert!(!map.candidates_for(t).is_empty(), "tier {t:?} has no candidates");
         }
     }
 
     #[test]
     fn deepseek_is_primary_for_heavy_and_standard() {
-        assert_eq!(&candidates_for(Tier::Heavy)[0].provider, "deepseek");
-        assert_eq!(&candidates_for(Tier::Standard)[0].provider, "deepseek");
+        let map = TierMap::from_config(&sample_config());
+        assert_eq!(&map.candidates_for(Tier::Heavy)[0].provider, "deepseek");
+        assert_eq!(&map.candidates_for(Tier::Standard)[0].provider, "deepseek");
     }
 }

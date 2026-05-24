@@ -5,6 +5,7 @@
 
 pub mod cmd_allowlist;
 pub mod path_guard;
+pub mod ssrf_guard;
 
 /// File I/O caps (used by `/v1/tool/file_{read,write}`).
 pub const FILE_READ_MAX_BYTES_DEFAULT: usize = 5 * 1024 * 1024; // 5 MiB

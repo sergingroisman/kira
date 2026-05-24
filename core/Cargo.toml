@@ -42,6 +42,19 @@ toml = "0.8"
 # YAML parsing (workflows .kira/workflows/*.yaml)
 serde_yaml = "0.9"
 
+# Stream adapters (BroadcastStream for SSE pillar fan-out)
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Async trait sugar (Pilot trait + future workflow extensions)
+async-trait = "0.1"
+
+# Web tools (P0 + sovereign search via SearXNG)
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+readability = "0.3"
+htmd = "0.1"
+url = "2.5"
+hickory-resolver = "0.24"
+
 # Embedded ACID DB for durable state (worktrees, agents, plans, etc).
 redb = "2"
 

@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useRef } from "react";
 import { Box, Text, Static } from "ink";
+import { md2ansi } from "./markdown.js";
 import { HumanMessage, SystemMessage, AIMessage } from "@langchain/core/messages";
 import type { BaseMessage } from "@langchain/core/messages";
 import { graph, makeSessionConfig } from "../graph/graph.js";
@@ -7,7 +8,7 @@ import { InputBar } from "./InputBar.js";
 import { StreamingOutput } from "./StreamingOutput.js";
 import { Spinner } from "./Spinner.js";
 import { ToolCallPanel } from "./ToolCallPanel.js";
-import { Logo } from "./components/index.js";
+import { Header } from "./Header.js";
 
 interface Message {
   role: "user" | "assistant";
@@ -175,8 +176,8 @@ export function App({ sessionId, systemPrompt }: AppProps) {
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      {/* KIRA Logo */}
-      <Logo size="small" color="magenta" showText={true} />
+      {/* KIRA Header */}
+      <Header coreUp={true} coreVersion="0.1" tier="standard" mode="plan" workingDir={process.cwd()} />
       
       {/* Static renders completed history without re-rendering previous items */}
       <Static items={history}>
@@ -185,7 +186,7 @@ export function App({ sessionId, systemPrompt }: AppProps) {
             <Text color={msg.role === "user" ? "green" : "white"} bold={msg.role === "user"}>
               {msg.role === "user" ? "You" : "KIRA"}
             </Text>
-            <Text>{msg.content}</Text>
+            <Text>{msg.role === "user" ? msg.content : md2ansi(msg.content)}</Text>
           </Box>
         )}
       </Static>

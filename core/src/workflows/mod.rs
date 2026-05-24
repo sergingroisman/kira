@@ -163,6 +163,7 @@ pub async fn execute_pr_review(
                     // Closed-world prompt should converge in <8 turns, but
                     // give headroom for retries on tool errors.
                     max_iters: Some(15),
+                    yolo_mode: None,
                 })
                 .await
                 .map(|a| a.id);
@@ -241,8 +242,16 @@ pub async fn execute_pr_review(
             skip_judge: cascade_cfg.skip_judge,
             haystack: diff.clone(),
             skip_meta_review: cascade_cfg.skip_meta_review,
+            worktree_path: String::new(),
+            skip_structural_lint: true,
         };
-        let gate_resp = run_cascade(&executor.router, Some(&executor.embed_cache), &req).await;
+        let gate_resp = run_cascade(
+            &executor.router,
+            Some(&executor.embed_cache),
+            &req,
+            crate::gates::GateConfig::default(),
+        )
+        .await;
         outcome_slot.gate_overall = format!("{:?}", gate_resp.overall).to_lowercase();
         outcome_slot.gate_failed_at =
             gate_resp.failed_at.map(|g| format!("{g:?}").to_lowercase());

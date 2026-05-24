@@ -9,29 +9,61 @@
 //!   L4 EmbeddingFaithfulness — ~$0.00007: cosine(embed(spec), embed(output)) >= 0.55
 //!   L5 JudgeLlm              — ~$0.10: heavy-tier judge returns score >= 7/10
 //!
-//! Per-level config is currently constants — v0.5+ moves to tokens.toml.
+//! Config is loaded from `tokens.toml` at startup via `GateConfig`.
 
 use anyhow::{Context, Result};
-use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-};
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, instrument};
 
 use crate::llm::embed_cache::EmbedCache;
+use crate::llm::types::ChatMessageUnified;
 use crate::llm::LlmProvider;
 use crate::proto::gate::{GateKind, GateOutcome, GateResult, RunGatesRequest, RunGatesResponse};
 use crate::router::Router;
 
-const FAITHFULNESS_PASS_THRESHOLD: f64 = 0.55;
-const JUDGE_PASS_SCORE: f64 = 7.0;
-const CHANGE_SUFF_MIN: f64 = 0.3;
-const CHANGE_SUFF_MAX: f64 = 3.0;
+/// Gate-level thresholds (loaded from tokens.toml).
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct GateConfig {
+    #[serde(default = "default_faithfulness_pass")]
+    pub faithfulness_pass_threshold: f64,
+    /// 3-zona escalate threshold: faithfulness ≥ this → high confidence,
+    /// skip Judge L5 (saves $0.10 per gate run). Mid-zone [pass, escalate)
+    /// always escalates to Judge.
+    #[serde(default = "default_faithfulness_escalate")]
+    pub faithfulness_escalate_threshold: f64,
+    #[serde(default = "default_judge_pass")]
+    pub judge_pass_score: f64,
+    #[serde(default = "default_change_suff_min")]
+    pub change_suff_min: f64,
+    #[serde(default = "default_change_suff_max")]
+    pub change_suff_max: f64,
+    #[serde(default = "default_meta_review_coverage")]
+    pub meta_review_coverage_min: f64,
+}
+
+fn default_faithfulness_pass() -> f64 { 0.55 }
+fn default_faithfulness_escalate() -> f64 { 0.80 }
+fn default_judge_pass() -> f64 { 7.0 }
+fn default_change_suff_min() -> f64 { 0.3 }
+fn default_change_suff_max() -> f64 { 3.0 }
+fn default_meta_review_coverage() -> f64 { 100.0 }
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            faithfulness_pass_threshold: 0.55,
+            faithfulness_escalate_threshold: 0.80,
+            judge_pass_score: 7.0,
+            change_suff_min: 0.3,
+            change_suff_max: 3.0,
+            meta_review_coverage_min: 100.0,
+        }
+    }
+}
+
 const EMBED_MODEL: &str = "text-embedding-v3";
-/// Minimum reviewer coverage required to clear meta-review. TRUST mandates
-/// 100% rule×file evaluation; partial coverage means "checked nothing".
-const META_REVIEW_COVERAGE_MIN: f64 = 100.0;
 
 const JUDGE_PROMPT: &str = "You are Kira's gate judge. \
 Given a SPEC and an OUTPUT, score how well OUTPUT meets SPEC on a 0-10 scale. \
@@ -44,21 +76,32 @@ Bias mitigation: longer != better; ignore verbosity, judge content match.";
 
 /// Run the cascade. Returns aggregate report + per-level details.
 /// `embed_cache` is optional — when present, level 4 reuses cached vectors.
+/// `cfg` provides thresholds (loaded from tokens.toml).
 #[instrument(skip(router, embed_cache, req), fields(skip_embed = req.skip_embedding, skip_judge = req.skip_judge))]
 pub async fn run_cascade(
     router: &Router,
     embed_cache: Option<&EmbedCache>,
     req: &RunGatesRequest,
+    gate_cfg: GateConfig,
 ) -> RunGatesResponse {
     let started = Instant::now();
     let mut results: Vec<GateResult> = Vec::new();
 
-    // L1 StructuralValidation
+    // L1 StructuralValidation — heuristic first (always), then optional real
+    // lint when worktree_path is provided.
     let r = gate_structural(&req.output);
     let outcome = r.outcome;
     results.push(r);
     if outcome == GateOutcome::Fail {
         return finalize(results, started);
+    }
+    if !req.skip_structural_lint && !req.worktree_path.is_empty() {
+        let r = gate_structural_lint(&req.worktree_path).await;
+        let outcome = r.outcome;
+        results.push(r);
+        if outcome == GateOutcome::Fail {
+            return finalize(results, started);
+        }
     }
 
     // L2 FileIntegrity
@@ -78,23 +121,44 @@ pub async fn run_cascade(
     }
 
     // L4 EmbeddingFaithfulness
+    // Tracks faithfulness similarity to enable L5 short-circuit on
+    // high-confidence outputs (3-zone classification: fail / mid / high).
+    let mut faith_sim: Option<f64> = None;
     if req.skip_embedding {
         results.push(skipped(GateKind::EmbeddingFaithfulness));
     } else {
         let r =
-            gate_embedding_faithfulness(router, embed_cache, &req.spec, &req.output).await;
+            gate_embedding_faithfulness(router, embed_cache, &req.spec, &req.output, gate_cfg).await;
         let outcome = r.outcome;
+        faith_sim = r.score;
         results.push(r);
         if outcome == GateOutcome::Fail {
             return finalize(results, started);
         }
     }
 
-    // L5 JudgeLlm
-    if req.skip_judge {
-        results.push(skipped(GateKind::JudgeLlm));
+    // L5 JudgeLlm — skip on high-confidence faithfulness (saves $0.10).
+    let high_confidence_skip = faith_sim
+        .is_some_and(|s| s >= gate_cfg.faithfulness_escalate_threshold);
+    if req.skip_judge || high_confidence_skip {
+        if high_confidence_skip {
+            results.push(GateResult {
+                gate: GateKind::JudgeLlm,
+                outcome: GateOutcome::Skipped,
+                score: faith_sim,
+                reason: Some(format!(
+                    "skipped — faithfulness {:.3} ≥ escalate {:.2} (high confidence)",
+                    faith_sim.unwrap_or(0.0),
+                    gate_cfg.faithfulness_escalate_threshold,
+                )),
+                suggestion: None,
+                duration_ms: 0,
+            });
+        } else {
+            results.push(skipped(GateKind::JudgeLlm));
+        }
     } else {
-        let r = gate_judge_llm(router, &req.spec, &req.output).await;
+        let r = gate_judge_llm(router, &req.spec, &req.output, gate_cfg).await;
         let outcome = r.outcome;
         results.push(r);
         if outcome == GateOutcome::Fail {
@@ -161,6 +225,117 @@ fn gate_structural(output: &str) -> GateResult {
         reason: None,
         suggestion: None,
         duration_ms: ms(start),
+    }
+}
+
+// ============================================================================
+// L1b — Real project lint/typecheck (cargo / bun) when worktree available.
+// ============================================================================
+//
+// Detects project type by marker file:
+//   - `Cargo.toml`   → `cargo check --message-format=short --offline` (60s cap)
+//   - `package.json` → `bunx tsc --noEmit` if `tsconfig.json` present, else skip
+//
+// Skipped silently if no markers. Fails fast on first non-zero exit with
+// stderr tail as `reason`.
+
+async fn gate_structural_lint(worktree_path: &str) -> GateResult {
+    use tokio::process::Command;
+    use tokio::time::{timeout, Duration};
+
+    let start = Instant::now();
+    let root = std::path::Path::new(worktree_path);
+    if !root.exists() {
+        return GateResult {
+            gate: GateKind::StructuralValidation,
+            outcome: GateOutcome::Skipped,
+            score: None,
+            reason: Some(format!("worktree path not found: {worktree_path}")),
+            suggestion: None,
+            duration_ms: ms(start),
+        };
+    }
+
+    // Pick lint command by marker.
+    let (cmd, args, label): (&str, Vec<&str>, &str) = if root.join("Cargo.toml").exists() {
+        ("cargo", vec!["check", "--message-format=short", "--offline"], "cargo check")
+    } else if root.join("tsconfig.json").exists() && root.join("package.json").exists() {
+        ("bunx", vec!["tsc", "--noEmit"], "bunx tsc --noEmit")
+    } else {
+        return GateResult {
+            gate: GateKind::StructuralValidation,
+            outcome: GateOutcome::Skipped,
+            score: None,
+            reason: Some("no Cargo.toml or tsconfig.json — no lint applicable".into()),
+            suggestion: None,
+            duration_ms: ms(start),
+        };
+    };
+
+    let fut = Command::new(cmd)
+        .args(&args)
+        .current_dir(root)
+        .kill_on_drop(true)
+        .output();
+
+    let output = match timeout(Duration::from_secs(60), fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return GateResult {
+                gate: GateKind::StructuralValidation,
+                outcome: GateOutcome::Skipped,
+                score: None,
+                reason: Some(format!("{label} spawn failed: {e}")),
+                suggestion: None,
+                duration_ms: ms(start),
+            };
+        }
+        Err(_) => {
+            return GateResult {
+                gate: GateKind::StructuralValidation,
+                outcome: GateOutcome::Fail,
+                score: None,
+                reason: Some(format!("{label} timed out after 60s")),
+                suggestion: Some(
+                    "Lint took too long — fix incremental build or skip via skip_structural_lint."
+                        .into(),
+                ),
+                duration_ms: ms(start),
+            };
+        }
+    };
+
+    if output.status.success() {
+        GateResult {
+            gate: GateKind::StructuralValidation,
+            outcome: GateOutcome::Pass,
+            score: None,
+            reason: Some(format!("{label}: clean")),
+            suggestion: None,
+            duration_ms: ms(start),
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        GateResult {
+            gate: GateKind::StructuralValidation,
+            outcome: GateOutcome::Fail,
+            score: None,
+            reason: Some(format!("{label} exit={:?}; tail:\n{tail}", output.status.code())),
+            suggestion: Some(
+                "Fix the lint/typecheck errors before next gate runs. Cheapest fix → most leverage."
+                    .into(),
+            ),
+            duration_ms: ms(start),
+        }
     }
 }
 
@@ -248,6 +423,8 @@ fn gate_file_integrity(touched: &[String], owned: &[String]) -> GateResult {
 // ============================================================================
 
 fn gate_change_sufficiency(estimated: Option<u32>, actual: Option<u32>) -> GateResult {
+    const CHANGE_SUFF_MIN: f64 = 0.3;
+    const CHANGE_SUFF_MAX: f64 = 3.0;
     let start = Instant::now();
     let (Some(e), Some(a)) = (estimated, actual) else {
         return GateResult {
@@ -280,7 +457,9 @@ fn gate_change_sufficiency(estimated: Option<u32>, actual: Option<u32>) -> GateR
         outcome,
         score: Some(ratio),
         reason: Some(format!(
-            "actual {a} vs estimated {e} → ratio {ratio:.2} (need [{CHANGE_SUFF_MIN}, {CHANGE_SUFF_MAX}])"
+            "actual {a} vs estimated {e} → ratio {ratio:.2} (need [{min}, {max}])",
+            min = CHANGE_SUFF_MIN,
+            max = CHANGE_SUFF_MAX,
         )),
         suggestion: if outcome == GateOutcome::Fail {
             Some(if ratio < CHANGE_SUFF_MIN {
@@ -304,6 +483,7 @@ async fn gate_embedding_faithfulness(
     embed_cache: Option<&EmbedCache>,
     spec: &str,
     output: &str,
+    gate_cfg: GateConfig,
 ) -> GateResult {
     let start = Instant::now();
     let Some(provider) = router.provider_handle("dashscope") else {
@@ -319,25 +499,39 @@ async fn gate_embedding_faithfulness(
     match embed_pair(&provider, embed_cache, spec, output).await {
         Ok((a, b)) => {
             let sim = cosine(&a, &b);
-            let outcome = if sim >= FAITHFULNESS_PASS_THRESHOLD {
-                GateOutcome::Pass
-            } else {
+            // 3-zone classification (TRUST-aligned):
+            //   sim < pass          → Fail fast (don't waste Judge LLM)
+            //   pass ≤ sim < escal  → Pass, but force Judge L5 to confirm
+            //   sim ≥ escal         → Pass with high confidence (Judge optional)
+            let pass = gate_cfg.faithfulness_pass_threshold;
+            let esc = gate_cfg.faithfulness_escalate_threshold;
+            let outcome = if sim < pass {
                 GateOutcome::Fail
+            } else {
+                GateOutcome::Pass
+            };
+            let zone = if sim < pass {
+                "fail_fast"
+            } else if sim < esc {
+                "escalate_to_judge"
+            } else {
+                "high_confidence"
             };
             GateResult {
                 gate: GateKind::EmbeddingFaithfulness,
                 outcome,
                 score: Some(sim),
                 reason: Some(format!(
-                    "cosine(spec, output)={sim:.3} (threshold {FAITHFULNESS_PASS_THRESHOLD})"
+                    "cosine(spec, output)={sim:.3} · zone={zone} (pass {pass:.2}, escalate {esc:.2})",
                 )),
-                suggestion: if outcome == GateOutcome::Fail {
-                    Some(
-                        "Output is semantically distant from spec — likely wrong content."
-                            .into(),
-                    )
-                } else {
-                    None
+                suggestion: match outcome {
+                    GateOutcome::Fail => Some(
+                        "Output semantically distant from spec — likely wrong content.".into(),
+                    ),
+                    GateOutcome::Pass if sim < esc => Some(
+                        "Mid-zone similarity — Judge L5 will confirm.".into(),
+                    ),
+                    _ => None,
                 },
                 duration_ms: ms(start),
             }
@@ -416,19 +610,20 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 // L5 — Judge LLM (~$0.10)
 // ============================================================================
 
-async fn gate_judge_llm(router: &Router, spec: &str, output: &str) -> GateResult {
+async fn gate_judge_llm(
+    router: &Router,
+    spec: &str,
+    output: &str,
+    gate_cfg: GateConfig,
+) -> GateResult {
     let start = Instant::now();
     let messages = vec![
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content(JUDGE_PROMPT)
-            .build()
-            .unwrap()
-            .into(),
-        ChatCompletionRequestUserMessageArgs::default()
-            .content(format!("SPEC:\n{spec}\n\nOUTPUT:\n{output}\n\nReturn JSON."))
-            .build()
-            .unwrap()
-            .into(),
+        ChatMessageUnified::System {
+            content: JUDGE_PROMPT.to_string(),
+        },
+        ChatMessageUnified::User {
+            content: format!("SPEC:\n{spec}\n\nOUTPUT:\n{output}\n\nReturn JSON."),
+        },
     ];
     let (resp, _provider, model) = match router
         .route_chat_with_tools("heavy", None, messages, Vec::new())
@@ -446,12 +641,7 @@ async fn gate_judge_llm(router: &Router, spec: &str, output: &str) -> GateResult
             };
         }
     };
-    let content = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+    let content = resp.content;
     let json: serde_json::Value = match serde_json::from_str(content.trim()) {
         Ok(v) => v,
         Err(_) => {
@@ -480,7 +670,7 @@ async fn gate_judge_llm(router: &Router, spec: &str, output: &str) -> GateResult
         .get("rationale")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let outcome = if score >= JUDGE_PASS_SCORE {
+    let outcome = if score >= gate_cfg.judge_pass_score {
         GateOutcome::Pass
     } else {
         GateOutcome::Fail
@@ -492,7 +682,7 @@ async fn gate_judge_llm(router: &Router, spec: &str, output: &str) -> GateResult
         score: Some(score),
         reason: rationale,
         suggestion: if outcome == GateOutcome::Fail {
-            Some(format!("Judge score {score} below threshold {JUDGE_PASS_SCORE}"))
+            Some(format!("Judge score {score} below threshold {}", gate_cfg.judge_pass_score))
         } else {
             None
         },
@@ -511,6 +701,7 @@ async fn gate_judge_llm(router: &Router, spec: &str, output: &str) -> GateResult
 // artifact). When `findings` is empty, the gate passes (nothing to hallucinate).
 
 fn gate_meta_review(output: &str, haystack: &str) -> GateResult {
+    const META_REVIEW_COVERAGE_MIN: f64 = 100.0;
     let start = Instant::now();
     let json_str = if output.trim_start().starts_with('{') {
         output.trim().to_string()

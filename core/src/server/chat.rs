@@ -1,6 +1,6 @@
-//! `POST /v1/chat` (non-streaming) + `POST /v1/chat/stream` (SSE).
+//! `POST /v1/chat` (non-streaming) + `POST /v1/chat/stream` (SSE) + `POST /v1/chat/yolo` (direct agent spawn).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
@@ -11,9 +11,11 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tracing::{instrument, warn};
 
+use crate::llm::types::StreamChunk;
 use crate::llm::LlmProvider;
-use crate::proto::chat::{ChatMessage, ChatRequest, ChatResponse, StreamEvent};
-use crate::router::tier::{candidates_for, Candidate, Tier};
+use crate::proto::agent::{AgentKind, SpawnAgentRequest};
+use crate::proto::chat::{ChatRequest, ChatResponse, StreamEvent, YoloResponse};
+use crate::router::tier::{Candidate, Tier};
 use crate::router::Router;
 use crate::server::{error::AppError, AppState};
 
@@ -26,16 +28,14 @@ pub async fn chat(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
-    let (response, _provider, model) = state.router.route_chat(&req, &req.messages).await?;
-    let choice = response.choices.into_iter().next().context("no choices")?;
-    let usage = response.usage.context("no usage returned")?;
+    let (output, _provider, model) = state.router.route_chat(&req, &req.messages).await?;
 
     Ok(Json(ChatResponse {
-        content: choice.message.content.unwrap_or_default(),
+        content: output.content,
         model,
-        tokens_in: usage.prompt_tokens,
-        tokens_out: usage.completion_tokens,
-        finish_reason: choice.finish_reason.map(|r| format!("{r:?}")),
+        tokens_in: output.tokens_in,
+        tokens_out: output.tokens_out,
+        finish_reason: output.finish_reason,
     }))
 }
 
@@ -73,16 +73,17 @@ pub async fn chat_stream(
 
         match provider.chat_stream(&cand.model, &req.messages).await {
             Ok(upstream) => {
-                breaker.record_success(); // setup succeeded
+                breaker.record_success();
                 let model = cand.model.clone();
-                let sse_stream = upstream.flat_map(move |chunk_result| {
+                let sse_stream = upstream.filter_map(move |chunk_result| {
                     let model = model.clone();
-                    let events: Vec<Result<Event, Infallible>> = match chunk_result {
-                        Ok(chunk) => render_chunk(&chunk, &model),
-                        Err(e) => vec![Ok(error_event(&e.to_string()))],
-                    };
-                    futures::stream::iter(events)
-                });
+                    async move {
+                        match chunk_result {
+                            Ok(chunk) => Some(render_stream_chunk(chunk, &model)),
+                            Err(e) => Some(error_event(&e.to_string())),
+                        }
+                    }
+                }).flat_map(futures::stream::iter);
                 return Ok(Sse::new(sse_stream).keep_alive(KeepAlive::new()));
             }
             Err(e) => {
@@ -103,60 +104,105 @@ pub async fn chat_stream(
 // Helpers
 // ============================================================================
 
-fn candidates_for_request(_router: &Router, req: &ChatRequest) -> Vec<Candidate> {
-    // For now mirror Router::candidates logic — simple tier-based selection.
-    // Future: expose Router::candidates() (or merge stream path into route_chat).
+fn candidates_for_request(router: &Router, req: &ChatRequest) -> Vec<Candidate> {
     if let Some(model) = req.model.as_deref() {
-        // Try first known provider with this model (simplification).
-        return vec![Candidate::new("deepseek", model.to_string())];
+        return router
+            .known_providers()
+            .into_iter()
+            .map(|p| Candidate::new(p, model.to_string()))
+            .collect();
     }
-    candidates_for(Tier::from_str_lossy(&req.tier))
+    router.tier_candidates(Tier::from_str_lossy(&req.tier))
 }
 
 fn provider_clone(router: &Router, name: &str) -> Option<Arc<LlmProvider>> {
     router.provider_handle(name)
 }
 
-fn render_chunk(
-    chunk: &async_openai::types::CreateChatCompletionStreamResponse,
-    model: &str,
-) -> Vec<Result<Event, Infallible>> {
-    let choice = chunk.choices.first();
-    let delta = choice
-        .and_then(|c| c.delta.content.as_ref())
-        .cloned()
-        .unwrap_or_default();
-    let finish = choice.and_then(|c| c.finish_reason.map(|r| format!("{r:?}")));
-
-    let mut events: Vec<Result<Event, Infallible>> = Vec::new();
-    if !delta.is_empty() {
-        let payload = StreamEvent::Token { delta };
-        events.push(Ok(Event::default()
-            .event("token")
-            .data(serde_json::to_string(&payload).unwrap_or_default())));
+fn render_stream_chunk(chunk: StreamChunk, model: &str) -> Vec<Result<Event, Infallible>> {
+    match chunk {
+        StreamChunk::Token(delta) if delta.is_empty() => vec![],
+        StreamChunk::Token(delta) => {
+            let payload = StreamEvent::Token { delta };
+            vec![Ok(Event::default()
+                .event("token")
+                .data(serde_json::to_string(&payload).unwrap_or_default()))]
+        }
+        StreamChunk::Finish { reason } => {
+            let payload = StreamEvent::Done {
+                model: model.to_string(),
+                finish_reason: reason,
+            };
+            vec![Ok(Event::default()
+                .event("done")
+                .data(serde_json::to_string(&payload).unwrap_or_default()))]
+        }
+        StreamChunk::Error(message) => {
+            let payload = StreamEvent::Error { message };
+            vec![Ok(Event::default()
+                .event("error")
+                .data(serde_json::to_string(&payload).unwrap_or_default()))]
+        }
     }
-    if let Some(reason) = finish {
-        let payload = StreamEvent::Done {
-            model: model.to_string(),
-            finish_reason: Some(reason),
-        };
-        events.push(Ok(Event::default()
-            .event("done")
-            .data(serde_json::to_string(&payload).unwrap_or_default())));
-    }
-    events
 }
 
-fn error_event(message: &str) -> Event {
+fn error_event(message: &str) -> Vec<Result<Event, Infallible>> {
     let payload = StreamEvent::Error {
         message: message.to_string(),
     };
-    Event::default()
+    vec![Ok(Event::default()
         .event("error")
-        .data(serde_json::to_string(&payload).unwrap_or_default())
+        .data(serde_json::to_string(&payload).unwrap_or_default()))]
 }
 
-// The `dead_code` unused helpers will be cleaned in next iteration when we
-// fully merge stream + non-stream into a single Router method.
-#[allow(dead_code)]
-fn _unused_for_now(_msgs: &[ChatMessage]) {}
+// ============================================================================
+// YOLO mode — /v1/chat/yolo
+// ============================================================================
+
+#[instrument(skip(state, req), fields(yolo = true))]
+pub async fn chat_yolo(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> Result<Json<YoloResponse>, AppError> {
+    let mut task = String::new();
+    for msg in &req.messages {
+        match msg.role.as_str() {
+            "user" => {
+                task.push_str(&format!("User: {}\n", msg.content));
+            }
+            "assistant" => {
+                let preview: String = msg.content.chars().take(500).collect();
+                task.push_str(&format!("Previous agent output: {}\n", preview));
+            }
+            _ => {}
+        }
+    }
+    let user_message = task.trim().to_string();
+
+    if user_message.is_empty() {
+        return Err(AppError::bad_request("no user message for yolo"));
+    }
+
+    let tier = req.tier.clone();
+    let agent_req = SpawnAgentRequest {
+        kind: AgentKind::Writer,
+        task: user_message,
+        worktree_id: None,
+        base: None,
+        budget_usd: None,
+        max_iters: None,
+        yolo_mode: Some(true),
+    };
+
+    let agent = state.agents.spawn(agent_req).await?;
+
+    Ok(Json(YoloResponse {
+        agent_id: agent.id.clone(),
+        kind: format!("{:?}", agent.kind).to_lowercase(),
+        status: format!("{:?}", agent.status).to_lowercase(),
+        message: format!(
+            "yolo agent {} spawned (tier={tier}, gates=reduced)",
+            &agent.id[..8]
+        ),
+    }))
+}

@@ -10,7 +10,12 @@ tier: string,
 /**
  * Override model explicitly (testing). If set, bypasses tier mapping.
  */
-model: string | null, messages: Array<ChatMessage>, };
+model: string | null, messages: Array<ChatMessage>, 
+/**
+ * Execution mode: "plan" (default, plan-first via Pilot) or "yolo"
+ * (direct agent spawn, reduced gates, no plan approval).
+ */
+mode: string | null, };
 
 export type ChatResponse = { content: string, model: string, tokens_in: number, tokens_out: number, finish_reason: string | null, };
 
@@ -18,3 +23,8 @@ export type ChatResponse = { content: string, model: string, tokens_in: number, 
  * SSE event payloads (server → client streaming).
  */
 export type StreamEvent = { "type": "token", delta: string, } | { "type": "done", model: string, finish_reason: string | null, } | { "type": "error", message: string, };
+
+/**
+ * Response for YOLO mode chat — direct agent spawn.
+ */
+export type YoloResponse = { agent_id: string, kind: string, status: string, message: string, };

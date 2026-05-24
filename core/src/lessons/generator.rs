@@ -1,12 +1,10 @@
 //! Auto-generate a Lesson from a failure context using a Light-tier LLM call.
 
 use anyhow::{Context, Result};
-use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-};
 use serde::Deserialize;
 use tracing::{instrument, warn};
 
+use crate::llm::types::ChatMessageUnified;
 use crate::proto::agent::AgentKind;
 use crate::proto::lesson::{LessonPriority, LessonScope};
 use crate::router::Router;
@@ -49,26 +47,19 @@ pub async fn generate_from_failure(
         ctx = context.chars().take(2000).collect::<String>()
     );
     let messages = vec![
-        ChatCompletionRequestSystemMessageArgs::default()
-            .content(GEN_PROMPT)
-            .build()?
-            .into(),
-        ChatCompletionRequestUserMessageArgs::default()
-            .content(user)
-            .build()?
-            .into(),
+        ChatMessageUnified::System {
+            content: GEN_PROMPT.to_string(),
+        },
+        ChatMessageUnified::User {
+            content: user,
+        },
     ];
     let (resp, _provider, _model) = router
         .route_chat_with_tools("light", None, messages, Vec::new())
         .await
         .context("lesson generator LLM call failed")?;
 
-    let content = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+    let content = resp.content;
 
     let json = extract_json(&content).context("lesson generator returned non-JSON")?;
     let parsed: GeneratedLesson =

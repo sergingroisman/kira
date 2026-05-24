@@ -9,14 +9,12 @@
 //!
 //! Sequential by default to keep budget bounded. v0.5+ may add parallelism.
 
-use async_openai::types::{
-    ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
-};
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{info, instrument, warn};
 
 use crate::gates::cosine_for_eval;
+use crate::llm::types::ChatMessageUnified;
 use crate::llm::embed_cache::EmbedCache;
 use crate::proto::eval::{EvalSample, ModelSummary, RunEvalRequest, RunEvalResponse};
 use crate::router::Router;
@@ -85,17 +83,12 @@ async fn run_one_sample(
     skip_judge: bool,
 ) -> EvalSample {
     let start = Instant::now();
-    let user_msg = match ChatCompletionRequestUserMessageArgs::default()
-        .content(spec.to_string())
-        .build()
-    {
-        Ok(m) => m,
-        Err(e) => return error_sample(task_id, model, format!("build user msg: {e}")),
-    };
-    let messages: Vec<ChatCompletionRequestMessage> = vec![user_msg.into()];
+    let messages: Vec<ChatMessageUnified> = vec![ChatMessageUnified::User {
+        content: spec.to_string(),
+    }];
 
     // Direct chat with explicit model override. Tier hint ignored when model is set.
-    let (response, _provider, model_used) = match router
+    let (output, _provider, model_used) = match router
         .route_chat_with_tools("standard", Some(model), messages, Vec::new())
         .await
     {
@@ -104,44 +97,36 @@ async fn run_one_sample(
     };
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let usage = response.usage.clone();
-    let choice = response.choices.into_iter().next();
-    let output = choice
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
-    let (tokens_in, tokens_out) = usage
-        .as_ref()
-        .map(|u| (u.prompt_tokens, u.completion_tokens))
-        .unwrap_or((0, 0));
+    let (tokens_in, tokens_out) = (output.tokens_in, output.tokens_out);
     let cost_usd = price_per_million(&model_used)
         .map(|(i, o)| (f64::from(tokens_in) * i + f64::from(tokens_out) * o) / 1_000_000.0)
         .unwrap_or(0.0);
 
     // Faithfulness via embedding (free with cache hit).
-    let faithfulness = if skip_embedding || output.is_empty() {
+    let faithfulness = if skip_embedding || output.content.is_empty() {
         None
     } else {
-        cosine_for_eval(router, embed_cache, spec, &output).await
+        cosine_for_eval(router, embed_cache, spec, &output.content).await
     };
 
     // Judge via Heavy LLM.
-    let (judge_score, judge_rationale) = if skip_judge || output.is_empty() {
+    let (judge_score, judge_rationale) = if skip_judge || output.content.is_empty() {
         (None, None)
     } else {
-        judge_sample(router, spec, &output).await
+        judge_sample(router, spec, &output.content).await
     };
 
     let gates_pass = match (faithfulness, judge_score) {
         (Some(f), Some(s)) => f >= 0.55 && s >= 7.0,
         (Some(f), None) => f >= 0.55,
         (None, Some(s)) => s >= 7.0,
-        (None, None) => !output.is_empty(),
+        (None, None) => !output.content.is_empty(),
     };
 
     EvalSample {
         task_id: task_id.to_string(),
         model: model_used,
-        output,
+        output: output.content,
         tokens_in,
         tokens_out,
         cost_usd,
@@ -159,22 +144,12 @@ async fn judge_sample(
     spec: &str,
     output: &str,
 ) -> (Option<f64>, Option<String>) {
-    use async_openai::types::ChatCompletionRequestSystemMessageArgs;
-
-    let messages: Vec<ChatCompletionRequestMessage> = vec![
-        match ChatCompletionRequestSystemMessageArgs::default()
-            .content(JUDGE_PROMPT)
-            .build()
-        {
-            Ok(m) => m.into(),
-            Err(_) => return (None, None),
+    let messages: Vec<ChatMessageUnified> = vec![
+        ChatMessageUnified::System {
+            content: JUDGE_PROMPT.to_string(),
         },
-        match ChatCompletionRequestUserMessageArgs::default()
-            .content(format!("SPEC:\n{spec}\n\nOUTPUT:\n{output}\n\nReturn JSON."))
-            .build()
-        {
-            Ok(m) => m.into(),
-            Err(_) => return (None, None),
+        ChatMessageUnified::User {
+            content: format!("SPEC:\n{spec}\n\nOUTPUT:\n{output}\n\nReturn JSON."),
         },
     ];
     let (resp, _, _) = match router
@@ -187,12 +162,7 @@ async fn judge_sample(
             return (None, None);
         }
     };
-    let content = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+    let content = resp.content;
     let parsed: Option<serde_json::Value> = serde_json::from_str(content.trim()).ok().or_else(|| {
         // Try inside fences.
         let s = content.trim();

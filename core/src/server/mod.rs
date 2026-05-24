@@ -5,6 +5,7 @@ pub mod chat;
 pub mod embed_api;
 pub mod error;
 pub mod eval_api;
+pub mod events_api;
 pub mod gates_api;
 pub mod health;
 pub mod lessons_api;
@@ -12,27 +13,35 @@ pub mod mailbox_api;
 pub mod ownership_api;
 pub mod plans_api;
 pub mod review_api;
+pub mod sdd_api;
+pub mod stats_api;
+pub mod web_api;
 pub mod tool;
 pub mod worktree_api;
 
 use anyhow::{Context, Result};
 use axum::{
-    routing::{delete, get, post},
     Router as AxumRouter,
+    routing::{delete, get, post},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::agents::{mailbox::MailboxFs, ownership::OwnershipRegistry, AgentManager};
+use crate::agents::{AgentManager, mailbox::MailboxFs, ownership::OwnershipRegistry};
+use crate::config::Tokens;
 use crate::hooks::HookRunner;
 use crate::lessons::LessonRegistry;
 use crate::llm::embed_cache::EmbedCache;
-use crate::llm::{dashscope, deepseek, LlmProvider};
+use crate::llm::LlmProvider;
+use crate::observability::pillar::{self, PillarTx};
 use crate::plans::PlanManager;
-use crate::router::budget::{BudgetConfig, BudgetGuard};
 use crate::router::Router;
-use crate::state::{default_state_path, KiraDb};
+use crate::router::budget::{BudgetConfig, BudgetGuard};
+use crate::router::tier::TierMap;
+use crate::sdd::SddManager;
+use crate::state::{KiraDb, default_state_path};
 use crate::worktree::WorktreeManager;
 
 #[derive(Clone)]
@@ -46,25 +55,50 @@ pub struct AppState {
     pub plans: PlanManager,
     pub lessons: LessonRegistry,
     pub embed_cache: EmbedCache,
+    pub tokens: Option<Tokens>,
+    /// Broadcast channel for pillar transparency events (REPL breadcrumbs).
+    pub pillar_tx: PillarTx,
+    pub sdd: SddManager,
 }
 
 impl AppState {
-    pub async fn new() -> Result<Self> {
-        let mut providers: Vec<LlmProvider> = Vec::new();
+    pub async fn new(tokens: Option<Tokens>) -> Result<Self> {
+        let mut providers = HashMap::new();
 
-        providers.push(dashscope::build().context("dashscope build (v0 mandatory)")?);
-
-        match deepseek::build() {
-            Ok(Some(p)) => providers.push(p),
-            Ok(None) => warn!("DEEPSEEK_API_KEY not set — router will fallback to dashscope only"),
-            Err(e) => warn!(error = ?e, "deepseek build failed; continuing without it"),
+        if let Some(ref t) = tokens {
+            for (name, entry) in &t.providers.entries {
+                match LlmProvider::from_config(name, entry) {
+                    Ok(Some(p)) => {
+                        info!(%name, protocol = %p.protocol.as_str(), "provider configured");
+                        providers.insert(name.clone(), Arc::new(p));
+                    }
+                    Ok(None) => warn!(%name, "provider not configured, skipping"),
+                    Err(e) => warn!(%name, error = ?e, "provider build failed"),
+                }
+            }
         }
 
-        let names: Vec<String> = providers.iter().map(|p| p.name.clone()).collect();
-        info!(providers = ?names, "router providers configured");
+        let names: Vec<String> = providers.keys().cloned().collect();
+        info!(?names, "router providers configured");
 
-        let budget = Arc::new(BudgetGuard::new(BudgetConfig::default()));
-        let router = Router::new(providers, budget);
+        let budget_cfg = tokens
+            .as_ref()
+            .map_or_else(BudgetConfig::default, |t| BudgetConfig {
+                monthly_hard_stop_usd: t.budget.monthly_hard_stop_usd,
+                warn_pct: t.budget.warn_pct,
+            });
+        let budget = Arc::new(BudgetGuard::new(budget_cfg));
+
+        let tier_map = tokens.as_ref().map_or_else(
+            || TierMap::from_config(&crate::config::TiersConfig {
+                heavy: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-pro".into(), "dashscope:qwen-max".into()] },
+                standard: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-pro".into(), "dashscope:qwen-plus".into()] },
+                light: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-flash".into(), "dashscope:qwen-flash".into()] },
+                long_context: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-pro".into(), "dashscope:qwen-max".into()] },
+            }),
+            |t| TierMap::from_config(&t.tiers),
+        );
+        let router = Router::new(providers, budget, tier_map);
 
         // Durable state — opens or creates the redb file.
         let db_path = default_state_path()?;
@@ -77,7 +111,8 @@ impl AppState {
         };
 
         let cwd = std::env::current_dir().context("cwd unavailable")?;
-        let worktrees = WorktreeManager::new(cwd.clone(), db.clone()).await?;
+        let max_wt = tokens.as_ref().map_or(2, |t| t.concurrency.max_worktrees);
+        let worktrees = WorktreeManager::new(cwd.clone(), db.clone(), max_wt).await?;
         let repo_root = crate::worktree::git::toplevel(&cwd).await?;
         let mailbox = MailboxFs::new(repo_root.clone());
         let ownership = OwnershipRegistry::new();
@@ -87,6 +122,18 @@ impl AppState {
         });
         let lessons = LessonRegistry::new(repo_root.clone(), db.clone());
         let embed_cache = EmbedCache::new(db.clone());
+        let gate_cfg = tokens
+            .as_ref()
+            .map_or_else(crate::gates::GateConfig::default, |t| {
+                crate::gates::GateConfig {
+                    faithfulness_pass_threshold: t.thresholds.faithfulness_pass_below,
+                    faithfulness_escalate_threshold: t.thresholds.faithfulness_escalate,
+                    judge_pass_score: t.thresholds.judge_pass_score,
+                    change_suff_min: t.thresholds.change_sufficiency_min,
+                    change_suff_max: t.thresholds.change_sufficiency_max,
+                    meta_review_coverage_min: t.thresholds.meta_review_coverage,
+                }
+            });
         let agents = AgentManager::new(
             router.clone(),
             worktrees.clone(),
@@ -96,8 +143,19 @@ impl AppState {
             db.clone(),
             lessons.clone(),
             embed_cache.clone(),
+            gate_cfg,
         );
-        let plans = PlanManager::new(router.clone(), agents.clone(), db);
+        let plans = PlanManager::new(router.clone(), agents.clone(), db.clone());
+
+        let pillar_tx = pillar::channel();
+        let sdd = SddManager::new(
+            agents.clone(),
+            worktrees.clone(),
+            router.clone(),
+            embed_cache.clone(),
+            pillar_tx.clone(),
+            db.clone(),
+        ).await;
 
         Ok(Self {
             router,
@@ -109,6 +167,9 @@ impl AppState {
             plans,
             lessons,
             embed_cache,
+            tokens,
+            pillar_tx,
+            sdd,
         })
     }
 }
@@ -119,10 +180,18 @@ pub fn router(state: AppState) -> AxumRouter {
         .route("/v1/health", get(health::health))
         .route("/v1/chat", post(chat::chat))
         .route("/v1/chat/stream", post(chat::chat_stream))
+        .route("/v1/chat/yolo", post(chat::chat_yolo))
         .route("/v1/embed", post(embed_api::embed))
         .route("/v1/gates/run", post(gates_api::run))
         .route("/v1/eval/run", post(eval_api::run))
         .route("/v1/review", post(review_api::run))
+        .route("/v1/events/stream", get(events_api::stream))
+        // SDD (P1 Spec-Driven Execution)
+        .route("/v1/sdd", get(sdd_api::list).post(sdd_api::start))
+        .route("/v1/sdd/:id", get(sdd_api::get_one))
+        // Web tools (P0 + soberania)
+        .route("/v1/web/search", post(web_api::search))
+        .route("/v1/web/fetch", post(web_api::fetch))
         // tools
         .route("/v1/tool/bash", post(tool::tool_bash))
         .route("/v1/tool/file_read", post(tool::tool_file_read))
@@ -153,9 +222,17 @@ pub fn router(state: AppState) -> AxumRouter {
         .route("/v1/plan/:id/approve", post(plans_api::approve))
         .route("/v1/plan/:id/cancel", post(plans_api::cancel))
         // lessons
-        .route("/v1/lessons", get(lessons_api::list).post(lessons_api::create))
-        .route("/v1/lessons/:id", get(lessons_api::get_one).delete(lessons_api::delete))
+        .route(
+            "/v1/lessons",
+            get(lessons_api::list).post(lessons_api::create),
+        )
+        .route(
+            "/v1/lessons/:id",
+            get(lessons_api::get_one).delete(lessons_api::delete),
+        )
         .route("/v1/lessons/:id/promote", post(lessons_api::promote))
+        // stats
+        .route("/v1/stats", get(stats_api::stats))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

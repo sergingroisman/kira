@@ -8,5 +8,10 @@
     "test": "npm test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present"
   },
-  "engines": { "node": ">=20.0.0" }
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "react-devtools-core": "^7.0.1"
+  }
 }

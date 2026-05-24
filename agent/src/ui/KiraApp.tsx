@@ -1,97 +1,165 @@
+#!/usr/bin/env bun
 /**
- * KiraApp — Ink REPL talking to the Rust core daemon.
+ * KiraApp v3 — Ink REPL with extracted components, YOLO/Plan mode toggle.
  *
- * v0 capabilities (Sem 6 + 10):
- *   - User types a prompt → POST /v1/chat/stream → tokens stream in
- *   - /agent <kind> <task>  → spawn agent + live-poll updates
- *   - /agents               → list all agents (status + cost)
- *   - /cancel <id-prefix>   → cancel a running agent
- *   - /health, /tier <h|s|l>, /quit
+ * Modes:
+ *   PLAN           — plan-first workflow, full gates, Judge evaluation
+ *   YOLO (default) — direct agent spawn, reduced gates, conversation context
  */
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { Box, Text, useStdout } from "ink";
 import {
   CoreClient,
   CoreError,
-  type Agent,
   type AgentKind,
-  type ChatMessage,
-  type Plan,
 } from "../core-client/client.js";
-import { LogoKira } from "./components/index.js";
+import type { StatsResponse, ModelUsage } from "../core-client/client.js";
+import {
+  Header,
+  StatusBar,
+  TurnRenderer,
+  SplashScreen,
+  hasSeenSplash,
+  useTheme,
+  InputBar,
+  HelpMenu,
+  AnimationClockProvider,
+  ToastContainer,
+  type Turn,
+} from "./components/index.js";
+import type { ToastItem, ToastType } from "./components/index.js";
+import { generateCompanion } from "./mascot/generator.js";
+import type { Emotion, MascotConfig } from "./mascot/types.js";
+import { Mascot } from "./mascot/Mascot.js";
+import { figletArt } from "./art.js";
+import {
+  parseAttachments,
+  generateFakeToolPairs,
+  type Attachment,
+} from "./attachment-parser.js";
+import { loadMotionReduced, saveMotionReduced } from "./theme.js";
 
-const TIERS = ["heavy", "standard", "light"] as const;
-type Tier = (typeof TIERS)[number];
+// -- Types ---------------------------------------------------------------------
 
-const AGENT_KINDS: ReadonlyArray<AgentKind> = ["writer", "deployer", "judge"];
+type Mode = "plan" | "yolo";
+type Tier = "heavy" | "standard" | "light";
 
-// -- Turn modelling -----------------------------------------------------------
+const TIERS: readonly Tier[] = ["heavy", "standard", "light"];
+const AGENT_KINDS: readonly AgentKind[] = ["writer", "deployer", "judge", "explorer"];
 
-type TurnBase = { user: string; inFlight: boolean; error?: string };
+// -- Turn creation helpers -----------------------------------------------------
 
-interface ChatTurn extends TurnBase {
-  kind: "chat";
-  assistant: string;
-  model?: string;
+function mkChat(user: string, inFlight = true, attachments?: Attachment[]): Turn {
+  return { kind: "chat", user, assistant: "", inFlight, attachments, startedAt: Date.now() };
 }
 
-interface AgentTurn extends TurnBase {
-  kind: "agent";
-  agentId?: string;
-  agentKind: AgentKind;
-  status?: string;
-  iters?: number;
-  usd?: number;
-  model?: string;
-  result?: string;
+function mkInfo(user: string, body: string, inFlight = false, error?: string): Turn {
+  return { kind: "info", user, body, inFlight, error, startedAt: inFlight ? Date.now() : undefined };
 }
 
-interface InfoTurn extends TurnBase {
-  kind: "info";
-  body: string;
+function mkAgent(
+  user: string,
+  agentKind: AgentKind,
+  inFlight = true,
+  yolo = false,
+  attachments?: Attachment[],
+): Turn {
+  return { kind: "agent", user, agentKind, inFlight, yolo, attachments, startedAt: Date.now() };
 }
 
-interface PlanTurn extends TurnBase {
-  kind: "plan";
-  planId?: string;
-  planStatus?: string;
-  goal?: string;
-  agentKind?: AgentKind;
-  scope?: string;
-  steps?: { idx: number; description: string; tool?: string | null }[];
-  executorAgentId?: string;
-  note?: string; // "drafted", "approved", "cancelled"
+function mkPlan(
+  user: string,
+  agentKind: AgentKind,
+  goal: string,
+  inFlight = true,
+): Turn {
+  return { kind: "plan", user, agentKind, goal, note: "drafting\u2026", inFlight, startedAt: inFlight ? Date.now() : undefined };
 }
 
-type Turn = ChatTurn | AgentTurn | InfoTurn | PlanTurn;
+// -- Conversation context builder -----------------------------------------------
+
+/** Extract recent agent turns as context messages for future LLM calls. */
+function buildConversationContext(
+  turns: Turn[],
+  maxTurns = 5,
+): { role: string; content: string }[] {
+  const context: { role: string; content: string }[] = [];
+  const completed = turns.filter(
+    (t) => t.kind === "agent" && !t.inFlight && t.result,
+  );
+  const recent = completed.slice(-maxTurns);
+  for (const turn of recent) {
+    if (turn.kind === "agent") {
+      context.push({ role: "user", content: turn.user });
+      if (turn.result) {
+        const preview =
+          turn.result.length > 600
+            ? turn.result.slice(0, 600) + "…"
+            : turn.result;
+        context.push({ role: "assistant", content: preview });
+      }
+    }
+  }
+  return context;
+}
+
+// -- Main App ------------------------------------------------------------------
 
 export interface KiraAppProps {
   client?: CoreClient;
   initialTier?: Tier;
+  initialMode?: Mode;
 }
 
 export function KiraApp({
   client = new CoreClient(),
   initialTier = "standard",
+  initialMode = "yolo",
 }: KiraAppProps) {
-  const { exit } = useApp();
+  const { mode: themeMode, setMode: setThemeMode } = useTheme();
+  const { stdout } = useStdout();
   const [tier, setTier] = useState<Tier>(initialTier);
-  const [input, setInput] = useState("");
+  const [mode, setMode] = useState<Mode>(initialMode);
   const [turns, setTurns] = useState<Turn[]>([]);
   const [coreUp, setCoreUp] = useState<boolean | null>(null);
   const [coreVersion, setCoreVersion] = useState<string | null>(null);
+  const [workingDir, setWorkingDir] = useState(process.cwd());
+  const [showSplash, setShowSplash] = useState(!hasSeenSplash());
+  const [showHelp, setShowHelp] = useState(false);
+  const [showGoodbye, setShowGoodbye] = useState(false);
+  const [showExitHint, setShowExitHint] = useState(false);
+  const [goodbyeStats, setGoodbyeStats] = useState<StatsResponse | null>(null);
+  const [motionReduced, setMotionReduced] = useState(loadMotionReduced());
 
-  // Active agent pollers — keyed by agent id, cleared on completion.
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const addToast = useCallback((type: ToastType, message: string) => {
+    const id = String(Date.now());
+    setToasts((prev) => {
+      const next = [...prev, { id, type, message, createdAt: Date.now() }];
+      return next.slice(-5);
+    });
+  }, []);
+
+  // Session stats
+  const sessionStart = useRef(Date.now());
+  const turnCount = useRef(0);
+  const agentCount = useRef(0);
+  const commandCount = useRef(0);
+
+  // Companion
+  const sessionId = useMemo(() => `kira-${sessionStart.current.toString(36).slice(0, 12)}`, []);
+  const companionConfig = useMemo<MascotConfig>(() => generateCompanion(sessionId), [sessionId]);
+
+  // Poller refs
   const agentPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
     new Map(),
   );
-
-  // Active plan pollers — keyed by plan id, cleared on terminal status.
   const planPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
     new Map(),
   );
 
+  // Health check
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -110,32 +178,46 @@ export function KiraApp({
     };
   }, [client]);
 
-  // Clean up pollers on unmount
+  // Cleanup pollers
   useEffect(
     () => () => {
       for (const t of agentPollers.current.values()) clearInterval(t);
-      agentPollers.current.clear();
       for (const t of planPollers.current.values()) clearInterval(t);
-      planPollers.current.clear();
     },
     [],
   );
 
-  // -- Helpers ---------------------------------------------------------------
+  // Fetch stats when goodbye is triggered
+  useEffect(() => {
+    if (!showGoodbye) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const s = await client.stats();
+        if (!cancelled) setGoodbyeStats(s);
+      } catch {
+        // stats endpoint may not be available; render without it
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [showGoodbye, client]);
 
-  const pushInfo = useCallback((user: string, body: string, error?: string) => {
-    setTurns((t) => [
-      ...t,
-      { kind: "info", user, body, inFlight: false, error },
-    ]);
-  }, []);
+  // -- Helpers ----------------------------------------------------------------
+
+  const pushInfo = useCallback(
+    (user: string, body: string, error?: string) => {
+      setTurns((t) => [...t, mkInfo(user, body, false, error)]);
+    },
+    [],
+  );
 
   const startAgentPoller = useCallback(
-    (turnIdx: number, agent: Agent) => {
-      const id = agent.id;
+    (turnIdx: number, agentId: string) => {
       const interval = setInterval(async () => {
         try {
-          const fresh = await client.getAgent(id);
+          const fresh = await client.getAgent(agentId);
           setTurns((t) => {
             const next = [...t];
             const cur = next[turnIdx];
@@ -158,44 +240,32 @@ export function KiraApp({
             return next;
           });
           if (
-            fresh.status === "completed" ||
-            fresh.status === "failed" ||
-            fresh.status === "cancelled" ||
-            fresh.status === "stopped"
+            ["completed", "failed", "cancelled", "stopped"].includes(fresh.status)
           ) {
-            const t = agentPollers.current.get(id);
+            const t = agentPollers.current.get(agentId);
             if (t) {
               clearInterval(t);
-              agentPollers.current.delete(id);
+              agentPollers.current.delete(agentId);
             }
           }
         } catch (e) {
-          setTurns((t) => {
-            const next = [...t];
-            const cur = next[turnIdx];
-            if (cur && cur.kind === "agent") {
-              next[turnIdx] = { ...cur, error: String(e), inFlight: false };
-            }
-            return next;
-          });
-          const t = agentPollers.current.get(id);
+          const t = agentPollers.current.get(agentId);
           if (t) {
             clearInterval(t);
-            agentPollers.current.delete(id);
+            agentPollers.current.delete(agentId);
           }
         }
       }, 2000);
-      agentPollers.current.set(id, interval);
+      agentPollers.current.set(agentId, interval);
     },
     [client],
   );
 
   const startPlanPoller = useCallback(
-    (turnIdx: number, plan: Plan) => {
-      const id = plan.id;
+    (turnIdx: number, planId: string) => {
       const interval = setInterval(async () => {
         try {
-          const fresh = await client.getPlan(id);
+          const fresh = await client.getPlan(planId);
           setTurns((t) => {
             const next = [...t];
             const cur = next[turnIdx];
@@ -212,68 +282,76 @@ export function KiraApp({
             return next;
           });
           if (["done", "failed", "cancelled", "expired"].includes(fresh.status)) {
-            const t = planPollers.current.get(id);
+            const t = planPollers.current.get(planId);
             if (t) {
               clearInterval(t);
-              planPollers.current.delete(id);
+              planPollers.current.delete(planId);
             }
           }
-        } catch (e) {
-          const t = planPollers.current.get(id);
+        } catch {
+          const t = planPollers.current.get(planId);
           if (t) {
             clearInterval(t);
-            planPollers.current.delete(id);
+            planPollers.current.delete(planId);
           }
-          setTurns((t) => {
-            const next = [...t];
-            const cur = next[turnIdx];
-            if (cur && cur.kind === "plan") {
-              next[turnIdx] = { ...cur, error: String(e), inFlight: false };
-            }
-            return next;
-          });
         }
       }, 2000);
-      planPollers.current.set(id, interval);
+      planPollers.current.set(planId, interval);
     },
     [client],
   );
 
-  // -- Slash command dispatch ------------------------------------------------
+  // -- Slash commands ---------------------------------------------------------
+
+  const handleMode = useCallback(
+    (raw: string) => {
+      const rest = raw.slice("/mode".length).trim().toLowerCase();
+      if (rest === "yolo") {
+        setMode("yolo");
+        addToast("success", "mode → YOLO (direct agent spawn)");
+      } else if (rest === "plan") {
+        setMode("plan");
+        addToast("success", "mode → PLAN (plan-first, full gates)");
+      } else {
+        addToast("info", `usage: /mode <plan|yolo> (current: ${mode})`);
+      }
+    },
+    [mode, addToast],
+  );
+
+  const handleTier = useCallback(
+    (raw: string) => {
+      const next = raw.slice("/tier".length).trim() as Tier;
+      if ((TIERS as readonly string[]).includes(next)) {
+        setTier(next);
+        addToast("success", `tier → ${next}`);
+      } else {
+        addToast("error", `unknown tier '${next}'. Valid: ${TIERS.join(", ")}`);
+      }
+    },
+    [addToast],
+  );
 
   const handleAgentCmd = useCallback(
     async (raw: string) => {
-      // /agent <kind> <task...>
       const rest = raw.slice("/agent".length).trim();
       const space = rest.indexOf(" ");
       if (space < 0) {
-        pushInfo(raw, "", `usage: /agent <writer|deployer|judge> <task>`);
+        pushInfo(raw, "", `usage: /agent <writer|deployer|judge|explorer> <task>`);
         return;
       }
       const kindStr = rest.slice(0, space).toLowerCase() as AgentKind;
       const task = rest.slice(space + 1).trim();
       if (!AGENT_KINDS.includes(kindStr)) {
-        pushInfo(
-          raw,
-          "",
-          `unknown kind '${kindStr}'. Valid: ${AGENT_KINDS.join(", ")}`,
-        );
+        pushInfo(raw, "", `unknown kind. Valid: ${AGENT_KINDS.join(", ")}`);
         return;
       }
       if (!task) {
-        pushInfo(raw, "", `task is empty`);
+        pushInfo(raw, "", "task is empty");
         return;
       }
       const turnIdx = turns.length;
-      setTurns((t) => [
-        ...t,
-        {
-          kind: "agent",
-          user: raw,
-          agentKind: kindStr,
-          inFlight: true,
-        },
-      ]);
+      setTurns((t) => [...t, mkAgent(raw, kindStr, true, mode === "yolo")]);
       try {
         const agent = await client.spawnAgent({
           kind: kindStr,
@@ -282,6 +360,7 @@ export function KiraApp({
           base: null,
           budget_usd: null,
           max_iters: null,
+          yolo_mode: mode === "yolo" ? true : null,
         });
         setTurns((t) => {
           const next = [...t];
@@ -298,7 +377,7 @@ export function KiraApp({
           }
           return next;
         });
-        startAgentPoller(turnIdx, agent);
+        startAgentPoller(turnIdx, agent.id);
       } catch (e) {
         const msg = e instanceof CoreError ? e.message : String(e);
         setTurns((t) => {
@@ -311,30 +390,27 @@ export function KiraApp({
         });
       }
     },
-    [client, turns.length, pushInfo, startAgentPoller],
+    [client, turns.length, mode, pushInfo, startAgentPoller],
   );
 
-  const handleAgentsList = useCallback(
-    async (raw: string) => {
-      try {
-        const all = await client.listAgents();
-        if (all.length === 0) {
-          pushInfo(raw, "(no agents)");
-          return;
-        }
-        const body = all
-          .map(
-            (a) =>
-              `${a.id.slice(0, 8)} ${a.kind.padEnd(8)} ${a.status.padEnd(9)} iters=${a.iters} $${a.usd_spent.toFixed(4)}`,
-          )
-          .join("\n");
-        pushInfo(raw, body);
-      } catch (e) {
-        pushInfo(raw, "", String(e));
+  const handleAgentsList = useCallback(async () => {
+    try {
+      const all = await client.listAgents();
+      if (all.length === 0) {
+        pushInfo("/agents", "(no agents)");
+        return;
       }
-    },
-    [client, pushInfo],
-  );
+      const body = all
+        .map(
+          (a) =>
+            `${a.id.slice(0, 8)} ${a.kind.padEnd(10)} ${a.status.padEnd(9)} iters=${a.iters} $${a.usd_spent.toFixed(4)}`,
+        )
+        .join("\n");
+      pushInfo("/agents", body);
+    } catch (e) {
+      pushInfo("/agents", "", String(e));
+    }
+  }, [client, pushInfo]);
 
   const handleCancel = useCallback(
     async (raw: string) => {
@@ -359,7 +435,6 @@ export function KiraApp({
     [client, pushInfo],
   );
 
-  // /plan draft <kind> <goal>
   const handlePlanDraft = useCallback(
     async (raw: string) => {
       const rest = raw.slice("/plan draft".length).trim();
@@ -375,21 +450,11 @@ export function KiraApp({
         return;
       }
       if (!goal) {
-        pushInfo(raw, "", `goal is empty`);
+        pushInfo(raw, "", "goal is empty");
         return;
       }
       const turnIdx = turns.length;
-      setTurns((t) => [
-        ...t,
-        {
-          kind: "plan",
-          user: raw,
-          agentKind: kindStr,
-          goal,
-          note: "drafting…",
-          inFlight: true,
-        },
-      ]);
+      setTurns((t) => [...t, mkPlan(raw, kindStr, goal, true)]);
       try {
         const plan = await client.draftPlan({
           goal,
@@ -431,7 +496,6 @@ export function KiraApp({
     [client, turns.length, pushInfo],
   );
 
-  // /plan approve <id-prefix>
   const handlePlanApprove = useCallback(
     async (raw: string) => {
       const prefix = raw.slice("/plan approve".length).trim();
@@ -449,35 +513,23 @@ export function KiraApp({
         const turnIdx = turns.length;
         setTurns((t) => [
           ...t,
-          {
-            kind: "plan",
-            user: raw,
-            planId: match.id,
-            planStatus: "approving…",
-            agentKind: match.agent_kind,
-            scope: match.scope,
-            goal: match.goal,
-            note: "approving…",
-            inFlight: true,
-          },
+          mkInfo(raw, `approving plan ${match.id.slice(0, 8)}…`, true),
         ]);
         const r = await client.approvePlan(match.id);
         setTurns((t) => {
           const next = [...t];
           const cur = next[turnIdx];
-          if (cur && cur.kind === "plan") {
+          if (cur && cur.kind === "info") {
             next[turnIdx] = {
               ...cur,
-              planStatus: "executing",
-              executorAgentId: r.executor_agent_id,
-              note: `executor: ${r.executor_agent_id.slice(0, 8)}`,
+              body: `executor: ${r.executor_agent_id.slice(0, 8)}`,
               inFlight: true,
             };
           }
           return next;
         });
         const planFresh = await client.getPlan(match.id);
-        startPlanPoller(turnIdx, planFresh);
+        startPlanPoller(turnIdx, planFresh.id);
       } catch (e) {
         pushInfo(raw, "", String(e));
       }
@@ -485,7 +537,6 @@ export function KiraApp({
     [client, turns.length, pushInfo, startPlanPoller],
   );
 
-  // /plan cancel <id-prefix>
   const handlePlanCancel = useCallback(
     async (raw: string) => {
       const prefix = raw.slice("/plan cancel".length).trim();
@@ -509,58 +560,49 @@ export function KiraApp({
     [client, pushInfo],
   );
 
-  // /plans
-  const handlePlansList = useCallback(
-    async (raw: string) => {
-      try {
-        const all = await client.listPlans();
-        if (all.length === 0) {
-          pushInfo(raw, "(no plans)");
-          return;
-        }
-        const body = all
-          .map(
-            (p) =>
-              `${p.id.slice(0, 8)} ${p.agent_kind.padEnd(8)} ${p.status.padEnd(9)} ${p.scope.padEnd(7)} steps=${p.steps.length} ${p.goal.slice(0, 34)}`,
-          )
-          .join("\n");
-        pushInfo(raw, body);
-      } catch (e) {
-        pushInfo(raw, "", String(e));
+  const handlePlansList = useCallback(async () => {
+    try {
+      const all = await client.listPlans();
+      if (all.length === 0) {
+        pushInfo("/plans", "(no plans)");
+        return;
       }
-    },
-    [client, pushInfo],
-  );
+      const body = all
+        .map(
+          (p) =>
+            `${p.id.slice(0, 8)} ${p.agent_kind.padEnd(10)} ${p.status.padEnd(9)} ${p.scope.padEnd(7)} steps=${p.steps.length} ${p.goal.slice(0, 34)}`,
+        )
+        .join("\n");
+      pushInfo("/plans", body);
+    } catch (e) {
+      pushInfo("/plans", "", String(e));
+    }
+  }, [client, pushInfo]);
 
-  // /lessons (list)
-  const handleLessonsList = useCallback(
-    async (raw: string) => {
-      try {
-        const all = await client.listLessons();
-        if (all.length === 0) {
-          pushInfo(raw, "(no lessons)");
-          return;
-        }
-        const body = all
-          .map((l) => {
-            const scope =
-              l.scope.kind === "global"
-                ? "global"
-                : l.scope.kind === "agent_kind"
-                  ? `kind=${l.scope.agent_kind}`
-                  : `wf=${l.scope.workflow}`;
-            return `${l.id.slice(0, 8)} ${l.status.padEnd(8)} ${l.priority.padEnd(6)} x${l.recurrence} ${scope.padEnd(14)} ${l.anti_pattern.slice(0, 60)}`;
-          })
-          .join("\n");
-        pushInfo(raw, body);
-      } catch (e) {
-        pushInfo(raw, "", String(e));
+  const handleLessonsList = useCallback(async () => {
+    try {
+      const all = await client.listLessons();
+      if (all.length === 0) {
+        pushInfo("/lessons", "(no lessons)");
+        return;
       }
-    },
-    [client, pushInfo],
-  );
+      const body = all
+        .map((l) => {
+          const scope =
+            l.scope.kind === "global"
+              ? "global"
+              : l.scope.kind === "agent_kind"
+                ? `kind=${l.scope.agent_kind}`
+                : `wf=${l.scope.workflow}`;
+          return `${l.id.slice(0, 8)} ${l.status.padEnd(8)} ${l.priority.padEnd(6)} x${l.recurrence} ${scope.padEnd(14)} ${l.anti_pattern.slice(0, 60)}`;
+        })
+        .join("\n");
+      pushInfo("/lessons", body);
+    } catch (e) {
+      pushInfo("/lessons", "", String(e));
+    }
+  }, [client, pushInfo]);
 
-  // /lessons promote <id-prefix>
   const handleLessonPromote = useCallback(
     async (raw: string) => {
       const prefix = raw.slice("/lessons promote".length).trim();
@@ -589,7 +631,6 @@ export function KiraApp({
     [client, pushInfo],
   );
 
-  // /lessons delete <id-prefix>
   const handleLessonDelete = useCallback(
     async (raw: string) => {
       const prefix = raw.slice("/lessons delete".length).trim();
@@ -613,74 +654,74 @@ export function KiraApp({
     [client, pushInfo],
   );
 
-  // /eval run <models-csv> | <task-spec>
-  const handleEvalRun = useCallback(
-    async (raw: string) => {
-      const rest = raw.slice("/eval run".length).trim();
-      const bar = rest.indexOf("|");
-      if (bar < 0) {
-        pushInfo(
-          raw,
-          "",
-          "usage: /eval run <model1,model2,...> | <task-spec>",
-        );
-        return;
-      }
-      const modelsCsv = rest.slice(0, bar).trim();
-      const taskSpec = rest.slice(bar + 1).trim();
-      if (!modelsCsv || !taskSpec) {
-        pushInfo(raw, "", "models or task is empty");
-        return;
-      }
-      const models = modelsCsv
-        .split(",")
-        .map((m) => m.trim())
-        .filter(Boolean);
-      if (models.length === 0) {
-        pushInfo(raw, "", "no valid models");
-        return;
-      }
+  // -- /sdd — Spec-Driven Execution (P1 4-phase pipeline) --------------------
 
+  // Color/emoji per pillar, mirroring docs/deck Excalidraw palette.
+  const pillarSigil = useCallback((p: string): { emoji: string; abbr: string } => {
+    switch (p) {
+      case "p1_sdd":          return { emoji: "🔵", abbr: "P1 SDD" };
+      case "p2_coordination": return { emoji: "🟣", abbr: "P2 Coord" };
+      case "p3_verification": return { emoji: "🟡", abbr: "P3 Verify" };
+      case "p4_gates":        return { emoji: "🟢", abbr: "P4 Gates" };
+      case "p5_guardrails":   return { emoji: "🟠", abbr: "P5 Guard" };
+      case "p6_resilience":   return { emoji: "🔴", abbr: "P6 Resil" };
+      case "p7_cognition":    return { emoji: "⚪", abbr: "P7 Cog" };
+      default:                return { emoji: "•",  abbr: p };
+    }
+  }, []);
+
+  const handleSdd = useCallback(
+    async (raw: string) => {
+      // Syntax: /sdd <goal>
+      //         /sdd kind=bug_fix loc=3 files=1 <goal>
+      const rest = raw.slice("/sdd".length).trim();
+      if (!rest) {
+        pushInfo(raw, "", "usage: /sdd [kind=bug_fix|feature|docs|refactor] [loc=N] [files=N] <goal>");
+        return;
+      }
+      // Parse k=v prefix flags then goal.
+      const tokens = rest.split(/\s+/);
+      let i = 0;
+      const flags: Record<string, string> = {};
+      while (i < tokens.length && tokens[i].includes("=")) {
+        const [k, v] = tokens[i].split("=", 2);
+        flags[k] = v;
+        i++;
+      }
+      const goal = tokens.slice(i).join(" ");
+      if (!goal) {
+        pushInfo(raw, "", "goal required after flags");
+        return;
+      }
+      const kindMap: Record<string, "bug_fix" | "feature" | "docs" | "refactor" | "unknown"> = {
+        bug_fix: "bug_fix", bugfix: "bug_fix", bug: "bug_fix",
+        feature: "feature", feat: "feature",
+        docs: "docs", doc: "docs",
+        refactor: "refactor",
+      };
+      const req = {
+        goal,
+        kind: (flags.kind ? (kindMap[flags.kind] ?? "unknown") : null) as
+          | "bug_fix" | "feature" | "docs" | "refactor" | "unknown" | null,
+        estimated_loc: flags.loc ? Number(flags.loc) : null,
+        estimated_files: flags.files ? Number(flags.files) : null,
+        force_full_pipeline: flags.full === "true" ? true : null,
+        worktree_id: null,
+        base: flags.base ?? null,
+      };
       const turnIdx = turns.length;
       setTurns((t) => [
         ...t,
         {
           kind: "info",
           user: raw,
-          body: `running eval: 1 task × ${models.length} models (judge enabled, may take 30-60s)…`,
+          body: "sdd starting…",
           inFlight: true,
         },
       ]);
-
+      let run;
       try {
-        const r = await client.runEval({
-          tasks: [{ id: "ad_hoc", spec: taskSpec, expected_topic: null, models: null }],
-          models,
-          skip_embedding: false,
-          skip_judge: false,
-        });
-        const lines = [
-          `${r.n_tasks} task × ${r.n_models} models · total $${r.total_cost_usd.toFixed(5)} · ${r.total_duration_ms}ms`,
-          "",
-          "model               score  faith   cost      ms     pass",
-          "─".repeat(58),
-        ];
-        for (const m of r.summary_by_model) {
-          const score = m.avg_judge_score?.toFixed(1) ?? "—";
-          const faith = m.avg_faithfulness?.toFixed(3) ?? "—";
-          const pass = (m.pass_rate * 100).toFixed(0) + "%";
-          lines.push(
-            `${m.model.padEnd(19)} ${score.padStart(5)}  ${faith.padStart(5)}  $${m.total_cost_usd.toFixed(5)}  ${m.avg_duration_ms.toFixed(0).padStart(5)}  ${pass}`,
-          );
-        }
-        setTurns((t) => {
-          const next = [...t];
-          const cur = next[turnIdx];
-          if (cur && cur.kind === "info") {
-            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: false };
-          }
-          return next;
-        });
+        run = await client.startSdd(req);
       } catch (e) {
         setTurns((t) => {
           const next = [...t];
@@ -690,43 +731,106 @@ export function KiraApp({
           }
           return next;
         });
-      }
-    },
-    [client, turns.length, pushInfo],
-  );
-
-  // /gates run <spec> | <output>
-  const handleGatesRun = useCallback(
-    async (raw: string) => {
-      const rest = raw.slice("/gates run".length).trim();
-      const bar = rest.indexOf("|");
-      if (bar < 0) {
-        pushInfo(raw, "", "usage: /gates run <spec> | <output>");
         return;
       }
-      const spec = rest.slice(0, bar).trim();
-      const output = rest.slice(bar + 1).trim();
-      if (!spec || !output) {
-        pushInfo(raw, "", "spec or output is empty");
+      const idShort = run.id.slice(0, 8);
+      const lines: string[] = [
+        `🔵 P1 SDD → run ${idShort} · sizing=${run.sizing} · first_phase=${run.current_phase}`,
+      ];
+      const flush = () => {
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: true };
+          }
+          return next;
+        });
+      };
+      flush();
+
+      // Stream pillar events filtered by run_id.
+      const ctrl = client.streamPillarEvents(
+        run.id,
+        (ev) => {
+          const { emoji, abbr } = pillarSigil(ev.pillar);
+          lines.push(`${emoji} ${abbr} → [${ev.phase}] ${ev.message}`);
+          flush();
+        },
+        () => { /* swallow — daemon may have closed */ },
+      );
+
+      // Poll terminal state — daemon drives detached so we wait.
+      const deadline = Date.now() + 30 * 60 * 1000; // 30min cap
+      let finalRun = run;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        try {
+          finalRun = await client.getSdd(run.id);
+          if (finalRun.current_phase === "done" || finalRun.current_phase === "failed") break;
+        } catch {
+          /* keep polling */
+        }
+      }
+      ctrl.abort();
+
+      // Final summary line.
+      const dirRel = `.kira/runs/${run.id}/`;
+      lines.push("");
+      lines.push(
+        `✅ ${finalRun.current_phase} · phases_run=${finalRun.phases_run.join(",") || "(none)"} · skipped=${finalRun.phases_skipped.join(",") || "(none)"} · $${finalRun.usd_spent.toFixed(4)}`,
+      );
+      lines.push(`artifacts → ${dirRel}`);
+      if (finalRun.error) lines.push(`error: ${finalRun.error}`);
+      setTurns((t) => {
+        const next = [...t];
+        const cur = next[turnIdx];
+        if (cur && cur.kind === "info") {
+          next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: false };
+        }
+        return next;
+      });
+    },
+    [client, turns.length, pushInfo, pillarSigil],
+  );
+
+  const handleSddList = useCallback(async () => {
+    try {
+      const r = await client.listSdd();
+      if (r.runs.length === 0) {
+        pushInfo("/sdds", "(no runs)");
+        return;
+      }
+      const lines = r.runs.map(
+        (run) =>
+          `${run.id.slice(0, 8)}  ${run.current_phase.padEnd(8)} ${run.kind.padEnd(10)} $${run.usd_spent.toFixed(4)}  ${run.goal.slice(0, 60)}`,
+      );
+      pushInfo("/sdds", lines.join("\n"));
+    } catch (e) {
+      pushInfo("/sdds", "", String(e));
+    }
+  }, [client, pushInfo]);
+
+  // -- /search <query> — SearXNG sovereign search -----------------------------
+
+  const handleSearch = useCallback(
+    async (raw: string) => {
+      const query = raw.slice("/search".length).trim();
+      if (!query) {
+        pushInfo(raw, "", "usage: /search <query>");
         return;
       }
       try {
-        const r = await client.runGates({
-          spec,
-          output,
-          owned_paths: [],
-          touched_paths: [],
-          estimated_loc: null,
-          actual_loc: null,
-          skip_embedding: false,
-          skip_judge: true, // fast UX path; user can curl for judge
-        });
-        const lines = [`overall=${r.overall}  failed_at=${r.failed_at ?? "—"}  ${r.duration_ms}ms`];
-        for (const g of r.results) {
-          const sc = g.score !== null && g.score !== undefined ? ` score=${g.score.toFixed(3)}` : "";
-          lines.push(`  ${g.outcome.padEnd(7)} ${g.gate.padEnd(24)}${sc}  ${g.reason ?? ""}`);
+        const r = await client.webSearch({ query });
+        if (r.results.length === 0) {
+          pushInfo(raw, "(no results)");
+          return;
         }
-        pushInfo(raw, lines.join("\n"));
+        const lines = r.results.map(
+          (s, i) =>
+            `${(i + 1).toString().padStart(2)}. [${s.engine.padEnd(12)}] ${s.title}\n    ${s.url}\n    ${s.snippet.slice(0, 120)}`,
+        );
+        pushInfo(raw, lines.join("\n\n"));
       } catch (e) {
         pushInfo(raw, "", String(e));
       }
@@ -734,100 +838,196 @@ export function KiraApp({
     [client, pushInfo],
   );
 
-  // /review <head> [base]    — TRUST-inspired multi-dim PR review
-  const handleReview = useCallback(
+  // -- /fetch <url> — readability + htmd → markdown ---------------------------
+
+  const handleFetch = useCallback(
     async (raw: string) => {
-      const rest = raw.slice("/review".length).trim();
-      const parts = rest.split(/\s+/).filter(Boolean);
-      if (parts.length === 0) {
-        pushInfo(raw, "", "usage: /review <head-branch> [base-branch]");
+      const url = raw.slice("/fetch".length).trim();
+      if (!url) {
+        pushInfo(raw, "", "usage: /fetch <url>");
         return;
       }
-      const head = parts[0];
-      const base = parts[1] ?? "main";
-      const turnIdx = turns.length;
-      setTurns((t) => [
-        ...t,
-        {
-          kind: "info",
-          user: raw,
-          body: `spawning 6 reviewers against ${head}…${base} (~60-180s)…`,
-          inFlight: true,
-        },
-      ]);
       try {
-        const r = await client.runReview({
-          head,
-          base,
-          workflow: null,
-          timeout_secs: null,
-        });
-        const lines = [
-          `run ${r.run_id.slice(0, 8)} · workflow=${r.workflow} · ${r.duration_ms}ms`,
-          `findings (post anti-hallucination): ${r.total_findings}`,
-          `report: ${r.review_md_path}`,
-          "",
-          "dim          status      gate    fail-at        kept  drop",
-          "─".repeat(64),
-        ];
-        for (const o of r.agents) {
-          lines.push(
-            `${o.dimension.padEnd(12)} ${o.status.padEnd(11)} ${o.gate_overall.padEnd(7)} ${(o.gate_failed_at ?? "—").padEnd(14)} ${String(o.findings_kept).padStart(3)}   ${String(o.findings_dropped).padStart(3)}`,
-          );
-        }
-        setTurns((t) => {
-          const next = [...t];
-          const cur = next[turnIdx];
-          if (cur && cur.kind === "info") {
-            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: false };
-          }
-          return next;
-        });
+        const r = await client.webFetch({ url });
+        const head = `source=${r.result.source} · final=${r.result.final_url} · ${r.result.bytes_read}B`;
+        const body = r.result.markdown.slice(0, 1200);
+        const more = r.result.markdown.length > 1200 ? `\n\n...(${r.result.markdown.length - 1200} more chars)` : "";
+        pushInfo(raw, `${head}\n\n${body}${more}`);
       } catch (e) {
-        setTurns((t) => {
-          const next = [...t];
-          const cur = next[turnIdx];
-          if (cur && cur.kind === "info") {
-            next[turnIdx] = { ...cur, error: String(e), inFlight: false };
-          }
-          return next;
-        });
+        pushInfo(raw, "", String(e));
       }
     },
-    [client, turns.length, pushInfo],
+    [client, pushInfo],
   );
 
-  // -- Main send -------------------------------------------------------------
+  // -- Free text / YOLO dispatch ----------------------------------------------
+
+  const handleFreeText = useCallback(
+    async (text: string) => {
+      // Parse @-mentions for file attachments
+      const { text: cleanedText, attachments } = parseAttachments(text, workingDir);
+      
+      if (mode === "yolo") {
+        // YOLO: spawn agent directly, with conversation context
+        const contextMsgs = buildConversationContext(turns);
+        const fakePairs = generateFakeToolPairs(attachments);
+        const messages = [
+          ...contextMsgs,
+          { role: "user" as const, content: cleanedText },
+          ...fakePairs.flat(),
+        ];
+        const turnIdx = turns.length;
+        setTurns((t) => [...t, mkAgent(cleanedText, "writer", true, true, attachments)]);
+        try {
+          const yolo = await client.chatYolo({
+            tier,
+            model: null,
+            messages,
+            mode: "yolo",
+          });
+          setTurns((t) => {
+            const next = [...t];
+            const cur = next[turnIdx];
+            if (cur && cur.kind === "agent") {
+              next[turnIdx] = {
+                ...cur,
+                agentId: yolo.agent_id,
+                status: yolo.status,
+              };
+            }
+            return next;
+          });
+          startAgentPoller(turnIdx, yolo.agent_id);
+        } catch (e) {
+          const msg = e instanceof CoreError ? e.message : String(e);
+          setTurns((t) => {
+            const next = [...t];
+            const cur = next[turnIdx];
+            if (cur && cur.kind === "agent") {
+              next[turnIdx] = { ...cur, error: msg, inFlight: false };
+            }
+            return next;
+          });
+        }
+      } else {
+        // PLAN mode: auto-draft a plan with conversation context
+        const planContextMsgs = buildConversationContext(turns);
+        const contextPreamble = planContextMsgs.length > 0
+          ? planContextMsgs.map(m => `${m.role}: ${m.content}`).join('\n') + '\n\nCurrent request: '
+          : '';
+        const turnIdx = turns.length;
+        setTurns((t) => [
+          ...t,
+          mkPlan(cleanedText, "writer", cleanedText, true),
+        ]);
+        try {
+          const plan = await client.draftPlan({
+            goal: contextPreamble + cleanedText,
+            agent_kind: "writer",
+            ttl_secs: null,
+          });
+          setTurns((t) => {
+            const next = [...t];
+            const cur = next[turnIdx];
+            if (cur && cur.kind === "plan") {
+              next[turnIdx] = {
+                ...cur,
+                planId: plan.id,
+                planStatus: plan.status,
+                scope: plan.scope,
+                steps: plan.steps.map((s) => ({
+                  idx: s.idx,
+                  description: s.description,
+                  tool: s.tool,
+                })),
+                note: `drafted — /plan approve ${plan.id.slice(0, 8)}`,
+                inFlight: false,
+              };
+            }
+            return next;
+          });
+        } catch (e) {
+          const msg = e instanceof CoreError ? e.message : String(e);
+          setTurns((t) => {
+            const next = [...t];
+            const cur = next[turnIdx];
+            if (cur && cur.kind === "plan") {
+              next[turnIdx] = { ...cur, error: msg, inFlight: false };
+            }
+            return next;
+          });
+        }
+      }
+    },
+    [client, mode, tier, turns.length, startAgentPoller],
+  );
+
+  // -- Main dispatch ----------------------------------------------------------
 
   const send = useCallback(
     async (raw: string) => {
       const text = raw.trim();
       if (!text) return;
 
+      // Track stats
+      turnCount.current++;
+      if (text.startsWith("/")) {
+        commandCount.current++;
+      }
+
       if (text === "/quit" || text === "/exit") {
-        exit();
+        setShowGoodbye(true);
         return;
       }
+
       if (text === "/health") {
         try {
           const h = await client.health();
-          pushInfo(text, `core ${h.version} • uptime ${h.uptime_secs}s`);
+          pushInfo(text, `core ${h.version} · uptime ${h.uptime_secs}s`);
         } catch (e) {
           pushInfo(text, "", String(e));
         }
         return;
       }
+
+      if (text === "/help") {
+        setShowHelp(true);
+        return;
+      }
+
+      if (text.startsWith("/mode ")) {
+        handleMode(text);
+        return;
+      }
       if (text.startsWith("/tier ")) {
-        const next = text.slice(6).trim() as Tier;
-        if ((TIERS as readonly string[]).includes(next)) {
-          setTier(next);
-          pushInfo(text, `tier → ${next}`);
+        handleTier(text);
+        return;
+      }
+      if (text.startsWith("/theme")) {
+        const themeArg = text.slice("/theme".length).trim();
+        const valid = ["dark", "light", "dark-ansi", "dracula", "catppuccin", "nord", "tokyonight", "gruvbox", "solarized"];
+        if (valid.includes(themeArg)) {
+          setThemeMode(themeArg);
+          addToast("success", `theme → ${themeArg}`);
+        } else if (!themeArg) {
+          addToast("info", `theme: ${themeMode}. Usage: /theme <${valid.join("|")}>`);
         } else {
-          pushInfo(
-            text,
-            "",
-            `unknown tier '${next}'. Valid: ${TIERS.join(", ")}`,
-          );
+          addToast("error", `unknown theme '${themeArg}'. Valid: ${valid.join(", ")}`);
+        }
+        return;
+      }
+      if (text.startsWith("/motion")) {
+        const arg = text.slice("/motion".length).trim();
+        if (arg === "on") {
+          setMotionReduced(false);
+          saveMotionReduced(false);
+          addToast("success", "motion → full");
+        } else if (arg === "off") {
+          setMotionReduced(true);
+          saveMotionReduced(true);
+          addToast("success", "motion → reduced (animations paused)");
+        } else {
+          addToast("info", `motion: ${motionReduced ? "reduced" : "full"}. Usage: /motion <on|off>`);
         }
         return;
       }
@@ -836,7 +1036,7 @@ export function KiraApp({
         return;
       }
       if (text === "/agents") {
-        await handleAgentsList(text);
+        await handleAgentsList();
         return;
       }
       if (text.startsWith("/cancel ")) {
@@ -856,11 +1056,11 @@ export function KiraApp({
         return;
       }
       if (text === "/plans") {
-        await handlePlansList(text);
+        await handlePlansList();
         return;
       }
       if (text === "/lessons") {
-        await handleLessonsList(text);
+        await handleLessonsList();
         return;
       }
       if (text.startsWith("/lessons promote ")) {
@@ -871,89 +1071,31 @@ export function KiraApp({
         await handleLessonDelete(text);
         return;
       }
-      if (text.startsWith("/gates run ")) {
-        await handleGatesRun(text);
+      if (text === "/sdds") {
+        await handleSddList();
         return;
       }
-      if (text.startsWith("/eval run ")) {
-        await handleEvalRun(text);
+      if (text.startsWith("/sdd")) {
+        await handleSdd(text);
         return;
       }
-      if (text.startsWith("/review ") || text === "/review") {
-        await handleReview(text);
+      if (text.startsWith("/search ")) {
+        await handleSearch(text);
+        return;
+      }
+      if (text.startsWith("/fetch ")) {
+        await handleFetch(text);
         return;
       }
 
-      // Free chat — streamed against current tier.
-      const history: ChatMessage[] = [];
-      for (const t of turns) {
-        if (t.kind === "chat") {
-          history.push({ role: "user", content: t.user });
-          if (t.assistant)
-            history.push({ role: "assistant", content: t.assistant });
-        }
-      }
-      history.push({ role: "user", content: text });
-
-      const turnIdx = turns.length;
-      setTurns((t) => [
-        ...t,
-        { kind: "chat", user: text, assistant: "", inFlight: true },
-      ]);
-
-      try {
-        for await (const ev of client.chatStream({
-          tier,
-          model: null,
-          messages: history,
-        })) {
-          if (ev.type === "token") {
-            setTurns((t) => {
-              const next = [...t];
-              const cur = next[turnIdx];
-              if (cur && cur.kind === "chat") {
-                next[turnIdx] = { ...cur, assistant: cur.assistant + ev.delta };
-              }
-              return next;
-            });
-          } else if (ev.type === "done") {
-            setTurns((t) => {
-              const next = [...t];
-              const cur = next[turnIdx];
-              if (cur && cur.kind === "chat") {
-                next[turnIdx] = { ...cur, model: ev.model, inFlight: false };
-              }
-              return next;
-            });
-          } else if (ev.type === "error") {
-            setTurns((t) => {
-              const next = [...t];
-              const cur = next[turnIdx];
-              if (cur && cur.kind === "chat") {
-                next[turnIdx] = { ...cur, error: ev.message, inFlight: false };
-              }
-              return next;
-            });
-          }
-        }
-      } catch (e) {
-        const msg = e instanceof CoreError ? e.message : String(e);
-        setTurns((t) => {
-          const next = [...t];
-          const cur = next[turnIdx];
-          if (cur && cur.kind === "chat") {
-            next[turnIdx] = { ...cur, error: msg, inFlight: false };
-          }
-          return next;
-        });
-      }
+      // Free text → mode dispatch
+      await handleFreeText(text);
     },
     [
       client,
-      tier,
-      turns,
-      exit,
       pushInfo,
+      handleMode,
+      handleTier,
       handleAgentCmd,
       handleAgentsList,
       handleCancel,
@@ -964,266 +1106,271 @@ export function KiraApp({
       handleLessonsList,
       handleLessonPromote,
       handleLessonDelete,
-      handleGatesRun,
-      handleEvalRun,
-      handleReview,
+      handleSdd,
+      handleSddList,
+      handleSearch,
+      handleFetch,
+      handleFreeText,
+      setThemeMode,
+      themeMode,
     ],
   );
 
-  useInput((ch, key) => {
-    if (key.return) {
-      const text = input;
-      setInput("");
-      void send(text);
-      return;
-    }
-    if (key.backspace || key.delete) {
-      setInput((s) => s.slice(0, -1));
-      return;
-    }
-    if (key.ctrl && ch === "c") {
-      exit();
-      return;
-    }
-    if (ch && !key.meta && !key.ctrl) {
-      setInput((s) => s + ch);
-    }
-  });
+  // -- Render -----------------------------------------------------------------
 
-  const prompt = `[${tier}] ❯ `;
+  const activeAgents = turns.filter(
+    (t) => t.kind === "agent" && t.inFlight,
+  ).length;
+  const completedTurns = turns.filter(
+    (t) => t.kind === "agent" && t.status === "completed",
+  ).length;
+  const failedTurns = turns.filter(
+    (t) => t.kind === "agent" && t.status === "failed",
+  ).length;
+  const mascotEmotion = useMemo<Emotion>(() => {
+    if (failedTurns > 0) return "sad";
+    if (activeAgents > 0) return "surprised";
+    if (completedTurns > 0) return "happy";
+    return "neutral";
+  }, [activeAgents, completedTurns, failedTurns]);
+  const termWidth = stdout?.columns ?? 80;
+  const boxWidth = Math.min(86, Math.max(60, termWidth - 4));
 
-  return (
-    <Box flexDirection="column">
-      <Header coreUp={coreUp} coreVersion={coreVersion} tier={tier} />
-      {turns.map((t, i) => (
-        <TurnView key={i} turn={t} />
-      ))}
-      <Box>
-        <Text color="cyan">{prompt}</Text>
-        <Text>{input}</Text>
-        <Text color="gray">█</Text>
-      </Box>
-      <Box marginTop={1}>
-        <Text dimColor>
-          chat · /agent {"<kind> <task>"} · /agents · /cancel {"<id>"}
-        </Text>
-      </Box>
-      <Box>
-        <Text dimColor>
-          /plan draft {"<kind> <goal>"} · /plan approve {"<id>"} · /plan cancel · /plans
-        </Text>
-      </Box>
-      <Box>
-        <Text dimColor>
-          /lessons · /lessons promote {"<id>"} · /lessons delete {"<id>"}
-        </Text>
-      </Box>
-      <Box>
-        <Text dimColor>
-          /gates run {"<spec> | <output>"} · /eval run {"<models-csv> | <task>"}
-        </Text>
-      </Box>
-      <Box>
-        <Text dimColor>
-          /review {"<head> [base]"} · /health · /tier · /quit
-        </Text>
-      </Box>
-    </Box>
-  );
-}
+  // Format wall time
+  function formatTime(ms: number): string {
+    const secs = Math.floor(ms / 1000);
+    const mins = Math.floor(secs / 60);
+    const hrs = Math.floor(mins / 60);
+    if (hrs > 0) return `${hrs}h ${mins % 60}m ${secs % 60}s`;
+    if (mins > 0) return `${mins}m ${secs % 60}s`;
+    return `${secs}s`;
+  }
 
-function Header({
-  coreUp,
-  coreVersion,
-  tier,
-}: {
-  coreUp: boolean | null;
-  coreVersion: string | null;
-  tier: Tier;
-}) {
-  const status =
-    coreUp === null ? "probing…" : coreUp ? `core ${coreVersion}` : "core DOWN";
-  const color = coreUp === null ? "gray" : coreUp ? "green" : "red";
-  return (
-    <Box flexDirection="column" alignItems="center" marginBottom={1}>
-      <LogoKira text="KIRA" />
-      <Box marginTop={1}>
-        <Text dimColor>
-          <Text color={color}>{status}</Text> · tier={tier}
-        </Text>
-      </Box>
-    </Box>
-  );
-}
+  const wallTime = formatTime(Date.now() - sessionStart.current);
+  const totalTurns = turnCount.current;
+  const totalAgents = turns.filter((t) => t.kind === "agent").length;
+  const completedAgents = turns.filter(
+    (t) => t.kind === "agent" && !t.inFlight,
+  ).length;
+  const totalCommands = commandCount.current;
 
-function TurnView({ turn }: { turn: Turn }) {
-  if (turn.kind === "plan") {
-    const statusColor =
-      turn.planStatus === "done"
-        ? "green"
-        : turn.planStatus === "failed"
-          ? "red"
-          : turn.planStatus === "cancelled" || turn.planStatus === "expired"
-            ? "yellow"
-            : "cyan";
+  const goodbyeArt = useMemo(() => figletArt("GOODBYE", "Small"), []);
+
+  // Show goodbye summary
+  if (showGoodbye) {
+    const sessionId = `kira-${sessionStart.current.toString(36).slice(0, 12)}`;
+    const stats = goodbyeStats;
+    const totalToolCalls = totalAgents;
+    const successfulAgents = turns.filter(
+      (t) => t.kind === "agent" && t.status === "completed",
+    ).length;
+    const successRate =
+      totalAgents > 0
+        ? ((successfulAgents / totalAgents) * 100).toFixed(1)
+        : "—";
+
+    const fmtNum = (n: number): string => n.toLocaleString();
+    const costColor = (usd: number): string => {
+      if (usd === 0) return "#666666";
+      if (usd < 0.01) return "#4ADE80";
+      if (usd < 0.10) return "#FBBF24";
+      if (usd < 1.00) return "#F97316";
+      return "#EF4444";
+    };
+
+    const totalTokensIn = stats
+      ? stats.model_usage.reduce((sum, m) => sum + Number(m.tokens_in), 0)
+      : 0;
+    const totalTokensOut = stats
+      ? stats.model_usage.reduce((sum, m) => sum + Number(m.tokens_out), 0)
+      : 0;
+
+    const contentWidth = boxWidth - 4;
+
+    const sep = () => (
+      <Text color="#444444">{"─".repeat(contentWidth)}</Text>
+    );
+
+    const labelRow = (
+      label: string,
+      value: string,
+      opts?: { color?: string },
+    ) => (
+      <Text>
+        <Text color="#888888">{`${label}:`.padEnd(22)}</Text>
+        <Text color={opts?.color ?? "#E8E8E8"}>{value}</Text>
+      </Text>
+    );
+
+    const header = (title: string) => (
+      <Text bold color="#D4D4D4">{`  ${title}`}</Text>
+    );
+
+    const content = (lines: React.ReactNode) => (
+      <Box flexDirection="column" paddingLeft={2}>
+        {lines}
+      </Box>
+    );
+
     return (
-      <Box flexDirection="column" marginBottom={1}>
-        <Box>
-          <Text color="cyan">❯ </Text>
-          <Text>{turn.user}</Text>
-        </Box>
-        {turn.error ? (
-          <Box>
-            <Text color="red">error: </Text>
-            <Text color="red">{turn.error}</Text>
+      <Box flexDirection="column" paddingX={1} marginTop={1}>
+        <Box
+          flexDirection="column"
+          borderStyle="classic"
+          borderColor="#A855F7"
+          width={boxWidth}
+          paddingX={1}
+          paddingY={0}
+        >
+          {/* Title */}
+          <Box flexDirection="column" paddingLeft={1} paddingTop={0} paddingBottom={1}>
+            {goodbyeArt.map((line, i) => (
+              <Text key={i} color="#A855F7">{line}</Text>
+            ))}
           </Box>
-        ) : (
-          <>
-            <Box>
-              <Text color="magenta">▸ </Text>
-              <Text dimColor>
-                plan {turn.planId?.slice(0, 8) ?? "..."}{" "}
-              </Text>
-              <Text color={statusColor}>{turn.planStatus ?? "draft"}</Text>
-              {turn.scope ? (
-                <Text color={scopeColor(turn.scope)}> [{turn.scope}]</Text>
-              ) : null}
-              {turn.executorAgentId ? (
-                <Text dimColor> exec={turn.executorAgentId.slice(0, 8)}</Text>
-              ) : null}
-              {turn.inFlight ? <Text color="yellow"> ▍</Text> : null}
+
+          <Box paddingLeft={1}>{sep()}</Box>
+
+          {/* Interaction Summary */}
+          <Box paddingLeft={1} marginTop={0}>{header("Interaction Summary")}</Box>
+          <Box paddingLeft={1}>{labelRow("Session ID", sessionId, { color: "#888888" })}</Box>
+          <Box paddingLeft={1}>{labelRow("Wall Time", wallTime)}</Box>
+          <Box paddingLeft={1}>{labelRow("Total Turns", String(totalTurns))}</Box>
+          <Box paddingLeft={1}>{labelRow("Commands", String(totalCommands))}</Box>
+          <Box paddingLeft={1}>{labelRow("Agents Spawned", String(totalAgents))}</Box>
+          <Box paddingLeft={1}>{labelRow("Agents Completed", String(successfulAgents))}</Box>
+          <Box paddingLeft={1}>{labelRow("Success Rate", `${successRate}%`)}</Box>
+
+          <Box paddingLeft={1}>{sep()}</Box>
+
+          {/* Performance */}
+          <Box paddingLeft={1} marginTop={0}>{header("Performance")}</Box>
+          <Box paddingLeft={1}>{labelRow("API Calls", String(totalToolCalls))}</Box>
+          <Box paddingLeft={1}>
+            {labelRow("Model Tier", tier, {
+              color: tier === "heavy" ? "#E879A8" : tier === "light" ? "#4ADE80" : "#87CEEB",
+            })}
+          </Box>
+          {stats && (
+            <Box paddingLeft={1}>{labelRow("USD Spent", `$${stats.usd_spent.toFixed(4)}`, { color: costColor(stats.usd_spent) })}</Box>
+          )}
+
+          {/* Model Usage */}
+          {stats && stats.model_usage.length > 0 && (
+            <>
+              <Box paddingLeft={1}>{sep()}</Box>
+              <Box paddingLeft={1} marginTop={0}>{header("Model Usage")}</Box>
+              <Box paddingLeft={1}>
+                <Text bold color="#888888">
+                  {`  Model${" ".repeat(14)}Reqs     Input      Output`}
+                </Text>
+              </Box>
+              {stats.model_usage.map((m) => (
+                <Box key={m.model} paddingLeft={1}>
+                  <Text color="#C8C8C8">{`  ${m.model.padEnd(20)}${String(m.requests).padStart(5)}  ${fmtNum(Number(m.tokens_in)).padStart(10)}  ${fmtNum(Number(m.tokens_out)).padStart(10)}`}</Text>
+                </Box>
+              ))}
+              <Box paddingLeft={1}>
+                <Text color="#E8E8E8">{`  Total: ${fmtNum(totalTokensIn)} in / ${fmtNum(totalTokensOut)} out`}</Text>
+              </Box>
+            </>
+          )}
+
+          <Box paddingLeft={1}>{sep()}</Box>
+
+          {/* Restart hint */}
+          <Box paddingLeft={1}>
+            <Text color="#888888">Restart: bun run src/cli/kira.tsx</Text>
+          </Box>
+
+          <Box paddingLeft={0}>{sep()}</Box>
+
+          {/* Dead companion */}
+          <Box paddingLeft={1} paddingBottom={1}>
+            <Mascot config={companionConfig} emotion="dead" />
+            <Box flexDirection="column" marginLeft={2}>
+              <Text color="#666666" dimColor>Your companion rests</Text>
+              <Text color="#666666" dimColor>until the next write.</Text>
             </Box>
-            {turn.note ? (
-              <Box marginLeft={2}>
-                <Text dimColor>{turn.note}</Text>
-              </Box>
-            ) : null}
-            {turn.steps && turn.steps.length > 0 ? (
-              <Box marginLeft={2} flexDirection="column">
-                {turn.steps.map((s) => (
-                  <Box key={s.idx}>
-                    <Text color="gray">{s.idx}. </Text>
-                    <Text>{s.description}</Text>
-                    {s.tool ? (
-                      <Text dimColor> [{s.tool}]</Text>
-                    ) : null}
-                  </Box>
-                ))}
-              </Box>
-            ) : null}
-          </>
-        )}
-      </Box>
-    );
-  }
-  if (turn.kind === "info") {
-    return (
-      <Box flexDirection="column" marginBottom={1}>
-        <Box>
-          <Text color="cyan">❯ </Text>
-          <Text>{turn.user}</Text>
+          </Box>
         </Box>
-        {turn.error ? (
-          <Box>
-            <Text color="red">error: </Text>
-            <Text color="red">{turn.error}</Text>
-          </Box>
-        ) : (
-          <Box>
-            <Text color="yellow">ℹ </Text>
-            <Text>{turn.body}</Text>
-          </Box>
-        )}
       </Box>
     );
   }
-  if (turn.kind === "agent") {
-    const statusColor =
-      turn.status === "completed"
-        ? "green"
-        : turn.status === "failed"
-          ? "red"
-          : turn.status === "cancelled"
-            ? "yellow"
-            : "cyan";
+
+  // Show splash on first launch
+  if (showSplash) {
     return (
-      <Box flexDirection="column" marginBottom={1}>
-        <Box>
-          <Text color="cyan">❯ </Text>
-          <Text>{turn.user}</Text>
-        </Box>
-        {turn.error ? (
-          <Box>
-            <Text color="red">error: </Text>
-            <Text color="red">{turn.error}</Text>
-          </Box>
-        ) : (
-          <>
-            <Box>
-              <Text color="magenta">▸ </Text>
-              <Text dimColor>
-                {turn.agentKind} {turn.agentId?.slice(0, 8) ?? "..."}{" "}
-              </Text>
-              <Text color={statusColor}>{turn.status ?? "spawning"}</Text>
-              <Text dimColor>
-                {" "}
-                iters={turn.iters ?? 0} ${(turn.usd ?? 0).toFixed(4)}
-                {turn.model ? ` (${turn.model})` : ""}
-              </Text>
-              {turn.inFlight ? <Text color="yellow"> ▍</Text> : null}
-            </Box>
-            {turn.result ? (
-              <Box marginLeft={2}>
-                <Text>{truncate(turn.result, 500)}</Text>
-              </Box>
-            ) : null}
-          </>
-        )}
+      <SplashScreen
+        coreUp={coreUp}
+        coreVersion={coreVersion}
+        tier={tier}
+        mode={mode}
+        workingDir={workingDir}
+        onDismiss={() => setShowSplash(false)}
+      />
+    );
+  }
+
+  // Show help menu
+  if (showHelp) {
+    return (
+      <Box flexDirection="column">
+        <Header
+          coreUp={coreUp}
+          coreVersion={coreVersion}
+          tier={tier}
+          mode={mode}
+          workingDir={workingDir}
+        />
+        <HelpMenu onDismiss={() => setShowHelp(false)} />
       </Box>
     );
   }
-  // chat turn
+
   return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Box>
-        <Text color="cyan">❯ </Text>
-        <Text>{turn.user}</Text>
+    <AnimationClockProvider>
+      <Box flexDirection="column">
+        {/* Header */}
+        <Header
+          coreUp={coreUp}
+          coreVersion={coreVersion}
+          tier={tier}
+          mode={mode}
+          workingDir={workingDir}
+        />
+
+        {/* Turns */}
+        {turns.map((t, i) => (
+          <TurnRenderer key={i} turn={t} />
+        ))}
+
+        {/* Toasts */}
+        <ToastContainer toasts={toasts} />
+
+        {/* Input line */}
+        <InputBar
+          mode={mode}
+          disabled={showHelp}
+          onSubmit={send}
+          onFirstCtrlC={() => setShowExitHint(true)}
+          onDoubleCtrlC={() => setShowGoodbye(true)}
+        />
+
+        {/* Status bar */}
+        <StatusBar
+          tier={tier}
+          mode={mode}
+          agentCount={totalAgents}
+          activeAgents={activeAgents}
+          themeMode={themeMode}
+          showExitHint={showExitHint}
+          onDismissExitHint={() => setShowExitHint(false)}
+          newMessageCount={completedTurns}
+          mascotConfig={companionConfig}
+          mascotEmotion={mascotEmotion}
+        />
       </Box>
-      {turn.error ? (
-        <Box>
-          <Text color="red">error: </Text>
-          <Text color="red">{turn.error}</Text>
-        </Box>
-      ) : (
-        <Box>
-          <Text color="green">⠿ </Text>
-          <Text>{turn.assistant}</Text>
-          {turn.inFlight ? <Text color="yellow"> ▍</Text> : null}
-          {turn.model ? <Text dimColor> ({turn.model})</Text> : null}
-        </Box>
-      )}
-    </Box>
+    </AnimationClockProvider>
   );
-}
-
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return s.slice(0, max) + "…";
-}
-
-function scopeColor(scope: string): string {
-  switch (scope) {
-    case "quick":
-      return "green";
-    case "small":
-      return "cyan";
-    case "medium":
-      return "yellow";
-    case "large":
-      return "magenta";
-    case "complex":
-      return "red";
-    default:
-      return "gray";
-  }
 }

@@ -16,6 +16,11 @@ pub struct ChatRequest {
     pub model: Option<String>,
 
     pub messages: Vec<ChatMessage>,
+
+    /// Execution mode: "plan" (default, plan-first via Pilot) or "yolo"
+    /// (direct agent spawn, reduced gates, no plan approval).
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 fn default_tier() -> String {
@@ -47,4 +52,14 @@ pub enum StreamEvent {
     Token { delta: String },
     Done { model: String, finish_reason: Option<String> },
     Error { message: String },
+}
+
+/// Response for YOLO mode chat — direct agent spawn.
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../agent/src/generated/chat.ts")]
+pub struct YoloResponse {
+    pub agent_id: String,
+    pub kind: String,
+    pub status: String,
+    pub message: String,
 }

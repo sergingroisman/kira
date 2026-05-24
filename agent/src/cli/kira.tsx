@@ -13,12 +13,22 @@
 import React from "react";
 import { render } from "ink";
 import { KiraApp } from "../ui/KiraApp.js";
+import { ThemeProvider } from "../ui/components/ThemeProvider.js";
 import { CoreClient } from "../core-client/client.js";
 
 const client = new CoreClient();
 
-const { waitUntilExit } = render(<KiraApp client={client} />, {
-  exitOnCtrlC: true,
-});
+const app = render(
+  <ThemeProvider>
+    <KiraApp client={client} />
+  </ThemeProvider>,
+  {
+    exitOnCtrlC: false,
+  },
+);
 
-await waitUntilExit();
+// Handle normal exit
+app.waitUntilExit().then(() => {
+  app.unmount();
+  process.exit(0);
+});

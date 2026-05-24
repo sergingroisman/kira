@@ -71,6 +71,15 @@ pub struct RunGatesRequest {
     /// Skip the meta-review gate.
     #[serde(default)]
     pub skip_meta_review: bool,
+    /// Optional worktree path for L1 to run real lint/typecheck.
+    /// When empty, L1 falls back to structural heuristics (regex truncation
+    /// + brace balance). When provided + project type detected, L1 runs
+    /// `cargo check` / `bun lint` / `tsc --noEmit`.
+    #[serde(default)]
+    pub worktree_path: String,
+    /// Skip the structural lint check (force heuristic-only L1).
+    #[serde(default)]
+    pub skip_structural_lint: bool,
 }
 
 #[derive(Serialize, TS)]

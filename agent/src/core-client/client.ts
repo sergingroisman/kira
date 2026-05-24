@@ -12,6 +12,7 @@ import type {
   ChatMessage,
   ChatResponse,
   StreamEvent,
+  YoloResponse,
 } from "../generated/chat";
 import type { BashRequest, BashResponse } from "../generated/bash";
 import type {
@@ -41,6 +42,9 @@ import type {
 import type { RunGatesRequest, RunGatesResponse } from "../generated/gate";
 import type { RunEvalRequest, RunEvalResponse } from "../generated/eval";
 import type { RunReviewRequest, RunReviewResponse } from "../generated/review";
+import type { SddRun, StartSddRequest, SddListResponse } from "../generated/sdd";
+import type { PillarEvent } from "../generated/pillar";
+import type { StatsResponse, ModelUsage } from "../generated/stats";
 
 export interface CoreClientConfig {
   baseUrl: string; // default http://127.0.0.1:7777
@@ -155,6 +159,18 @@ export class CoreClient {
         if (event) yield event;
       }
     }
+  }
+
+  // -----------------------------------------------------------------
+  // YOLO mode — direct agent spawn (bypass plan approval)
+  // -----------------------------------------------------------------
+
+  /**
+   * YOLO chat: spawn a writer agent directly without plan approval.
+   * Returns immediately with agent info; poll /v1/agents/{id} for status.
+   */
+  async chatYolo(req: ChatRequest): Promise<YoloResponse> {
+    return this.postJson<YoloResponse>("/v1/chat/yolo", req);
   }
 
   // -----------------------------------------------------------------
@@ -290,6 +306,121 @@ export class CoreClient {
   // Multi-dim PR review (TRUST-inspired)
   // -----------------------------------------------------------------
 
+  // -----------------------------------------------------------------
+  // SDD (P1 Spec-Driven Execution)
+  // -----------------------------------------------------------------
+
+  async startSdd(req: StartSddRequest): Promise<SddRun> {
+    return this.postJson<SddRun>("/v1/sdd", req);
+  }
+
+  // -----------------------------------------------------------------
+  // Web tools (P0 + soberania)
+  // -----------------------------------------------------------------
+
+  async webSearch(req: {
+    query: string;
+    max_results?: number | null;
+    language?: string | null;
+  }): Promise<{ results: Array<{ title: string; url: string; snippet: string; engine: string }>; markdown: string }> {
+    return this.postJson("/v1/web/search", req);
+  }
+
+  async webFetch(req: { url: string }): Promise<{
+    result: {
+      url: string;
+      final_url: string;
+      bytes_read: number;
+      markdown: string;
+      source: "local" | "jina_fallback";
+    };
+    markdown: string;
+  }> {
+    // Fetch can be slow — bump timeout.
+    const res = await fetch(`${this.config.baseUrl}/v1/web/fetch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(this.config.timeoutMs * 3),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<{
+      result: {
+        url: string;
+        final_url: string;
+        bytes_read: number;
+        markdown: string;
+        source: "local" | "jina_fallback";
+      };
+      markdown: string;
+    }>;
+  }
+
+  async listSdd(): Promise<SddListResponse> {
+    const res = await fetch(`${this.config.baseUrl}/v1/sdd`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<SddListResponse>;
+  }
+
+  async getSdd(id: string): Promise<SddRun> {
+    const res = await fetch(`${this.config.baseUrl}/v1/sdd/${id}`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<SddRun>;
+  }
+
+  // -----------------------------------------------------------------
+  // Pillar transparency SSE — open EventSource-style consumer.
+  // Returns an `AbortController`; call .abort() to close.
+  // -----------------------------------------------------------------
+
+  streamPillarEvents(
+    runId: string | undefined,
+    onEvent: (ev: PillarEvent) => void,
+    onError?: (e: unknown) => void,
+  ): AbortController {
+    const ctrl = new AbortController();
+    const qs = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+    (async () => {
+      try {
+        const res = await fetch(`${this.config.baseUrl}/v1/events/stream${qs}`, {
+          signal: ctrl.signal,
+        });
+        if (!res.ok || !res.body) throw new Error(`events stream ${res.status}`);
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buf.indexOf("\n\n")) >= 0) {
+            const frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            for (const line of frame.split("\n")) {
+              if (line.startsWith("data:")) {
+                const data = line.slice(5).trim();
+                if (!data) continue;
+                try {
+                  onEvent(JSON.parse(data) as PillarEvent);
+                } catch {
+                  /* skip malformed */
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        if (!ctrl.signal.aborted) onError?.(e);
+      }
+    })();
+    return ctrl;
+  }
+
   async runReview(req: RunReviewRequest): Promise<RunReviewResponse> {
     // Review fans out N reviewer agents in parallel; full run can hit 5-8min
     // on Heavy tier. Hard timeout matches server-side default (300s) + slack.
@@ -303,6 +434,18 @@ export class CoreClient {
     });
     if (!res.ok) throw await parseError(res);
     return res.json() as Promise<RunReviewResponse>;
+  }
+
+  // -----------------------------------------------------------------
+  // Stats (session summary for goodbye)
+  // -----------------------------------------------------------------
+
+  async stats(): Promise<StatsResponse> {
+    const res = await fetch(`${this.config.baseUrl}/v1/stats`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<StatsResponse>;
   }
 
   // -----------------------------------------------------------------
@@ -349,6 +492,7 @@ export type {
   ChatMessage,
   ChatResponse,
   StreamEvent,
+  YoloResponse,
   BashRequest,
   BashResponse,
   FileReadRequest,
@@ -373,4 +517,10 @@ export type {
   RunEvalResponse,
   RunReviewRequest,
   RunReviewResponse,
+  StatsResponse,
+  ModelUsage,
+  SddRun,
+  StartSddRequest,
+  SddListResponse,
+  PillarEvent,
 };

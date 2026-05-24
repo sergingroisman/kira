@@ -28,7 +28,6 @@ use self::store::Store;
 const WORKTREES_SUBDIR: &str = ".worktrees";
 const BRANCH_PREFIX: &str = "kira/";
 const WT_PREFIX: &str = "wt-";
-const DEFAULT_MAX_PARALLEL: usize = 2;
 
 /// Short UUID v7 (12 hex chars) — keeps directory + branch names readable.
 fn short_id() -> String {
@@ -48,7 +47,12 @@ impl WorktreeManager {
     /// Build a manager rooted at the toplevel of `start` (commonly `cwd`).
     /// Reconciles existing `kira/*` worktrees found on disk into the store as `Stale`.
     /// `db` is optional — when present, store is durable.
-    pub async fn new(start: PathBuf, db: Option<crate::state::KiraDb>) -> Result<Self> {
+    /// `max_parallel` controls concurrent worktree operations (default 2).
+    pub async fn new(
+        start: PathBuf,
+        db: Option<crate::state::KiraDb>,
+        max_parallel: usize,
+    ) -> Result<Self> {
         let repo_root = git::toplevel(&start)
             .await
             .with_context(|| format!("not inside a git repo: {}", start.display()))?;
@@ -61,7 +65,7 @@ impl WorktreeManager {
         let mgr = Self {
             repo_root: repo_root.clone(),
             store,
-            semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_PARALLEL)),
+            semaphore: Arc::new(Semaphore::new(max_parallel.max(1))),
         };
         mgr.reconcile().await?;
         Ok(mgr)
