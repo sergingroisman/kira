@@ -141,7 +141,7 @@ impl PlanManager {
 
         let (response, _provider, model) = self
             .router
-            .route_chat_with_tools("heavy", None, messages, Vec::new())
+            .route_chat_with_tools("heavy", None, messages, Vec::new(), None)
             .await
             .context("planner LLM call failed")?;
 

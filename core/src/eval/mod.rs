@@ -14,17 +14,13 @@ use std::time::Instant;
 use tracing::{info, instrument, warn};
 
 use crate::gates::cosine_for_eval;
-use crate::llm::types::ChatMessageUnified;
+use crate::llm::types::{ChatMessageUnified, ChatParams};
 use crate::llm::embed_cache::EmbedCache;
 use crate::proto::eval::{EvalSample, ModelSummary, RunEvalRequest, RunEvalResponse};
 use crate::router::Router;
 
 const JUDGE_TIER: &str = "heavy";
-const JUDGE_PROMPT: &str = "You are an eval judge. Given SPEC and OUTPUT, \
-score how well OUTPUT meets SPEC on 0-10 scale. \
-Output STRICT JSON only: {\"score\": <integer>, \"rationale\": \"<1 sentence>\"}. \
-No prose, no markdown. NO flattery, NO hedging. \
-If OUTPUT is unrelated to SPEC, score 0.";
+const JUDGE_PROMPT: &str = crate::gates::JUDGE_PROMPT;
 
 #[instrument(skip(router, embed_cache, req), fields(n_tasks = req.tasks.len(), n_models = req.models.len()))]
 pub async fn run_eval(
@@ -89,7 +85,7 @@ async fn run_one_sample(
 
     // Direct chat with explicit model override. Tier hint ignored when model is set.
     let (output, _provider, model_used) = match router
-        .route_chat_with_tools("standard", Some(model), messages, Vec::new())
+        .route_chat_with_tools("standard", Some(model), messages, Vec::new(), None)
         .await
     {
         Ok(t) => t,
@@ -152,8 +148,9 @@ async fn judge_sample(
             content: format!("SPEC:\n{spec}\n\nOUTPUT:\n{output}\n\nReturn JSON."),
         },
     ];
+    let judge_params = ChatParams::judge_deterministic();
     let (resp, _, _) = match router
-        .route_chat_with_tools(JUDGE_TIER, None, messages, Vec::new())
+        .route_chat_with_tools(JUDGE_TIER, None, messages, Vec::new(), Some(judge_params))
         .await
     {
         Ok(t) => t,

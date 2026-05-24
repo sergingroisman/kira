@@ -348,7 +348,7 @@ async fn agent_loop(ctx: AgentContext, mut cancel_rx: oneshot::Receiver<()>) {
         // Race LLM call vs cancellation.
         let route = ctx
             .router
-            .route_chat_with_tools(&ctx.tier, None, messages.clone(), tools.clone());
+            .route_chat_with_tools(&ctx.tier, None, messages.clone(), tools.clone(), None);
         let (output, _provider, model) = tokio::select! {
             _ = &mut cancel_rx => {
                 warn!(agent_id = %ctx.id, "cancelled mid-loop");

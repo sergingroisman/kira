@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::{info, instrument, warn};
 
-use crate::llm::types::{ChatMessageUnified, ChatOutput, ToolDef};
+use crate::llm::types::{ChatMessageUnified, ChatOutput, ChatParams, ToolDef};
 use crate::llm::LlmProvider;
 use crate::proto::chat::{ChatMessage, ChatRequest};
 
@@ -197,6 +197,7 @@ impl Router {
         model_override: Option<&str>,
         messages: Vec<ChatMessageUnified>,
         tools: Vec<ToolDef>,
+        params: Option<ChatParams>,
     ) -> Result<(ChatOutput, String, String)> {
         self.budget.check()?;
 
@@ -230,7 +231,7 @@ impl Router {
             };
 
             match provider
-                .chat_with_tools(&cand.model, messages.clone(), tools.clone())
+                .chat_with_tools(&cand.model, messages.clone(), tools.clone(), params.clone())
                 .await
             {
                 Ok(output) => {

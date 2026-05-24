@@ -65,14 +65,34 @@ impl Default for GateConfig {
 
 const EMBED_MODEL: &str = "text-embedding-v3";
 
-const JUDGE_PROMPT: &str = "You are Kira's gate judge. \
+pub const JUDGE_PROMPT: &str = "You are Kira's gate judge. \
 Given a SPEC and an OUTPUT, score how well OUTPUT meets SPEC on a 0-10 scale. \
 Output STRICT JSON only: {\"score\": <integer 0-10>, \"rationale\": \"<one sentence>\"}. \
 No prose, no markdown fences. \
 Rules: be evidence-based; NO flattery, NO hedging. \
 If OUTPUT is missing or unrelated to SPEC, score 0. \
 NEVER invent details about OUTPUT — score only what is literally present. \
-Bias mitigation: longer != better; ignore verbosity, judge content match.";
+Bias mitigation: longer != better; ignore verbosity, judge content match.\n\n\
+## Examples\n\n\
+SPEC: Add a health endpoint GET /v1/health that returns {\"status\":\"ok\"}\n\
+OUTPUT: Added GET /v1/health handler returning {\"status\":\"ok\"} with 200. Includes uptime_secs field. Tests pass.\n\
+{\"score\": 9, \"rationale\": \"Meets spec fully; uptime_secs is a harmless bonus.\"}\n\n\
+SPEC: Implement circuit breaker with 5 failures / 60s threshold\n\
+OUTPUT: Circuit breaker implemented with AtomicU8 state + AtomicU32 failures. 5 failures in 60s opens for 30s. HalfOpen probes 1 request. Tests cover open/close/half-open transitions.\n\
+{\"score\": 10, \"rationale\": \"All spec requirements met with correct thresholds and state transitions tested.\"}\n\n\
+SPEC: Fix the budget guard to reject calls when monthly limit exceeded\n\
+OUTPUT: Added logging to budget guard. No rejection logic implemented.\n\
+{\"score\": 2, \"rationale\": \"Only added logging; core requirement (rejection) not implemented.\"}\n\n\
+SPEC: Implement worktree spawn with UUID v7 naming\n\
+OUTPUT: Here is a design document describing how worktree spawn could work with various naming strategies.\n\
+{\"score\": 1, \"rationale\": \"Design doc instead of implementation; no code produced.\"}\n\n\
+SPEC: Write unit tests for the router fallback logic\n\
+OUTPUT: fn test_fallback() { assert!(true); }\n\
+{\"score\": 0, \"rationale\": \"Trivial assertion; tests nothing about router fallback.\"}\n\n\
+SPEC: Add SSRF guard blocking private IP ranges\n\
+OUTPUT: SSRF guard implemented. Blocks 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16. DNS resolution checked post-resolve. Tests cover IPv4 private, IPv6 loopback, and redirect chains.\n\
+{\"score\": 10, \"rationale\": \"All private ranges blocked, DNS rebind covered, redirect chain validated.\"}";
+
 
 /// Run the cascade. Returns aggregate report + per-level details.
 /// `embed_cache` is optional — when present, level 4 reuses cached vectors.
@@ -625,8 +645,9 @@ async fn gate_judge_llm(
             content: format!("SPEC:\n{spec}\n\nOUTPUT:\n{output}\n\nReturn JSON."),
         },
     ];
+    let judge_params = crate::llm::types::ChatParams::judge_deterministic();
     let (resp, _provider, model) = match router
-        .route_chat_with_tools("heavy", None, messages, Vec::new())
+        .route_chat_with_tools("heavy", None, messages, Vec::new(), Some(judge_params))
         .await
     {
         Ok(t) => t,
@@ -676,6 +697,9 @@ async fn gate_judge_llm(
         GateOutcome::Fail
     };
     debug!(score, ?outcome, "judge gate");
+
+    append_judge_decision(spec, output, score, rationale.as_deref(), &model, outcome);
+
     GateResult {
         gate: GateKind::JudgeLlm,
         outcome,
@@ -968,4 +992,64 @@ mod tests {
         let a = vec![1.0_f32, 2.0, 3.0];
         assert!((cosine(&a, &a) - 1.0).abs() < 1e-6);
     }
+}
+
+// ============================================================================
+// Judge audit JSONL (A2 — training pipeline data collection)
+// ============================================================================
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+fn judge_audit_path() -> Option<&'static PathBuf> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let home = std::env::var("HOME").ok()?;
+        let dir = PathBuf::from(home).join(".local/share/kira/audit");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join("judge-decisions.jsonl"))
+    })
+    .as_ref()
+}
+
+fn append_judge_decision(
+    spec: &str,
+    output: &str,
+    score: f64,
+    rationale: Option<&str>,
+    model: &str,
+    outcome: GateOutcome,
+) {
+    let Some(path) = judge_audit_path() else {
+        return;
+    };
+    let verdict = match outcome {
+        GateOutcome::Pass => "accept",
+        GateOutcome::Fail => "reject",
+        GateOutcome::Skipped => "skipped",
+    };
+    let record = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "spec": spec.chars().take(2000).collect::<String>(),
+        "output": output.chars().take(2000).collect::<String>(),
+        "judgment": {
+            "score": score,
+            "verdict": verdict,
+            "rationale": rationale.unwrap_or(""),
+        },
+        "model": model,
+        "temperature": 0.0,
+        "human_label": null,
+    });
+    let Ok(line) = serde_json::to_string(&record) else {
+        return;
+    };
+    let _ = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(f, "{line}")
+    })();
 }

@@ -55,7 +55,7 @@ pub async fn generate_from_failure(
         },
     ];
     let (resp, _provider, _model) = router
-        .route_chat_with_tools("light", None, messages, Vec::new())
+        .route_chat_with_tools("light", None, messages, Vec::new(), None)
         .await
         .context("lesson generator LLM call failed")?;
 
