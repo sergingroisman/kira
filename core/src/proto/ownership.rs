@@ -43,7 +43,7 @@ pub struct CheckRequest {
     pub path: String,
 }
 
-#[derive(Serialize, TS)]
+#[derive(Serialize, Debug, TS)]
 #[ts(export, export_to = "../../agent/src/generated/ownership.ts")]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum WriteDecision {

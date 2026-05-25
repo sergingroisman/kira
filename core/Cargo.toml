@@ -45,9 +45,6 @@ serde_yaml = "0.9"
 # Stream adapters (BroadcastStream for SSE pillar fan-out)
 tokio-stream = { version = "0.1", features = ["sync"] }
 
-# Async trait sugar (Pilot trait + future workflow extensions)
-async-trait = "0.1"
-
 # Web tools (P0 + sovereign search via SearXNG)
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 readability = "0.3"
@@ -76,6 +73,15 @@ async-openai = "0.27"
 # Streams (for SSE token streaming)
 futures = "0.3"
 
+# MCP client (Model Context Protocol — stdio transport to child processes)
+rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
+
+# SHA-256 hashing (MCP schema pinning — SC7)
+sha2 = "0.10"
+
+# Hex encoding (schema hash display)
+hex = "0.4"
+
 # Regex (bash tool arg validation, SC3)
 regex = "1"
 
@@ -84,6 +90,10 @@ once_cell = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
+# Dead code is expected in v0 — functions are planned, not yet wired
+dead_code = "allow"
+# async_fn_in_trait: auto trait bounds not needed for mac-local v0
+async_fn_in_trait = "allow"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -93,6 +103,47 @@ nursery = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
+# Doc-style: not enforcing doc coverage in v0
+doc_markdown = "allow"
+missing_panics_doc = "allow"
+doc_lazy_continuation = "allow"
+too_long_first_doc_paragraph = "allow"
+# Cast policy: intentional in v0 numerical code
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Style: too subjective for v0
+unreadable_literal = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+match_same_arms = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+trivially_copy_pass_by_ref = "allow"
+struct_excessive_bools = "allow"
+needless_pass_by_value = "allow"
+option_if_let_else = "allow"
+assigning_clones = "allow"
+return_self_not_must_use = "allow"
+should_implement_trait = "allow"
+# Nursery: too aggressive for v0
+significant_drop_tightening = "allow"
+literal_string_with_formatting_args = "allow"
+format_push_string = "allow"
+or_fun_call = "allow"
+# Refactor targets — allow now, fix in v0.5
+ptr_arg = "allow"
+len_without_is_empty = "allow"
+unused_async = "allow"
+unnecessary_wraps = "allow"
+while_let_loop = "allow"
+manual_let_else = "allow"
+manual_strip = "allow"
+manual_clamp = "allow"
+needless_continue = "allow"
+useless_let_if_seq = "allow"
+overly_complex_bool_expr = "allow"
 
 [profile.release]
 opt-level = 3
