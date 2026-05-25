@@ -4,21 +4,24 @@
 //! Receives a state snapshot, returns the next `Intent`. Orquestrador
 //! executes; Pilot observes the result and decides again.
 
+use tracing::{info, warn};
+
 use crate::proto::intent::{Intent, StepOutcome, StepResult};
 use crate::proto::sdd::{SddPhase, SddRun};
+use crate::router::fallback;
 
 /// Pilot trait — a state machine reduced to two functions.
 pub trait Pilot: Send + Sync {
     /// Decide next intent given current state.
     async fn next_intent(&self, run: &SddRun) -> Intent;
 
-    /// Observe a step result. Mutating reactions (e.g. escalation flag)
+    /// Observe a step result. Mutating reactions (escalation, retry state)
     /// live here. Default no-op suits stateless pilots.
     async fn observe(&self, _run: &mut SddRun, _result: &StepResult) {}
 }
 
 /// SDD-specific pilot. Walks SPECIFY → DESIGN → TASKS → EXECUTE.
-/// Handles auto-sizing (skips SPECIFY+DESIGN when `sizing == SkipSpecifyDesign`).
+/// Failure policy: FallbackChain per FailureClass (retry/escalate/halt).
 pub struct SddPilot;
 
 impl Pilot for SddPilot {
@@ -39,11 +42,67 @@ impl Pilot for SddPilot {
     }
 
     async fn observe(&self, run: &mut SddRun, result: &StepResult) {
-        if result.outcome == StepOutcome::Failed {
-            run.error = Some(result.message.clone());
+        if result.outcome != StepOutcome::Failed {
+            // Success: reset retry counter for this phase.
+            let phase_key = format!("{:?}", run.current_phase);
+            run.phase_retries.remove(&phase_key);
+            return;
         }
-        // Halt-on-fail policy v0: any failed step terminates.
-        // v0.5+: classify failure → RetryWith / EscalateTier per FailureClass.
+
+        let phase = run.current_phase;
+        let error = result.message.clone();
+        run.error = Some(error.clone());
+
+        // FallbackChain: classify failure and decide retry/escalate/halt.
+        let phase_key = format!("{phase:?}");
+        let attempt = {
+            let entry = run.phase_retries.entry(phase_key).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        let decision = fallback::decide(phase, &error, attempt);
+
+        match &decision.intent {
+            Intent::RunSddPhase { .. } => {
+                // Retry: keep current_phase unchanged so next_intent returns the same phase.
+                info!(
+                    run_id = %run.id,
+                    phase = ?phase,
+                    attempt,
+                    message = %decision.message,
+                    "pilot: retrying phase"
+                );
+            }
+            Intent::EscalateTier { tier, reason } => {
+                warn!(
+                    run_id = %run.id,
+                    phase = ?phase,
+                    attempt,
+                    ?tier,
+                    reason = %reason,
+                    "pilot: escalating after retries exhausted"
+                );
+                // Escalation is a no-op in v0.5 (orchestrator returns Pending).
+                // Mark failed so the drive loop terminates cleanly.
+                run.current_phase = SddPhase::Failed;
+                run.error = Some(reason.clone());
+            }
+            Intent::Halt { reason } => {
+                warn!(
+                    run_id = %run.id,
+                    phase = ?phase,
+                    attempt,
+                    reason = %reason,
+                    "pilot: halting"
+                );
+                run.current_phase = SddPhase::Failed;
+                run.error = Some(reason.clone());
+            }
+            _ => {
+                run.current_phase = SddPhase::Failed;
+            }
+        }
     }
 }
 
@@ -74,6 +133,7 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
             finished_at: None,
             error: None,
+            phase_retries: Default::default(),
         }
     }
 
@@ -113,18 +173,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observe_failed_sets_error() {
+    async fn observe_budget_exceeded_halts_immediately() {
         let p = SddPilot;
         let mut run = sample_run(SddPhase::Tasks);
-        let result = StepResult {
+        p.observe(&mut run, &fail("budget cap reached ($1.00)")).await;
+        assert_eq!(run.current_phase, SddPhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn observe_agent_mistake_retries_then_escalates() {
+        let p = SddPilot;
+        let mut run = sample_run(SddPhase::Specify);
+        // max_attempts=3 → allows_retry for attempts 1, 2; escalates at 3
+        for i in 1..=2 {
+            p.observe(&mut run, &fail("output failed gate check")).await;
+            assert_eq!(run.current_phase, SddPhase::Specify, "attempt {i}: expected Specify");
+        }
+        // attempt 3 → allows_retry(3) = 3 < 3 = false → escalate → Failed
+        p.observe(&mut run, &fail("output failed gate check")).await;
+        assert_eq!(run.current_phase, SddPhase::Failed, "attempt 3: expected Failed");
+    }
+
+    #[tokio::test]
+    async fn observe_success_clears_retry_counter() {
+        let p = SddPilot;
+        let mut run = sample_run(SddPhase::Specify);
+        p.observe(&mut run, &fail("connection timeout")).await;
+        assert_eq!(*run.phase_retries.get("Specify").unwrap_or(&0), 1);
+        p.observe(&mut run, &ok()).await;
+        assert_eq!(*run.phase_retries.get("Specify").unwrap_or(&0), 0);
+    }
+
+    fn fail(msg: &str) -> StepResult {
+        StepResult {
             outcome: StepOutcome::Failed,
-            message: "phase agent timeout".into(),
+            message: msg.into(),
             duration_ms: 100,
             cost_usd: 0.0,
             artifact_path: None,
             fields: serde_json::Map::new(),
-        };
-        p.observe(&mut run, &result).await;
-        assert_eq!(run.error.as_deref(), Some("phase agent timeout"));
+        }
+    }
+
+    fn ok() -> StepResult {
+        StepResult {
+            outcome: StepOutcome::Ok,
+            message: "ok".into(),
+            duration_ms: 100,
+            cost_usd: 0.0,
+            artifact_path: None,
+            fields: serde_json::Map::new(),
+        }
     }
 }

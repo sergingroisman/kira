@@ -1,0 +1,270 @@
+# tokens.toml — Kira single source of truth
+#
+# No literals: zero hardcoded numbers, URLs, or paths in source.
+# Everything loaded here. Parsed once at startup → Arc<Tokens>.
+#
+# Source: plan T4-T10 + design system audit (2026-05-21)
+
+# ─── Timeouts (all in seconds) ───────────────────────────────────────────────
+[time]
+tool_timeout_default       = 30
+bash_timeout_max           = 300
+hook_timeout_default       = 5
+agent_timeout_default      = 3600
+agent_heartbeat_interval   = 30
+agent_stale_after_minutes  = 5
+plan_ttl_default           = 3600
+worktree_cleanup_after_min = 10
+mailbox_message_ttl_days   = 7
+breaker_window             = 60
+breaker_open_duration      = 30
+budget_watchdog_period     = 3600
+heartbeat_scanner_period   = 60
+circuit_probe_period       = 30
+sse_keepalive              = 15
+http_connect_timeout       = 10
+http_read_timeout          = 60
+eval_poll_interval_ms      = 500
+eval_default_timeout       = 300
+session_rate_limit_per_min = 30
+
+# ─── Budget (USD) ────────────────────────────────────────────────────────────
+[budget]
+monthly_hard_stop_usd = 50.00
+warn_pct              = 80.0
+agent_default_usd     = 1.00
+retry_estimated_usd   = 0.10
+embed_call_usd        = 0.00007
+judge_call_usd        = 0.10
+
+# ─── Concurrency ─────────────────────────────────────────────────────────────
+[concurrency]
+max_worktrees             = 2
+max_agent_iters           = 10
+max_agent_iters_quick     = 3
+max_agent_iters_small     = 5
+max_agent_iters_complex   = 20
+max_retries_per_task      = 3
+breaker_failure_threshold = 5
+breaker_half_open_probes  = 1
+mailbox_inbox_max_pending = 100
+stall_same_tool_threshold = 3
+max_agents                = 4    # concurrent agent cap (Arc<Semaphore>)
+
+# ─── Thresholds ──────────────────────────────────────────────────────────────
+[thresholds]
+faithfulness_pass_below = 0.55
+faithfulness_escalate   = 0.80
+judge_pass_score        = 7.0       # 0..10
+change_sufficiency_min  = 0.3       # diff_lines / estimated
+change_sufficiency_max  = 3.0       # scope creep
+lesson_promote_count    = 5
+inject_top_n            = 5
+embed_cache_max_entries = 5000
+embed_cache_evict_batch = 500
+rag_score_check         = 0.85
+meta_review_coverage    = 100.0
+diff_cap_bytes          = 60000
+
+# ─── Providers ───────────────────────────────────────────────────────────────
+# Each entry defines one endpoint. `protocol` is the wire format:
+#   "openai-compatible" — /v1/chat/completions + SSE (DashScope, DeepSeek,
+#                          OpenAI, Groq, OpenRouter, Ollama, GitHub Copilot)
+#   "anthropic"         — /v1/messages + SSE (Anthropic Claude)
+#
+# Add a new provider = add a block here + reference it in [tiers.*]. Zero Rust.
+
+[providers.deepseek]
+protocol = "openai-compatible"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+enabled = true
+
+[providers.openai]
+protocol = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+enabled = false
+
+[providers.dashscope]
+protocol = "openai-compatible"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+enabled = false
+
+[providers.ollama_local]
+protocol = "openai-compatible"
+base_url = "http://127.0.0.1:11434/v1"
+enabled = false
+
+[providers.anthropic]
+protocol = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+enabled = false
+max_tokens = 4096
+api_version = "2023-06-01"
+
+[providers.github_copilot]
+protocol = "openai-compatible"
+base_url = "https://api.githubcopilot.com"
+api_key_env = "GITHUB_COPILOT_TOKEN"
+enabled = false
+
+[providers.openrouter]
+protocol = "openai-compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+enabled = false
+
+[providers.groq]
+protocol = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+enabled = false
+
+[providers.siliconflow]
+protocol = "openai-compatible"
+base_url = "https://api.siliconflow.cn/v1"
+api_key_env = "SILICONFLOW_API_KEY"
+enabled = false
+
+# ─── Tiers (config-driven candidate lists) ───────────────────────────────────
+# Format: "provider:model" strings, ordered by priority (first = primary).
+# References provider names from [providers.*] above.
+
+[tiers.heavy]
+candidates = [
+    "deepseek:deepseek-v4-pro",
+    "dashscope:qwen-max",
+    "dashscope:qwen-plus",
+]
+
+[tiers.standard]
+candidates = [
+    "deepseek:deepseek-v4-pro",
+    "dashscope:qwen-plus",
+    "deepseek:deepseek-v4-flash",
+]
+
+[tiers.light]
+candidates = [
+    "deepseek:deepseek-v4-flash",
+    "dashscope:qwen-flash",
+]
+
+[tiers.long_context]
+candidates = [
+    "deepseek:deepseek-v4-pro",
+    "dashscope:qwen-max",
+]
+
+# Dedicated tier for L5 Judge LLM gate (P3). MUST be disjoint from writer
+# tiers — `judge_model ≠ writer_model` (Spektor invariant, self-enhancement
+# bias defence). Primary is qwen-max because Heavy primary is deepseek-v4-pro.
+[tiers.judge]
+candidates = [
+    "dashscope:qwen-max",
+    "dashscope:qwen-plus",
+]
+
+# ─── Model pricing (USD per 1M tokens) ───────────────────────────────────────
+[pricing]
+qwen-max-input       = 1.60
+qwen-max-output      = 6.40
+qwen-plus-input      = 0.40
+qwen-plus-output     = 1.20
+qwen-flash-input     = 0.15
+qwen-flash-output    = 0.60
+deepseek-v4-pro-input  = 0.43
+deepseek-v4-pro-output = 0.87
+deepseek-v4-flash-input  = 0.14
+deepseek-v4-flash-output = 0.28
+
+# ─── Model metadata (context limits etc.) ────────────────────────────────────
+[models.deepseek-v4-pro]
+context_limit = 1_000_000
+
+[models.deepseek-v4-flash]
+context_limit = 1_000_000
+
+[models.qwen-max]
+context_limit = 131_072
+
+[models.qwen-plus]
+context_limit = 131_072
+
+[models.qwen-flash]
+context_limit = 131_072
+
+# ─── Paths ───────────────────────────────────────────────────────────────────
+[paths]
+state_db_mac              = "~/.local/share/kira/state.redb"
+state_db_linux            = "/var/lib/kira/state.redb"
+worktrees_subdir          = ".worktrees"
+mailbox_subdir            = ".kira/mailbox"
+runs_subdir               = ".kira/runs"
+prompts_dir               = "core/agents/prompts"
+workflows_dir             = ".kira/workflows"
+audit_dir                 = "~/.local/share/kira/audit"
+lessons_dir               = "AGENTS-memory/lessons"
+tokenizer_vocab_cache     = "~/.cache/kira/tokenizers"
+branch_prefix             = "kira/"
+wt_prefix                 = "wt-"
+
+# ─── Bind / HTTP ─────────────────────────────────────────────────────────────
+[bind]
+host_dev     = "127.0.0.1"
+port_default = 7777
+api_version  = "v1"
+
+# ─── Embedding ───────────────────────────────────────────────────────────────
+[embedding]
+model = "text-embedding-v3"
+
+# ─── Safety ──────────────────────────────────────────────────────────────────
+[safety]
+prompt_injection_keywords     = [
+    "ignore previous",
+    "developer mode",
+    "reveal prompt",
+    "system:",
+    "you are now",
+]
+prompt_injection_levenshtein  = 2
+tool_risk_default             = "MEDIUM"
+bash_executable_allowlist     = [
+    "ls", "cat", "head", "tail", "grep", "find",
+    "git", "cargo", "bun", "npm", "pnpm", "node",
+    "rg", "sd", "wc", "diff", "stat", "python", "python3",
+]
+bash_arg_regex                = '^[a-zA-Z0-9_./ @:=,-]+$'
+bash_forbidden_chars          = ['&', '|', ';', '$', '>', '<', '\\', '!', "'", '"', '(', ')', '`']
+file_read_max_bytes           = 5242880     # 5 MiB
+file_write_max_bytes          = 5242880     # 5 MiB
+http_request_max_bytes        = 1048576     # 1 MiB
+secrets_redact_keys_regex     = '(?i)(api_?key|token|secret|password|authorization|bearer)'
+audit_jsonl_max_field_bytes   = 8192
+session_budget_usd            = 10.00
+
+# ─── Text pipeline ───────────────────────────────────────────────────────────
+[text_pipeline]
+default_tokenizer       = "qwen"
+chunker_target_tokens   = 512
+chunker_overlap_tokens  = 50
+compress_target_ratio   = 0.5
+compress_strategy       = "rule_based"
+preserve_entities       = true
+rerank_strategy         = "bm25"
+rerank_top_k            = 5
+
+# ─── Sandbox runtime (P5 Guardrails / v0.5) ────────────────────────────────────
+[sandbox]
+default_runtime             = "host"        # host | docker | firecracker
+firecracker_enabled         = false
+microvm_memory_mib          = 512
+microvm_vcpu_count          = 1
+microvm_timeout_secs        = 600
+network_policy              = "off"         # off | allow_searxng | allow_llm | custom
+rootfs_path                 = ".kira/firecracker/rootfs.ext4"
+kernel_path                 = ".kira/firecracker/vmlinux"

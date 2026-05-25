@@ -12,6 +12,7 @@
 pub mod budget;
 pub mod circuit;
 pub mod failure;
+pub mod fallback;
 pub mod tier;
 
 use anyhow::Result;
@@ -80,6 +81,9 @@ pub struct Router {
     pub budget: Arc<BudgetGuard>,
     model_usage: Arc<ModelUsageTracker>,
     tiers: TierMap,
+    /// C2 — Optional DB handle for persisting breaker snapshots so daemon
+    /// restarts preserve Open state.
+    db: Option<crate::state::KiraDb>,
 }
 
 impl Router {
@@ -94,7 +98,51 @@ impl Router {
             budget,
             model_usage: Arc::new(ModelUsageTracker::default()),
             tiers,
+            db: None,
         }
+    }
+
+    /// C2 — Attach a DB handle and restore any persisted breaker snapshots.
+    /// Returns the count of restored breakers for logging.
+    pub fn with_db(mut self, db: crate::state::KiraDb) -> Self {
+        let restored = self.restore_breakers_from_db(&db);
+        self.db = Some(db);
+        if restored > 0 {
+            tracing::info!(count = restored, "circuit breakers restored from redb");
+        }
+        self
+    }
+
+    fn restore_breakers_from_db(&self, db: &crate::state::KiraDb) -> usize {
+        use crate::router::circuit::{BreakerConfig, BreakerSnapshot};
+        use crate::state::TBL_BREAKERS;
+        let pairs: Vec<(String, String)> = db.list_kv(TBL_BREAKERS).unwrap_or_default();
+        let cfg = BreakerConfig::default();
+        let mut map = self.breakers.lock().expect("breakers mutex poisoned");
+        let mut count = 0;
+        for (key, json) in pairs {
+            if let Ok(snap) = serde_json::from_str::<BreakerSnapshot>(&json) {
+                map.insert(key, Arc::new(CircuitBreaker::restore(cfg, &snap)));
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// C2 — Fire-and-forget persist of one breaker's current state.
+    /// Called by `record_call_outcome` on state-changing transitions.
+    fn persist_breaker_async(&self, key: String, breaker: Arc<CircuitBreaker>) {
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            use crate::state::TBL_BREAKERS;
+            let snap = breaker.snapshot();
+            if let Ok(json) = serde_json::to_string(&snap)
+                && let Err(e) = db.put_kv(TBL_BREAKERS, &key, &json) {
+                    tracing::warn!(key, error = ?e, "breaker persist failed");
+                }
+        });
     }
 
     /// Returns a snapshot of per-model token usage for the stats endpoint.
@@ -184,7 +232,7 @@ impl Router {
     /// (so agent loops can include `Tool` result messages between turns)
     /// and `ToolDef` schemas.
     ///
-    /// **Tool‑call ordering note**: when `tools` is non-empty, DeepSeek
+    /// **Tool‑call ordering note**: when `tools` is non-empty, `DeepSeek`
     /// candidates are demoted to the end of the fallback chain. Reason: the
     /// `deepseek-v4-*` family runs in thinking mode by default and returns
     /// `reasoning_content` in the assistant message that the API requires us
@@ -201,63 +249,82 @@ impl Router {
     ) -> Result<(ChatOutput, String, String)> {
         self.budget.check()?;
 
-        let pseudo_req = ChatRequest {
-            tier: tier.to_string(),
-            model: model_override.map(str::to_string),
-            messages: Vec::new(),
-            mode: None,
-        };
-        let all = self.candidates(&pseudo_req);
-        let candidates = if tools.is_empty() {
-            all
-        } else {
-            let (deepseek, others): (Vec<_>, Vec<_>) =
-                all.into_iter().partition(|c| c.provider == "deepseek");
-            let mut out = others;
-            out.extend(deepseek);
-            out
-        };
+        // C3 — Build escalation tier chain. Try requested tier first, then
+        // upper tiers if all candidates exhaust. Judge tier never escalates.
+        let primary_tier = Tier::from_str_lossy(tier);
+        let mut tiers_to_try: Vec<Tier> = vec![primary_tier];
+        tiers_to_try.extend_from_slice(primary_tier.escalation_chain());
+
         let mut last_err: Option<anyhow::Error> = None;
 
-        for cand in candidates {
-            let key = cand.key();
-            let breaker = self.breaker_for(&key);
-            if breaker.is_open() {
-                warn!(candidate = %key, "skipping — breaker Open");
-                continue;
+        for (idx, current_tier) in tiers_to_try.iter().enumerate() {
+            if idx > 0 {
+                info!(
+                    from = ?primary_tier,
+                    to = ?current_tier,
+                    "cross-tier escalation — primary exhausted"
+                );
             }
-            let Some(provider) = self.providers.get(&cand.provider).cloned() else {
-                continue;
+            let tier_str = format!("{current_tier:?}").to_lowercase();
+            let pseudo_req = ChatRequest {
+                tier: tier_str,
+                model: if idx == 0 { model_override.map(str::to_string) } else { None },
+                messages: Vec::new(),
+                mode: None,
+            };
+            let all = self.candidates(&pseudo_req);
+            let candidates = if tools.is_empty() {
+                all
+            } else {
+                let (deepseek, others): (Vec<_>, Vec<_>) =
+                    all.into_iter().partition(|c| c.provider == "deepseek");
+                let mut out = others;
+                out.extend(deepseek);
+                out
             };
 
-            match provider
-                .chat_with_tools(&cand.model, messages.clone(), tools.clone(), params.clone())
-                .await
-            {
-                Ok(output) => {
-                    breaker.record_success();
-                    self.budget
-                        .track_call(&cand.model, output.tokens_in, output.tokens_out);
-                    self.model_usage
-                        .record(&cand.model, output.tokens_in, output.tokens_out);
-                    return Ok((output, cand.provider.clone(), cand.model.clone()));
-                }
-                Err(e) => {
-                    let err_msg = format!("{e:#}");
-                    warn!(candidate = %key, error = %err_msg, "tool-call candidate failed, trying next");
-                    breaker.record_failure();
-                    last_err = Some(e);
+            for cand in candidates {
+                let key = cand.key();
+                let breaker = self.breaker_for(&key);
+                if breaker.is_open() {
+                    warn!(candidate = %key, "skipping — breaker Open");
                     continue;
+                }
+                let Some(provider) = self.providers.get(&cand.provider).cloned() else {
+                    continue;
+                };
+
+                match provider
+                    .chat_with_tools(&cand.model, messages.clone(), tools.clone(), params.clone())
+                    .await
+                {
+                    Ok(output) => {
+                        breaker.record_success();
+                        self.persist_breaker_async(key.clone(), breaker.clone());
+                        self.budget
+                            .track_call(&cand.model, output.tokens_in, output.tokens_out);
+                        self.model_usage
+                            .record(&cand.model, output.tokens_in, output.tokens_out);
+                        return Ok((output, cand.provider.clone(), cand.model.clone()));
+                    }
+                    Err(e) => {
+                        let err_msg = format!("{e:#}");
+                        warn!(candidate = %key, error = %err_msg, "tool-call candidate failed, trying next");
+                        breaker.record_failure();
+                        self.persist_breaker_async(key.clone(), breaker.clone());
+                        last_err = Some(e);
+                        continue;
+                    }
                 }
             }
         }
 
         Err(last_err
-            .unwrap_or_else(|| anyhow::anyhow!("all tool-call candidates exhausted (tier {})", tier)))
+            .unwrap_or_else(|| anyhow::anyhow!("all tool-call candidates exhausted (tier {tier} + escalation chain)")))
     }
 
     /// Convenience: full route + chat (non-streaming). Iterates fallback on failure.
-    /// Returns (ChatOutput, provider_name, model).
+    /// Returns (`ChatOutput`, `provider_name`, model).
     pub async fn route_chat(
         &self,
         req: &ChatRequest,
@@ -282,6 +349,7 @@ impl Router {
             match provider.chat(&cand.model, messages).await {
                 Ok(output) => {
                     breaker.record_success();
+                    self.persist_breaker_async(key.clone(), breaker.clone());
                     self.budget
                         .track_call(&cand.model, output.tokens_in, output.tokens_out);
                     self.model_usage
@@ -292,6 +360,7 @@ impl Router {
                     let err_msg = format!("{e:#}");
                     warn!(candidate = %key, error = %err_msg, "candidate failed, trying next");
                     breaker.record_failure();
+                    self.persist_breaker_async(key.clone(), breaker.clone());
                     last_err = Some(e);
                     continue;
                 }
@@ -314,6 +383,7 @@ mod tests {
             standard: crate::config::TierEntry { candidates: vec![] },
             light: crate::config::TierEntry { candidates: vec![] },
             long_context: crate::config::TierEntry { candidates: vec![] },
+            judge: None,
         });
         Router::new(HashMap::new(), Arc::new(BudgetGuard::new(Default::default())), tiers)
     }
@@ -337,6 +407,7 @@ mod tests {
             standard: crate::config::TierEntry { candidates: vec!["fake:model".into()] },
             light: crate::config::TierEntry { candidates: vec![] },
             long_context: crate::config::TierEntry { candidates: vec![] },
+            judge: None,
         });
         let r = Router::new(HashMap::new(), budget, tiers);
         let req = ChatRequest {

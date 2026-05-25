@@ -10,11 +10,13 @@ pub mod gates_api;
 pub mod health;
 pub mod lessons_api;
 pub mod mailbox_api;
+pub mod mcp_api;
 pub mod ownership_api;
 pub mod plans_api;
 pub mod review_api;
 pub mod sdd_api;
 pub mod stats_api;
+pub mod text_api;
 pub mod web_api;
 pub mod tool;
 pub mod worktree_api;
@@ -31,6 +33,7 @@ use tracing::{info, warn};
 
 use crate::agents::{AgentManager, mailbox::MailboxFs, ownership::OwnershipRegistry};
 use crate::config::Tokens;
+use crate::mcp::McpRegistry;
 use crate::hooks::HookRunner;
 use crate::lessons::LessonRegistry;
 use crate::llm::embed_cache::EmbedCache;
@@ -41,7 +44,7 @@ use crate::router::Router;
 use crate::router::budget::{BudgetConfig, BudgetGuard};
 use crate::router::tier::TierMap;
 use crate::sdd::SddManager;
-use crate::state::{KiraDb, default_state_path};
+use crate::state::{KiraDb, resolve_state_path};
 use crate::worktree::WorktreeManager;
 
 #[derive(Clone)]
@@ -59,6 +62,7 @@ pub struct AppState {
     /// Broadcast channel for pillar transparency events (REPL breadcrumbs).
     pub pillar_tx: PillarTx,
     pub sdd: SddManager,
+    pub mcp: McpRegistry,
 }
 
 impl AppState {
@@ -95,13 +99,15 @@ impl AppState {
                 standard: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-pro".into(), "dashscope:qwen-plus".into()] },
                 light: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-flash".into(), "dashscope:qwen-flash".into()] },
                 long_context: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-pro".into(), "dashscope:qwen-max".into()] },
+                judge: Some(crate::config::TierEntry { candidates: vec!["dashscope:qwen-max".into(), "dashscope:qwen-plus".into()] }),
             }),
             |t| TierMap::from_config(&t.tiers),
         );
-        let router = Router::new(providers, budget, tier_map);
+        let router_base = Router::new(providers, budget, tier_map);
 
-        // Durable state — opens or creates the redb file.
-        let db_path = default_state_path()?;
+        // Durable state — opens or creates the redb file. Path comes from
+        // [paths] config when present (B3) — falls back to ~/.local/share/kira.
+        let db_path = resolve_state_path(tokens.as_ref().map(|t| &t.paths))?;
         let db = match KiraDb::open(&db_path) {
             Ok(d) => Some(d),
             Err(e) => {
@@ -109,9 +115,16 @@ impl AppState {
                 None
             }
         };
+        // C2 — Attach DB to router so circuit breaker snapshots persist
+        // across daemon restarts.
+        let router = match db.clone() {
+            Some(d) => router_base.with_db(d),
+            None => router_base,
+        };
 
         let cwd = std::env::current_dir().context("cwd unavailable")?;
         let max_wt = tokens.as_ref().map_or(2, |t| t.concurrency.max_worktrees);
+        let max_agents = tokens.as_ref().map_or(4, |t| t.concurrency.max_agents);
         let worktrees = WorktreeManager::new(cwd.clone(), db.clone(), max_wt).await?;
         let repo_root = crate::worktree::git::toplevel(&cwd).await?;
         let mailbox = MailboxFs::new(repo_root.clone());
@@ -134,6 +147,19 @@ impl AppState {
                     meta_review_coverage_min: t.thresholds.meta_review_coverage,
                 }
             });
+
+        // MCP client registry — connects to servers listed in .kira/mcp.toml.
+        let mcp = McpRegistry::load_from_paths(&repo_root).await;
+        let mcp_servers = mcp.connected_servers().await;
+        if !mcp_servers.is_empty() {
+            info!(?mcp_servers, "MCP servers connected");
+        }
+
+        let runs_dir = repo_root.join(".kira/runs");
+        let pricing = tokens
+            .as_ref().map_or_else(|| Arc::new(crate::config::PricingConfig::default()), |t| Arc::new(t.pricing));
+        let models = tokens
+            .as_ref().map_or_else(|| Arc::new(crate::config::ModelsConfig::default()), |t| Arc::new(t.models.clone()));
         let agents = AgentManager::new(
             router.clone(),
             worktrees.clone(),
@@ -144,7 +170,16 @@ impl AppState {
             lessons.clone(),
             embed_cache.clone(),
             gate_cfg,
+            pricing,
+            models,
+            mcp.clone(),
+            runs_dir,
+            max_agents,
         );
+
+        // Spawn watchdog tasks (stale detection + worktree cleanup).
+        crate::watchdogs::spawn_all(agents.clone(), worktrees.clone());
+
         let plans = PlanManager::new(router.clone(), agents.clone(), db.clone());
 
         let pillar_tx = pillar::channel();
@@ -170,6 +205,7 @@ impl AppState {
             tokens,
             pillar_tx,
             sdd,
+            mcp,
         })
     }
 }
@@ -214,7 +250,9 @@ pub fn router(state: AppState) -> AxumRouter {
         .route("/v1/agents", get(agents_api::list))
         .route("/v1/agents/spawn", post(agents_api::spawn))
         .route("/v1/agents/:id", get(agents_api::get_one))
+        .route("/v1/agents/:id/history", get(agents_api::history))
         .route("/v1/agents/:id/cancel", post(agents_api::cancel))
+        .route("/v1/agents/:id/approval", post(agents_api::approve))
         // plans
         .route("/v1/plan", get(plans_api::list))
         .route("/v1/plan/draft", post(plans_api::draft))
@@ -231,6 +269,13 @@ pub fn router(state: AppState) -> AxumRouter {
             get(lessons_api::get_one).delete(lessons_api::delete),
         )
         .route("/v1/lessons/:id/promote", post(lessons_api::promote))
+        // MCP
+        .route("/v1/mcp/servers", get(mcp_api::servers))
+        // Text pipeline (C1 / M17-M20)
+        .route("/v1/text/tokenize", post(text_api::tokenize))
+        .route("/v1/text/chunk", post(text_api::chunk_endpoint))
+        .route("/v1/text/compress", post(text_api::compress_endpoint))
+        .route("/v1/text/rerank", post(text_api::rerank_endpoint))
         // stats
         .route("/v1/stats", get(stats_api::stats))
         .layer(TraceLayer::new_for_http())

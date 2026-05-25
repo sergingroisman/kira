@@ -15,7 +15,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration as TokioDuration};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -115,6 +115,8 @@ pub struct AgentManager {
     db: Option<crate::state::KiraDb>,
     /// Agent lifecycle event bus — subscribe to receive async agent state changes.
     pub events: EventBus<AgentEvent>,
+    /// Concurrency cap: at most `max_agents` agent loops run simultaneously.
+    concurrency: Arc<Semaphore>,
 }
 
 impl AgentManager {
@@ -132,6 +134,7 @@ impl AgentManager {
         models: Arc<ModelsConfig>,
         mcp_registry: McpRegistry,
         runs_dir: PathBuf,
+        max_agents: usize,
     ) -> Self {
         let store = match db.clone() {
             Some(d) => AgentStore::with_db(d),
@@ -155,6 +158,7 @@ impl AgentManager {
             approval_gate: ApprovalGate::new(),
             db,
             events: EventBus::new(),
+            concurrency: Arc::new(Semaphore::new(max_agents.max(1))),
         }
     }
 
@@ -282,6 +286,12 @@ impl AgentManager {
         let yolo = req.yolo_mode.unwrap_or(false);
         let background = req.background.unwrap_or(false);
 
+        // Acquire concurrency permit — blocks (async) until a slot is free.
+        let permit = Arc::clone(&self.concurrency)
+            .acquire_owned()
+            .await
+            .context("concurrency semaphore closed")?;
+
         let runs_dir = self.runs_dir.clone();
         let transcript = TranscriptWriter::new(&runs_dir, id);
         let injections = default_registry(kind);
@@ -320,6 +330,7 @@ impl AgentManager {
             approval_timeout_secs: 60,
             db: self.db.clone(),
             event_bus: self.events.clone(),
+            _concurrency_permit: permit,
         };
 
         self.events.publish(AgentEvent::Spawned {
@@ -399,6 +410,8 @@ struct AgentContext {
     db: Option<crate::state::KiraDb>,
     /// Agent lifecycle event bus — publish state changes for subscribers.
     event_bus: EventBus<AgentEvent>,
+    /// Held for the lifetime of agent_loop; dropped in finish() → releases concurrency slot.
+    _concurrency_permit: OwnedSemaphorePermit,
 }
 
 #[instrument(skip(ctx, cancel_rx), fields(agent_id = %ctx.id, kind = ?ctx.kind))]
