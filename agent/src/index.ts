@@ -47,5 +47,11 @@ export type {
   WriteDecision,
 } from './core-client/client.ts';
 
+/** Convenience factory that creates a CoreClient with default configuration. */
+export function createKiraClient(overrides?: Partial<CoreClientConfig>): CoreClient {
+  const config = { ...DEFAULT_CONFIG, ...overrides };
+  return new CoreClient(config);
+}
+
 // Also re-export as default for `import Kira from 'kira-agent'`.
 export { default } from './core-client/client.ts';
