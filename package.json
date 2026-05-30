@@ -1,3 +1,5 @@
-import { CoreClient, createKiraClient } from 'kira-agent';
-// or
-import Kira from 'kira-agent';
+{
+  "name": "kira",
+  "private": true,
+  "type": "module"
+}
