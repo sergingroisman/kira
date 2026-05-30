@@ -55,3 +55,7 @@ export function createKiraClient(overrides?: Partial<CoreClientConfig>): CoreCli
 
 // Also re-export as default for `import Kira from 'kira-agent'`.
 export { default } from './core-client/client.ts';
+
+// React integration
+export { KiraProvider, useKiraClient, useKira } from './react';
+export type { KiraProviderProps } from './react';
