@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "workspaces": ["agent", "shared"],
+  "workspaces": ["agent"],
   "scripts": {
     "test": "npm test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present"
@@ -11,7 +11,5 @@
   "engines": {
     "node": ">=20.0.0"
   },
-  "devDependencies": {
-    "react-devtools-core": "^7.0.1"
-  }
+  "devDependencies": {}
 }

@@ -24,9 +24,12 @@ import type {
 import type {
   Agent,
   AgentKind,
+  ApprovalRequest,
+  ApprovalResponse,
   CancelResponse,
+  PendingApproval,
   SpawnAgentRequest,
-} from "../generated/agent";
+} from "../generated/agent.js";
 import type {
   ApproveResponse,
   CancelPlanResponse,
@@ -42,9 +45,25 @@ import type {
 import type { RunGatesRequest, RunGatesResponse } from "../generated/gate";
 import type { RunEvalRequest, RunEvalResponse } from "../generated/eval";
 import type { RunReviewRequest, RunReviewResponse } from "../generated/review";
-import type { SddRun, StartSddRequest, SddListResponse } from "../generated/sdd";
+import type { AnswerQuestionsRequest, PlanOption, PlanQuestion, SddRun, StartSddRequest, SddListResponse } from "../generated/sdd.js";
 import type { PillarEvent } from "../generated/pillar";
 import type { StatsResponse, ModelUsage } from "../generated/stats";
+import type { Worktree } from "../generated/worktree";
+import type { Claim, WriteDecision } from "../generated/ownership";
+
+/** Subset of `GET /v1/mcp/servers` response. */
+export interface McpServersResponse {
+  servers: Array<{
+    name: string;
+    tools: Array<{
+      name: string;
+      namespaced_name: string;
+      description: string;
+      risk: string;
+    }>;
+  }>;
+  total_tools: number;
+}
 
 export interface CoreClientConfig {
   baseUrl: string; // default http://127.0.0.1:7777
@@ -213,8 +232,27 @@ export class CoreClient {
     return res.json() as Promise<Agent>;
   }
 
+  async getAgentDiff(id: string): Promise<string | null> {
+    const res = await fetch(`${this.config.baseUrl}/v1/agents/${id}/diff`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) return null;
+    return res.text();
+  }
+
   async cancelAgent(id: string): Promise<CancelResponse> {
     return this.postJson<CancelResponse>(`/v1/agents/${id}/cancel`, {});
+  }
+
+  async approveAgentTool(
+    id: string,
+    approved: boolean,
+    feedback?: string,
+  ): Promise<ApprovalResponse> {
+    return this.postJson<ApprovalResponse>(`/v1/agents/${id}/approval`, {
+      approved,
+      feedback: feedback ?? null,
+    });
   }
 
   // -----------------------------------------------------------------
@@ -372,6 +410,21 @@ export class CoreClient {
     return res.json() as Promise<SddRun>;
   }
 
+  async getSddQuestions(id: string): Promise<PlanQuestion[]> {
+    const res = await fetch(`${this.config.baseUrl}/v1/sdd/${id}/questions`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<PlanQuestion[]>;
+  }
+
+  async answerSddQuestions(
+    id: string,
+    answers: Record<string, string[]>,
+  ): Promise<void> {
+    await this.postJson(`/v1/sdd/${id}/questions`, { answers });
+  }
+
   // -----------------------------------------------------------------
   // Pillar transparency SSE — open EventSource-style consumer.
   // Returns an `AbortController`; call .abort() to close.
@@ -434,6 +487,43 @@ export class CoreClient {
     });
     if (!res.ok) throw await parseError(res);
     return res.json() as Promise<RunReviewResponse>;
+  }
+
+  // -----------------------------------------------------------------
+  // Observability (read-only)
+  // -----------------------------------------------------------------
+
+  async listWorktrees(): Promise<Worktree[]> {
+    const res = await fetch(`${this.config.baseUrl}/v1/worktree`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<Worktree[]>;
+  }
+
+  async listOwnership(): Promise<Claim[]> {
+    const res = await fetch(`${this.config.baseUrl}/v1/ownership`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<Claim[]>;
+  }
+
+  async checkOwnership(agentId: string, path: string): Promise<WriteDecision> {
+    const qs = `?agent_id=${encodeURIComponent(agentId)}&path=${encodeURIComponent(path)}`;
+    const res = await fetch(`${this.config.baseUrl}/v1/ownership/check${qs}`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<WriteDecision>;
+  }
+
+  async mcpServers(): Promise<McpServersResponse> {
+    const res = await fetch(`${this.config.baseUrl}/v1/mcp/servers`, {
+      signal: AbortSignal.timeout(this.config.timeoutMs),
+    });
+    if (!res.ok) throw await parseError(res);
+    return res.json() as Promise<McpServersResponse>;
   }
 
   // -----------------------------------------------------------------
@@ -522,5 +612,14 @@ export type {
   SddRun,
   StartSddRequest,
   SddListResponse,
+  PlanQuestion,
+  PlanOption,
+  AnswerQuestionsRequest,
   PillarEvent,
+  Worktree,
+  Claim,
+  WriteDecision,
+  ApprovalResponse,
+  ApprovalRequest,
+  PendingApproval,
 };
