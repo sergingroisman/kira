@@ -623,3 +623,5 @@ export type {
   ApprovalRequest,
   PendingApproval,
 };
+
+export default CoreClient;
