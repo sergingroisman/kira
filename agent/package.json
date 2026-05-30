@@ -3,7 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "./src/cli/kira.tsx",
+  "main": "./src/core-client/client.ts",
+  "types": "./src/core-client/client.ts",
+  "exports": {
+    ".": "./src/core-client/client.ts"
+  },
   "scripts": {
     "start": "bun run src/cli/kira.tsx",
     "dev": "bun run --watch src/cli/kira.tsx",
