@@ -762,7 +762,7 @@ impl Orchestrator {
         run: &mut WorkflowRun,
         started: Instant,
     ) -> Result<StepResult> {
-        let Some(tasks_path) = run.tasks_path().map(str::to_owned) else {
+        let Some(tasks_path) = run.tasks_json_path() else {
             return Ok(StepResult {
                 outcome: StepOutcome::Failed,
                 message: "EXECUTE without tasks.json artifact".into(),

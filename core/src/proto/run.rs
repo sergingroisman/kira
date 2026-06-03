@@ -91,6 +91,33 @@ impl WorkflowRun {
         self.artifacts.get("tasks.json").map(String::as_str)
     }
 
+    /// Resolve the tasks.json path defensively. The `artifacts` map can be lost
+    /// across a plan-approval gate pause/reload, and the worktree may be pruned
+    /// by the orphan watchdog while the run waits for approval. Fall back to the
+    /// deterministic run-dir location (worktree, then repo-promoted copy) so
+    /// EXECUTE and the plan matrix find tasks.json regardless.
+    pub fn tasks_json_path(&self) -> Option<String> {
+        use std::path::Path;
+        // 1. Registered artifact, if the file is still there.
+        if let Some(p) = self.artifacts.get("tasks.json")
+            && Path::new(p).exists()
+        {
+            return Some(p.clone());
+        }
+        // 2. Worktree run-dir (where the TASKS agent wrote it).
+        let wt = format!("{}/.kira/runs/{}/tasks.json", self.worktree_path, self.id);
+        if Path::new(&wt).exists() {
+            return Some(wt);
+        }
+        // 3. Repo-promoted copy (daemon CWD = repo root; survives worktree prune).
+        let repo = format!(".kira/runs/{}/tasks.json", self.id);
+        if Path::new(&repo).exists() {
+            return Some(repo);
+        }
+        // 4. Last resort: whatever was registered (for a meaningful error).
+        self.artifacts.get("tasks.json").cloned()
+    }
+
     /// Convenience: set an artifact by name.
     pub fn set_artifact(&mut self, name: impl Into<String>, path: impl Into<String>) {
         self.artifacts.insert(name.into(), path.into());

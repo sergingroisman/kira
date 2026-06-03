@@ -141,7 +141,7 @@ impl WorkflowManager {
     pub async fn get_plan(&self, id: &str) -> Option<crate::sdd::plan_view::PlanView> {
         let run = self.runs.lock().await.get(id).cloned()?;
         let parsed = run
-            .tasks_path()
+            .tasks_json_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .unwrap_or_else(|| serde_json::json!({ "tasks": [] }));
