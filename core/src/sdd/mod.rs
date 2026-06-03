@@ -21,14 +21,19 @@
 //! halts and persists artifacts for inspection.
 
 pub mod prompts;
+pub mod clarify;
+pub mod plan_view;
 pub mod store;
+pub mod wave_executor;
+pub mod wave_spawner;
+pub mod waves;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{instrument, warn};
 use uuid::Uuid;
 
@@ -36,7 +41,7 @@ use crate::agents::AgentManager;
 use crate::llm::embed_cache::EmbedCache;
 use crate::observability::pillar::{self, PillarTx};
 use crate::proto::pillar::Pillar;
-use crate::proto::sdd::{SddKind, SddPhase, SddRun, SizingVerdict, StartSddRequest};
+use crate::proto::sdd::{AnswerQuestionsRequest, SddKind, SddPhase, SddRun, SizingVerdict, StartSddRequest};
 use crate::proto::worktree::SpawnRequest as WorktreeSpawnRequest;
 use crate::router::Router;
 use crate::state::{KiraDb, TBL_SDD};
@@ -70,6 +75,9 @@ pub struct SddManager {
     pub db: Option<KiraDb>,
     /// In-memory snapshot for fast list/get; mirror of redb.
     runs: Arc<Mutex<std::collections::HashMap<String, SddRun>>>,
+    /// Per-run notifier — signalled when `question_answers` are submitted,
+    /// unblocking the drive loop from its `AwaitUserInput` wait.
+    notifiers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
 
 impl SddManager {
@@ -98,7 +106,60 @@ impl SddManager {
             pillar_tx,
             db,
             runs,
+            notifiers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Return pending questions for a run (empty vec if none or run not found).
+    pub async fn get_questions(&self, id: &str) -> Vec<crate::proto::sdd::PlanQuestion> {
+        let map = self.runs.lock().await;
+        map.get(id).map(|r| r.pending_questions.clone()).unwrap_or_default()
+    }
+
+    /// Submit answers for a run's pending questions.
+    /// Clears `pending_questions`, stores `question_answers`, notifies drive loop.
+    /// Returns `false` if run not found.
+    pub async fn answer_questions(&self, id: &str, req: AnswerQuestionsRequest) -> bool {
+        {
+            let mut map = self.runs.lock().await;
+            let Some(run) = map.get_mut(id) else { return false; };
+
+            // Resolve UUID → question text before we lose pending_questions.
+            // The orchestrator reads `clarifications` (human-readable Q+A
+            // pairs) when building the SPECIFY task; the UUID-keyed
+            // `question_answers` map alone is opaque to the LLM.
+            for q in &run.pending_questions {
+                if let Some(answers) = req.answers.get(&q.id) {
+                    run.clarifications.push(
+                        crate::proto::sdd::ClarificationEntry {
+                            question: q.question.clone(),
+                            answers: answers.clone(),
+                        },
+                    );
+                }
+            }
+            run.question_answers.extend(req.answers);
+            run.pending_questions.clear();
+            // Persist the updated run.
+            if let Some(db) = &self.db
+                && let Err(e) = db.put(TBL_SDD, &run.id, run) {
+                    warn!(error = ?e, "sdd answer_questions persist failed");
+                }
+        }
+        // Wake the drive loop.
+        let notify = {
+            let map = self.notifiers.lock().await;
+            map.get(id).cloned()
+        };
+        if let Some(n) = notify {
+            n.notify_one();
+        }
+        true
+    }
+
+    async fn notifier_for(&self, id: &str) -> Arc<Notify> {
+        let mut map = self.notifiers.lock().await;
+        map.entry(id.to_string()).or_insert_with(|| Arc::new(Notify::new())).clone()
     }
 
     pub async fn list(&self) -> Vec<SddRun> {
@@ -182,6 +243,9 @@ impl SddManager {
             finished_at: None,
             error: None,
             phase_retries: HashMap::default(),
+            pending_questions: Vec::new(),
+            clarifications: Vec::new(),
+            question_answers: HashMap::default(),
         };
         self.persist(&run).await;
 
@@ -220,10 +284,40 @@ impl SddManager {
         use crate::proto::intent::Intent;
 
         let pilot = SddPilot;
-        let orch = Orchestrator::new(self.agents.clone(), self.pillar_tx.clone());
+        let orch = Orchestrator::new(
+            self.agents.clone(),
+            self.pillar_tx.clone(),
+            self.router.clone(),
+        );
+        let notifier = self.notifier_for(&run.id).await;
 
         loop {
+            // If questions are pending, wait for user answers (up to 30 min timeout).
+            if !run.pending_questions.is_empty() {
+                use tokio::time::{timeout, Duration};
+                pillar::emit(
+                    &self.pillar_tx,
+                    Pillar::P1Sdd,
+                    "await_input",
+                    format!("SDD {} awaiting {} user questions", &run.id[..8.min(run.id.len())], run.pending_questions.len()),
+                );
+                let _ = timeout(Duration::from_mins(30), notifier.notified()).await;
+                // Reload run from in-memory store to pick up submitted answers.
+                if let Some(fresh) = self.get(&run.id).await {
+                    run = fresh;
+                }
+                continue;
+            }
+
             let intent = pilot.next_intent(&run).await;
+
+            // AwaitUserInput: store questions and re-enter wait at top of loop.
+            if let Intent::AwaitUserInput { questions } = intent {
+                run.pending_questions = questions;
+                self.persist(&run).await;
+                continue;
+            }
+
             // Terminal intents short-circuit (Orq just records).
             let terminal = matches!(intent, Intent::Done | Intent::Halt { .. });
             let result = match orch.execute(&mut run, intent).await {

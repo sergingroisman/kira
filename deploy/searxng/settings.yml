@@ -1,0 +1,22 @@
+# SearXNG settings for Kira (merges over the image defaults).
+# JSON format is REQUIRED — Kira's web_search parses `format=json`. The bot
+# limiter is disabled so the agent (non-browser client) isn't rate-blocked on
+# a local instance.
+use_default_settings: true
+
+server:
+  # Change this in any non-local deployment.
+  secret_key: "kira-searxng-local-dev-change-me"
+  limiter: false
+  image_proxy: false
+  bind_address: "0.0.0.0"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true

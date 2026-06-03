@@ -1,0 +1,27 @@
+# SearXNG — self-hosted, keyless search backend for Kira's `web_search` tool.
+#
+# Start:   cd deploy/searxng && docker compose up -d
+# Verify:  curl 'http://127.0.0.1:8888/search?q=rust&format=json' | head
+# Stop:    docker compose down
+#
+# Kira's chain hits http://127.0.0.1:8888/search?format=json (see
+# WebToolsConfig.searxng_base_url, default http://127.0.0.1:8888). JSON output
+# and the bot limiter are configured in ./settings.yml.
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: kira-searxng
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      - SEARXNG_PORT=8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

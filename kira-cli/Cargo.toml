@@ -1,0 +1,73 @@
+[package]
+name = "kira-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Kira harness — Rust TUI client (Ratatui)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "kira"
+path = "src/main.rs"
+
+[lib]
+name = "kira_cli"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = "0.7"
+
+# Markdown & syntax highlighting
+syntect = "5"
+pulldown-cmark = "0.12"
+
+# Fuzzy matching (command palette, file completion)
+nucleo = "0.5"
+
+# HTTP client (talks to kira-cored on 127.0.0.1:7777)
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# SSE client
+eventsource-stream = "0.2"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI args
+clap = { version = "4", features = ["derive", "env"] }
+
+# Config (tokens.toml)
+toml = "0.8"
+
+# Errors
+anyhow = "1"
+
+# IDs
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Platform dirs (~/.config, ~/.local/share)
+dirs-next = "2"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio-test = "0.4"
+proptest = "1"

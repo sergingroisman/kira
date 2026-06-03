@@ -80,6 +80,10 @@ pub struct RunGatesRequest {
     /// Skip the structural lint check (force heuristic-only L1).
     #[serde(default)]
     pub skip_structural_lint: bool,
+    /// B1 — Writer model (when known) for `judge_model ≠ writer_model` invariant
+    /// check at L5. Recorded in `TBL_EVAL` + judge audit JSONL.
+    #[serde(default)]
+    pub writer_model: Option<String>,
 }
 
 #[derive(Serialize, TS)]

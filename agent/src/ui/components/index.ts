@@ -20,6 +20,11 @@ export { AnimatedNumber } from './AnimatedNumber.js';
 export { TextReveal } from './TextReveal.js';
 export { ToastProvider, ToastContainer, useToast } from './Toast.js';
 export type { ToastType, ToastItem } from './Toast.js';
+export { PomodoroProvider, usePomodoro } from './PomodoroProvider.js';
+export { BuddyChat } from './BuddyChat.js';
+export { ApprovalPrompt, type ApprovalPromptProps } from './ApprovalPrompt.js';
+export { PlanQuestions, type PlanQuestionsProps } from './PlanQuestions.js';
+export { ThinkingDisplay, type SubAgentInfo, type ThinkingCategory } from './ThinkingDisplay.js';
 
 // Attachment parser exports
 export {
@@ -45,3 +50,41 @@ export {
   invalidateFileCache,
   type FileSuggestion,
 } from '../file-suggestions.js';
+
+// Suggestion engine exports
+export {
+  extractCompletionToken,
+  formatReplacementValue,
+  getPreservedSelection,
+  findLongestCommonPrefix,
+  debounce,
+  firstGrapheme,
+  type SuggestionItem,
+  type CompletionToken,
+  type Replacement,
+} from '../suggestion-engine.js';
+
+// REPL history exports
+export {
+  recordCommand,
+  searchHistory,
+  clearHistory,
+  type HistoryResult,
+} from '../repl-history.js';
+
+// File suggestions hook
+export {
+  useFileSuggestions,
+  type FileSuggestionsState,
+  type UseFileSuggestionsReturn,
+} from '../use-file-suggestions.js';
+
+// Word rank exports
+export {
+  tokenize,
+  recordWords,
+  getTopWords,
+  getWordBoost,
+  clearWords,
+  type WordRankResult,
+} from '../word-rank.js';

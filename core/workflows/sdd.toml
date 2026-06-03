@@ -1,0 +1,51 @@
+# SDD (Spec-Driven Development) — 4-phase workflow.
+#
+# The original Kira methodology, now expressed as data.
+# Narrow waist: tasks.json → Waves execution.
+#
+# Sizing: trivial bug fixes (≤5 LOC, ≤1 file) skip specify+design,
+# jumping directly to tasks. All other goals run the full pipeline.
+
+id          = "sdd"
+description = "Spec-Driven Development: specify → design → tasks → execute"
+sizing      = "loc_heuristic"
+
+# ── Phase: specify ────────────────────────────────────────────────────────
+[[phase]]
+id       = "specify"
+prompt   = "sdd/specify.md"
+gate     = "judge"
+clarify  = true
+produces = "spec.md"
+
+  [[phase.edges]]
+  to   = "design"
+  when = "always"
+
+# ── Phase: design ─────────────────────────────────────────────────────────
+[[phase]]
+id       = "design"
+prompt   = "sdd/design.md"
+gate     = "judge"
+produces = "design.md"
+
+  [[phase.edges]]
+  to   = "tasks"
+  when = "always"
+
+# ── Phase: tasks ──────────────────────────────────────────────────────────
+[[phase]]
+id       = "tasks"
+prompt   = "sdd/tasks.md"
+gate     = "judge"
+produces = "tasks.json"           # narrow waist → Waves
+
+  [[phase.edges]]
+  to   = "execute"
+  when = "always"
+
+# ── Phase: execute ────────────────────────────────────────────────────────
+[[phase]]
+id   = "execute"
+kind = "execute"                  # fan-out: tasks.json → Waves parallel exec
+prompt = "sdd/tasks.md"           # unused for execute kind, kept for schema completeness

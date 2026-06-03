@@ -1,0 +1,40 @@
+# GSD2 (Get Shit Done v2) — lean discuss→plan→execute→verify→ship.
+#
+# Inspired by the gsd-pi workflow: pragmatic, no heavy spec ceremony.
+# Skip discuss+plan for trivial bug fixes (same loc_heuristic as SDD).
+# Proof: zero Rust written — only this TOML. Everything → Waves.
+
+id          = "gsd2"
+description = "Get Shit Done v2: discuss → plan → execute → verify → ship"
+sizing      = "loc_heuristic"
+
+# ── Phase: discuss ────────────────────────────────────────────────────────
+[[phase]]
+id       = "discuss"
+prompt   = "sdd/specify.md"       # reuse specify prompt as discuss baseline
+clarify  = true
+produces = "discuss.md"
+
+  [[phase.edges]]
+  to   = "plan"
+  when = "always"
+
+# ── Phase: plan ───────────────────────────────────────────────────────────
+[[phase]]
+id       = "plan"
+prompt   = "sdd/tasks.md"         # reuse tasks prompt for planning
+gate     = "judge"
+produces = "tasks.json"           # narrow waist → Waves
+
+  [[phase.edges]]
+  to   = "execute"
+  when = "always"
+
+# ── Phase: execute ────────────────────────────────────────────────────────
+[[phase]]
+id   = "execute"
+kind = "execute"
+prompt = "sdd/tasks.md"
+
+# Note: verify + ship phases (CLI commands, human approval) come in v0.5
+# when the workflow engine supports `kind = "hitl"` phases.

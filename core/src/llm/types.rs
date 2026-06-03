@@ -1,12 +1,13 @@
 //! Unified, protocol-agnostic types for LLM interactions.
 //!
 //! These replace direct dependency on `async_openai` types in all external
-//! interfaces (Router, AgentManager, handlers). Each `LlmProvider` impl
+//! interfaces (Router, `AgentManager`, handlers). Each `LlmProvider` impl
 //! converts to/from its native format internally.
 
 use std::pin::Pin;
 
 use futures::Stream;
+use serde::{Deserialize, Serialize};
 
 /// Sampling/format overrides for a single chat call. Default = vendor defaults.
 ///
@@ -36,7 +37,7 @@ pub struct ChatOutput {
     pub tokens_out: u32,
     pub finish_reason: Option<String>,
     pub tool_calls: Vec<ToolCall>,
-    /// DeepSeek V4 "thinking mode" — must be echoed back verbatim on the
+    /// `DeepSeek` V4 "thinking mode" — must be echoed back verbatim on the
     /// next assistant message turn when tool‑calling. `None` for all
     /// other providers.
     pub reasoning_content: Option<String>,
@@ -44,7 +45,7 @@ pub struct ChatOutput {
 
 /// A tool-call request emitted by the model — the agent loop feeds these
 /// back via `ChatMessageUnified::Tool` after dispatching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -68,7 +69,7 @@ pub struct ToolDef {
 /// Unified message types for building chat history in the agent loop.
 ///
 /// Replaces `async_openai::types::ChatCompletionRequestMessage*`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatMessageUnified {
     System {
         content: String,
@@ -79,13 +80,42 @@ pub enum ChatMessageUnified {
     Assistant {
         content: Option<String>,
         tool_calls: Vec<ToolCall>,
-        /// DeepSeek reasoning_content — must be echoed back in follow‑up calls.
+        /// `DeepSeek` `reasoning_content` — must be echoed back in follow‑up calls.
         reasoning_content: Option<String>,
     },
     Tool {
         call_id: String,
         content: String,
     },
+}
+
+impl ChatMessageUnified {
+    /// Concatenate all textual content in this message for token counting.
+    pub fn content(&self) -> String {
+        match self {
+            Self::System { content } => content.clone(),
+            Self::User { content } => content.clone(),
+            Self::Assistant {
+                content,
+                tool_calls,
+                reasoning_content,
+            } => {
+                let mut out = String::new();
+                if let Some(rc) = reasoning_content {
+                    out.push_str(rc);
+                }
+                if let Some(c) = content {
+                    out.push_str(c);
+                }
+                for tc in tool_calls {
+                    out.push_str(&tc.name);
+                    out.push_str(&tc.arguments);
+                }
+                out
+            }
+            Self::Tool { content, .. } => content.clone(),
+        }
+    }
 }
 
 /// Streaming event from any protocol (OpenAI-compatible SSE, Anthropic SSE, …).

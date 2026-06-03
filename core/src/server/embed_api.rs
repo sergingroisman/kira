@@ -1,5 +1,5 @@
-//! `/v1/embed` handler — proxy to DashScope's text-embedding-v3 (default).
-//! Reads through EmbedCache to avoid re-paying for identical (model, text) pairs.
+//! `/v1/embed` handler — proxy to `DashScope`'s text-embedding-v3 (default).
+//! Reads through `EmbedCache` to avoid re-paying for identical (model, text) pairs.
 
 use anyhow::Context;
 use axum::{extract::State, Json};
@@ -21,7 +21,7 @@ pub async fn embed(
         .embed_cache
         .embed_or_compute(&provider, &req.model, req.input)
         .await?;
-    let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
+    let dim = vectors.first().map_or(0, std::vec::Vec::len);
     Ok(Json(EmbedResponse {
         model: req.model,
         vectors,

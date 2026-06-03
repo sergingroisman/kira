@@ -26,7 +26,7 @@ pub struct EmbedCache {
 }
 
 impl EmbedCache {
-    pub fn new(db: Option<KiraDb>) -> Self {
+    pub const fn new(db: Option<KiraDb>) -> Self {
         Self { db }
     }
 
@@ -50,20 +50,14 @@ impl EmbedCache {
         // Lookup phase.
         for (i, text) in inputs.iter().enumerate() {
             let key = cache_key(model, text);
-            match db.list_one(TBL_EMBED_CACHE, &key) {
-                Ok(Some(json)) => match serde_json::from_str::<Vec<f32>>(&json) {
-                    Ok(v) => {
-                        results[i] = Some(v);
-                    }
-                    Err(_) => {
-                        miss_indices.push(i);
-                        miss_inputs.push(text.clone());
-                    }
-                },
-                _ => {
-                    miss_indices.push(i);
-                    miss_inputs.push(text.clone());
-                }
+            if let Ok(Some(json)) = db.list_one(TBL_EMBED_CACHE, &key) { if let Ok(v) = serde_json::from_str::<Vec<f32>>(&json) {
+                results[i] = Some(v);
+            } else {
+                miss_indices.push(i);
+                miss_inputs.push(text.clone());
+            } } else {
+                miss_indices.push(i);
+                miss_inputs.push(text.clone());
             }
         }
 

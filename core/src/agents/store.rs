@@ -37,11 +37,10 @@ impl Store {
     }
 
     fn db_save(&self, a: &Agent) {
-        if let Some(db) = &self.db {
-            if let Err(e) = db.put(TBL_AGENTS, &a.id, a) {
+        if let Some(db) = &self.db
+            && let Err(e) = db.put(TBL_AGENTS, &a.id, a) {
                 warn!(error = ?e, id = %a.id, "persist agent failed");
             }
-        }
     }
 
     pub fn insert(&self, id: Uuid, a: Agent) {

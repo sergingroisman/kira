@@ -1,0 +1,30 @@
+# SearXNG settings — dev local. Tighten for VPS (limiter: true, secret_key rotation).
+use_default_settings: true
+
+server:
+  secret_key: "kira-dev-secret-change-me-on-vps"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false # dev only; set true on shared VPS
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "pt-BR"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: github
+    disabled: false
+  - name: stackoverflow
+    disabled: false

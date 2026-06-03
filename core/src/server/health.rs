@@ -15,7 +15,7 @@ pub struct HealthResponse {
 }
 
 pub async fn health() -> Json<HealthResponse> {
-    let uptime = START_TIME.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    let uptime = START_TIME.get().map_or(0, |t| t.elapsed().as_secs());
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),

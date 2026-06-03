@@ -8,12 +8,14 @@ use crate::proto::agent::AgentKind;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, TS)]
 #[ts(export, export_to = "../../agent/src/generated/plan.ts")]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PlanScope {
     /// ≤3 files, ≤1 sentence change. Skip design/tasks formally.
     Quick,
     /// ≤3 files, clear feature, no new patterns. 1-3 steps.
     Small,
     /// Multi-file feature, recognizable pattern. 3-7 steps.
+    #[default]
     Medium,
     /// Multi-component or new domain. 7-10 steps.
     Large,
@@ -21,11 +23,6 @@ pub enum PlanScope {
     Complex,
 }
 
-impl Default for PlanScope {
-    fn default() -> Self {
-        Self::Medium
-    }
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, TS)]
 #[ts(export, export_to = "../../agent/src/generated/plan.ts")]
@@ -64,6 +61,10 @@ pub struct PlanStep {
     /// Rough LOC estimate (used by change sufficiency check in v0.5).
     #[serde(default)]
     pub estimated_loc: Option<u32>,
+    /// `idx` of steps that must finish before this one. Steps that don't
+    /// depend on each other run in the same wave (parallel).
+    #[serde(default)]
+    pub dependencies: Vec<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, TS)]
@@ -72,7 +73,7 @@ pub struct Plan {
     pub id: String,
     pub goal: String,
     pub agent_kind: AgentKind,
-    /// Planner-detected scope. Drives executor budget + max_iters defaults.
+    /// Planner-detected scope. Drives executor budget + `max_iters` defaults.
     #[serde(default)]
     pub scope: PlanScope,
     pub steps: Vec<PlanStep>,
@@ -89,6 +90,21 @@ pub struct Plan {
     pub executor_agent_id: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Steps grouped into parallel waves by their `dependencies` (computed at
+    /// draft). Empty until decomposed.
+    #[serde(default)]
+    pub waves: Vec<Wave>,
+}
+
+/// One parallel wave: a set of step indices with no dependency on each other,
+/// runnable concurrently once all earlier waves finish.
+#[derive(Serialize, Deserialize, Debug, Clone, TS)]
+#[ts(export, export_to = "../../agent/src/generated/plan.ts")]
+pub struct Wave {
+    /// 0-based wave index (execution order).
+    pub index: u32,
+    /// `idx` values of the steps in this wave.
+    pub step_idxs: Vec<u32>,
 }
 
 #[derive(Deserialize, Debug, TS)]

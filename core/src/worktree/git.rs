@@ -1,6 +1,6 @@
 //! `git worktree` shell-out wrappers.
 //!
-//! Per plan T5: tokio::process, parse `--porcelain` output for determinism,
+//! Per plan T5: `tokio::process`, parse `--porcelain` output for determinism,
 //! no `git2` dependency.
 
 use anyhow::{Context, Result};
@@ -39,6 +39,12 @@ pub async fn toplevel(start: &Path) -> Result<std::path::PathBuf> {
 pub async fn diff_three_dot(repo_root: &Path, base: &str, head: &str) -> Result<String> {
     let range = format!("{base}...{head}");
     run_git(repo_root, &["diff", &range]).await
+}
+
+/// `git diff --no-color HEAD` — unstaged changes in a worktree or repo.
+/// Runs from the given `repo_path` (the worktree or repo root).
+pub async fn diff_head(repo_path: &Path) -> Result<String> {
+    run_git(repo_path, &["diff", "--no-color", "HEAD"]).await
 }
 
 /// `git worktree add -b <branch> <path> <base>`

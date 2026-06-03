@@ -38,19 +38,17 @@ impl Store {
     }
 
     fn db_save(&self, w: &Worktree) {
-        if let Some(db) = &self.db {
-            if let Err(e) = db.put(TBL_WORKTREES, &w.id, w) {
+        if let Some(db) = &self.db
+            && let Err(e) = db.put(TBL_WORKTREES, &w.id, w) {
                 warn!(error = ?e, id = %w.id, "persist worktree failed");
             }
-        }
     }
 
     fn db_delete(&self, id: &str) {
-        if let Some(db) = &self.db {
-            if let Err(e) = db.delete(TBL_WORKTREES, id) {
+        if let Some(db) = &self.db
+            && let Err(e) = db.delete(TBL_WORKTREES, id) {
                 warn!(error = ?e, id, "delete worktree failed");
             }
-        }
     }
 
     pub fn insert(&self, id: Uuid, wt: Worktree) {

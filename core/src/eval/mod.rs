@@ -95,8 +95,7 @@ async fn run_one_sample(
 
     let (tokens_in, tokens_out) = (output.tokens_in, output.tokens_out);
     let cost_usd = price_per_million(&model_used)
-        .map(|(i, o)| (f64::from(tokens_in) * i + f64::from(tokens_out) * o) / 1_000_000.0)
-        .unwrap_or(0.0);
+        .map_or(0.0, |(i, o)| f64::from(tokens_in).mul_add(i, f64::from(tokens_out) * o) / 1_000_000.0);
 
     // Faithfulness via embedding (free with cache hit).
     let faithfulness = if skip_embedding || output.content.is_empty() {
@@ -169,7 +168,7 @@ async fn judge_sample(
     });
     match parsed {
         Some(v) => (
-            v.get("score").and_then(|s| s.as_f64()),
+            v.get("score").and_then(serde_json::Value::as_f64),
             v.get("rationale")
                 .and_then(|r| r.as_str())
                 .map(str::to_string),
@@ -197,16 +196,15 @@ fn error_sample(task_id: &str, model: &str, err: String) -> EvalSample {
 
 fn price_per_million(model: &str) -> Option<(f64, f64)> {
     match model {
-        "qwen-max" => Some((1.60, 6.40)),
-        "qwen-plus" => Some((0.40, 1.20)),
-        "qwen-flash" => Some((0.15, 0.60)),
         "deepseek-v4-pro" => Some((0.43, 0.87)),
         "deepseek-v4-flash" => Some((0.14, 0.28)),
+        "gpt-4o" => Some((2.50, 10.00)),
+        "gpt-4o-mini" => Some((0.15, 0.60)),
         _ => None,
     }
 }
 
-fn summarize(samples: &[EvalSample]) -> Vec<ModelSummary> {
+pub(crate) fn summarize(samples: &[EvalSample]) -> Vec<ModelSummary> {
     let mut by_model: HashMap<String, Vec<&EvalSample>> = HashMap::new();
     for s in samples {
         by_model.entry(s.model.clone()).or_default().push(s);
@@ -247,4 +245,101 @@ fn summarize(samples: &[EvalSample]) -> Vec<ModelSummary> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(model: &str, judge: Option<f64>, faith: Option<f64>, cost: f64, ms: u64, gates_pass: bool) -> EvalSample {
+        EvalSample {
+            task_id: "t1".into(),
+            model: model.into(),
+            output: "out".into(),
+            tokens_in: 100,
+            tokens_out: 50,
+            cost_usd: cost,
+            duration_ms: ms,
+            judge_score: judge,
+            judge_rationale: None,
+            faithfulness: faith,
+            gates_pass,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn summarize_empty_returns_empty() {
+        assert!(summarize(&[]).is_empty());
+    }
+
+    #[test]
+    fn summarize_groups_by_model() {
+        let samples = vec![
+            sample("m1", Some(8.0), Some(0.9), 0.01, 100, true),
+            sample("m1", Some(6.0), Some(0.7), 0.02, 200, false),
+            sample("m2", Some(9.0), Some(0.95), 0.05, 300, true),
+        ];
+        let out = summarize(&samples);
+        assert_eq!(out.len(), 2);
+        // Sorted by avg_judge_score desc: m2 (9.0) before m1 (7.0)
+        assert_eq!(out[0].model, "m2");
+        assert_eq!(out[1].model, "m1");
+    }
+
+    #[test]
+    fn summarize_averages_judge_and_faithfulness() {
+        let samples = vec![
+            sample("m1", Some(8.0), Some(0.8), 0.0, 0, true),
+            sample("m1", Some(6.0), Some(0.6), 0.0, 0, true),
+        ];
+        let out = summarize(&samples);
+        let m1 = out.iter().find(|s| s.model == "m1").unwrap();
+        assert!((m1.avg_judge_score.unwrap() - 7.0).abs() < 1e-9);
+        assert!((m1.avg_faithfulness.unwrap() - 0.7).abs() < 1e-9);
+        assert_eq!(m1.n_samples, 2);
+    }
+
+    #[test]
+    fn summarize_pass_rate_handles_partial() {
+        let samples = vec![
+            sample("m1", Some(8.0), None, 0.0, 0, true),
+            sample("m1", Some(7.0), None, 0.0, 0, false),
+            sample("m1", Some(6.0), None, 0.0, 0, true),
+            sample("m1", Some(5.0), None, 0.0, 0, false),
+        ];
+        let out = summarize(&samples);
+        let m1 = &out[0];
+        assert!((m1.pass_rate - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summarize_treats_none_judge_as_skipped_not_zero() {
+        // Per workshop "barato primeiro": a None score (skipped) MUST NOT
+        // poison the average — only present scores count. Else cheap-judge
+        // skip would tank a model's apparent quality.
+        let samples = vec![
+            sample("m1", Some(9.0), None, 0.0, 0, true),
+            sample("m1", None, None, 0.0, 0, true),
+            sample("m1", None, None, 0.0, 0, true),
+        ];
+        let out = summarize(&samples);
+        let m1 = &out[0];
+        assert!((m1.avg_judge_score.unwrap() - 9.0).abs() < 1e-9);
+        assert_eq!(m1.avg_faithfulness, None);
+    }
+
+    #[test]
+    fn summarize_total_cost_sums_per_model() {
+        let samples = vec![
+            sample("m1", None, None, 0.01, 0, true),
+            sample("m1", None, None, 0.02, 0, true),
+            sample("m2", None, None, 0.10, 0, true),
+        ];
+        let out = summarize(&samples);
+        let m1 = out.iter().find(|s| s.model == "m1").unwrap();
+        let m2 = out.iter().find(|s| s.model == "m2").unwrap();
+        assert!((m1.total_cost_usd - 0.03).abs() < 1e-9);
+        assert!((m2.total_cost_usd - 0.10).abs() < 1e-9);
+    }
 }

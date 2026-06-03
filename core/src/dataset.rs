@@ -94,12 +94,9 @@ fn export_judge(
         if line.trim().is_empty() {
             continue;
         }
-        let record: JudgeRecord = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
+        let record: JudgeRecord = if let Ok(r) = serde_json::from_str(&line) { r } else {
+            skipped += 1;
+            continue;
         };
 
         if labeled_only && record.human_label.is_none() {
@@ -107,20 +104,17 @@ fn export_judge(
             continue;
         }
 
-        if let Some(ref dt) = since_dt {
-            if let Ok(ts) = DateTime::parse_from_rfc3339(&record.ts) {
-                if ts < *dt {
+        if let Some(ref dt) = since_dt
+            && let Ok(ts) = DateTime::parse_from_rfc3339(&record.ts)
+                && ts < *dt {
                     skipped += 1;
                     continue;
                 }
-            }
-        }
 
-        if let Some(max) = count {
-            if exported >= max {
+        if let Some(max) = count
+            && exported >= max {
                 break;
             }
-        }
 
         let expected_output = serde_json::json!({
             "score": record.judgment.score as u32,

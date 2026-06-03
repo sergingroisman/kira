@@ -31,8 +31,8 @@ pub async fn run(
     let resp = run_cascade(&state.router, Some(&state.embed_cache), &req, cfg).await;
 
     // Flywheel: any failure produces a lesson, fire-and-forget.
-    if resp.overall == GateOutcome::Fail {
-        if let Some(failed) = resp.results.iter().find(|r| r.outcome == GateOutcome::Fail) {
+    if resp.overall == GateOutcome::Fail
+        && let Some(failed) = resp.results.iter().find(|r| r.outcome == GateOutcome::Fail) {
             let reason = failed.reason.clone().unwrap_or_default();
             let context = format!(
                 "Gate {:?} failed.\nReason: {}\nSpec: {}\nOutput (first 400 chars): {}",
@@ -43,7 +43,6 @@ pub async fn run(
             );
             generator::fire_and_forget(state.router.clone(), state.lessons.clone(), context, None);
         }
-    }
 
     Json(resp)
 }

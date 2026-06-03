@@ -133,7 +133,10 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
             finished_at: None,
             error: None,
-            phase_retries: Default::default(),
+            phase_retries: std::collections::HashMap::default(),
+            pending_questions: vec![],
+            question_answers: std::collections::HashMap::default(),
+            clarifications: vec![],
         }
     }
 

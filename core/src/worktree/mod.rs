@@ -144,7 +144,7 @@ impl WorktreeManager {
     }
 
     /// Spawn a fresh worktree forked from `req.base`.
-    /// Acquires a permit from the semaphore — caller is blocked while max_parallel is reached.
+    /// Acquires a permit from the semaphore — caller is blocked while `max_parallel` is reached.
     #[instrument(skip(self, req), fields(base = %req.base))]
     pub async fn spawn(&self, req: SpawnRequest) -> Result<Worktree> {
         // 1. Concurrency permit.

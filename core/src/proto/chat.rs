@@ -8,7 +8,7 @@ use ts_rs::TS;
 #[derive(Deserialize, Debug, TS)]
 #[ts(export, export_to = "../../agent/src/generated/chat.ts")]
 pub struct ChatRequest {
-    /// Tier hint — "heavy" | "standard" (default) | "light" | "long_context".
+    /// Tier hint — "heavy" | "standard" (default) | "light" | "`long_context`".
     #[serde(default = "default_tier")]
     pub tier: String,
 
@@ -61,5 +61,11 @@ pub struct YoloResponse {
     pub agent_id: String,
     pub kind: String,
     pub status: String,
-    pub message: String,
+    /// Direct inline answer (only on degraded fallback). When an agent is
+    /// spawned the answer streams via the agent poller, so this is `None` and
+    /// the client polls `agent_id`.
+    pub message: Option<String>,
+    /// Routing taken: "lite" (read-only Explorer for a conceptual question),
+    /// "full" (Writer agent with all tools), or "fallback" (inline single-shot).
+    pub route: String,
 }

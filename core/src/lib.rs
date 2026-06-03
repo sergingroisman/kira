@@ -3,7 +3,8 @@
 //! `main.rs` does CLI parsing + tracing init and delegates to [`run`].
 //! Everything else lives in submodules.
 
-#![forbid(unsafe_code)]
+// unsafe_code = "deny" is set in Cargo.toml [lints.rust]
+// sqlite_backend.rs has a scoped #![allow(unsafe_code)] for FFI extension loading.
 
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
@@ -18,11 +19,12 @@ pub mod hooks;
 pub mod lessons;
 pub mod llm;
 pub mod mcp;
+pub mod memory;
 pub mod observability;
 pub mod orchestrator;
 pub mod pilot;
-pub mod plans;
 pub mod proto;
+pub mod queue;
 pub mod router;
 pub mod safety;
 pub mod sandbox;
@@ -32,6 +34,7 @@ pub mod state;
 pub mod text;
 pub mod watchdogs;
 pub mod web;
+pub mod workflow;
 pub mod workflows;
 pub mod worktree;
 
@@ -72,7 +75,15 @@ fn load_tokens_config() -> Option<Tokens> {
 /// Boot and serve the HTTP+SSE daemon. Returns when the listener exits.
 pub async fn run(bind: SocketAddr) -> Result<()> {
     let tokens = load_tokens_config();
-    let state = AppState::new(tokens).await?;
+    let state = AppState::new(tokens.clone()).await?;
+
+    // Spawn SIGHUP handler for maturation config hot-reload (Unix only).
+    let maturation_cfg = tokens
+        .as_ref()
+        .map(|t| t.memory.maturation.clone())
+        .unwrap_or_default();
+    let shared_maturation = config::reload::shared_config(maturation_cfg);
+    config::reload::spawn_sighup_handler(shared_maturation);
 
     // Background watchdogs.
     watchdogs::spawn_all(state.agents.clone(), state.worktrees.clone());

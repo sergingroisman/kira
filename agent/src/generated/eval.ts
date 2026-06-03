@@ -2,11 +2,11 @@
 
 export type EvalSample = { task_id: string, model: string, output: string, tokens_in: number, tokens_out: number, cost_usd: number, duration_ms: bigint, 
 /**
- * 0-10 from judge (None when skip_judge or call failed).
+ * 0-10 from judge (None when `skip_judge` or call failed).
  */
 judge_score: number | null, judge_rationale: string | null, 
 /**
- * Cosine similarity spec↔output (None when skip_embedding).
+ * Cosine similarity spec↔output (None when `skip_embedding`).
  */
 faithfulness: number | null, 
 /**

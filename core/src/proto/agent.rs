@@ -12,6 +12,9 @@ pub enum AgentKind {
     Judge,
     Reviewer,
     Explorer,
+    /// Universal multi-dimension code reviewer (6 lenses + consolidator).
+    /// Read-only, judge-tier. `model ≠ writer_model` enforced.
+    Detective,
 }
 
 impl AgentKind {
@@ -20,9 +23,11 @@ impl AgentKind {
     pub const fn allowed_tools(self) -> Option<&'static [&'static str]> {
         match self {
             Self::Writer | Self::Deployer => None,
-            Self::Judge | Self::Reviewer | Self::Explorer => Some(&[
+            Self::Judge | Self::Reviewer | Self::Explorer | Self::Detective => Some(&[
                 "done",
                 "file_read",
+                "code_search",
+                "read_symbol",
                 "web_search",
                 "web_fetch",
             ]),
@@ -37,6 +42,7 @@ impl AgentKind {
             Self::Judge => "heavy",
             Self::Reviewer => "heavy",
             Self::Explorer => "standard",
+            Self::Detective => "judge", // enforces model ≠ writer_model
         }
     }
 
@@ -68,6 +74,13 @@ impl AgentKind {
             "\n\n---\n\n",
             include_str!("../agents/prompts/explorer.md"),
         );
+        // Detective consolidator uses the consolidate lens as its base prompt.
+        // Individual lens agents are spawned separately by the DetectiveRunner.
+        const DETECTIVE: &str = concat!(
+            include_str!("../agents/prompts/_principles.md"),
+            "\n\n---\n\n",
+            include_str!("../agents/prompts/detective/consolidate.md"),
+        );
         let _ = SEPARATOR; // documentation marker
         match self {
             Self::Writer => WRITER,
@@ -75,6 +88,7 @@ impl AgentKind {
             Self::Judge => JUDGE,
             Self::Reviewer => REVIEWER,
             Self::Explorer => EXPLORER,
+            Self::Detective => DETECTIVE,
         }
     }
 }
@@ -110,6 +124,10 @@ pub enum AgentStatus {
 pub struct SpawnAgentRequest {
     pub kind: AgentKind,
     pub task: String,
+    /// Override the tier. If absent, uses `kind.default_tier()`. Lets the YOLO
+    /// conceptual route spawn a read-only Explorer on a cheap/user-chosen tier.
+    #[serde(default)]
+    pub tier: Option<String>,
     /// Existing worktree to attach. If absent, daemon spawns a new one from `base` (default "main").
     #[serde(default)]
     pub worktree_id: Option<String>,
@@ -133,6 +151,16 @@ pub struct SpawnAgentRequest {
     pub timeout_secs: Option<u64>,
 }
 
+/// Set on an `Agent` when a HIGH-risk tool call is awaiting user approval.
+/// Cleared once the verdict arrives (approve or reject).
+#[derive(Serialize, Deserialize, Debug, Clone, TS)]
+#[ts(export, export_to = "../../agent/src/generated/agent.ts")]
+pub struct PendingApproval {
+    pub tool_name: String,
+    /// JSON-serialized tool arguments (truncated to 2 KB for display).
+    pub arguments: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, TS)]
 #[ts(export, export_to = "../../agent/src/generated/agent.ts")]
 pub struct Agent {
@@ -154,6 +182,10 @@ pub struct Agent {
     /// ISO 8601 of the most recent iters increment. Used by the
     /// heartbeat watchdog to detect stalled agents.
     pub last_progress_at: Option<String>,
+    /// Set while the agent loop is paused waiting for the user to approve a
+    /// HIGH-risk tool call. REPL polls this field and shows ApprovalPrompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_approval: Option<PendingApproval>,
 }
 
 #[derive(Serialize, TS)]
@@ -185,6 +217,37 @@ pub struct ApprovalResponse {
     pub approved: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default, TS)]
+#[ts(export, export_to = "../../agent/src/generated/agent.ts")]
+pub struct AgentCostSnapshot {
+    pub agent_id: String,
+    pub yolo_mode: bool,
+    pub max_iters: u32,
+    pub budget_usd_cap: f64,
+    pub lesson_chars: usize,
+    pub system_prompt_chars: usize,
+    pub total_tokens_in: u64,
+    pub total_tokens_out: u64,
+    pub total_tool_calls: u64,
+    pub total_usd: f64,
+    pub iterations: Vec<AgentCostIteration>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, TS)]
+#[ts(export, export_to = "../../agent/src/generated/agent.ts")]
+pub struct AgentCostIteration {
+    pub iter: u32,
+    pub model: String,
+    pub prompt_tokens_estimate: usize,
+    pub messages_count: usize,
+    pub tokens_in: u32,
+    pub tokens_out: u32,
+    pub tool_calls: usize,
+    pub usd: f64,
+    pub cumulative_usd: f64,
+    pub assistant_chars: usize,
+}
+
 /// Agent lifecycle event — published on `EventBus<AgentEvent>`.
 ///
 /// Consumers (watchdogs, orchestrator, REPL) subscribe to these
@@ -202,6 +265,22 @@ pub enum AgentEvent {
         agent_id: String,
         iters: u32,
         usd_spent: f64,
+        /// Cumulative input tokens across all iterations so far. Added 2026-05-26
+        /// for Sprint 2.1 (P7 cost transparency) so the REPL StatusBar and any
+        /// SSE consumer can show live token burn without polling
+        /// `/v1/agents/{id}/cost`. Pre-existing consumers can ignore the field.
+        #[serde(default)]
+        tokens_in: u64,
+        #[serde(default)]
+        tokens_out: u64,
+        /// Cumulative tool calls dispatched across all iterations.
+        #[serde(default)]
+        tool_calls: u64,
+        /// Model used on the iteration that just completed. Lets the REPL
+        /// render `via=qwen2.5:3b` vs `via=deepseek-v4-flash` (workshop
+        /// SPEKTOR P7: bundle/route transparency).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Completed {
         agent_id: String,
@@ -221,5 +300,16 @@ pub enum AgentEvent {
     },
     Cancelled {
         agent_id: String,
+    },
+    /// Agent loop is paused waiting for the user to approve a HIGH-risk tool call.
+    AwaitingApproval {
+        agent_id: String,
+        tool_name: String,
+        arguments: String,
+    },
+    /// Approval verdict received (cleared from `Agent.awaiting_approval`).
+    ApprovalResolved {
+        agent_id: String,
+        approved: bool,
     },
 }

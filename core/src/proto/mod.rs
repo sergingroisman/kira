@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod bash;
 pub mod chat;
+pub mod context_window;
 pub mod embed;
 pub mod eval;
 pub mod file;
@@ -15,6 +16,8 @@ pub mod ownership;
 pub mod intent;
 pub mod pillar;
 pub mod plan;
+pub mod detective;
 pub mod review;
+pub mod run;
 pub mod sdd;
 pub mod worktree;

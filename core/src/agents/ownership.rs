@@ -1,4 +1,4 @@
-//! OwnershipRegistry — claim/check/release of FS path patterns per agent.
+//! `OwnershipRegistry` — claim/check/release of FS path patterns per agent.
 //!
 //! v0 is in-memory only (`Arc<Mutex<HashMap>>`). Plan T7/T8 moves this into a
 //! `redb::Tree::transaction` to defeat claim races. For Mac-local solo v0 the
@@ -134,12 +134,11 @@ mod tests {
             OwnershipMode::Exclusive,
         ))
         .unwrap();
-        match r.check_write("deployer", "src/content/index.md") {
-            WriteDecision::Denied { conflicting_agent, .. } => {
-                assert_eq!(conflicting_agent.as_deref(), Some("writer"));
-            }
-            _ => panic!("expected Denied"),
-        }
+        let decision = r.check_write("deployer", "src/content/index.md");
+        assert!(
+            matches!(&decision, WriteDecision::Denied { conflicting_agent: Some(id), .. } if id == "writer"),
+            "expected Denied by 'writer', got {decision:?}"
+        );
     }
 
     #[test]

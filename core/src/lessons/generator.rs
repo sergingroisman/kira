@@ -85,7 +85,7 @@ pub async fn generate_from_failure(
 
 fn extract_json(s: &str) -> Option<String> {
     let trimmed = s.trim();
-    if let Ok(_) = serde_json::from_str::<serde_json::Value>(trimmed) {
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
         return Some(trimmed.to_string());
     }
     let start = trimmed.find('{')?;

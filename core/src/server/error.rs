@@ -11,7 +11,7 @@ use tracing::error;
 pub struct AppError(pub anyhow::Error);
 
 impl AppError {
-    /// Create an AppError with a 400 Bad Request status.
+    /// Create an `AppError` with a 400 Bad Request status.
     pub fn bad_request(msg: &str) -> Self {
         Self(anyhow::anyhow!("{msg}"))
     }

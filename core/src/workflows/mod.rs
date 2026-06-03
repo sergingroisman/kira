@@ -85,7 +85,7 @@ impl Default for CascadeSpec {
     }
 }
 
-fn default_true() -> bool { true }
+const fn default_true() -> bool { true }
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct ConsolidatorSpec {
@@ -157,6 +157,7 @@ pub async fn execute_pr_review(
                 .spawn(SpawnAgentRequest {
                     kind: AgentKind::Reviewer,
                     task,
+                    tier: None,
                     worktree_id: None,
                     base: None,
                     budget_usd: None,
@@ -164,6 +165,8 @@ pub async fn execute_pr_review(
                     // give headroom for retries on tool errors.
                     max_iters: Some(15),
                     yolo_mode: None,
+                    background: None,
+                    timeout_secs: None,
                 })
                 .await
                 .map(|a| a.id);
@@ -244,6 +247,7 @@ pub async fn execute_pr_review(
             skip_meta_review: cascade_cfg.skip_meta_review,
             worktree_path: String::new(),
             skip_structural_lint: true,
+            writer_model: None,
         };
         let gate_resp = run_cascade(
             &executor.router,
@@ -336,19 +340,17 @@ fn changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut set = std::collections::BTreeSet::new();
     for line in diff.lines() {
         // `diff --git a/path b/path`
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            if let Some(b_idx) = rest.find(" b/") {
+        if let Some(rest) = line.strip_prefix("diff --git ")
+            && let Some(b_idx) = rest.find(" b/") {
                 let b = &rest[b_idx + 3..];
                 set.insert(b.to_string());
                 continue;
             }
-        }
         // Fallback: `+++ b/path` (handles renames).
-        if let Some(p) = line.strip_prefix("+++ b/") {
-            if p != "/dev/null" {
+        if let Some(p) = line.strip_prefix("+++ b/")
+            && p != "/dev/null" {
                 set.insert(p.to_string());
             }
-        }
     }
     set.into_iter().collect()
 }
@@ -367,7 +369,7 @@ fn spawn_failed(wa: &WorkflowAgent, err: &str) -> AgentReviewOutcome {
     }
 }
 
-fn is_terminal(s: AgentStatus) -> bool {
+const fn is_terminal(s: AgentStatus) -> bool {
     matches!(
         s,
         AgentStatus::Completed
@@ -397,7 +399,7 @@ mod tests {
 
     #[test]
     fn parse_minimal_workflow() {
-        let yaml = r#"
+        let yaml = "
 version: 1
 id: pr-review
 description: test
@@ -414,7 +416,7 @@ gates:
     skip_embedding: true
     skip_judge: true
     skip_meta_review: false
-"#;
+";
         let wf: Workflow = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(wf.version, 1);
         assert_eq!(wf.agents.len(), 2);

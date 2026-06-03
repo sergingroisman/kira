@@ -4,7 +4,7 @@ export type ChatMessage = { role: string, content: string, };
 
 export type ChatRequest = { 
 /**
- * Tier hint — "heavy" | "standard" (default) | "light" | "long_context".
+ * Tier hint — "heavy" | "standard" (default) | "light" | "`long_context`".
  */
 tier: string, 
 /**
@@ -27,4 +27,15 @@ export type StreamEvent = { "type": "token", delta: string, } | { "type": "done"
 /**
  * Response for YOLO mode chat — direct agent spawn.
  */
-export type YoloResponse = { agent_id: string, kind: string, status: string, message: string, };
+export type YoloResponse = { agent_id: string, kind: string, status: string, 
+/**
+ * Direct inline answer (only on degraded fallback). When an agent is
+ * spawned the answer streams via the agent poller, so this is `None` and
+ * the client polls `agent_id`.
+ */
+message: string | null, 
+/**
+ * Routing taken: "lite" (read-only Explorer for a conceptual question),
+ * "full" (Writer agent with all tools), or "fallback" (inline single-shot).
+ */
+route: string, };

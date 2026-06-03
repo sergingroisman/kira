@@ -10,12 +10,16 @@ pub mod gates_api;
 pub mod health;
 pub mod lessons_api;
 pub mod mailbox_api;
+pub mod maturation_api;
 pub mod mcp_api;
+pub mod memory_api;
 pub mod ownership_api;
-pub mod plans_api;
+pub mod queue_api;
+pub mod detective_api;
 pub mod review_api;
 pub mod sdd_api;
 pub mod stats_api;
+pub mod workflow_api;
 pub mod text_api;
 pub mod web_api;
 pub mod tool;
@@ -38,13 +42,15 @@ use crate::hooks::HookRunner;
 use crate::lessons::LessonRegistry;
 use crate::llm::embed_cache::EmbedCache;
 use crate::llm::LlmProvider;
+use crate::memory::consolidator::{self, ConsolidatorState};
 use crate::observability::pillar::{self, PillarTx};
-use crate::plans::PlanManager;
 use crate::router::Router;
 use crate::router::budget::{BudgetConfig, BudgetGuard};
 use crate::router::tier::TierMap;
 use crate::sdd::SddManager;
 use crate::state::{KiraDb, resolve_state_path};
+use crate::workflow::manager::WorkflowManager;
+use crate::workflow::registry::{LocHeuristicSizer, ServiceRegistry};
 use crate::worktree::WorktreeManager;
 
 #[derive(Clone)]
@@ -55,14 +61,22 @@ pub struct AppState {
     pub ownership: OwnershipRegistry,
     pub agents: AgentManager,
     pub hooks: HookRunner,
-    pub plans: PlanManager,
     pub lessons: LessonRegistry,
     pub embed_cache: EmbedCache,
     pub tokens: Option<Tokens>,
     /// Broadcast channel for pillar transparency events (REPL breadcrumbs).
     pub pillar_tx: PillarTx,
     pub sdd: SddManager,
+    pub workflow: WorkflowManager,
     pub mcp: McpRegistry,
+    /// Cross-thread semantic memory store (None if backend unavailable).
+    pub memory: Option<Arc<crate::memory::sqlite_backend::SqliteVecStore>>,
+    /// Message queue (None if queue disabled or backend unavailable).
+    pub queue: Option<Arc<crate::queue::InMemoryQueue>>,
+    /// Consolidator shared state for maturation API (None if not initialized).
+    pub consolidator_state: Option<Arc<ConsolidatorState>>,
+    /// Durable state database (None if redb open failed).
+    pub db: Option<KiraDb>,
 }
 
 impl AppState {
@@ -100,6 +114,7 @@ impl AppState {
                 light: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-flash".into(), "dashscope:qwen-flash".into()] },
                 long_context: crate::config::TierEntry { candidates: vec!["deepseek:deepseek-v4-pro".into(), "dashscope:qwen-max".into()] },
                 judge: Some(crate::config::TierEntry { candidates: vec!["dashscope:qwen-max".into(), "dashscope:qwen-plus".into()] }),
+                local: None,
             }),
             |t| TierMap::from_config(&t.tiers),
         );
@@ -160,6 +175,14 @@ impl AppState {
             .as_ref().map_or_else(|| Arc::new(crate::config::PricingConfig::default()), |t| Arc::new(t.pricing));
         let models = tokens
             .as_ref().map_or_else(|| Arc::new(crate::config::ModelsConfig::default()), |t| Arc::new(t.models.clone()));
+        let approval_timeout = tokens.as_ref().map_or(300, |t| t.time.approval_timeout_secs);
+        let default_max_iters = tokens.as_ref().map_or(20, |t| t.concurrency.max_agent_iters);
+        let default_agent_budget_usd = tokens.as_ref().map_or(1.00, |t| t.budget.agent_default_usd);
+        // Pillar channel must exist before AgentManager so the agent loop
+        // can emit per-iter P7 cost events to the SSE stream. Previously
+        // created later (just before SddManager) which left agents unable
+        // to publish — fixed 2026-05-26 as part of Sprint 2.1 instrumentation.
+        let pillar_tx = pillar::channel();
         let agents = AgentManager::new(
             router.clone(),
             worktrees.clone(),
@@ -175,14 +198,15 @@ impl AppState {
             mcp.clone(),
             runs_dir,
             max_agents,
+            approval_timeout,
+            default_max_iters,
+            default_agent_budget_usd,
+            pillar_tx.clone(),
         );
 
         // Spawn watchdog tasks (stale detection + worktree cleanup).
         crate::watchdogs::spawn_all(agents.clone(), worktrees.clone());
 
-        let plans = PlanManager::new(router.clone(), agents.clone(), db.clone());
-
-        let pillar_tx = pillar::channel();
         let sdd = SddManager::new(
             agents.clone(),
             worktrees.clone(),
@@ -192,6 +216,51 @@ impl AppState {
             db.clone(),
         ).await;
 
+        // WorkflowManager — methodology-agnostic front-end. Register built-in services.
+        let mut wf_registry = ServiceRegistry::new();
+        let loc_sizer = std::sync::Arc::new(LocHeuristicSizer::default());
+        wf_registry.register_sizer("loc_heuristic", loc_sizer);
+        let bundled_wf_dir = crate::workflow::loader::bundled_workflow_dir();
+        let workflow = WorkflowManager::new(
+            agents.clone(),
+            worktrees.clone(),
+            router.clone(),
+            embed_cache.clone(),
+            pillar_tx.clone(),
+            db.clone(),
+            wf_registry,
+            bundled_wf_dir.as_deref(),
+        ).await;
+
+        // Initialize memory store.
+        let memory = Self::init_memory(tokens.as_ref());
+
+        // Spawn consolidation timer if memory store is available and maturation is enabled.
+        let maturation_cfg = tokens
+            .as_ref()
+            .map(|t| t.memory.maturation.clone())
+            .unwrap_or_default();
+        let consolidator_state = if maturation_cfg.enabled {
+            if let Some(ref store) = memory {
+                let cfg = Arc::new(maturation_cfg);
+                let cs = consolidator::spawn_consolidation_timer(
+                    cfg,
+                    Arc::clone(store),
+                    pillar_tx.clone(),
+                    Arc::new(router.clone()),
+                )
+                .await;
+                info!("maturation consolidation timer active");
+                Some(cs)
+            } else {
+                info!("maturation enabled but memory store unavailable — consolidation timer not spawned");
+                None
+            }
+        } else {
+            info!("maturation disabled — consolidation timer not spawned");
+            None
+        };
+
         Ok(Self {
             router,
             worktrees,
@@ -199,14 +268,41 @@ impl AppState {
             ownership,
             agents,
             hooks,
-            plans,
             lessons,
             embed_cache,
-            tokens,
-            pillar_tx,
+            tokens: tokens.clone(),
+            pillar_tx: pillar_tx.clone(),
             sdd,
+            workflow,
             mcp,
+            memory,
+            queue: Some(Arc::new(crate::queue::InMemoryQueue::new())),
+            consolidator_state,
+            db,
         })
+    }
+
+    /// Initialize the memory store from config. Returns None on failure (graceful degradation).
+    fn init_memory(tokens: Option<&Tokens>) -> Option<Arc<crate::memory::sqlite_backend::SqliteVecStore>> {
+        let memory_cfg = tokens.map(|t| &t.memory);
+        let sqlite_path = memory_cfg
+            .map(|m| m.sqlite_path.clone())
+            .unwrap_or_else(|| "~/.local/share/kira/memory.db".to_string());
+        let max_per_thread = memory_cfg
+            .map(|m| m.max_fragments_per_thread)
+            .unwrap_or(1000);
+
+        let resolved = crate::config::resolve_home(&sqlite_path);
+        match crate::memory::sqlite_backend::SqliteVecStore::open(&resolved, max_per_thread) {
+            Ok(store) => {
+                info!(path = %resolved.display(), "memory store initialized (sqlite-vec)");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                warn!(error = ?e, path = %resolved.display(), "memory store init failed — running without semantic memory");
+                None
+            }
+        }
     }
 }
 
@@ -222,9 +318,20 @@ pub fn router(state: AppState) -> AxumRouter {
         .route("/v1/eval/run", post(eval_api::run))
         .route("/v1/review", post(review_api::run))
         .route("/v1/events/stream", get(events_api::stream))
-        // SDD (P1 Spec-Driven Execution)
+        // SDD (legacy P1 Spec-Driven Execution — kept for backward compat)
         .route("/v1/sdd", get(sdd_api::list).post(sdd_api::start))
         .route("/v1/sdd/:id", get(sdd_api::get_one))
+        .route("/v1/sdd/:id/questions", get(sdd_api::get_questions).post(sdd_api::answer_questions))
+        .route("/v1/sdd/:id/waves", get(sdd_api::get_waves))
+        // Workflow (methodology-agnostic, replaces SDD)
+        .route("/v1/workflow", get(workflow_api::list).post(workflow_api::start))
+        .route("/v1/workflow/list", get(workflow_api::list_workflows))
+        .route("/v1/workflow/:id", get(workflow_api::get_one))
+        .route("/v1/workflow/:id/questions", get(workflow_api::get_questions).post(workflow_api::answer_questions))
+        .route("/v1/workflow/:id/plan", get(workflow_api::get_plan))
+        .route("/v1/workflow/:id/approve_plan", post(workflow_api::approve_plan))
+        // Detective (universal code review)
+        .route("/v1/detective/run", post(detective_api::run))
         // Web tools (P0 + soberania)
         .route("/v1/web/search", post(web_api::search))
         .route("/v1/web/fetch", post(web_api::fetch))
@@ -251,14 +358,12 @@ pub fn router(state: AppState) -> AxumRouter {
         .route("/v1/agents/spawn", post(agents_api::spawn))
         .route("/v1/agents/:id", get(agents_api::get_one))
         .route("/v1/agents/:id/history", get(agents_api::history))
+        .route("/v1/agents/:id/cost", get(agents_api::cost))
+        .route("/v1/agents/:id/context", get(agents_api::context_window))
+        .route("/v1/agents/:id/diff", get(agents_api::diff))
         .route("/v1/agents/:id/cancel", post(agents_api::cancel))
         .route("/v1/agents/:id/approval", post(agents_api::approve))
         // plans
-        .route("/v1/plan", get(plans_api::list))
-        .route("/v1/plan/draft", post(plans_api::draft))
-        .route("/v1/plan/:id", get(plans_api::get_one))
-        .route("/v1/plan/:id/approve", post(plans_api::approve))
-        .route("/v1/plan/:id/cancel", post(plans_api::cancel))
         // lessons
         .route(
             "/v1/lessons",
@@ -278,6 +383,18 @@ pub fn router(state: AppState) -> AxumRouter {
         .route("/v1/text/rerank", post(text_api::rerank_endpoint))
         // stats
         .route("/v1/stats", get(stats_api::stats))
+        // memory (cross-thread semantic)
+        .route("/v1/memory/search", get(memory_api::search))
+        .route("/v1/memory/:run_id/context", get(memory_api::get_context))
+        .route("/v1/memory/:fragment_id", delete(memory_api::delete_fragment))
+        // memory maturation
+        .route("/v1/memory/maturation/status", get(maturation_api::status))
+        .route("/v1/memory/maturation/consolidate", post(maturation_api::consolidate))
+        .route("/v1/memory/handoff", get(maturation_api::get_handoff_handler).delete(maturation_api::delete_handoff_handler))
+        .route("/v1/memory/:fragment_id/metadata", get(maturation_api::fragment_metadata))
+        // queue (resilience buffer)
+        .route("/v1/queue", get(queue_api::list))
+        .route("/v1/queue/:queue_id", delete(queue_api::cancel))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

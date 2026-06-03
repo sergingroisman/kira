@@ -16,10 +16,10 @@ use crate::agents::AgentManager;
 use crate::proto::agent::AgentStatus;
 use crate::worktree::WorktreeManager;
 
-const HEARTBEAT_SCAN_PERIOD: Duration = Duration::from_secs(60);
+const HEARTBEAT_SCAN_PERIOD: Duration = Duration::from_mins(1);
 const AGENT_STALE_AFTER: ChronoDuration = ChronoDuration::minutes(5);
 
-const CLEANUP_SCAN_PERIOD: Duration = Duration::from_secs(60);
+const CLEANUP_SCAN_PERIOD: Duration = Duration::from_mins(1);
 const WORKTREE_ORPHAN_AGE: ChronoDuration = ChronoDuration::minutes(10);
 
 /// Boot all watchdogs. Tasks live for the lifetime of the runtime.
@@ -35,7 +35,7 @@ fn parse_iso(s: &str) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-fn is_terminal(status: AgentStatus) -> bool {
+const fn is_terminal(status: AgentStatus) -> bool {
     matches!(
         status,
         AgentStatus::Completed
@@ -60,19 +60,21 @@ async fn agent_heartbeat_scanner(agents: AgentManager) {
         let now = Utc::now();
         let mut marked = 0_usize;
         for a in agents.list() {
-            if a.status != AgentStatus::Active && a.status != AgentStatus::Spawning {
+            if a.status != AgentStatus::ActiveForeground
+                && a.status != AgentStatus::ActiveBackground
+                && a.status != AgentStatus::Spawning
+            {
                 continue;
             }
             let Some(last) = a.last_progress_at.as_deref().and_then(parse_iso) else {
                 continue;
             };
-            if now.signed_duration_since(last) > AGENT_STALE_AFTER {
-                if let Ok(uuid) = Uuid::parse_str(&a.id) {
+            if now.signed_duration_since(last) > AGENT_STALE_AFTER
+                && let Ok(uuid) = Uuid::parse_str(&a.id) {
                     agents.mark_stale(uuid);
                     marked += 1;
                     warn!(agent_id = %a.id, last_progress = %a.last_progress_at.as_deref().unwrap_or("?"), "agent marked Stale");
                 }
-            }
         }
         if marked > 0 {
             info!(marked, "heartbeat_scanner pass");

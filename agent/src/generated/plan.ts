@@ -13,7 +13,7 @@ ttl_secs: bigint | null, };
 
 export type Plan = { id: string, goal: string, agent_kind: AgentKind, 
 /**
- * Planner-detected scope. Drives executor budget + max_iters defaults.
+ * Planner-detected scope. Drives executor budget + `max_iters` defaults.
  */
 scope: PlanScope, steps: Array<PlanStep>, status: PlanStatus, 
 /**
@@ -23,7 +23,12 @@ created_at: string, expires_at: string, approved_at: string | null, finished_at:
 /**
  * When approved, the executor agent id.
  */
-executor_agent_id: string | null, error: string | null, };
+executor_agent_id: string | null, error: string | null, 
+/**
+ * Steps grouped into parallel waves by their `dependencies` (computed at
+ * draft). Empty until decomposed.
+ */
+waves: Array<Wave>, };
 
 export type PlanScope = "quick" | "small" | "medium" | "large" | "complex";
 
@@ -45,4 +50,23 @@ owned_files: Array<string>,
 /**
  * Rough LOC estimate (used by change sufficiency check in v0.5).
  */
-estimated_loc: number | null, };
+estimated_loc: number | null, 
+/**
+ * `idx` of steps that must finish before this one. Steps that don't
+ * depend on each other run in the same wave (parallel).
+ */
+dependencies: Array<number>, };
+
+/**
+ * One parallel wave: a set of step indices with no dependency on each other,
+ * runnable concurrently once all earlier waves finish.
+ */
+export type Wave = { 
+/**
+ * 0-based wave index (execution order).
+ */
+index: number, 
+/**
+ * `idx` values of the steps in this wave.
+ */
+step_idxs: Array<number>, };

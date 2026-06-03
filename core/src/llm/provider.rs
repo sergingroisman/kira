@@ -21,7 +21,7 @@ use crate::config::ProviderEntry;
 
 use super::anthropic;
 use super::protocol::Protocol;
-use super::types::*;
+use super::types::{ChatOutput, ChatMessageUnified, ToolDef, ChatParams, ChatStream, ToolCall, StreamChunk};
 
 /// A single LLM provider, configured at startup from `tokens.toml`.
 ///
@@ -34,6 +34,10 @@ pub struct LlmProvider {
     pub protocol: Protocol,
     pub base_url: String,
     api_key: String,
+    /// Anthropic-only: `max_tokens` for /v1/messages.
+    pub max_tokens: u32,
+    /// Anthropic-only: API version header.
+    pub api_version: String,
     #[allow(dead_code)]
     http: reqwest::Client,
     /// Eagerly‑initialised `async_openai` client — only `Some` for
@@ -43,7 +47,15 @@ pub struct LlmProvider {
 
 impl LlmProvider {
     /// Create a new provider from raw parts.
-    pub fn new(name: String, protocol: Protocol, base_url: String, api_key: String) -> Self {
+    pub fn new(
+        name: String,
+        protocol: Protocol,
+        base_url: String,
+        api_key: String,
+        max_tokens: u32,
+        api_version: String,
+        timeout_secs: u64,
+    ) -> Self {
         let openai_client = if protocol == Protocol::OpenAiCompatible {
             Some(Client::with_config(
                 OpenAIConfig::new()
@@ -58,8 +70,10 @@ impl LlmProvider {
             protocol,
             base_url,
             api_key,
+            max_tokens,
+            api_version,
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
+                .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()
                 .expect("reqwest client build"),
             openai_client,
@@ -92,7 +106,15 @@ impl LlmProvider {
             ),
         };
 
-        Ok(Some(Self::new(name.to_string(), protocol, base_url, api_key)))
+        Ok(Some(Self::new(
+            name.to_string(),
+            protocol,
+            base_url,
+            api_key,
+            entry.max_tokens,
+            entry.api_version.clone(),
+            entry.llm_timeout_secs,
+        )))
     }
 
     // ── Eager async-openai client access ─────────────────────────────
@@ -126,10 +148,19 @@ impl LlmProvider {
                     .create(req)
                     .await
                     .with_context(|| format!("{name} chat failed (model={model})", name = self.name))?;
-                Ok(chat_response_to_output(resp))
+                chat_response_to_output(resp)
             }
             Protocol::Anthropic => {
-                anthropic::chat(&self.http, &self.api_key, &self.base_url, model, messages).await
+                anthropic::chat(
+                    &self.http,
+                    &self.api_key,
+                    &self.base_url,
+                    self.max_tokens,
+                    &self.api_version,
+                    model,
+                    messages,
+                )
+                .await
             }
         }
     }
@@ -138,7 +169,7 @@ impl LlmProvider {
     ///
     /// Accepts pre‑built `ChatMessageUnified` messages (so agent loops can
     /// include `Tool` result messages between turns) and `ToolDef` schemas.
-    /// Optional `ChatParams` overrides sampling (temperature, response_format).
+    /// Optional `ChatParams` overrides sampling (temperature, `response_format`).
     #[instrument(skip(self, messages, tools, params), fields(provider = %self.name, model))]
     pub async fn chat_with_tools(
         &self,
@@ -156,6 +187,8 @@ impl LlmProvider {
                     &self.http,
                     &self.api_key,
                     &self.base_url,
+                    self.max_tokens,
+                    &self.api_version,
                     model,
                     messages,
                     tools,
@@ -166,7 +199,7 @@ impl LlmProvider {
     }
 
     /// Raw JSON path: used when a `ChatMessageUnified::Assistant` carries
-    /// `reasoning_content` (DeepSeek V4 thinking mode).  Builds the request
+    /// `reasoning_content` (`DeepSeek` V4 thinking mode).  Builds the request
     /// as JSON, injects `reasoning_content`, sends via `reqwest`, and parses
     /// the response — including `reasoning_content` — back into `ChatOutput`.
     async fn chat_with_tools_raw(
@@ -240,6 +273,8 @@ impl LlmProvider {
                     &self.http,
                     &self.api_key,
                     &self.base_url,
+                    self.max_tokens,
+                    &self.api_version,
                     model,
                     messages,
                 )
@@ -300,11 +335,10 @@ fn chat_messages_to_openai(messages: &[crate::proto::chat::ChatMessage]) -> Resu
 /// Convert an `async_openai` response into our unified `ChatOutput`.
 /// The `reasoning_content` field is always `None` here — async‑openai
 /// 0.27 does not surface it.  Use `chat_output_from_json` for raw parsing.
-fn chat_response_to_output(resp: async_openai::types::CreateChatCompletionResponse) -> ChatOutput {
-    let choice = resp.choices.into_iter().next().unwrap_or_else(|| {
-        panic!("{} chat response has no choices", resp.model)
-    });
-    let usage = resp.usage.unwrap_or_else(|| async_openai::types::CompletionUsage {
+fn chat_response_to_output(resp: async_openai::types::CreateChatCompletionResponse) -> Result<ChatOutput> {
+    let choice = resp.choices.into_iter().next()
+        .ok_or_else(|| anyhow::anyhow!("{} chat response has no choices", resp.model))?;
+    let usage = resp.usage.unwrap_or(async_openai::types::CompletionUsage {
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
@@ -324,18 +358,18 @@ fn chat_response_to_output(resp: async_openai::types::CreateChatCompletionRespon
         })
         .collect();
 
-    ChatOutput {
+    Ok(ChatOutput {
         content: choice.message.content.unwrap_or_default(),
         tokens_in: usage.prompt_tokens,
         tokens_out: usage.completion_tokens,
         finish_reason: choice.finish_reason.map(|r| format!("{r:?}")),
         tool_calls,
         reasoning_content: None,
-    }
+    })
 }
 
 /// Parse the raw JSON from an OpenAI‑compatible chat‑completions response.
-/// Extracts every field, including `reasoning_content` (DeepSeek thinking mode).
+/// Extracts every field, including `reasoning_content` (`DeepSeek` thinking mode).
 fn chat_output_from_json(resp: serde_json::Value) -> ChatOutput {
     let choice = &resp["choices"][0];
     let msg = &choice["message"];
@@ -363,13 +397,13 @@ fn chat_output_from_json(resp: serde_json::Value) -> ChatOutput {
         tokens_out: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
         finish_reason: choice["finish_reason"]
             .as_str()
-            .map(|s| s.to_string()),
+            .map(std::string::ToString::to_string),
         tool_calls,
-        reasoning_content: msg["reasoning_content"].as_str().map(|s| s.to_string()),
+        reasoning_content: msg["reasoning_content"].as_str().map(std::string::ToString::to_string),
     }
 }
 
-/// Map a single OpenAI streaming chunk to our `StreamChunk` enum.
+/// Map a single `OpenAI` streaming chunk to our `StreamChunk` enum.
 fn openai_chunk_to_stream_chunk(
     chunk_result: Result<async_openai::types::CreateChatCompletionStreamResponse, async_openai::error::OpenAIError>,
 ) -> Result<StreamChunk> {

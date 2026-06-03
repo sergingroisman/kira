@@ -78,6 +78,39 @@ pub struct StartSddRequest {
     pub base: Option<String>,
 }
 
+/// A single option within a `PlanQuestion`.
+#[derive(Serialize, Deserialize, Debug, Clone, TS)]
+#[ts(export, export_to = "../../agent/src/generated/sdd.ts")]
+pub struct PlanOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// A clarifying question the SDD Pilot asks the user during SPECIFY/DESIGN.
+#[derive(Serialize, Deserialize, Debug, Clone, TS)]
+#[ts(export, export_to = "../../agent/src/generated/sdd.ts")]
+pub struct PlanQuestion {
+    pub id: String,
+    pub question: String,
+    pub options: Vec<PlanOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+/// User answers to pending questions. `answers` maps question_id → selected labels.
+#[derive(Deserialize, Debug, TS)]
+#[ts(export, export_to = "../../agent/src/generated/sdd.ts")]
+pub struct AnswerQuestionsRequest {
+    pub answers: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// Resolve a plan-approval gate. `approved=false` halts the run.
+#[derive(Deserialize, Debug, TS)]
+#[ts(export, export_to = "../../agent/src/generated/sdd.ts")]
+pub struct ApprovePlanRequest {
+    pub approved: bool,
+}
+
 /// SDD run snapshot — persisted in redb, streamed via SSE on changes.
 #[derive(Serialize, Deserialize, Debug, Clone, TS)]
 #[ts(export, export_to = "../../agent/src/generated/sdd.ts")]
@@ -120,6 +153,32 @@ pub struct SddRun {
     /// Used by Pilot to decide retry vs escalate vs halt.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub phase_retries: std::collections::HashMap<String, u32>,
+
+    /// Questions the Pilot needs answered before proceeding.
+    /// Non-empty → drive loop pauses, REPL shows PlanQuestions UI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_questions: Vec<PlanQuestion>,
+
+    /// Answers collected from the user: question_id → selected labels.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub question_answers: std::collections::HashMap<String, Vec<String>>,
+
+    /// Resolved Q+A pairs preserved for downstream phase context.
+    /// Populated by `answer_questions` so the SPECIFY Writer sees the
+    /// human-readable question text alongside the chosen options.
+    /// `question_answers` keys by UUID which is opaque to the LLM.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clarifications: Vec<ClarificationEntry>,
+}
+
+/// A resolved clarifying Q+A pair. Stored on `SddRun.clarifications` after
+/// the user answers via `/v1/sdd/{id}/questions`. Read by the orchestrator
+/// when building the SPECIFY Writer task context (P1, 2026-05-25).
+#[derive(Serialize, Deserialize, Debug, Clone, TS)]
+#[ts(export, export_to = "../../agent/src/generated/sdd.ts")]
+pub struct ClarificationEntry {
+    pub question: String,
+    pub answers: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, TS)]

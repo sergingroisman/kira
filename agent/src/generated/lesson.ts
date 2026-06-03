@@ -7,7 +7,7 @@ export type DeleteLessonResponse = { deleted: boolean, id: string, };
 
 export type Lesson = { id: string, 
 /**
- * What signal triggered the lesson (e.g. "judge_failed: writer truncated output").
+ * What signal triggered the lesson (e.g. "`judge_failed`: writer truncated output").
  */
 trigger: string, 
 /**

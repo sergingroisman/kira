@@ -124,12 +124,11 @@ pub async fn tool_file_write(
     let resolved = path_guard::resolve_within(&req.path, &req.base_dir)?;
 
     // Optional parent mkdir, but ONLY for paths already verified inside base_dir.
-    if req.create_dirs {
-        if let Some(parent) = resolved.parent() {
+    if req.create_dirs
+        && let Some(parent) = resolved.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create_dir_all failed: {}", parent.display()))?;
         }
-    }
 
     let exists = resolved.exists();
     if exists && !req.overwrite {

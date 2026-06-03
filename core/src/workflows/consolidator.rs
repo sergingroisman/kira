@@ -31,7 +31,7 @@ pub struct Finding {
     pub recommendation: String,
 }
 
-fn default_confidence() -> f64 { 0.0 }
+const fn default_confidence() -> f64 { 0.0 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewerOutput {
@@ -90,8 +90,7 @@ fn emoji_for(sev: &str) -> &'static str {
     SEVERITY_EMOJI
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(sev))
-        .map(|(_, e)| *e)
-        .unwrap_or("•")
+        .map_or("•", |(_, e)| *e)
 }
 
 /// Render the final markdown report.
@@ -200,7 +199,7 @@ fn capitalize(s: &str) -> String {
 fn trim_quote(q: &str) -> String {
     let one_line = q.replace('\n', " ⏎ ");
     if one_line.len() > 120 {
-        format!("{}…", &one_line[..120])
+        format!("{}…", one_line.chars().take(120).collect::<String>())
     } else {
         one_line
     }

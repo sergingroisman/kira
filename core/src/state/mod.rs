@@ -29,6 +29,24 @@ pub const TBL_LESSONS: TableDefinition<&str, &str> = TableDefinition::new("lesso
 pub const TBL_SDD: TableDefinition<&str, &str> = TableDefinition::new("sdd_runs");
 pub const TBL_EMBED_CACHE: TableDefinition<&str, &str> =
     TableDefinition::new("embed_cache");
+/// B1 — structured judge decisions (complements flat JSONL with query/index).
+///
+/// Key: `eval_id` (uuid v7). Value: JSON with `judge_model`, `writer_model`,
+/// score, verdict, rationale, `model_collision`, ts. Populated by `eval` API
+/// (v0.5+); the L5 cascade currently writes only to the JSONL audit file.
+pub const TBL_EVAL: TableDefinition<&str, &str> = TableDefinition::new("eval_runs");
+/// C2 — persisted circuit breaker snapshots so daemon restarts preserve Open state.
+pub const TBL_BREAKERS: TableDefinition<&str, &str> = TableDefinition::new("circuit_breakers");
+/// P6 — agent message checkpoints for resume after daemon crash.
+/// Key: `agent_id` (Uuid). Value: JSON array of `ChatMessageUnified`.
+pub const TBL_AGENT_CHECKPOINTS: TableDefinition<&str, &str> =
+    TableDefinition::new("agent_checkpoints");
+/// P3 — session-scoped judge trust scores.
+/// Key: `writer_model`. Value: JSON {count, `total_score`}.
+pub const TBL_JUDGE_TRUST: TableDefinition<&str, &str> =
+    TableDefinition::new("judge_trust");
+pub const TBL_WORKFLOW: TableDefinition<&str, &str> = TableDefinition::new("workflow_runs");
+pub const TBL_HANDOFF: TableDefinition<&str, &str> = TableDefinition::new("memory_handoff");
 pub const TBL_META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
 #[derive(Clone)]
@@ -59,6 +77,12 @@ impl KiraDb {
             txn.open_table(TBL_LESSONS)?;
             txn.open_table(TBL_SDD)?;
             txn.open_table(TBL_EMBED_CACHE)?;
+            txn.open_table(TBL_EVAL)?;
+            txn.open_table(TBL_BREAKERS)?;
+            txn.open_table(TBL_AGENT_CHECKPOINTS)?;
+            txn.open_table(TBL_JUDGE_TRUST)?;
+            txn.open_table(TBL_WORKFLOW)?;
+            txn.open_table(TBL_HANDOFF)?;
             {
                 let mut meta = txn.open_table(TBL_META)?;
                 let current_version: Option<u32> = {
@@ -153,6 +177,29 @@ impl KiraDb {
         Ok(t.get(key)?.map(|g| g.value().to_string()))
     }
 
+    /// List all (key, value) pairs in a table as raw strings.
+    /// Used by router/circuit (C2) breaker snapshot restore.
+    pub fn list_kv(&self, table: TableDefinition<&str, &str>) -> Result<Vec<(String, String)>> {
+        let txn = self.inner.begin_read()?;
+        let t = txn.open_table(table)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            out.push((k.value().to_string(), v.value().to_string()));
+        }
+        Ok(out)
+    }
+
+    /// Put raw string value (alias of `put_raw`, clearer intent).
+    pub fn put_kv(
+        &self,
+        table: TableDefinition<&str, &str>,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.put_raw(table, key, value)
+    }
+
     /// Count rows in a table (used for cache eviction triggers).
     pub fn count(&self, table: TableDefinition<&str, &str>) -> Result<u64> {
         let txn = self.inner.begin_read()?;
@@ -207,10 +254,39 @@ impl KiraDb {
     }
 }
 
-/// Resolve the default state path: `~/.local/share/kira/state.redb` (Mac/Linux).
+/// Resolve the default state path. Falls back to `~/.local/share/kira/state.redb`
+/// when `paths` is `None` (backward compat).
 pub fn default_state_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".local/share/kira/state.redb"))
+    resolve_state_path(None)
+}
+
+/// Resolve the state DB path from `[paths]` config when present, picking the
+/// macOS or Linux variant based on `cfg!(target_os = ...)`. Expands a leading
+/// `~/` to the user's home dir.
+pub fn resolve_state_path(paths: Option<&crate::config::PathConfig>) -> Result<PathBuf> {
+    let raw = match paths {
+        Some(p) => {
+            if cfg!(target_os = "macos") {
+                p.state_db_mac.clone()
+            } else {
+                p.state_db_linux.clone()
+            }
+        }
+        None => "~/.local/share/kira/state.redb".to_string(),
+    };
+    expand_tilde(&raw)
+}
+
+fn expand_tilde(raw: &str) -> Result<PathBuf> {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home).join(rest))
+    } else if raw == "~" {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home))
+    } else {
+        Ok(PathBuf::from(raw))
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +298,25 @@ mod tests {
     struct Sample {
         id: String,
         n: u32,
+    }
+
+    #[test]
+    fn tilde_expansion_basic() {
+        let home = std::env::var("HOME").unwrap();
+        let p = expand_tilde("~/foo/bar.db").unwrap();
+        assert_eq!(p, std::path::PathBuf::from(home).join("foo/bar.db"));
+    }
+
+    #[test]
+    fn tilde_expansion_absolute_passthrough() {
+        let p = expand_tilde("/var/lib/kira/state.redb").unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/var/lib/kira/state.redb"));
+    }
+
+    #[test]
+    fn resolve_state_path_fallback() {
+        let p = resolve_state_path(None).unwrap();
+        assert!(p.ends_with(".local/share/kira/state.redb"));
     }
 
     #[test]

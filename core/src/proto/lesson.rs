@@ -39,7 +39,7 @@ pub enum LessonStatus {
 #[ts(export, export_to = "../../agent/src/generated/lesson.ts")]
 pub struct Lesson {
     pub id: String,
-    /// What signal triggered the lesson (e.g. "judge_failed: writer truncated output").
+    /// What signal triggered the lesson (e.g. "`judge_failed`: writer truncated output").
     pub trigger: String,
     /// What the agent did wrong (one short sentence, imperative form).
     pub anti_pattern: String,

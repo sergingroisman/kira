@@ -42,10 +42,10 @@ pub struct EvalSample {
     pub tokens_out: u32,
     pub cost_usd: f64,
     pub duration_ms: u64,
-    /// 0-10 from judge (None when skip_judge or call failed).
+    /// 0-10 from judge (None when `skip_judge` or call failed).
     pub judge_score: Option<f64>,
     pub judge_rationale: Option<String>,
-    /// Cosine similarity spec↔output (None when skip_embedding).
+    /// Cosine similarity spec↔output (None when `skip_embedding`).
     pub faithfulness: Option<f64>,
     /// True if all enabled gates passed.
     pub gates_pass: bool,

@@ -9,6 +9,7 @@
 
 pub mod anthropic;
 pub mod embed_cache;
+pub mod ollama_health;
 pub mod protocol;
 pub mod provider;
 pub mod types;

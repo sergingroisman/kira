@@ -59,6 +59,11 @@ worktree_path: string,
 /**
  * Skip the structural lint check (force heuristic-only L1).
  */
-skip_structural_lint: boolean, };
+skip_structural_lint: boolean, 
+/**
+ * B1 — Writer model (when known) for `judge_model ≠ writer_model` invariant
+ * check at L5. Recorded in `TBL_EVAL` + judge audit JSONL.
+ */
+writer_model: string | null, };
 
 export type RunGatesResponse = { results: Array<GateResult>, overall: GateOutcome, failed_at: GateKind | null, duration_ms: bigint, };

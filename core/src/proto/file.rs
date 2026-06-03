@@ -12,7 +12,7 @@ pub struct FileReadRequest {
     pub max_bytes: usize,
 }
 
-fn default_max_read_bytes() -> usize {
+const fn default_max_read_bytes() -> usize {
     crate::safety::FILE_READ_MAX_BYTES_DEFAULT
 }
 
@@ -37,7 +37,7 @@ pub struct FileWriteRequest {
     pub overwrite: bool,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 

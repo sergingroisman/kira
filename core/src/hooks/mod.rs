@@ -12,8 +12,8 @@
 //! timeout_secs = 5
 //! ```
 //!
-//! v0 semantics: exit code 0 → allow; exit code != 0 on PreToolUse → block.
-//! Stdout JSON parsing (action/message/modified_input) is v0.5.
+//! v0 semantics: exit code 0 → allow; exit code != 0 on `PreToolUse` → block.
+//! Stdout JSON parsing (`action/message/modified_input`) is v0.5.
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -37,13 +37,13 @@ pub enum HookEvent {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Matcher {
-    /// Match a specific tool name (e.g. "bash", "file_write").
+    /// Match a specific tool name (e.g. "bash", "`file_write`").
     #[serde(default)]
     pub tool: Option<String>,
-    /// Regex applied to the joined argument string for PreToolUse / PostToolUse.
+    /// Regex applied to the joined argument string for `PreToolUse` / `PostToolUse`.
     #[serde(default)]
     pub regex: Option<String>,
-    /// Glob applied to `path` field of file_read/file_write tools.
+    /// Glob applied to `path` field of `file_read/file_write` tools.
     #[serde(default)]
     pub path_glob: Option<String>,
 }
@@ -58,7 +58,7 @@ pub struct HookConfig {
     pub timeout_secs: u64,
 }
 
-fn default_timeout() -> u64 {
+const fn default_timeout() -> u64 {
     5
 }
 
@@ -92,7 +92,17 @@ pub struct HookContext {
 
 impl HookRunner {
     /// Load hooks from `<repo_root>/.kira/hooks.toml`. Missing file = no hooks.
+    ///
+    /// Prefers the unified `kira-core.toml` when present (B2).
     pub fn load(repo_root: &PathBuf) -> Result<Self> {
+        let unified = repo_root.join("kira-core.toml");
+        if unified.exists() {
+            let cfg = crate::config::runtime::KiraCoreConfig::load_from_repo(repo_root);
+            info!(count = cfg.hooks.len(), "hooks loaded from kira-core.toml");
+            return Ok(Self {
+                hooks: std::sync::Arc::new(cfg.hooks),
+            });
+        }
         let path = repo_root.join(".kira").join("hooks.toml");
         if !path.exists() {
             info!(path = %path.display(), "no hooks.toml — hook runner disabled");
@@ -105,7 +115,7 @@ impl HookRunner {
         info!(
             path = %path.display(),
             count = parsed.hooks.len(),
-            "hooks loaded"
+            "hooks loaded (legacy .kira/hooks.toml)"
         );
         Ok(Self {
             hooks: std::sync::Arc::new(parsed.hooks),
@@ -126,11 +136,10 @@ impl HookRunner {
         if h.event != event {
             return false;
         }
-        if let Some(t) = &h.matcher.tool {
-            if ctx.tool_name.as_deref() != Some(t.as_str()) {
+        if let Some(t) = &h.matcher.tool
+            && ctx.tool_name.as_deref() != Some(t.as_str()) {
                 return false;
             }
-        }
         if let Some(re) = &h.matcher.regex {
             let blob = ctx.tool_args.as_deref().unwrap_or("");
             match regex::Regex::new(re) {

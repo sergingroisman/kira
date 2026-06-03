@@ -8,11 +8,14 @@
  */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { Box, Text, useStdout } from "ink";
+import { Box, Text, useStdout, AlternateScreen, useTerminalSize } from "../ink/kira-ink.js";
+import { FullscreenLayout } from "./components/FullscreenLayout.js";
 import {
   CoreClient,
   CoreError,
   type AgentKind,
+  type PendingApproval,
+  type PlanQuestion,
 } from "../core-client/client.js";
 import type { StatsResponse, ModelUsage } from "../core-client/client.js";
 import {
@@ -26,19 +29,32 @@ import {
   HelpMenu,
   AnimationClockProvider,
   ToastContainer,
+  PomodoroProvider,
+  BuddyChat,
+  ThinkingDisplay,
+  ApprovalPrompt,
+  PlanQuestions,
   type Turn,
+  type SubAgentInfo,
+  type ThinkingCategory,
 } from "./components/index.js";
 import type { ToastItem, ToastType } from "./components/index.js";
-import { generateCompanion } from "./mascot/generator.js";
-import type { Emotion, MascotConfig } from "./mascot/types.js";
+import { generateCompanion, generateSoul } from "./mascot/generator.js";
+import type { Emotion, MascotConfig, PersistedCompanionState, TamaAction, PomodoroState, PomodoroPhase } from "./mascot/types.js";
 import { Mascot } from "./mascot/Mascot.js";
-import { figletArt } from "./art.js";
+
+import { xpToLevel } from "./mascot/types.js";
+import { applyDecay, dispatchAction, pomodoroAutoCare, tamaEmotion, setDecayFocusDuration } from "./mascot/tamagotchi.js";
+import { loadCompanionState, saveCompanionState } from "./mascot/persistence.js";
+
 import {
   parseAttachments,
   generateFakeToolPairs,
   type Attachment,
 } from "./attachment-parser.js";
+import { interpolatePalette } from "./art.js";
 import { loadMotionReduced, saveMotionReduced } from "./theme.js";
+import { readFile } from "node:fs/promises";
 
 // -- Types ---------------------------------------------------------------------
 
@@ -47,6 +63,14 @@ type Tier = "heavy" | "standard" | "light";
 
 const TIERS: readonly Tier[] = ["heavy", "standard", "light"];
 const AGENT_KINDS: readonly AgentKind[] = ["writer", "deployer", "judge", "explorer"];
+
+const GOODBYE_BANNER = [
+  "______     ______     ______     _____     ______     __  __     ______    ",
+  "/\\  ___\\   /\\  __ \\   /\\  __ \\   /\\  __-.  /\\  == \\   /\\ \\_\\ \\   /\\  ___\\   ",
+  "\\ \\ \\__ \\  \\ \\ \\/\\ \\  \\ \\ \\/\\ \\  \\ \\ \\/\\ \\ \\ \\  __<   \\ \\____ \\  \\ \\  __\\   ",
+  " \\ \\_____\\  \\ \\_____\\  \\ \\_____\\  \\ \\____-  \\ \\_____\\  \\/\\_____\\  \\ \\_____\\ ",
+  "  \\/_____/   \\/_____/   \\/_____/   \\/____/   \\/_____/   \\/_____/   \\/_____/ ",
+];
 
 // -- Turn creation helpers -----------------------------------------------------
 
@@ -117,8 +141,9 @@ export function KiraApp({
   initialTier = "standard",
   initialMode = "yolo",
 }: KiraAppProps) {
-  const { mode: themeMode, setMode: setThemeMode } = useTheme();
+  const { mode: themeMode, setMode: setThemeMode, colors } = useTheme();
   const { stdout } = useStdout();
+  const { rows: terminalRows } = useTerminalSize();
   const [tier, setTier] = useState<Tier>(initialTier);
   const [mode, setMode] = useState<Mode>(initialMode);
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -131,6 +156,20 @@ export function KiraApp({
   const [showExitHint, setShowExitHint] = useState(false);
   const [goodbyeStats, setGoodbyeStats] = useState<StatsResponse | null>(null);
   const [motionReduced, setMotionReduced] = useState(loadMotionReduced());
+
+  const [pendingApproval, setPendingApproval] = useState<{
+    agentId: string;
+    agentKind: string;
+    approval: PendingApproval;
+  } | null>(null);
+  // Tracks approvals already decided by the user so the poller doesn't
+  // re-show the same tool while the server is processing the verdict.
+  const decidedApprovalRef = useRef<{ agentId: string; toolName: string } | null>(null);
+
+  const [pendingSddQuestions, setPendingSddQuestions] = useState<{
+    sddRunId: string;
+    questions: PlanQuestion[];
+  } | null>(null);
 
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const addToast = useCallback((type: ToastType, message: string) => {
@@ -150,6 +189,46 @@ export function KiraApp({
   // Companion
   const sessionId = useMemo(() => `kira-${sessionStart.current.toString(36).slice(0, 12)}`, []);
   const companionConfig = useMemo<MascotConfig>(() => generateCompanion(sessionId), [sessionId]);
+  const companionPersistedRef = useRef<PersistedCompanionState>(loadCompanionState());
+  const [companionState, setCompanionState] = useState<PersistedCompanionState>(companionPersistedRef.current);
+  const [companionWidgetMessage, setCompanionWidgetMessage] = useState<string | null>(null);
+  const [thinkingCategory, setThinkingCategory] = useState<ThinkingCategory>("idle");
+  const [thinkingStalled, setThinkingStalled] = useState(false);
+  const [totalSessionTokens, setTotalSessionTokens] = useState(0);
+  const thinkingLastTokenRef = useRef<{ time: number; count: number }>({ time: 0, count: 0 });
+
+  // Pomodoro callbacks
+  const pomodoroPrevPhaseRef = useRef<PomodoroPhase>(companionState.pomodoro.phase);
+  const handlePomodoroOnTick = useCallback((next: PomodoroState) => {
+    const prevPhase = pomodoroPrevPhaseRef.current;
+    pomodoroPrevPhaseRef.current = next.phase;
+    const prev = companionPersistedRef.current;
+    const nextState = { ...prev, pomodoro: next };
+    companionPersistedRef.current = nextState;
+    setCompanionState(nextState);
+    saveCompanionState(nextState);
+    if (prevPhase === "focus" && next.phase !== "idle" && next.phase !== "focus") {
+      const tama = { ...prev.tama };
+      pomodoroAutoCare(tama);
+      const xpGain = 100;
+      const xp = { ...prev.xp, total: prev.xp.total + xpGain };
+      const final = { ...nextState, tama, xp };
+      companionPersistedRef.current = final;
+      setCompanionState(final);
+      saveCompanionState(final);
+      const prevLevel = xpToLevel(prev.xp.total).level;
+      const newLevel = xpToLevel(final.xp.total).level;
+      if (newLevel > prevLevel) {
+        setCompanionWidgetMessage(`\u2192 Lv.${newLevel}!`);
+      } else {
+        setCompanionWidgetMessage(`Pomodoro done! +${xpGain}XP`);
+      }
+      addToast("success", "\u25CF Pomodoro completed! Coglu is happy.");
+    }
+    if (prevPhase !== "focus" && next.phase === "idle" && next.completed > 0) {
+      addToast("info", "Break over. Ready for next focus!");
+    }
+  }, [addToast]);
 
   // Poller refs
   const agentPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
@@ -158,6 +237,8 @@ export function KiraApp({
   const planPollers = useRef<Map<string, ReturnType<typeof setInterval>>>(
     new Map(),
   );
+  // Active pillar-events stream (started by `/events`). One at a time.
+  const eventsCtrl = useRef<AbortController | null>(null);
 
   // Health check
   useEffect(() => {
@@ -204,6 +285,136 @@ export function KiraApp({
     };
   }, [showGoodbye, client]);
 
+  // Auto-start pomodoro after splash is dismissed
+  const pomodoroStartedRef = useRef(false);
+  useEffect(() => {
+    if (!showSplash && !pomodoroStartedRef.current && companionState.companion) {
+      pomodoroStartedRef.current = true;
+      const now = Date.now();
+      const prev = companionPersistedRef.current;
+      const nextPomo = { ...prev.pomodoro, phase: "focus" as const, startedAt: now, elapsed: 0 };
+      const next = { ...prev, pomodoro: nextPomo };
+      companionPersistedRef.current = next;
+      setCompanionState(next);
+      saveCompanionState(next);
+    }
+  }, [showSplash]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Companion: generate soul on first mount
+  useEffect(() => {
+    if (!companionState.companion) {
+      const soul = generateSoul(sessionId);
+      const next = { ...companionPersistedRef.current, companion: soul };
+      companionPersistedRef.current = next;
+      setCompanionState(next);
+      saveCompanionState(next);
+    }
+    setDecayFocusDuration(companionPersistedRef.current.pomodoro.focusDuration);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Companion: token polling (every 30s)
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      try {
+        const stats = await client.stats();
+        const totalIn = stats.model_usage.reduce((s, m) => s + Number(m.tokens_in), 0);
+        const totalOut = stats.model_usage.reduce((s, m) => s + Number(m.tokens_out), 0);
+        const totalTokens = totalIn + totalOut;
+
+        const prev = companionPersistedRef.current;
+        const deltaIn = Math.max(0, totalIn - prev.xp.lastSeenTokensIn);
+        const deltaOut = Math.max(0, totalOut - prev.xp.lastSeenTokensOut);
+        if (deltaIn + deltaOut > 0) {
+          const xpGain = Math.floor((deltaIn + deltaOut) / 1000);
+          if (xpGain <= 0) return;
+          const prevLevel = xpToLevel(prev.xp.total).level;
+          const next: PersistedCompanionState = {
+            ...prev,
+            xp: {
+              total: prev.xp.total + xpGain,
+              lastSeenTokensIn: totalIn,
+              lastSeenTokensOut: totalOut,
+            },
+            tama: { ...prev.tama },
+          };
+          companionPersistedRef.current = next;
+          setCompanionState(next);
+          saveCompanionState(next);
+
+          const newLevel = xpToLevel(next.xp.total).level;
+          if (newLevel > prevLevel) {
+            setCompanionWidgetMessage(`\u2192 Lv.${newLevel}!`);
+          } else if (xpGain > 0) {
+            setCompanionWidgetMessage(`+${xpGain} XP`);
+          }
+        }
+      } catch {
+        // core may be down
+      }
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [client]);
+
+  // ThinkingDisplay: fast poller for tokens + stall (5s, only when agents active)
+  const fastPollerActiveAgents = turns.filter(
+    (t) => t.kind === "agent" && t.inFlight,
+  ).length;
+  useEffect(() => {
+    if (fastPollerActiveAgents === 0) return;
+    const timer = setInterval(async () => {
+      try {
+        const stats = await client.stats();
+        const totalIn = stats.model_usage.reduce((s, m) => s + Number(m.tokens_in), 0);
+        const totalOut = stats.model_usage.reduce((s, m) => s + Number(m.tokens_out), 0);
+        const totalTokens = totalIn + totalOut;
+        setTotalSessionTokens(totalTokens);
+
+        const now = Date.now();
+        if (totalTokens > thinkingLastTokenRef.current.count) {
+          thinkingLastTokenRef.current = { time: now, count: totalTokens };
+          setThinkingStalled(false);
+        } else if (thinkingLastTokenRef.current.time > 0 &&
+                   now - thinkingLastTokenRef.current.time > 3000) {
+          setThinkingStalled(true);
+        }
+      } catch { /* core may be down */ }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [client, fastPollerActiveAgents]);
+
+  // Companion: tamagotchi decay (every 5s)
+  useEffect(() => {
+    let persistCounter = 0;
+    const timer = setInterval(() => {
+      const prev = companionPersistedRef.current;
+      if (prev.tama.isDead) return;
+      const tama = { ...prev.tama };
+      applyDecay(tama, Date.now());
+      const next = { ...prev, tama };
+      companionPersistedRef.current = next;
+      setCompanionState(next);
+      persistCounter++;
+      if (persistCounter % 6 === 0) saveCompanionState(next);
+    }, 5000);
+    return () => {
+      clearInterval(timer);
+      saveCompanionState(companionPersistedRef.current);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Companion: show widget at end of each turn
+  const completedTurnsRef = useRef(0);
+  useEffect(() => {
+    if (turns.length === 0) { completedTurnsRef.current = 0; return; }
+    const doneCount = turns.filter((t) => !t.inFlight).length;
+    if (doneCount > completedTurnsRef.current) {
+      completedTurnsRef.current = doneCount;
+      if (companionState.companion) {
+        setCompanionWidgetMessage(null);
+      }
+    }
+  }, [turns]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // -- Helpers ----------------------------------------------------------------
 
   const pushInfo = useCallback(
@@ -239,6 +450,33 @@ export function KiraApp({
             }
             return next;
           });
+
+          // SC2 — surface approval prompt when agent awaits HIGH-risk tool.
+          if (fresh.awaiting_approval) {
+            const decided = decidedApprovalRef.current;
+            const alreadyDecided =
+              decided?.agentId === agentId &&
+              decided?.toolName === fresh.awaiting_approval.tool_name;
+            if (!alreadyDecided) {
+              setPendingApproval((prev) =>
+                prev?.agentId === agentId
+                  ? prev
+                  : {
+                      agentId,
+                      agentKind: fresh.kind,
+                      approval: fresh.awaiting_approval!,
+                    },
+              );
+            }
+          } else {
+            // Server cleared awaiting_approval — clear the decided guard too.
+            decidedApprovalRef.current = null;
+            // Clear if agent no longer needs approval (verdict received).
+            setPendingApproval((prev) =>
+              prev?.agentId === agentId ? null : prev,
+            );
+          }
+
           if (
             ["completed", "failed", "cancelled", "stopped"].includes(fresh.status)
           ) {
@@ -246,6 +484,25 @@ export function KiraApp({
             if (t) {
               clearInterval(t);
               agentPollers.current.delete(agentId);
+            }
+
+            // Fetch worktree diff to show generated files
+            if (fresh.status === "completed") {
+              void (async () => {
+                try {
+                  const diff = await client.getAgentDiff(agentId);
+                  if (diff && diff.trim().length > 0) {
+                    setTurns((t) => {
+                      const next = [...t];
+                      const cur = next[turnIdx];
+                      if (cur && cur.kind === "agent") {
+                        next[turnIdx] = { ...cur, diff };
+                      }
+                      return next;
+                    });
+                  }
+                } catch { /* diff may be empty or unavailable */ }
+              })();
             }
           }
         } catch (e) {
@@ -537,6 +794,43 @@ export function KiraApp({
     [client, turns.length, pushInfo, startPlanPoller],
   );
 
+  const handleSddQuestionSubmit = useCallback(
+    async (answers: Record<string, string[]>) => {
+      if (!pendingSddQuestions) return;
+      const { sddRunId } = pendingSddQuestions;
+      setPendingSddQuestions(null);
+      try {
+        await client.answerSddQuestions(sddRunId, answers);
+        addToast("success", `Answers submitted for SDD run ${sddRunId.slice(0, 8)}`);
+      } catch (e) {
+        addToast("error", `Failed to submit answers: ${String(e)}`);
+      }
+    },
+    [pendingSddQuestions, client, addToast],
+  );
+
+  const handleApprovalDecide = useCallback(
+    async (approved: boolean, feedback?: string) => {
+      if (!pendingApproval) return;
+      const { agentId, approval } = pendingApproval;
+      // Guard against poller re-showing while server processes verdict.
+      decidedApprovalRef.current = { agentId, toolName: approval.tool_name };
+      setPendingApproval(null);
+      try {
+        await client.approveAgentTool(agentId, approved, feedback);
+        addToast(
+          approved ? "success" : "warning",
+          approved
+            ? `Tool approved for agent ${agentId.slice(0, 8)}`
+            : `Tool rejected for agent ${agentId.slice(0, 8)}${feedback ? `: ${feedback}` : ""}`,
+        );
+      } catch (e) {
+        addToast("error", `Approval request failed: ${String(e)}`);
+      }
+    },
+    [pendingApproval, client, addToast],
+  );
+
   const handlePlanCancel = useCallback(
     async (raw: string) => {
       const prefix = raw.slice("/plan cancel".length).trim();
@@ -768,11 +1062,25 @@ export function KiraApp({
         try {
           finalRun = await client.getSdd(run.id);
           if (finalRun.current_phase === "done" || finalRun.current_phase === "failed") break;
+
+          // Surface pending questions → show PlanQuestions UI.
+          if (finalRun.pending_questions && finalRun.pending_questions.length > 0) {
+            setPendingSddQuestions((prev) =>
+              prev?.sddRunId === run.id
+                ? prev
+                : { sddRunId: run.id, questions: finalRun.pending_questions },
+            );
+          } else {
+            setPendingSddQuestions((prev) =>
+              prev?.sddRunId === run.id ? null : prev,
+            );
+          }
         } catch {
           /* keep polling */
         }
       }
       ctrl.abort();
+      setPendingSddQuestions((prev) => (prev?.sddRunId === run.id ? null : prev));
 
       // Final summary line.
       const dirRel = `.kira/runs/${run.id}/`;
@@ -860,6 +1168,458 @@ export function KiraApp({
     [client, pushInfo],
   );
 
+  // -- /review <head> [base] [timeout=N] --------------------------------------
+
+  const handleReview = useCallback(
+    async (raw: string) => {
+      const rest = raw.slice("/review".length).trim();
+      if (!rest) {
+        pushInfo(raw, "", "usage: /review <head> [base] [timeout=N]");
+        return;
+      }
+      const tokens = rest.split(/\s+/);
+      const flags: Record<string, string> = {};
+      const positional: string[] = [];
+      for (const tok of tokens) {
+        if (tok.includes("=")) {
+          const [k, v] = tok.split("=", 2);
+          flags[k] = v;
+        } else {
+          positional.push(tok);
+        }
+      }
+      const head = positional[0];
+      const base = positional[1] ?? null;
+      const timeout = flags.timeout ? Number(flags.timeout) : null;
+      if (!head) {
+        pushInfo(raw, "", "head branch required");
+        return;
+      }
+      const turnIdx = turns.length;
+      setTurns((t) => [
+        ...t,
+        { kind: "info", user: raw, body: `🟡 P3 Review → ${head} vs ${base ?? "main"} starting…`, inFlight: true },
+      ]);
+      const lines: string[] = [`🟡 P3 Review → ${head} vs ${base ?? "main"} starting…`];
+      const flush = () => {
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: true };
+          }
+          return next;
+        });
+      };
+
+      // Subscribe to all pillar events (no run_id filter — review fires
+      // multiple agent runs, each with its own id).
+      const ctrl = client.streamPillarEvents(
+        undefined,
+        (ev) => {
+          const { emoji, abbr } = pillarSigil(ev.pillar);
+          lines.push(`${emoji} ${abbr} → [${ev.phase}] ${ev.message}`);
+          flush();
+        },
+        () => { /* swallow */ },
+      );
+
+      try {
+        const resp = await client.runReview({
+          workflow: null,
+          head,
+          base,
+          timeout_secs: timeout != null ? BigInt(timeout) : null,
+        });
+        ctrl.abort();
+        lines.push("");
+        lines.push(
+          `✅ run ${resp.run_id.slice(0, 8)} · agents=${resp.agents.length} · findings=${resp.total_findings} · ${Number(resp.duration_ms) / 1000}s`,
+        );
+        for (const a of resp.agents) {
+          lines.push(
+            `  · ${a.dimension.padEnd(14)} ${a.status.padEnd(9)} kept=${a.findings_kept} dropped=${a.findings_dropped} gate=${a.gate_overall}${a.gate_failed_at ? ` (failed_at=${a.gate_failed_at})` : ""}`,
+          );
+        }
+        lines.push(`REVIEW.md → ${resp.review_md_path}`);
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: false };
+          }
+          return next;
+        });
+      } catch (e) {
+        ctrl.abort();
+        const msg = e instanceof CoreError ? e.message : String(e);
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), error: msg, inFlight: false };
+          }
+          return next;
+        });
+      }
+    },
+    [client, turns.length, pushInfo, pillarSigil],
+  );
+
+  // -- /eval <path-to-json> ---------------------------------------------------
+
+  const handleEvalFile = useCallback(
+    async (raw: string) => {
+      const path = raw.slice("/eval".length).trim();
+      if (!path) {
+        pushInfo(raw, "", "usage: /eval <path-to-config.json>  (see docs/eval-config.md)");
+        return;
+      }
+      let cfg: {
+        tasks: Array<{ id: string; spec: string; expected_topic?: string | null; models?: string[] | null }>;
+        models: string[];
+        skip_embedding?: boolean;
+        skip_judge?: boolean;
+      };
+      try {
+        const text = await readFile(path, "utf-8");
+        cfg = JSON.parse(text);
+      } catch (e) {
+        pushInfo(raw, "", `read/parse failed: ${e}`);
+        return;
+      }
+      if (!Array.isArray(cfg.tasks) || cfg.tasks.length === 0) {
+        pushInfo(raw, "", "config.tasks must be a non-empty array");
+        return;
+      }
+      if (!Array.isArray(cfg.models) || cfg.models.length === 0) {
+        pushInfo(raw, "", "config.models must be a non-empty array");
+        return;
+      }
+      const turnIdx = turns.length;
+      setTurns((t) => [
+        ...t,
+        {
+          kind: "info",
+          user: raw,
+          body: `🟢 P4 Eval → ${cfg.tasks.length} task(s) × ${cfg.models.length} model(s) starting…`,
+          inFlight: true,
+        },
+      ]);
+      try {
+        const resp = await client.runEval({
+          tasks: cfg.tasks.map((t) => ({
+            id: t.id,
+            spec: t.spec,
+            expected_topic: t.expected_topic ?? null,
+            models: t.models ?? null,
+          })),
+          models: cfg.models,
+          skip_embedding: cfg.skip_embedding ?? false,
+          skip_judge: cfg.skip_judge ?? false,
+        });
+        const lines: string[] = [
+          `🟢 P4 Eval ✅ · ${resp.n_tasks} task(s) × ${resp.n_models} model(s) · $${resp.total_cost_usd.toFixed(4)} · ${Number(resp.total_duration_ms) / 1000}s`,
+          "",
+          "model".padEnd(28) + "n   judge   faith   pass    cost".padEnd(40),
+        ];
+        for (const s of resp.summary_by_model) {
+          const judge = s.avg_judge_score != null ? s.avg_judge_score.toFixed(2) : "  -";
+          const faith = s.avg_faithfulness != null ? s.avg_faithfulness.toFixed(2) : "  -";
+          lines.push(
+            `${s.model.padEnd(28)}${String(s.n_samples).padEnd(4)}${judge.padEnd(8)}${faith.padEnd(8)}${(s.pass_rate * 100).toFixed(0).padStart(3)}%   $${s.total_cost_usd.toFixed(4)}`,
+          );
+        }
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: false };
+          }
+          return next;
+        });
+      } catch (e) {
+        const msg = e instanceof CoreError ? e.message : String(e);
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, error: msg, inFlight: false };
+          }
+          return next;
+        });
+      }
+    },
+    [client, turns.length, pushInfo],
+  );
+
+  // -- /gates <sdd-run-prefix> ------------------------------------------------
+
+  const handleGates = useCallback(
+    async (raw: string) => {
+      const prefix = raw.slice("/gates".length).trim();
+      if (!prefix) {
+        pushInfo(raw, "", "usage: /gates <sdd-run-prefix>  (reuses spec/design from .kira/runs/<id>/)");
+        return;
+      }
+      let run: Awaited<ReturnType<typeof client.getSdd>>;
+      try {
+        const list = await client.listSdd();
+        const match = list.runs.find((r: { id: string }) => r.id.startsWith(prefix));
+        if (!match) {
+          pushInfo(raw, "", `no sdd run with prefix '${prefix}'`);
+          return;
+        }
+        run = await client.getSdd(match.id);
+      } catch (e) {
+        pushInfo(raw, "", String(e));
+        return;
+      }
+      if (!run.spec_path || !run.design_path) {
+        pushInfo(raw, "", `run ${run.id.slice(0, 8)} missing spec_path or design_path; gates need both`);
+        return;
+      }
+      let spec: string;
+      let output: string;
+      try {
+        spec = await readFile(run.spec_path, "utf-8");
+        output = await readFile(run.design_path, "utf-8");
+      } catch (e) {
+        pushInfo(raw, "", `read artifacts failed: ${e}`);
+        return;
+      }
+      const turnIdx = turns.length;
+      setTurns((t) => [
+        ...t,
+        {
+          kind: "info",
+          user: raw,
+          body: `🟢 P4 Gates → run ${run.id.slice(0, 8)} (spec=${spec.length}B output=${output.length}B)…`,
+          inFlight: true,
+        },
+      ]);
+      try {
+        const resp = await client.runGates({
+          spec,
+          output,
+          owned_paths: [],
+          touched_paths: [],
+          estimated_loc: null,
+          actual_loc: null,
+          skip_embedding: false,
+          skip_judge: false,
+          haystack: output,
+          skip_meta_review: false,
+          worktree_path: run.worktree_path,
+          skip_structural_lint: true,
+          writer_model: null,
+        });
+        const lines: string[] = [
+          `🟢 P4 Gates · run ${run.id.slice(0, 8)} · overall=${resp.overall}${resp.failed_at ? ` (failed_at=${resp.failed_at})` : ""} · ${Number(resp.duration_ms)}ms`,
+          "",
+        ];
+        for (const r of resp.results) {
+          const score = r.score != null ? r.score.toFixed(2).padStart(5) : "   - ";
+          lines.push(`  ${r.outcome.padEnd(8)} ${r.gate.padEnd(22)} score=${score}  ${r.reason ?? ""}`);
+        }
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: false };
+          }
+          return next;
+        });
+      } catch (e) {
+        const msg = e instanceof CoreError ? e.message : String(e);
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, error: msg, inFlight: false };
+          }
+          return next;
+        });
+      }
+    },
+    [client, turns.length, pushInfo],
+  );
+
+  // -- /worktrees, /ownership, /mcp, /stats — read-only observability ---------
+
+  const handleWorktrees = useCallback(async () => {
+    try {
+      const all = await client.listWorktrees();
+      if (all.length === 0) {
+        pushInfo("/worktrees", "(no worktrees)");
+        return;
+      }
+      const body = all
+        .map(
+          (w) =>
+            `${w.id.slice(0, 8)} ${w.status.padEnd(10)} ${(w.agent_kind ?? "-").padEnd(9)} ${w.branch.padEnd(28)} ${w.path}`,
+        )
+        .join("\n");
+      pushInfo("/worktrees", body);
+    } catch (e) {
+      pushInfo("/worktrees", "", String(e));
+    }
+  }, [client, pushInfo]);
+
+  const handleOwnership = useCallback(
+    async (raw: string) => {
+      const rest = raw.slice("/ownership".length).trim();
+      // /ownership check agent=<id> path=<p>
+      if (rest.startsWith("check")) {
+        const flags: Record<string, string> = {};
+        for (const tok of rest.slice("check".length).trim().split(/\s+/)) {
+          if (tok.includes("=")) {
+            const [k, v] = tok.split("=", 2);
+            flags[k] = v;
+          }
+        }
+        if (!flags.agent || !flags.path) {
+          pushInfo(raw, "", "usage: /ownership check agent=<id> path=<path>");
+          return;
+        }
+        try {
+          const d = await client.checkOwnership(flags.agent, flags.path);
+          if (d.decision === "allowed") {
+            pushInfo(raw, `allowed · agent=${flags.agent.slice(0, 8)} path=${flags.path}`);
+          } else {
+            pushInfo(
+              raw,
+              `denied · reason=${d.reason}${d.conflicting_agent ? ` conflicting=${d.conflicting_agent.slice(0, 8)}` : ""}`,
+            );
+          }
+        } catch (e) {
+          pushInfo(raw, "", String(e));
+        }
+        return;
+      }
+      // /ownership — list
+      try {
+        const all = await client.listOwnership();
+        if (all.length === 0) {
+          pushInfo("/ownership", "(no claims)");
+          return;
+        }
+        const body = all
+          .map(
+            (c) =>
+              `${c.agent_id.slice(0, 8)} ${c.mode.padEnd(10)} patterns=[${c.patterns.join(",")}] since=${c.created_at}`,
+          )
+          .join("\n");
+        pushInfo("/ownership", body);
+      } catch (e) {
+        pushInfo("/ownership", "", String(e));
+      }
+    },
+    [client, pushInfo],
+  );
+
+  const handleMcp = useCallback(async () => {
+    try {
+      const r = await client.mcpServers();
+      if (r.servers.length === 0) {
+        pushInfo("/mcp", `(no MCP servers connected) · total_tools=${r.total_tools}`);
+        return;
+      }
+      const lines: string[] = [`MCP servers=${r.servers.length} · total_tools=${r.total_tools}`];
+      for (const s of r.servers) {
+        lines.push(`  ${s.name} (${s.tools.length} tools)`);
+        for (const t of s.tools.slice(0, 8)) {
+          lines.push(`    · ${t.namespaced_name.padEnd(36)} [${t.risk}] ${t.description.slice(0, 60)}`);
+        }
+        if (s.tools.length > 8) lines.push(`    … +${s.tools.length - 8} more`);
+      }
+      pushInfo("/mcp", lines.join("\n"));
+    } catch (e) {
+      pushInfo("/mcp", "", String(e));
+    }
+  }, [client, pushInfo]);
+
+  const handleStats = useCallback(async () => {
+    try {
+      const s = await client.stats();
+      const lines = [
+        `usd_spent=$${s.usd_spent.toFixed(4)} · agents total=${s.total_agents} active=${s.active_agents} completed=${s.completed_agents} finished=${s.finished_agents}`,
+      ];
+      if (s.model_usage.length > 0) {
+        lines.push("");
+        lines.push("model".padEnd(28) + "reqs   tokens_in    tokens_out");
+        for (const m of s.model_usage) {
+          lines.push(
+            `${m.model.padEnd(28)}${String(m.requests).padEnd(7)}${String(m.tokens_in).padStart(10)}    ${String(m.tokens_out).padStart(10)}`,
+          );
+        }
+      }
+      pushInfo("/stats", lines.join("\n"));
+    } catch (e) {
+      pushInfo("/stats", "", String(e));
+    }
+  }, [client, pushInfo]);
+
+  // -- /events [run_id] — tail pillar events; /events stop --------------------
+
+  const handleEvents = useCallback(
+    async (raw: string) => {
+      const rest = raw.slice("/events".length).trim();
+      if (rest === "stop") {
+        if (eventsCtrl.current) {
+          eventsCtrl.current.abort();
+          eventsCtrl.current = null;
+          pushInfo(raw, "events stream stopped");
+        } else {
+          pushInfo(raw, "(no active events stream)");
+        }
+        return;
+      }
+      if (eventsCtrl.current) {
+        pushInfo(raw, "", "stream already active — use /events stop first");
+        return;
+      }
+      const runId = rest || undefined;
+      const turnIdx = turns.length;
+      setTurns((t) => [
+        ...t,
+        {
+          kind: "info",
+          user: raw,
+          body: `📡 events${runId ? ` run=${runId.slice(0, 8)}` : " (all)"} — tailing… /events stop to end`,
+          inFlight: true,
+        },
+      ]);
+      const lines: string[] = [
+        `📡 events${runId ? ` run=${runId.slice(0, 8)}` : " (all)"} — tailing… /events stop to end`,
+      ];
+      const flush = () => {
+        setTurns((t) => {
+          const next = [...t];
+          const cur = next[turnIdx];
+          if (cur && cur.kind === "info") {
+            next[turnIdx] = { ...cur, body: lines.join("\n"), inFlight: true };
+          }
+          return next;
+        });
+      };
+      eventsCtrl.current = client.streamPillarEvents(
+        runId,
+        (ev) => {
+          const { emoji, abbr } = pillarSigil(ev.pillar);
+          const runTag = ev.run_id ? ` ${ev.run_id.slice(0, 8)}` : "";
+          lines.push(`${emoji} ${abbr}${runTag} [${ev.phase}] ${ev.message}`);
+          flush();
+        },
+        (e) => {
+          lines.push(`(stream error: ${e})`);
+          flush();
+        },
+      );
+    },
+    [client, turns.length, pushInfo, pillarSigil],
+  );
+
   // -- Free text / YOLO dispatch ----------------------------------------------
 
   const handleFreeText = useCallback(
@@ -885,19 +1645,40 @@ export function KiraApp({
             messages,
             mode: "yolo",
           });
-          setTurns((t) => {
-            const next = [...t];
-            const cur = next[turnIdx];
-            if (cur && cur.kind === "agent") {
-              next[turnIdx] = {
-                ...cur,
-                agentId: yolo.agent_id,
-                status: yolo.status,
-              };
-            }
-            return next;
-          });
-          startAgentPoller(turnIdx, yolo.agent_id);
+          // Fast-path response (H6, 2026-05-25): backend resolved without
+          // spawning an agent — `agent_id` empty, `kind` is "chat", `message`
+          // holds the model output. Render inline and skip the poller.
+          const isFastPath =
+            !yolo.agent_id && yolo.kind === "chat" && yolo.status === "completed";
+          if (isFastPath) {
+            setTurns((t) => {
+              const next = [...t];
+              const cur = next[turnIdx];
+              if (cur && cur.kind === "agent") {
+                next[turnIdx] = {
+                  ...cur,
+                  status: "completed",
+                  inFlight: false,
+                  result: yolo.message,
+                };
+              }
+              return next;
+            });
+          } else {
+            setTurns((t) => {
+              const next = [...t];
+              const cur = next[turnIdx];
+              if (cur && cur.kind === "agent") {
+                next[turnIdx] = {
+                  ...cur,
+                  agentId: yolo.agent_id,
+                  status: yolo.status,
+                };
+              }
+              return next;
+            });
+            startAgentPoller(turnIdx, yolo.agent_id);
+          }
         } catch (e) {
           const msg = e instanceof CoreError ? e.message : String(e);
           setTurns((t) => {
@@ -962,6 +1743,11 @@ export function KiraApp({
     [client, mode, tier, turns.length, startAgentPoller],
   );
 
+  // Save Tama state on graceful exit — between-session survival handled by loadCompanionState
+  const tuckInTama = useCallback(() => {
+    saveCompanionState(companionPersistedRef.current);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // -- Main dispatch ----------------------------------------------------------
 
   const send = useCallback(
@@ -976,6 +1762,7 @@ export function KiraApp({
       }
 
       if (text === "/quit" || text === "/exit") {
+        tuckInTama();
         setShowGoodbye(true);
         return;
       }
@@ -1087,6 +1874,187 @@ export function KiraApp({
         await handleFetch(text);
         return;
       }
+      if (text.startsWith("/review")) {
+        await handleReview(text);
+        return;
+      }
+      if (text.startsWith("/eval")) {
+        await handleEvalFile(text);
+        return;
+      }
+      if (text.startsWith("/gates")) {
+        await handleGates(text);
+        return;
+      }
+      if (text === "/worktrees") {
+        await handleWorktrees();
+        return;
+      }
+      if (text === "/ownership" || text.startsWith("/ownership ")) {
+        await handleOwnership(text);
+        return;
+      }
+      if (text === "/mcp") {
+        await handleMcp();
+        return;
+      }
+      if (text === "/stats") {
+        await handleStats();
+        return;
+      }
+      if (text === "/events" || text.startsWith("/events ")) {
+        await handleEvents(text);
+        return;
+      }
+
+      // Companion commands (English + Portuguese aliases)
+      const companionCmd = text.toLowerCase();
+      const tamaCmds = ["/feed", "/play", "/clean", "/medicate", "/sleep", "/wake", "/revive",
+                        "/alimentar", "/brincar", "/limpar", "/medicar", "/dormir", "/acordar", "/reviver"];
+      if (tamaCmds.includes(companionCmd)) {
+        const actionMap: Record<string, TamaAction> = {
+          "/feed": "feed", "/play": "play", "/clean": "clean",
+          "/medicate": "medicate", "/sleep": "sleep", "/wake": "wake",
+          "/revive": "revive",
+          "/alimentar": "feed", "/brincar": "play", "/limpar": "clean",
+          "/medicar": "medicate", "/dormir": "sleep", "/acordar": "wake",
+          "/reviver": "revive",
+        };
+        const action = actionMap[companionCmd]!;
+        const prev = companionPersistedRef.current;
+        const tama = { ...prev.tama };
+        const msg = dispatchAction(tama, action);
+        if (msg) {
+          const next = { ...prev, tama };
+          companionPersistedRef.current = next;
+          setCompanionState(next);
+          setCompanionWidgetMessage(msg);
+          saveCompanionState(next);
+          pushInfo(text, msg);
+        } else {
+          pushInfo(text, "nothing happens");
+        }
+        return;
+      }
+      if (companionCmd === "/companion" || companionCmd.startsWith("/companion ")) {
+        const arg = companionCmd.slice("/companion".length).trim();
+        if (arg === "on") {
+          const next = { ...companionPersistedRef.current, hidden: false };
+          companionPersistedRef.current = next;
+          setCompanionState(next);
+          saveCompanionState(next);
+          pushInfo(text, "companion visible");
+        } else if (arg === "off") {
+          const next = { ...companionPersistedRef.current, hidden: true };
+          companionPersistedRef.current = next;
+          setCompanionState(next);
+          saveCompanionState(next);
+          pushInfo(text, "companion hidden");
+        } else if (arg === "toggle") {
+          const next = { ...companionPersistedRef.current, hidden: !companionPersistedRef.current.hidden };
+          companionPersistedRef.current = next;
+          setCompanionState(next);
+          saveCompanionState(next);
+          pushInfo(text, next.hidden ? "companion hidden" : "companion visible");
+        } else if (!arg) {
+          const soul = companionState.companion;
+          if (soul) {
+            pushInfo(text, `${soul.name}: ${soul.personality} | XP: ${companionState.xp.total} | Hunger: ${Math.round(companionState.tama.hunger)} | Happiness: ${Math.round(companionState.tama.happiness)}`);
+          } else {
+            pushInfo(text, "No companion yet.");
+          }
+        }
+        return;
+      }
+
+      // Pomodoro commands
+      if (text === "/pomodoro start") {
+        const prev = companionPersistedRef.current;
+        if (prev.pomodoro.phase !== "idle" && prev.pomodoro.phase !== "short_break" && prev.pomodoro.phase !== "long_break") {
+          pushInfo(text, "already in focus");
+          return;
+        }
+        const now = Date.now();
+        const nextPomo = { ...prev.pomodoro, phase: "focus" as const, startedAt: now, elapsed: 0 };
+        const next = { ...prev, pomodoro: nextPomo };
+        companionPersistedRef.current = next;
+        setCompanionState(next);
+        saveCompanionState(next);
+        const mins = nextPomo.focusDuration / 60000;
+        pushInfo(text, `focus started (${mins}:00)`);
+        return;
+      }
+      if (text === "/pomodoro stop") {
+        const prev = companionPersistedRef.current;
+        if (prev.pomodoro.phase === "idle") {
+          pushInfo(text, "no active session");
+          return;
+        }
+        const nextPomo = { ...prev.pomodoro, phase: "idle" as const, startedAt: null, elapsed: 0 };
+        const next = { ...prev, pomodoro: nextPomo };
+        companionPersistedRef.current = next;
+        setCompanionState(next);
+        saveCompanionState(next);
+        pushInfo(text, "pomodoro stopped");
+        return;
+      }
+      if (text === "/pomodoro pause") {
+        const prev = companionPersistedRef.current;
+        if (prev.pomodoro.phase === "idle" || !prev.pomodoro.startedAt) {
+          pushInfo(text, "nothing to pause");
+          return;
+        }
+        const elapsed = prev.pomodoro.elapsed + (Date.now() - prev.pomodoro.startedAt);
+        const nextPomo = { ...prev.pomodoro, startedAt: null, elapsed };
+        const next = { ...prev, pomodoro: nextPomo };
+        companionPersistedRef.current = next;
+        setCompanionState(next);
+        saveCompanionState(next);
+        pushInfo(text, "pomodoro paused");
+        return;
+      }
+      if (text === "/pomodoro resume") {
+        const prev = companionPersistedRef.current;
+        if (prev.pomodoro.phase === "idle" || prev.pomodoro.startedAt) {
+          pushInfo(text, prev.pomodoro.startedAt ? "already running" : "no active session");
+          return;
+        }
+        const nextPomo = { ...prev.pomodoro, startedAt: Date.now() };
+        const next = { ...prev, pomodoro: nextPomo };
+        companionPersistedRef.current = next;
+        setCompanionState(next);
+        saveCompanionState(next);
+        pushInfo(text, "pomodoro resumed");
+        return;
+      }
+      if (text === "/pomodoro status") {
+        const p = companionState.pomodoro;
+        const phase = p.phase === "idle" ? "idle" : `${p.phase} (${Math.floor(p.elapsed / 60000)}m)`;
+        pushInfo(text, `pomodoro: ${phase} | completed: ${p.completed} | durations: ${p.focusDuration / 60000}m focus / ${p.shortBreakDuration / 60000}m break`);
+        return;
+      }
+      if (text.startsWith("/pomodoro config ")) {
+        const rest = text.slice("/pomodoro config ".length).trim();
+        const parts = rest.split(/\s+/).map(Number);
+        if (parts.length >= 2 && parts[0] > 0 && parts[1] > 0) {
+          const prev = companionPersistedRef.current;
+          const nextPomo = {
+            ...prev.pomodoro,
+            focusDuration: parts[0] * 60 * 1000,
+            shortBreakDuration: parts[1] * 60 * 1000,
+            longBreakDuration: Math.min(parts[1] * 3, 30) * 60 * 1000,
+          };
+          const next = { ...prev, pomodoro: nextPomo };
+          companionPersistedRef.current = next;
+          setCompanionState(next);
+          saveCompanionState(next);
+          setDecayFocusDuration(nextPomo.focusDuration);
+          pushInfo(text, `pomodoro configured: ${parts[0]}m focus / ${parts[1]}m break`);
+        } else {
+          pushInfo(text, "", "usage: /pomodoro config <focusMin> <breakMin>");
+        }
+        return;
+      }
 
       // Free text → mode dispatch
       await handleFreeText(text);
@@ -1110,11 +2078,76 @@ export function KiraApp({
       handleSddList,
       handleSearch,
       handleFetch,
+      handleReview,
+      handleEvalFile,
+      handleGates,
+      handleWorktrees,
+      handleOwnership,
+      handleMcp,
+      handleStats,
+      handleEvents,
       handleFreeText,
       setThemeMode,
       themeMode,
+      companionState,
     ],
   );
+
+  // -- ThinkingDisplay state machine -----------------------------------------
+
+  const prevActiveAgents = useRef(0);
+  const prevFailedCount = useRef(0);
+
+  const activeAgentTurns = useMemo(
+    () => turns.filter((t): t is Extract<Turn, { kind: "agent" }> => t.kind === "agent" && t.inFlight),
+    [turns],
+  );
+
+  const failedAgentTurns = useMemo(
+    () => turns.filter((t) => t.kind === "agent" && t.status === "failed"),
+    [turns],
+  );
+
+  const subAgents: SubAgentInfo[] = useMemo(
+    () =>
+      activeAgentTurns.map((t) => ({
+        agentId: t.agentId ?? "unknown",
+        kind: t.agentKind,
+        status: t.status ?? "active",
+        activity: t.user,
+        iterations: t.iters ?? 0,
+        elapsed: t.startedAt ? Math.floor((Date.now() - t.startedAt) / 1000) : 0,
+      })),
+    [activeAgentTurns],
+  );
+
+  // Category transitions
+  useEffect(() => {
+    const now = activeAgentTurns.length;
+    const prev = prevActiveAgents.current;
+    prevActiveAgents.current = now;
+
+    if (now > 0) {
+      // Update failed count while agents are active (for comparison later)
+      prevFailedCount.current = failedAgentTurns.length;
+
+      const allSpawning = activeAgentTurns.every(
+        (t) => t.status === "spawning" || t.status === undefined,
+      );
+      if (allSpawning) {
+        setThinkingCategory("spawning");
+      } else {
+        setThinkingCategory("thinking");
+      }
+    } else if (prev > 0) {
+      // Just transitioned from active → idle
+      setThinkingCategory(
+        failedAgentTurns.length > prevFailedCount.current
+          ? "failure"
+          : "success",
+      );
+    }
+  }, [activeAgentTurns, failedAgentTurns.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // -- Render -----------------------------------------------------------------
 
@@ -1128,14 +2161,18 @@ export function KiraApp({
     (t) => t.kind === "agent" && t.status === "failed",
   ).length;
   const mascotEmotion = useMemo<Emotion>(() => {
+    const tama = tamaEmotion(companionState.tama);
+    if (tama !== "neutral" && tama !== "happy") return tama;
     if (failedTurns > 0) return "sad";
     if (activeAgents > 0) return "surprised";
     if (completedTurns > 0) return "happy";
-    return "neutral";
-  }, [activeAgents, completedTurns, failedTurns]);
+    return tama; // "neutral" or "happy" from tama
+  }, [activeAgents, completedTurns, failedTurns, companionState.tama]);
+  const bannerRowColors = useMemo(
+    () => interpolatePalette(colors.logoGradientK, GOODBYE_BANNER.length),
+    [colors.logoGradientK],
+  );
   const termWidth = stdout?.columns ?? 80;
-  const boxWidth = Math.min(86, Math.max(60, termWidth - 4));
-
   // Format wall time
   function formatTime(ms: number): string {
     const secs = Math.floor(ms / 1000);
@@ -1146,7 +2183,6 @@ export function KiraApp({
     return `${secs}s`;
   }
 
-  const wallTime = formatTime(Date.now() - sessionStart.current);
   const totalTurns = turnCount.current;
   const totalAgents = turns.filter((t) => t.kind === "agent").length;
   const completedAgents = turns.filter(
@@ -1154,13 +2190,11 @@ export function KiraApp({
   ).length;
   const totalCommands = commandCount.current;
 
-  const goodbyeArt = useMemo(() => figletArt("GOODBYE", "Small"), []);
-
   // Show goodbye summary
   if (showGoodbye) {
+    const wallTime = formatTime(Date.now() - sessionStart.current);
     const sessionId = `kira-${sessionStart.current.toString(36).slice(0, 12)}`;
     const stats = goodbyeStats;
-    const totalToolCalls = totalAgents;
     const successfulAgents = turns.filter(
       (t) => t.kind === "agent" && t.status === "completed",
     ).length;
@@ -1185,113 +2219,130 @@ export function KiraApp({
       ? stats.model_usage.reduce((sum, m) => sum + Number(m.tokens_out), 0)
       : 0;
 
-    const contentWidth = boxWidth - 4;
+    const tierColor =
+      tier === "heavy" ? "#E879A8" : tier === "light" ? "#4ADE80" : "#87CEEB";
 
-    const sep = () => (
-      <Text color="#444444">{"─".repeat(contentWidth)}</Text>
-    );
+    const bannerWidth = Math.max(...GOODBYE_BANNER.map((l) => l.length));
+    const cardWidth = Math.min(termWidth - 4, Math.max(bannerWidth + 6, 66));
+    const leftPad = Math.max(0, Math.floor((termWidth - cardWidth) / 2));
 
-    const labelRow = (
-      label: string,
-      value: string,
-      opts?: { color?: string },
-    ) => (
+    const row = (items: { label: string; value: string; color?: string }[]) => (
       <Text>
-        <Text color="#888888">{`${label}:`.padEnd(22)}</Text>
-        <Text color={opts?.color ?? "#E8E8E8"}>{value}</Text>
+        {items.map((it, i) => (
+          <React.Fragment key={i}>
+            {i > 0 && <Text color="#444444">{`   `}</Text>}
+            <Text color="#777777">{it.label} </Text>
+            <Text color={it.color ?? "#E8E8E8"}>{it.value}</Text>
+          </React.Fragment>
+        ))}
       </Text>
     );
 
-    const header = (title: string) => (
-      <Text bold color="#D4D4D4">{`  ${title}`}</Text>
-    );
-
-    const content = (lines: React.ReactNode) => (
-      <Box flexDirection="column" paddingLeft={2}>
-        {lines}
-      </Box>
-    );
-
     return (
-      <Box flexDirection="column" paddingX={1} marginTop={1}>
+      <Box flexDirection="column" paddingX={1} marginTop={1} marginLeft={leftPad}>
         <Box
           flexDirection="column"
-          borderStyle="classic"
+          borderStyle="round"
           borderColor="#A855F7"
-          width={boxWidth}
+          width={cardWidth}
           paddingX={1}
           paddingY={0}
         >
-          {/* Title */}
-          <Box flexDirection="column" paddingLeft={1} paddingTop={0} paddingBottom={1}>
-            {goodbyeArt.map((line, i) => (
-              <Text key={i} color="#A855F7">{line}</Text>
+          {/* Banner */}
+          <Box flexDirection="column" paddingX={1} paddingTop={1} paddingBottom={0}>
+            {GOODBYE_BANNER.map((line, i) => (
+              <Text key={i} color={bannerRowColors[i] ?? colors.logoGradientK[0]}>{line}</Text>
             ))}
           </Box>
 
-          <Box paddingLeft={1}>{sep()}</Box>
-
-          {/* Interaction Summary */}
-          <Box paddingLeft={1} marginTop={0}>{header("Interaction Summary")}</Box>
-          <Box paddingLeft={1}>{labelRow("Session ID", sessionId, { color: "#888888" })}</Box>
-          <Box paddingLeft={1}>{labelRow("Wall Time", wallTime)}</Box>
-          <Box paddingLeft={1}>{labelRow("Total Turns", String(totalTurns))}</Box>
-          <Box paddingLeft={1}>{labelRow("Commands", String(totalCommands))}</Box>
-          <Box paddingLeft={1}>{labelRow("Agents Spawned", String(totalAgents))}</Box>
-          <Box paddingLeft={1}>{labelRow("Agents Completed", String(successfulAgents))}</Box>
-          <Box paddingLeft={1}>{labelRow("Success Rate", `${successRate}%`)}</Box>
-
-          <Box paddingLeft={1}>{sep()}</Box>
-
-          {/* Performance */}
-          <Box paddingLeft={1} marginTop={0}>{header("Performance")}</Box>
-          <Box paddingLeft={1}>{labelRow("API Calls", String(totalToolCalls))}</Box>
-          <Box paddingLeft={1}>
-            {labelRow("Model Tier", tier, {
-              color: tier === "heavy" ? "#E879A8" : tier === "light" ? "#4ADE80" : "#87CEEB",
-            })}
+          <Box paddingX={1} paddingTop={0} paddingBottom={0}>
+            <Text> </Text>
           </Box>
-          {stats && (
-            <Box paddingLeft={1}>{labelRow("USD Spent", `$${stats.usd_spent.toFixed(4)}`, { color: costColor(stats.usd_spent) })}</Box>
+
+          {/* Session */}
+          <Box paddingX={1} paddingTop={0} paddingBottom={0}>
+            <Text color="#888888" dimColor>{sessionId}</Text>
+          </Box>
+
+          <Box paddingX={1} paddingTop={0} paddingBottom={0}>
+            {row([
+              { label: "time", value: wallTime },
+              { label: "turns", value: String(totalTurns) },
+              { label: "agents", value: String(totalAgents) },
+            ])}
+          </Box>
+
+          {totalCommands > 0 && (
+            <Box paddingX={1} paddingTop={0} paddingBottom={0}>
+              {row([
+                { label: "commands", value: String(totalCommands) },
+                { label: "completed", value: `${successfulAgents}/${totalAgents}` },
+                { label: "rate", value: `${successRate}%` },
+              ])}
+            </Box>
           )}
 
           {/* Model Usage */}
           {stats && stats.model_usage.length > 0 && (
             <>
-              <Box paddingLeft={1}>{sep()}</Box>
-              <Box paddingLeft={1} marginTop={0}>{header("Model Usage")}</Box>
-              <Box paddingLeft={1}>
-                <Text bold color="#888888">
-                  {`  Model${" ".repeat(14)}Reqs     Input      Output`}
-                </Text>
+              <Box paddingX={1} paddingTop={1} paddingBottom={0}>
+                <Text bold color="#A855F7">{"\u25C8"} MODELS</Text>
               </Box>
               {stats.model_usage.map((m) => (
-                <Box key={m.model} paddingLeft={1}>
-                  <Text color="#C8C8C8">{`  ${m.model.padEnd(20)}${String(m.requests).padStart(5)}  ${fmtNum(Number(m.tokens_in)).padStart(10)}  ${fmtNum(Number(m.tokens_out)).padStart(10)}`}</Text>
+                <Box key={m.model} paddingX={1} paddingTop={0} paddingBottom={0}>
+                  <Text color="#C8C8C8">
+                    <Text color="#777777">{m.model.padEnd(22)}</Text>
+                    <Text color="#666666">{`${String(m.requests).padStart(3)} req  `}</Text>
+                    <Text color="#666666">{`${fmtNum(Number(m.tokens_in)).padStart(9)} \u2192 `}</Text>
+                    <Text color="#666666">{fmtNum(Number(m.tokens_out)).padStart(9)}</Text>
+                  </Text>
                 </Box>
               ))}
-              <Box paddingLeft={1}>
-                <Text color="#E8E8E8">{`  Total: ${fmtNum(totalTokensIn)} in / ${fmtNum(totalTokensOut)} out`}</Text>
+              <Box paddingX={1} paddingTop={0} paddingBottom={0}>
+                <Text color="#666666" dimColor>
+                  <Text color="#777777">{"total".padEnd(22)}</Text>
+                  {`${fmtNum(totalTokensIn).padStart(12)} \u2192 ${fmtNum(totalTokensOut).padStart(9)}`}
+                </Text>
               </Box>
             </>
           )}
 
-          <Box paddingLeft={1}>{sep()}</Box>
-
-          {/* Restart hint */}
-          <Box paddingLeft={1}>
-            <Text color="#888888">Restart: bun run src/cli/kira.tsx</Text>
+          {/* Cost & Tier */}
+          <Box paddingX={1} paddingTop={1} paddingBottom={0}>
+            <Text bold color="#A855F7">{"\u25C8"} BILL</Text>
+          </Box>
+          <Box paddingX={1} paddingTop={0} paddingBottom={0}>
+            {row([
+              { label: "tier", value: tier.toUpperCase(), color: tierColor },
+              ...(stats ? [{ label: "usd", value: `$${stats.usd_spent.toFixed(4)}`, color: costColor(stats.usd_spent) }] : []),
+            ])}
           </Box>
 
-          <Box paddingLeft={0}>{sep()}</Box>
+          {/* Companion */}
+          <Box paddingX={1} paddingTop={1} paddingBottom={0}>
+            <Text bold color="#A855F7">{"\u25C8"} COMPANION</Text>
+          </Box>
+          <Box paddingX={1} paddingTop={0} paddingBottom={1}>
+            {companionState.companion ? (
+              <Box alignItems="center">
+                <Box marginRight={2}>
+                  <Mascot config={companionConfig} emotion="sleepy" />
+                </Box>
+                <Box flexDirection="column">
+                  <Text bold color="#9CA3AF">{companionState.companion.name} <Text dimColor color="#6B7280">zzz</Text></Text>
+                  <Text dimColor color="#6B7280">will wake on next write</Text>
+                </Box>
+              </Box>
+            ) : (
+              <Box marginLeft={2}>
+                <Text dimColor color="#6B7280">companion sleeps until next write</Text>
+              </Box>
+            )}
+          </Box>
 
-          {/* Dead companion */}
-          <Box paddingLeft={1} paddingBottom={1}>
-            <Mascot config={companionConfig} emotion="dead" />
-            <Box flexDirection="column" marginLeft={2}>
-              <Text color="#666666" dimColor>Your companion rests</Text>
-              <Text color="#666666" dimColor>until the next write.</Text>
-            </Box>
+          {/* Restart */}
+          <Box paddingX={1} paddingBottom={1}>
+            <Text color="#444444" dimColor>restart: bun run src/cli/kira.tsx</Text>
           </Box>
         </Box>
       </Box>
@@ -1328,36 +2379,55 @@ export function KiraApp({
     );
   }
 
-  return (
-    <AnimationClockProvider>
-      <Box flexDirection="column">
-        {/* Header */}
-        <Header
-          coreUp={coreUp}
-          coreVersion={coreVersion}
-          tier={tier}
-          mode={mode}
-          workingDir={workingDir}
+  const scrollableContent = (
+    <>
+      {thinkingCategory !== "idle" && (
+        <ThinkingDisplay
+          category={thinkingCategory}
+          agents={subAgents}
+          totalTokens={totalSessionTokens}
+          totalAgents={totalAgents}
+          sessionStartedAt={sessionStart.current}
+          stalled={thinkingStalled}
+          onComplete={() => setThinkingCategory("idle")}
         />
+      )}
+      {turns.map((t, i) => (
+        <TurnRenderer key={i} turn={t} />
+      ))}
+      <ToastContainer toasts={toasts} />
+      {pendingApproval && (
+        <ApprovalPrompt
+          agentId={pendingApproval.agentId}
+          agentKind={pendingApproval.agentKind}
+          approval={pendingApproval.approval}
+          onDecide={handleApprovalDecide}
+        />
+      )}
+      {pendingSddQuestions && (
+        <PlanQuestions
+          sddRunId={pendingSddQuestions.sddRunId}
+          questions={pendingSddQuestions.questions}
+          onSubmit={handleSddQuestionSubmit}
+          onCancel={() => setPendingSddQuestions(null)}
+        />
+      )}
+    </>
+  );
 
-        {/* Turns */}
-        {turns.map((t, i) => (
-          <TurnRenderer key={i} turn={t} />
-        ))}
-
-        {/* Toasts */}
-        <ToastContainer toasts={toasts} />
-
-        {/* Input line */}
+  const bottomContent = (
+    <AnimationClockProvider>
+      <PomodoroProvider
+        state={companionState.pomodoro}
+        onTick={handlePomodoroOnTick}
+      >
         <InputBar
           mode={mode}
-          disabled={showHelp}
+          disabled={showHelp || pendingApproval !== null || pendingSddQuestions !== null}
           onSubmit={send}
           onFirstCtrlC={() => setShowExitHint(true)}
-          onDoubleCtrlC={() => setShowGoodbye(true)}
+          onDoubleCtrlC={() => { tuckInTama(); setShowGoodbye(true); }}
         />
-
-        {/* Status bar */}
         <StatusBar
           tier={tier}
           mode={mode}
@@ -1367,10 +2437,42 @@ export function KiraApp({
           showExitHint={showExitHint}
           onDismissExitHint={() => setShowExitHint(false)}
           newMessageCount={completedTurns}
-          mascotConfig={companionConfig}
-          mascotEmotion={mascotEmotion}
         />
-      </Box>
+      </PomodoroProvider>
     </AnimationClockProvider>
+  );
+
+  const headerContent = (
+    <Header
+      coreUp={coreUp}
+      coreVersion={coreVersion}
+      tier={tier}
+      mode={mode}
+      workingDir={workingDir}
+      rightSlot={
+        companionState.companion && !companionState.hidden ? (
+          <BuddyChat
+            mascotConfig={companionConfig}
+            companionSoul={companionState.companion}
+            message={companionWidgetMessage}
+            tamaState={companionState.tama}
+            level={xpToLevel(companionState.xp.total).level}
+            emotion={mascotEmotion}
+            onMessageExpired={() => setCompanionWidgetMessage(null)}
+          />
+        ) : undefined
+      }
+    />
+  );
+
+  return (
+    <AlternateScreen mouseTracking={false}>
+      <FullscreenLayout
+        header={headerContent}
+        scrollable={scrollableContent}
+        bottom={bottomContent}
+        terminalRows={terminalRows}
+      />
+    </AlternateScreen>
   );
 }

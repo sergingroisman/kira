@@ -1,13 +1,13 @@
-//! CompletionGate cascade (Spektor P4 / Kira G4).
+//! `CompletionGate` cascade (Spektor P4 / Kira G4).
 //!
 //! 5 levels ordered cheapest → most expensive. Short-circuits on first fail.
 //!
-//!   L1 StructuralValidation — free: simple sanity checks on output text
+//!   L1 `StructuralValidation` — free: simple sanity checks on output text
 //!      (non-empty, no obvious truncation, balanced braces if looks like code)
-//!   L2 FileIntegrity         — free: touched_paths ⊆ owned_paths (when both given)
-//!   L3 ChangeSufficiency     — free: actual_loc within [0.3, 3.0] × estimated_loc
-//!   L4 EmbeddingFaithfulness — ~$0.00007: cosine(embed(spec), embed(output)) >= 0.55
-//!   L5 JudgeLlm              — ~$0.10: heavy-tier judge returns score >= 7/10
+//!   L2 `FileIntegrity`         — free: `touched_paths` ⊆ `owned_paths` (when both given)
+//!   L3 `ChangeSufficiency`     — free: `actual_loc` within [0.3, 3.0] × `estimated_loc`
+//!   L4 `EmbeddingFaithfulness` — ~$0.00007: cosine(embed(spec), embed(output)) >= 0.55
+//!   L5 `JudgeLlm`              — ~$0.10: heavy-tier judge returns score >= 7/10
 //!
 //! Config is loaded from `tokens.toml` at startup via `GateConfig`.
 
@@ -43,12 +43,12 @@ pub struct GateConfig {
     pub meta_review_coverage_min: f64,
 }
 
-fn default_faithfulness_pass() -> f64 { 0.55 }
-fn default_faithfulness_escalate() -> f64 { 0.80 }
-fn default_judge_pass() -> f64 { 7.0 }
-fn default_change_suff_min() -> f64 { 0.3 }
-fn default_change_suff_max() -> f64 { 3.0 }
-fn default_meta_review_coverage() -> f64 { 100.0 }
+const fn default_faithfulness_pass() -> f64 { 0.55 }
+const fn default_faithfulness_escalate() -> f64 { 0.80 }
+const fn default_judge_pass() -> f64 { 7.0 }
+const fn default_change_suff_min() -> f64 { 0.3 }
+const fn default_change_suff_max() -> f64 { 3.0 }
+const fn default_meta_review_coverage() -> f64 { 100.0 }
 
 impl Default for GateConfig {
     fn default() -> Self {
@@ -158,28 +158,77 @@ pub async fn run_cascade(
     }
 
     // L5 JudgeLlm — skip on high-confidence faithfulness (saves $0.10).
+    // P3 — also skip if this writer_model has earned session trust.
     let high_confidence_skip = faith_sim
         .is_some_and(|s| s >= gate_cfg.faithfulness_escalate_threshold);
-    if req.skip_judge || high_confidence_skip {
-        if high_confidence_skip {
-            results.push(GateResult {
-                gate: GateKind::JudgeLlm,
-                outcome: GateOutcome::Skipped,
-                score: faith_sim,
-                reason: Some(format!(
-                    "skipped — faithfulness {:.3} ≥ escalate {:.2} (high confidence)",
-                    faith_sim.unwrap_or(0.0),
-                    gate_cfg.faithfulness_escalate_threshold,
-                )),
-                suggestion: None,
-                duration_ms: 0,
-            });
-        } else {
-            results.push(skipped(GateKind::JudgeLlm));
+    // AP3 hardening (2026-05-26): trust_skip MUST NOT bypass the judge when
+    // the current `[tiers.judge]` config would collide with the writer
+    // model. Otherwise an operator flipping the judge tier post-trust
+    // accumulation would silently re-enable self-approval — exactly what
+    // AP2 closes inside the judge path. Verify disjointness before
+    // honouring trust, even though trust itself was earned under a
+    // disjoint config. Workshop SPEKTOR P3: "Anti-padrão: mesmo modelo
+    // executando e julgando. Ele se autoaprova."
+    let trust_skip = req.writer_model.as_deref().is_some_and(|wm| {
+        let earned = trust_score_for(wm).is_some_and(|t| t >= gate_cfg.judge_pass_score);
+        if !earned {
+            return false;
         }
+        // Check the live judge tier — if any candidate collides with the
+        // writer, trust skip is disabled until the operator restores
+        // disjointness.
+        let judge_candidates = router.tier_candidates(crate::router::tier::Tier::Judge);
+        let any_collision = judge_candidates.iter().any(|c| c.model == wm);
+        if any_collision {
+            tracing::warn!(
+                writer_model = %wm,
+                "trust_skip blocked: current [tiers.judge] candidates collide with writer — \
+                 self-approval safety (AP3). Falling through to live judge call."
+            );
+            return false;
+        }
+        true
+    });
+    if req.skip_judge || high_confidence_skip || trust_skip {
+        let reason = if high_confidence_skip {
+            format!(
+                "skipped — faithfulness {:.3} ≥ escalate {:.2} (high confidence)",
+                faith_sim.unwrap_or(0.0),
+                gate_cfg.faithfulness_escalate_threshold,
+            )
+        } else if trust_skip {
+            format!(
+                "skipped — writer model '{}' has session trust ≥ {:.1}",
+                req.writer_model.as_deref().unwrap_or("?"),
+                gate_cfg.judge_pass_score,
+            )
+        } else {
+            "skipped — yolo or config".into()
+        };
+        results.push(GateResult {
+            gate: GateKind::JudgeLlm,
+            outcome: GateOutcome::Skipped,
+            score: if high_confidence_skip { faith_sim } else { None },
+            reason: Some(reason),
+            suggestion: None,
+            duration_ms: 0,
+        });
     } else {
-        let r = gate_judge_llm(router, &req.spec, &req.output, gate_cfg).await;
+        let r = gate_judge_llm_with_writer(
+            router,
+            &req.spec,
+            &req.output,
+            gate_cfg,
+            req.writer_model.as_deref(),
+        )
+        .await;
         let outcome = r.outcome;
+        // P3 — update trust memory on passing judge scores.
+        if outcome == GateOutcome::Pass
+            && let Some(wm) = req.writer_model.as_deref()
+                && let Some(score) = r.score {
+                    record_judge_trust(wm, score);
+                }
         results.push(r);
         if outcome == GateOutcome::Fail {
             return finalize(results, started);
@@ -226,8 +275,8 @@ fn gate_structural(output: &str) -> GateResult {
         };
     }
     // Light balance check on common brace pairs.
-    let open = trimmed.matches(|c: char| matches!(c, '{' | '[' | '(')).count();
-    let close = trimmed.matches(|c: char| matches!(c, '}' | ']' | ')')).count();
+    let open = trimmed.matches(['{', '[', '(']).count();
+    let close = trimmed.matches(['}', ']', ')']).count();
     if open.abs_diff(close) > 2 {
         return GateResult {
             gate: GateKind::StructuralValidation,
@@ -298,7 +347,7 @@ async fn gate_structural_lint(worktree_path: &str) -> GateResult {
         .kill_on_drop(true)
         .output();
 
-    let output = match timeout(Duration::from_secs(60), fut).await {
+    let output = match timeout(Duration::from_mins(1), fut).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             return GateResult {
@@ -477,9 +526,7 @@ fn gate_change_sufficiency(estimated: Option<u32>, actual: Option<u32>) -> GateR
         outcome,
         score: Some(ratio),
         reason: Some(format!(
-            "actual {a} vs estimated {e} → ratio {ratio:.2} (need [{min}, {max}])",
-            min = CHANGE_SUFF_MIN,
-            max = CHANGE_SUFF_MAX,
+            "actual {a} vs estimated {e} → ratio {ratio:.2} (need [{CHANGE_SUFF_MIN}, {CHANGE_SUFF_MAX}])",
         )),
         suggestion: if outcome == GateOutcome::Fail {
             Some(if ratio < CHANGE_SUFF_MIN {
@@ -636,6 +683,20 @@ async fn gate_judge_llm(
     output: &str,
     gate_cfg: GateConfig,
 ) -> GateResult {
+    gate_judge_llm_with_writer(router, spec, output, gate_cfg, None).await
+}
+
+/// L5 Judge with optional `writer_model` for `judge_model ≠ writer_model`
+/// invariant enforcement (P3 self-enhancement bias defence).
+/// Hard invariant since 2026-05-25 (AP2): collision → Fail with reason,
+/// not warn-only. Workshop SPEKTOR: "modelo executando e julgando se autoaprova".
+async fn gate_judge_llm_with_writer(
+    router: &Router,
+    spec: &str,
+    output: &str,
+    gate_cfg: GateConfig,
+    writer_model: Option<&str>,
+) -> GateResult {
     let start = Instant::now();
     let messages = vec![
         ChatMessageUnified::System {
@@ -646,8 +707,9 @@ async fn gate_judge_llm(
         },
     ];
     let judge_params = crate::llm::types::ChatParams::judge_deterministic();
+    // P3 — Use dedicated "judge" tier (disjoint from heavy by default).
     let (resp, _provider, model) = match router
-        .route_chat_with_tools("heavy", None, messages, Vec::new(), Some(judge_params))
+        .route_chat_with_tools("judge", None, messages, Vec::new(), Some(judge_params))
         .await
     {
         Ok(t) => t,
@@ -663,29 +725,26 @@ async fn gate_judge_llm(
         }
     };
     let content = resp.content;
-    let json: serde_json::Value = match serde_json::from_str(content.trim()) {
-        Ok(v) => v,
-        Err(_) => {
-            // Try to extract JSON from inside fences.
-            let extracted = extract_json_blob(&content).unwrap_or_default();
-            match serde_json::from_str(&extracted) {
-                Ok(v) => v,
-                Err(e) => {
-                    return GateResult {
-                        gate: GateKind::JudgeLlm,
-                        outcome: GateOutcome::Skipped,
-                        score: None,
-                        reason: Some(format!("judge returned non-JSON ({e}); model={model}")),
-                        suggestion: Some("Re-run with stricter prompt or different judge model.".into()),
-                        duration_ms: ms(start),
-                    };
-                }
+    let json: serde_json::Value = if let Ok(v) = serde_json::from_str(content.trim()) { v } else {
+        // Try to extract JSON from inside fences.
+        let extracted = extract_json_blob(&content).unwrap_or_default();
+        match serde_json::from_str(&extracted) {
+            Ok(v) => v,
+            Err(e) => {
+                return GateResult {
+                    gate: GateKind::JudgeLlm,
+                    outcome: GateOutcome::Skipped,
+                    score: None,
+                    reason: Some(format!("judge returned non-JSON ({e}); model={model}")),
+                    suggestion: Some("Re-run with stricter prompt or different judge model.".into()),
+                    duration_ms: ms(start),
+                };
             }
         }
     };
     let score = json
         .get("score")
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0);
     let rationale = json
         .get("rationale")
@@ -698,7 +757,57 @@ async fn gate_judge_llm(
     };
     debug!(score, ?outcome, "judge gate");
 
-    append_judge_decision(spec, output, score, rationale.as_deref(), &model, outcome);
+    // P3 collision check — judge_model ≠ writer_model is the Spektor invariant.
+    // AP2 (2026-05-25): hard-fail on collision. Self-enhancement bias makes the
+    // judge meaningless when it's the same model that wrote the output. The
+    // tier `judge` config should list candidates disjoint from writer tiers;
+    // if all collide, that's an operator config error — surfacing it as Fail
+    // is safer than silently passing a self-approval.
+    let model_collision = writer_model
+        .is_some_and(|w| w == model.as_str());
+    if model_collision {
+        tracing::error!(
+            judge_model = %model,
+            writer_model = ?writer_model,
+            "judge_model == writer_model — failing L5 closed (P3 invariant)"
+        );
+        append_judge_decision_v2(
+            spec,
+            output,
+            score,
+            rationale.as_deref(),
+            &model,
+            writer_model,
+            GateOutcome::Fail,
+            true,
+        );
+        return GateResult {
+            gate: GateKind::JudgeLlm,
+            outcome: GateOutcome::Fail,
+            score: Some(score),
+            reason: Some(format!(
+                "judge_model == writer_model ({model}) — self-approval blocked. \
+                 Configure [tiers.judge] candidates disjoint from writer tiers."
+            )),
+            suggestion: Some(
+                "Add a non-overlapping model to [tiers.judge] in tokens.toml \
+                 (e.g. switch judge primary to a different provider family)."
+                    .into(),
+            ),
+            duration_ms: ms(start),
+        };
+    }
+
+    append_judge_decision_v2(
+        spec,
+        output,
+        score,
+        rationale.as_deref(),
+        &model,
+        writer_model,
+        outcome,
+        model_collision,
+    );
 
     GateResult {
         gate: GateKind::JudgeLlm,
@@ -757,8 +866,8 @@ fn gate_meta_review(output: &str, haystack: &str) -> GateResult {
     };
     // Coverage matrix check (TRUST: pct_evaluated < 100 = HALT).
     if let Some(cov) = parsed.get("coverage") {
-        let pct = cov.get("pct_evaluated").and_then(|v| v.as_f64()).unwrap_or(-1.0);
-        if pct >= 0.0 && pct < META_REVIEW_COVERAGE_MIN {
+        let pct = cov.get("pct_evaluated").and_then(serde_json::Value::as_f64).unwrap_or(-1.0);
+        if (0.0..META_REVIEW_COVERAGE_MIN).contains(&pct) {
             return GateResult {
                 gate: GateKind::MetaReview,
                 outcome: GateOutcome::Fail,
@@ -787,7 +896,7 @@ fn gate_meta_review(output: &str, haystack: &str) -> GateResult {
             continue;
         }
         if !haystack.contains(q) {
-            hallucinated.push((i, format!("quote not found literally: {:.80}…", q)));
+            hallucinated.push((i, format!("quote not found literally: {q:.80}…")));
         }
     }
     let pass_count = total - hallucinated.len();
@@ -875,6 +984,7 @@ fn finalize(results: Vec<GateResult>, started: Instant) -> RunGatesResponse {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -992,6 +1102,76 @@ mod tests {
         let a = vec![1.0_f32, 2.0, 3.0];
         assert!((cosine(&a, &a) - 1.0).abs() < 1e-6);
     }
+
+    // ─── AP3 trust skip safety (2026-05-26) ───────────────────────────────
+    //
+    // The trust memory feeds the L5 `trust_skip` branch in `run_cascade`.
+    // These tests cover the pure record/read surface; the collision guard
+    // itself lives in `run_cascade` and needs a Router fixture (covered by
+    // integration tests once we add a mocked Router in v0.6).
+
+    #[test]
+    fn trust_below_min_samples_returns_none() {
+        let model = "test-trust-undertrained";
+        record_judge_trust(model, 9.0);
+        record_judge_trust(model, 9.0);
+        // Only 2 samples — below TRUST_MIN_SAMPLES (3) → still untrusted.
+        assert!(trust_score_for(model).is_none());
+    }
+
+    #[test]
+    fn trust_at_min_samples_returns_average() {
+        let model = "test-trust-reaches-min";
+        record_judge_trust(model, 8.0);
+        record_judge_trust(model, 9.0);
+        record_judge_trust(model, 10.0);
+        let avg = trust_score_for(model).expect("3 samples should clear the floor");
+        assert!((avg - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trust_accumulates_more_samples() {
+        let model = "test-trust-more-samples";
+        for s in [7.0, 8.0, 9.0, 10.0] {
+            record_judge_trust(model, s);
+        }
+        let avg = trust_score_for(model).expect("4 samples available");
+        assert!((avg - 8.5).abs() < 1e-9);
+    }
+}
+
+// ============================================================================
+// P3 — Session-scoped judge trust memory (skip L5 when model is proven)
+// ============================================================================
+
+use std::sync::{LazyLock, Mutex};
+
+/// In-memory accumulator for (`writer_model`) → (count, `total_score`).
+/// v0 uses process-local memory; v0.5 should persist to redb `TBL_JUDGE_TRUST`.
+static JUDGE_TRUST: LazyLock<Mutex<std::collections::HashMap<String, (u32, f64)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+const TRUST_MIN_SAMPLES: u32 = 3;
+
+/// Returns the average judge score for `writer_model` if it has at least
+/// `TRUST_MIN_SAMPLES` recorded decisions.
+fn trust_score_for(writer_model: &str) -> Option<f64> {
+    let map = JUDGE_TRUST.lock().ok()?;
+    let (count, total) = map.get(writer_model)?;
+    if *count >= TRUST_MIN_SAMPLES {
+        Some(*total / f64::from(*count))
+    } else {
+        None
+    }
+}
+
+/// Record a passing judge score for `writer_model`.
+fn record_judge_trust(writer_model: &str, score: f64) {
+    if let Ok(mut map) = JUDGE_TRUST.lock() {
+        let entry = map.entry(writer_model.to_string()).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += score;
+    }
 }
 
 // ============================================================================
@@ -1012,6 +1192,7 @@ fn judge_audit_path() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
+#[allow(dead_code)]
 fn append_judge_decision(
     spec: &str,
     output: &str,
@@ -1019,6 +1200,20 @@ fn append_judge_decision(
     rationale: Option<&str>,
     model: &str,
     outcome: GateOutcome,
+) {
+    append_judge_decision_v2(spec, output, score, rationale, model, None, outcome, false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_judge_decision_v2(
+    spec: &str,
+    output: &str,
+    score: f64,
+    rationale: Option<&str>,
+    judge_model: &str,
+    writer_model: Option<&str>,
+    outcome: GateOutcome,
+    model_collision: bool,
 ) {
     let Some(path) = judge_audit_path() else {
         return;
@@ -1037,7 +1232,11 @@ fn append_judge_decision(
             "verdict": verdict,
             "rationale": rationale.unwrap_or(""),
         },
-        "model": model,
+        // Backwards-compat: `model` field preserved (= judge_model).
+        "model": judge_model,
+        "judge_model": judge_model,
+        "writer_model": writer_model,
+        "model_collision": model_collision,
         "temperature": 0.0,
         "human_label": null,
     });

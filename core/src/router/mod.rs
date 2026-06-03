@@ -159,6 +159,29 @@ impl Router {
         self.tiers.candidates_for(tier).to_vec()
     }
 
+    /// Whether `tier` has any configured candidates. Used by fast-path
+    /// routing decisions (e.g. chat YOLO conceptual probe before deciding
+    /// whether to use `tier=local` or fall through to agent spawn).
+    pub fn tier_has_candidates(&self, tier: Tier) -> bool {
+        !self.tiers.candidates_for(tier).is_empty()
+    }
+
+    /// Check if a tier has at least one candidate with a non-open circuit breaker.
+    ///
+    /// Used by maturation subsystems (consolidator, handoff) to short-circuit
+    /// before loading prompts or building messages when the LLM is known to be
+    /// unavailable. This avoids unnecessary I/O when all providers are broken.
+    pub fn is_tier_available(&self, tier: Tier) -> bool {
+        let candidates = self.tiers.candidates_for(tier);
+        if candidates.is_empty() {
+            return false;
+        }
+        candidates.iter().any(|cand| {
+            let breaker = self.breaker_for(&cand.key());
+            !breaker.is_open()
+        })
+    }
+
     fn breaker_for(&self, key: &str) -> Arc<CircuitBreaker> {
         let mut map = self.breakers.lock().expect("breakers mutex poisoned");
         map.entry(key.to_string())
@@ -232,13 +255,9 @@ impl Router {
     /// (so agent loops can include `Tool` result messages between turns)
     /// and `ToolDef` schemas.
     ///
-    /// **Tool‑call ordering note**: when `tools` is non-empty, `DeepSeek`
-    /// candidates are demoted to the end of the fallback chain. Reason: the
-    /// `deepseek-v4-*` family runs in thinking mode by default and returns
-    /// `reasoning_content` in the assistant message that the API requires us
-    /// to echo back on the next turn. async‑openai 0.27 does not surface
-    /// `reasoning_content` in request types, so iter≥2 of any agent loop
-    /// would fail and fall back. Demoting upfront skips the wasted call.
+    /// All OpenAI-compatible providers (including DeepSeek) go through
+    /// `chat_with_tools_raw`, which builds JSON manually and correctly echoes
+    /// `reasoning_content` on subsequent turns. No provider demotion needed.
     pub async fn route_chat_with_tools(
         &self,
         tier: &str,
@@ -272,16 +291,7 @@ impl Router {
                 messages: Vec::new(),
                 mode: None,
             };
-            let all = self.candidates(&pseudo_req);
-            let candidates = if tools.is_empty() {
-                all
-            } else {
-                let (deepseek, others): (Vec<_>, Vec<_>) =
-                    all.into_iter().partition(|c| c.provider == "deepseek");
-                let mut out = others;
-                out.extend(deepseek);
-                out
-            };
+            let candidates = self.candidates(&pseudo_req);
 
             for cand in candidates {
                 let key = cand.key();
@@ -376,6 +386,7 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::budget::BudgetConfig;
 
     fn mk_router() -> Router {
         let tiers = TierMap::from_config(&crate::config::TiersConfig {
@@ -384,8 +395,9 @@ mod tests {
             light: crate::config::TierEntry { candidates: vec![] },
             long_context: crate::config::TierEntry { candidates: vec![] },
             judge: None,
+            local: None,
         });
-        Router::new(HashMap::new(), Arc::new(BudgetGuard::new(Default::default())), tiers)
+        Router::new(HashMap::new(), Arc::new(BudgetGuard::new(BudgetConfig::default())), tiers)
     }
 
     #[test]
@@ -408,6 +420,7 @@ mod tests {
             light: crate::config::TierEntry { candidates: vec![] },
             long_context: crate::config::TierEntry { candidates: vec![] },
             judge: None,
+            local: None,
         });
         let r = Router::new(HashMap::new(), budget, tiers);
         let req = ChatRequest {

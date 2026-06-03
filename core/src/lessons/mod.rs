@@ -2,7 +2,7 @@
 //!
 //! Lifecycle:
 //!   1. Gate fails → `LessonGenerator` builds a compact Lesson via Light-tier LLM.
-//!   2. `LessonRegistry.record(lesson)` dedupes by hash(trigger, anti_pattern):
+//!   2. `LessonRegistry.record(lesson)` dedupes by hash(trigger, `anti_pattern)`:
 //!      duplicate → increment `recurrence`; new → insert as `Active`.
 //!   3. `AgentManager.spawn` calls `LessonRegistry.inject_for(kind)` to fetch
 //!      active lessons matching scope, top-N by priority + recency. These get
@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::proto::agent::AgentKind;
 use crate::proto::lesson::{Lesson, LessonPriority, LessonScope, LessonStatus};
+use crate::text::{compress, rerank, CompressOpts};
 
 pub const LESSON_PROMOTE_THRESHOLD: u32 = 5;
 pub const INJECT_TOP_N: usize = 5;
@@ -39,7 +40,7 @@ pub struct LessonRegistry {
     store: Store,
     repo_root: PathBuf,
     /// Dedup key (`hash(trigger + anti_pattern)`) → lesson id.
-    /// Avoids a full scan on each record() call.
+    /// Avoids a full scan on each `record()` call.
     dedup_index: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -80,7 +81,7 @@ impl LessonRegistry {
         removed.is_some()
     }
 
-    /// Record a lesson. If an active one with the same (trigger, anti_pattern)
+    /// Record a lesson. If an active one with the same (trigger, `anti_pattern`)
     /// hash exists, increment `recurrence` and update `last_seen_at`.
     /// Otherwise insert as new Active. Returns the resulting lesson.
     #[instrument(skip(self, trigger, anti_pattern, preferred_pattern), fields(priority = ?priority))]
@@ -102,8 +103,8 @@ impl LessonRegistry {
             .get(&key)
             .cloned();
 
-        if let Some(id_str) = existing_id {
-            if let Ok(uuid) = Uuid::parse_str(&id_str) {
+        if let Some(id_str) = existing_id
+            && let Ok(uuid) = Uuid::parse_str(&id_str) {
                 self.store.update(uuid, |l| {
                     l.recurrence = l.recurrence.saturating_add(1);
                     l.last_seen_at = now.clone();
@@ -131,7 +132,6 @@ impl LessonRegistry {
                     return updated;
                 }
             }
-        }
 
         let id = Uuid::now_v7();
         let lesson = Lesson {
@@ -157,9 +157,16 @@ impl LessonRegistry {
     }
 
     /// Get lessons that should be injected into an agent's system prompt.
-    /// Filters by scope, status=Active, sorted by (priority desc, last_seen desc),
-    /// capped at `INJECT_TOP_N`.
-    pub fn inject_for(&self, kind: AgentKind) -> Vec<Lesson> {
+    ///
+    /// Pipeline (M20 — Sprint 3):
+    /// 1. Filter: scope + Active status.
+    /// 2. Sort: priority desc, then recency desc (deterministic baseline).
+    /// 3. If `task` is non-empty: rerank top-`2×INJECT_TOP_N` candidates via
+    ///    BM25 against the task text → keeps the most *relevant* lessons.
+    ///    BM25 score is blended with priority weight so High-priority lessons
+    ///    still beat irrelevant Low ones.
+    /// 4. Cap at `INJECT_TOP_N`.
+    pub fn inject_for(&self, kind: AgentKind, task: &str) -> Vec<Lesson> {
         let mut matching: Vec<Lesson> = self
             .store
             .list()
@@ -168,13 +175,39 @@ impl LessonRegistry {
             .filter(|l| scope_matches(&l.scope, kind))
             .collect();
 
+        // Step 2: priority + recency baseline sort.
         matching.sort_by(|a, b| {
             let pa = priority_rank(a.priority);
             let pb = priority_rank(b.priority);
             pb.cmp(&pa)
                 .then_with(|| b.last_seen_at.cmp(&a.last_seen_at))
         });
-        matching.truncate(INJECT_TOP_N);
+
+        // Step 3: BM25 rerank when we have a task and more lessons than INJECT_TOP_N.
+        // Widen the candidate window to 2×INJECT_TOP_N before reranking so BM25
+        // can pick the most relevant from a broader pool.
+        if !task.is_empty() && matching.len() > INJECT_TOP_N {
+            let pool: Vec<_> = matching.iter().take(INJECT_TOP_N * 2).collect();
+            let docs: Vec<String> = pool
+                .iter()
+                .map(|l| format!("{} {} {}", l.trigger, l.anti_pattern, l.preferred_pattern))
+                .collect();
+            let ranked = rerank(task, &docs, pool.len());
+            // Blend BM25 rank with priority weight so High > Medium > Low.
+            let mut blended: Vec<(usize, f64)> = ranked
+                .iter()
+                .map(|r| {
+                    let prio_w = f64::from(priority_rank(pool[r.index].priority));
+                    (r.index, prio_w.mul_add(0.5, r.score))
+                })
+                .collect();
+            blended.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            blended.truncate(INJECT_TOP_N);
+            matching = blended.into_iter().map(|(i, _)| pool[i].clone()).collect();
+        } else {
+            matching.truncate(INJECT_TOP_N);
+        }
+
         matching
     }
 
@@ -210,7 +243,7 @@ fn scope_matches(scope: &LessonScope, kind: AgentKind) -> bool {
     }
 }
 
-fn priority_rank(p: LessonPriority) -> u8 {
+const fn priority_rank(p: LessonPriority) -> u8 {
     match p {
         LessonPriority::High => 3,
         LessonPriority::Medium => 2,
@@ -264,21 +297,32 @@ fn render_promoted_md(l: &Lesson) -> String {
 }
 
 /// Convert a list of lessons into a snippet to append to a system prompt.
+///
+/// M19 (Sprint 3): each lesson's `anti_pattern` and `preferred_pattern` texts
+/// are compressed (whitespace collapse, comment strip) before injection to
+/// prevent prompt bloat when lessons accumulate long descriptions.
+///
 /// Empty input → empty string (caller can short-circuit).
 pub fn render_inject_snippet(lessons: &[Lesson]) -> String {
     if lessons.is_empty() {
         return String::new();
     }
+    let opts = CompressOpts {
+        target_ratio: 0.8, // 20% reduction max — lessons are already compact
+        strip_comments: false, // lesson text is natural language, not code
+    };
     let mut out = String::from(
         "\n\n### Lessons learned (apply these to avoid past mistakes):\n",
     );
     for l in lessons {
+        let anti = compress(&l.anti_pattern, opts).output;
+        let pref = compress(&l.preferred_pattern, opts).output;
         out.push_str(&format!(
             "- (priority={prio:?}, x{rec}) AVOID: {anti}  →  DO: {pref}\n",
             prio = l.priority,
             rec = l.recurrence,
-            anti = l.anti_pattern,
-            pref = l.preferred_pattern,
+            anti = anti.trim(),
+            pref = pref.trim(),
         ));
     }
     out
@@ -339,9 +383,9 @@ mod tests {
             LessonPriority::Low,
             LessonScope::Global,
         );
-        let for_writer = r.inject_for(AgentKind::Writer);
+        let for_writer = r.inject_for(AgentKind::Writer, "");
         assert_eq!(for_writer.len(), 2);
-        let for_deployer = r.inject_for(AgentKind::Deployer);
+        let for_deployer = r.inject_for(AgentKind::Deployer, "");
         assert_eq!(for_deployer.len(), 1); // only Global
     }
 
@@ -362,7 +406,7 @@ mod tests {
             LessonPriority::High,
             LessonScope::Global,
         );
-        let sorted = r.inject_for(AgentKind::Writer);
+        let sorted = r.inject_for(AgentKind::Writer, "");
         assert_eq!(sorted[0].priority, LessonPriority::High);
     }
 

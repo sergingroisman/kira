@@ -1,4 +1,3 @@
-```
 # Dependencies
 node_modules/
 
@@ -6,11 +5,11 @@ node_modules/
 dist/
 build/
 target/
+.cargo-shared-target/
 
 # Environment variables
 .env
 .env.local
-*.env.*
 
 # Python specific
 __pycache__/
@@ -26,7 +25,7 @@ pip-selfcheck.json
 .eggs/
 *.egg-info/
 .installed.cfg
-. coverage
+.coverage
 .coverage.*
 .cache
 nosetests.xml
@@ -46,8 +45,6 @@ htmlcov/
 .pyup.yml
 .isort.dict
 .python-version
-.DS_Store
-Thumbs.db
 
 # Editor specific
 .vscode/
@@ -67,7 +64,26 @@ Thumbs.db
 .Trashes
 ehthumbs.db
 Thumbs.db
-```
 
+# Kira runtime state
+.worktrees/
+.kira/
+
+# Kira dev artifacts
+.qwen/
+.planning/
+.curls-temp
+session-*.md
+
+# Editor / AI-tool config (not part of kira)
+.windsurf/
+.kiro/
+.agents/
+
+# Vendored / unrelated projects (do not track in kira)
+paperclip-master/
+
+# Misc
 .claude
 .bun.lock
+.aider*

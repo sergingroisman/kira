@@ -14,7 +14,7 @@ pub struct BashRequest {
     pub timeout_secs: u64,
 }
 
-fn default_bash_timeout() -> u64 {
+const fn default_bash_timeout() -> u64 {
     crate::safety::cmd_allowlist::BASH_TIMEOUT_DEFAULT_SECS
 }
 

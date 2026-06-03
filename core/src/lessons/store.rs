@@ -37,19 +37,17 @@ impl Store {
     }
 
     fn db_save(&self, l: &Lesson) {
-        if let Some(db) = &self.db {
-            if let Err(e) = db.put(TBL_LESSONS, &l.id, l) {
+        if let Some(db) = &self.db
+            && let Err(e) = db.put(TBL_LESSONS, &l.id, l) {
                 warn!(error = ?e, id = %l.id, "persist lesson failed");
             }
-        }
     }
 
     fn db_delete(&self, id: &str) {
-        if let Some(db) = &self.db {
-            if let Err(e) = db.delete(TBL_LESSONS, id) {
+        if let Some(db) = &self.db
+            && let Err(e) = db.delete(TBL_LESSONS, id) {
                 warn!(error = ?e, id, "delete lesson failed");
             }
-        }
     }
 
     pub fn insert(&self, id: Uuid, l: Lesson) {

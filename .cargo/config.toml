@@ -1,0 +1,11 @@
+[build]
+# Shared target directory across all worktrees to avoid duplicating
+# build artifacts. Without this, each .worktrees/<wt_id>/ build creates
+# its own target/ directory — with the core alone at 12GB debug builds.
+target-dir = ".cargo-shared-target"
+
+[profile.release]
+# Override workspace-level: full LTO reduces binary size vs thin LTO.
+lto = true
+# Abort on panic removes unwind tables (~10-15% smaller binary).
+panic = "abort"

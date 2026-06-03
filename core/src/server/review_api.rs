@@ -54,9 +54,7 @@ pub async fn run(
         // Persist result to disk regardless of whether the handler is still listening.
         if let Ok(resp) = &result {
             let run_dir = std::path::Path::new(&resp.review_md_path)
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| repo_root.join(".kira/runs").join(&resp.run_id));
+                .parent().map_or_else(|| repo_root.join(".kira/runs").join(&resp.run_id), std::path::Path::to_path_buf);
             let path = run_dir.join("result.json");
             match serde_json::to_string_pretty(resp) {
                 Ok(json) => {

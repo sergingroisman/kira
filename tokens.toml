@@ -23,10 +23,11 @@ heartbeat_scanner_period   = 60
 circuit_probe_period       = 30
 sse_keepalive              = 15
 http_connect_timeout       = 10
-http_read_timeout          = 60
+http_read_timeout          = 60  # unused; per-provider timeout set via [providers.X].llm_timeout_secs
 eval_poll_interval_ms      = 500
 eval_default_timeout       = 300
 session_rate_limit_per_min = 30
+approval_timeout_secs      = 900  # 15 min — time user has to click Y/N on HIGH-risk tools
 
 # ─── Budget (USD) ────────────────────────────────────────────────────────────
 [budget]
@@ -40,7 +41,8 @@ judge_call_usd        = 0.10
 # ─── Concurrency ─────────────────────────────────────────────────────────────
 [concurrency]
 max_worktrees             = 2
-max_agent_iters           = 10
+max_agent_iters           = 20
+max_agent_iters_yolo      = 5
 max_agent_iters_quick     = 3
 max_agent_iters_small     = 5
 max_agent_iters_complex   = 20
@@ -79,23 +81,31 @@ protocol = "openai-compatible"
 base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"
 enabled = true
+llm_timeout_secs = 300  # 5 min — Reviewer/SDD with large context needs >60s
 
 [providers.openai]
 protocol = "openai-compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
-enabled = false
+enabled = true
+llm_timeout_secs = 300
 
+# Qwen via DashScope — quando ativar: enabled = true + add "dashscope:qwen-*" no topo dos tiers
+# (substituindo deepseek como primary).
 [providers.dashscope]
 protocol = "openai-compatible"
 base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 api_key_env = "DASHSCOPE_API_KEY"
 enabled = false
+llm_timeout_secs = 300
 
+# Local Ollama (Apple Silicon M1 8GB): pulls qwen2.5:3b-instruct-q4_K_M (~2GB)
+# on first start via core health-check. Tier `local` + primary of `light`.
+# SPEKTOR alignment: "barato primeiro, caro só quando precisa".
 [providers.ollama_local]
 protocol = "openai-compatible"
 base_url = "http://127.0.0.1:11434/v1"
-enabled = false
+enabled = true
 
 [providers.anthropic]
 protocol = "anthropic"
@@ -105,11 +115,14 @@ enabled = false
 max_tokens = 4096
 api_version = "2023-06-01"
 
+# GitHub Copilot token → mesma API OpenAI-compatible mas sem custo direto (via plano).
+# Quando ativar: enabled = true + trocar "openai:gpt-4o" → "github_copilot:gpt-4o" nos tiers.
 [providers.github_copilot]
 protocol = "openai-compatible"
 base_url = "https://api.githubcopilot.com"
 api_key_env = "GITHUB_COPILOT_TOKEN"
 enabled = false
+llm_timeout_secs = 300
 
 [providers.openrouter]
 protocol = "openai-compatible"
@@ -133,53 +146,64 @@ enabled = false
 # Format: "provider:model" strings, ordered by priority (first = primary).
 # References provider names from [providers.*] above.
 
+# Heavy: SDD planner/design, complex agents. Pro primary (caro só aqui).
 [tiers.heavy]
 candidates = [
     "deepseek:deepseek-v4-pro",
-    "dashscope:qwen-max",
-    "dashscope:qwen-plus",
+    "openai:gpt-4o",
 ]
 
+# Standard: chat YOLO + writer agents. SPEKTOR "barato primeiro": flash primary,
+# pro só como fallback. Anteriormente pro era primary — invertido 2026-05-25.
 [tiers.standard]
 candidates = [
-    "deepseek:deepseek-v4-pro",
-    "dashscope:qwen-plus",
     "deepseek:deepseek-v4-flash",
+    "deepseek:deepseek-v4-pro",
+    "openai:gpt-4o-mini",
 ]
 
+# Light: respostas curtas, perguntas conceituais, dedup. Ollama local primary
+# (qwen2.5:3b ~2GB no M1). Fallback flash só se Ollama down.
 [tiers.light]
 candidates = [
+    "ollama_local:qwen2.5:3b-instruct-q4_K_M",
     "deepseek:deepseek-v4-flash",
-    "dashscope:qwen-flash",
+    "openai:gpt-4o-mini",
+]
+
+# Local: rotas que NÃO devem escalar pra remoto (chat conceitual, dedup interno).
+# Sem fallback pago — controlado.
+[tiers.local]
+candidates = [
+    "ollama_local:qwen2.5:3b-instruct-q4_K_M",
 ]
 
 [tiers.long_context]
 candidates = [
     "deepseek:deepseek-v4-pro",
-    "dashscope:qwen-max",
+    "openai:gpt-4o",
 ]
 
 # Dedicated tier for L5 Judge LLM gate (P3). MUST be disjoint from writer
 # tiers — `judge_model ≠ writer_model` (Spektor invariant, self-enhancement
-# bias defence). Primary is qwen-max because Heavy primary is deepseek-v4-pro.
+# bias defence). Primary is gpt-4o-mini (OpenAI family ≠ DeepSeek writer),
+# fallback deepseek-v4-flash only when OpenAI unavailable.
 [tiers.judge]
 candidates = [
-    "dashscope:qwen-max",
-    "dashscope:qwen-plus",
+    "openai:gpt-4o-mini",
+    "deepseek:deepseek-v4-flash",
 ]
 
 # ─── Model pricing (USD per 1M tokens) ───────────────────────────────────────
 [pricing]
-qwen-max-input       = 1.60
-qwen-max-output      = 6.40
-qwen-plus-input      = 0.40
-qwen-plus-output     = 1.20
-qwen-flash-input     = 0.15
-qwen-flash-output    = 0.60
-deepseek-v4-pro-input  = 0.43
-deepseek-v4-pro-output = 0.87
+deepseek-v4-pro-input    = 0.43
+deepseek-v4-pro-output   = 0.87
 deepseek-v4-flash-input  = 0.14
 deepseek-v4-flash-output = 0.28
+gpt-4o-input             = 2.50
+gpt-4o-output            = 10.00
+gpt-4o-mini-input        = 0.15
+gpt-4o-mini-output       = 0.60
 
 # ─── Model metadata (context limits etc.) ────────────────────────────────────
 [models.deepseek-v4-pro]
@@ -188,14 +212,11 @@ context_limit = 1_000_000
 [models.deepseek-v4-flash]
 context_limit = 1_000_000
 
-[models.qwen-max]
-context_limit = 131_072
+[models.gpt-4o]
+context_limit = 128_000
 
-[models.qwen-plus]
-context_limit = 131_072
-
-[models.qwen-flash]
-context_limit = 131_072
+[models.gpt-4o-mini]
+context_limit = 128_000
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 [paths]
@@ -268,3 +289,29 @@ microvm_timeout_secs        = 600
 network_policy              = "off"         # off | allow_searxng | allow_llm | custom
 rootfs_path                 = ".kira/firecracker/rootfs.ext4"
 kernel_path                 = ".kira/firecracker/vmlinux"
+
+# ─── Memory Maturation (P7 Cognition) ───────────────────────────────────────────
+[memory.maturation]
+# Master switch for consolidation and handoff generation.
+# When false, decay scoring still applies at retrieval time.
+enabled = true
+# Exponential decay factor applied per day since last access (range: 0.5–0.999).
+decay_factor = 0.95
+# Minimum effective score floor (range: 0.001–0.1).
+decay_floor = 0.01
+# Minimum working-tier fragments in a session to trigger consolidation (range: 2–50).
+min_fragments_for_consolidation = 3
+# Cosine similarity threshold for single-linkage clustering (range: 0.5–1.0).
+semantic_similarity_threshold = 0.75
+# Minimum episodic fragments in a cluster to trigger semantic consolidation (range: 3–20).
+min_episodic_for_semantic = 5
+# Hours between periodic semantic consolidation checks (range: 1–168).
+semantic_check_interval_hours = 6
+# Access count threshold for procedural promotion (range: 5–100).
+procedural_access_threshold = 10
+# Minimum age in days for procedural promotion (range: 1–90).
+procedural_min_age_days = 7
+# Maximum characters for handoff summary (range: 500–10000).
+max_handoff_chars = 2000
+# Maximum fragments promoted to procedural per consolidation cycle (range: 1–500).
+max_promotions_per_cycle = 50

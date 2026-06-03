@@ -5,15 +5,61 @@ export type Agent = { id: string, kind: AgentKind, status: AgentStatus, worktree
  * ISO 8601 of the most recent iters increment. Used by the
  * heartbeat watchdog to detect stalled agents.
  */
-last_progress_at: string | null, };
+last_progress_at: string | null, 
+/**
+ * Set while the agent loop is paused waiting for the user to approve a
+ * HIGH-risk tool call. REPL polls this field and shows ApprovalPrompt.
+ */
+awaiting_approval: PendingApproval | null, };
 
-export type AgentKind = "writer" | "deployer" | "judge" | "reviewer" | "explorer";
+export type AgentCostIteration = { iter: number, model: string, prompt_tokens_estimate: number, messages_count: number, tokens_in: number, tokens_out: number, tool_calls: number, usd: number, cumulative_usd: number, assistant_chars: number, };
 
-export type AgentStatus = "spawning" | "active" | "stale" | "completed" | "failed" | "stopped" | "cancelled";
+export type AgentCostSnapshot = { agent_id: string, yolo_mode: boolean, max_iters: number, budget_usd_cap: number, lesson_chars: number, system_prompt_chars: number, total_tokens_in: bigint, total_tokens_out: bigint, total_tool_calls: bigint, total_usd: number, iterations: Array<AgentCostIteration>, };
+
+export type AgentKind = "writer" | "deployer" | "judge" | "reviewer" | "explorer" | "detective";
+
+export type AgentStatus = "idle" | "spawning" | "active_foreground" | "active_background" | "stale" | "completed" | "failed" | "stopped" | "cancelled" | "killed";
+
+export type ApprovalRequest = { 
+/**
+ * true = approve the pending HIGH-risk tool call.
+ * false = reject it (agent receives an error tool result).
+ */
+approved: boolean, 
+/**
+ * Optional human feedback explaining the decision.
+ * Injected into the tool result when the call is rejected.
+ */
+feedback: string | null, };
+
+export type ApprovalResponse = { 
+/**
+ * true if the agent had a pending approval request.
+ */
+resolved: boolean, id: string, 
+/**
+ * true if the tool was approved.
+ */
+approved: boolean, };
 
 export type CancelResponse = { cancelled: boolean, id: string, };
 
+/**
+ * Set on an `Agent` when a HIGH-risk tool call is awaiting user approval.
+ * Cleared once the verdict arrives (approve or reject).
+ */
+export type PendingApproval = { tool_name: string, 
+/**
+ * JSON-serialized tool arguments (truncated to 2 KB for display).
+ */
+arguments: string, };
+
 export type SpawnAgentRequest = { kind: AgentKind, task: string, 
+/**
+ * Override the tier. If absent, uses `kind.default_tier()`. Lets the YOLO
+ * conceptual route spawn a read-only Explorer on a cheap/user-chosen tier.
+ */
+tier: string | null, 
 /**
  * Existing worktree to attach. If absent, daemon spawns a new one from `base` (default "main").
  */
@@ -30,4 +76,12 @@ max_iters: number | null,
  * YOLO mode: bypass plan gates, use reduced gate cascade (L1+L2 only).
  * Faster, cheaper, but less thorough evaluation.
  */
-yolo_mode: boolean | null, };
+yolo_mode: boolean | null, 
+/**
+ * Run in background (non-blocking). Defaults to foreground.
+ */
+background: boolean | null, 
+/**
+ * Timeout in seconds. Agent is cancelled if it exceeds this.
+ */
+timeout_secs: bigint | null, };
