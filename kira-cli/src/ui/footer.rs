@@ -80,9 +80,9 @@ pub fn render_footer(frame: &mut Frame, state: &AppState, area: Rect) {
 const fn keybinding_hints(state: &AppState) -> &'static str {
     if state.overlay_stack.is_empty() {
         if state.layers_visible {
-            "^P palette  ^O mode  ^E expand  Tab sidebar  ? help"
+            "^P palette  ^O mode  ^E expand  ^Y copy  Tab sidebar  ? help"
         } else {
-            "^P palette  ^O mode  ^L layers  ^E expand  Tab sidebar  ? help"
+            "^P palette  ^O mode  ^L layers  ^E expand  ^Y copy  Tab sidebar  ? help"
         }
     } else {
         "Esc close  ↑↓ navigate  Enter select"

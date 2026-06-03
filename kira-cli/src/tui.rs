@@ -589,6 +589,37 @@ fn is_research_doc(t: &str) -> bool {
     RESEARCH.iter().any(|k| t.contains(k))
 }
 
+/// Copy `text` to the system clipboard. Shells out (zero extra deps):
+/// macOS `pbcopy`, then Wayland `wl-copy`, then X11 `xclip`. Returns true on
+/// the first tool that accepts the text.
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let candidates: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+    ];
+    for (cmd, args) in candidates {
+        let Ok(mut child) = Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue; // tool not installed — try next
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
 fn wants_plan(text: &str) -> bool {
     let t = text.to_lowercase();
     // Research/doc/question → single Explorer agent, not the SDD pipeline.
@@ -1010,6 +1041,39 @@ async fn event_loop(
                             && key.code == KeyCode::Char('e')
                         {
                             state.toggle_all_activity();
+                            continue;
+                        }
+
+                        // ── Copy last prompt (Ctrl+Y) ──────────────────────────
+                        // Yank the most recent user prompt to the system clipboard.
+                        if key.modifiers == KeyModifiers::CONTROL
+                            && key.code == KeyCode::Char('y')
+                        {
+                            match state
+                                .conversation
+                                .iter()
+                                .rev()
+                                .find(|(role, _)| role == "user")
+                            {
+                                Some((_, content)) if copy_to_clipboard(content) => {
+                                    state.push_toast(
+                                        ToastKind::Success,
+                                        "Prompt copiado pro clipboard".to_string(),
+                                    );
+                                }
+                                Some(_) => {
+                                    state.push_toast(
+                                        ToastKind::Error,
+                                        "Falha ao copiar (instale pbcopy/wl-copy/xclip)".to_string(),
+                                    );
+                                }
+                                None => {
+                                    state.push_toast(
+                                        ToastKind::Info,
+                                        "Nenhum prompt pra copiar ainda".to_string(),
+                                    );
+                                }
+                            }
                             continue;
                         }
 
