@@ -1824,6 +1824,13 @@ async fn finish(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|p| relativize(&p, &ctx.worktree_path))
+                // `.kira/` is framework-managed runtime state (SDD run artifacts:
+                // spec.md / design.md / tasks.json / research-notes.md). It is
+                // never part of an agent's `owned_files`, so exclude it from the
+                // FileIntegrity check — otherwise every SDD phase agent fails the
+                // gate for writing its own legitimate artifact (noise + wasted
+                // lesson-generation calls every phase).
+                .filter(|p| !p.starts_with(".kira/"))
                 .collect();
             let kind = ctx.kind;
             let aid = id;

@@ -571,8 +571,30 @@ fn apply_pillar_event(kind: PillarEventKind, state: &mut AppState) {
 /// Heuristic for AUTO mode: does this request warrant a reviewed Plan (vs a
 /// direct Yolo run)? Plan when it looks like a complex, multi-step build;
 /// Yolo for questions and single simple actions.
+/// Detect a single-deliverable research / documentation / question task.
+/// These should run as ONE Explorer agent (cheap), NOT the 4-phase SDD
+/// pipeline — running specify→design→tasks→execute on "study X / write a doc"
+/// repeats web research 4× and burns ~60× the tokens for the same output.
+fn is_research_doc(t: &str) -> bool {
+    const RESEARCH: &[&str] = &[
+        // PT
+        "estud", "pesquis", "documenta", "explica", "explique", "resum",
+        "o que é", "o que e", "como funciona", "como usar", "por que",
+        "analise", "análise", "analisa", "tutorial", "compare", "leia",
+        // EN
+        "study", "research", "document", "explain", "summar", "what is",
+        "how does", "how to", "why ", "analyze", "analyse", "compare ",
+        "read ", "investigate", "overview",
+    ];
+    RESEARCH.iter().any(|k| t.contains(k))
+}
+
 fn wants_plan(text: &str) -> bool {
     let t = text.to_lowercase();
+    // Research/doc/question → single Explorer agent, not the SDD pipeline.
+    if is_research_doc(&t) {
+        return false;
+    }
     // Planning-worthy scope keywords (PT + EN).
     const HEAVY: &[&str] = &[
         "módulo", "modulo", "sistema", "projeto", "completo", "arquitetura",

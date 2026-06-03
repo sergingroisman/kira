@@ -10,8 +10,11 @@ use super::wave_executor::{TaskResult, TaskSpawner};
 
 /// Default timeout for a single task execution (30 minutes).
 const TASK_TIMEOUT_SECS: u64 = 1800;
-/// Default max iterations per task agent.
-const TASK_MAX_ITERS: u32 = 50;
+/// Default max iterations per task agent. Tasks are atomic by construction
+/// (tasks.md: ≤50 LOC, ≤2 files), so a high cap only enables runaway
+/// exploration (observed: one task burned 32 iters of web_fetch). 15 is ample
+/// for an atomic task and bounds token spend.
+const TASK_MAX_ITERS: u32 = 15;
 
 /// Real TaskSpawner that uses AgentManager to spawn and poll agents.
 pub struct AgentTaskSpawner {
