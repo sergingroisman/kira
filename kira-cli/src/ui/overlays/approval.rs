@@ -102,25 +102,29 @@ pub fn render_approval(frame: &mut Frame, state: &AppState, area: Rect) {
     // Blank line for spacing
     lines.push(Line::from(""));
 
-    // Tool name (bold)
-    lines.push(Line::from(vec![
-        Span::styled("  Tool: ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            request.tool_name.clone(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    // Action summary — Claude-Code-style one-liner (✎ Write path / $ cmd / …)
+    // instead of raw "Tool:" + cryptic args.
+    let action_width = inner.width.saturating_sub(4) as usize;
+    let action = action_summary(&request.tool_name, &request.arguments_preview);
+    let action = if action.chars().count() > action_width.max(8) {
+        let kept: String = action.chars().take(action_width.saturating_sub(1)).collect();
+        format!("{kept}…")
+    } else {
+        action
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  {action}"),
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )));
 
-    // Risk level badge (color-coded)
+    // Risk badge + dim agent id on one line.
     let (badge_foreground, badge_background) = match request.risk_level.as_str() {
         "CRITICAL" => (Color::White, Color::Red),
         "HIGH" => (Color::Black, Color::Yellow),
         _ => (Color::White, Color::DarkGray),
     };
     lines.push(Line::from(vec![
-        Span::styled("  Risk: ", Style::default().fg(Color::Gray)),
+        Span::styled("  ", Style::default()),
         Span::styled(
             format!(" {} ", request.risk_level),
             Style::default()
@@ -128,14 +132,9 @@ pub fn render_approval(frame: &mut Frame, state: &AppState, area: Rect) {
                 .bg(badge_background)
                 .add_modifier(Modifier::BOLD),
         ),
-    ]));
-
-    // Agent short ID
-    lines.push(Line::from(vec![
-        Span::styled("  Agent: ", Style::default().fg(Color::Gray)),
         Span::styled(
-            request.short_agent_id().to_string(),
-            Style::default().fg(Color::Cyan),
+            format!("  agent {}", request.short_agent_id()),
+            Style::default().fg(Color::DarkGray),
         ),
     ]));
 
@@ -179,24 +178,10 @@ pub fn render_approval(frame: &mut Frame, state: &AppState, area: Rect) {
     // Blank separator
     lines.push(Line::from(""));
 
-    // Countdown timer
+    // Countdown as a depleting health bar.
     let remaining = request.seconds_remaining();
-    let timer_color = if remaining <= 5 {
-        Color::Red
-    } else if remaining <= 15 {
-        Color::Yellow
-    } else {
-        Color::Green
-    };
-    lines.push(Line::from(vec![
-        Span::styled("  Time: ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{remaining}s remaining"),
-            Style::default()
-                .fg(timer_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    let bar_width = (inner.width.saturating_sub(10) as usize).clamp(8, 40);
+    lines.push(timer_bar(remaining, request.timeout_secs, bar_width));
 
     // Blank separator
     lines.push(Line::from(""));
@@ -241,6 +226,62 @@ fn parse_tool_args(raw: &str) -> Option<serde_json::Value> {
         serde_json::Value::String(s) => serde_json::from_str(&s).ok(),
         other => Some(other),
     }
+}
+
+/// Build a Claude-Code-style one-line action summary from the tool + args,
+/// e.g. `✎ Write  .kira/runs/…/spec.md`, `$ bun -e …`, `🌐 Fetch  https://…`.
+/// Falls back to the bare tool name when args can't be parsed.
+fn action_summary(tool: &str, args_raw: &str) -> String {
+    let parsed = parse_tool_args(args_raw);
+    let field = |key: &str| -> Option<String> {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key).and_then(|x| x.as_str()).map(str::to_string))
+            .or_else(|| lenient_str_field(args_raw, key))
+    };
+    match tool {
+        "file_write" => format!("✎ Write  {}", field("path").unwrap_or_else(|| "?".into())),
+        "edit" => format!("✎ Edit  {}", field("path").unwrap_or_else(|| "?".into())),
+        "file_read" => format!("📖 Read  {}", field("path").unwrap_or_else(|| "?".into())),
+        "web_fetch" => format!("🌐 Fetch  {}", field("url").unwrap_or_else(|| "?".into())),
+        "web_search" => format!("🔎 Search  {}", field("query").unwrap_or_else(|| "?".into())),
+        "bash" => {
+            // argv is an array; join for a shell-like preview.
+            let argv = parsed
+                .as_ref()
+                .and_then(|v| v.get("argv").and_then(|a| a.as_array()))
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+            format!("$ {}", argv.unwrap_or_else(|| "(comando)".into()))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Render a depleting "health bar" for the approval countdown. Full + green
+/// when fresh, shrinks + turns yellow/red as the deadline approaches.
+fn timer_bar(remaining: u64, total: u64, width: usize) -> Line<'static> {
+    let width = width.max(8);
+    let ratio = if total == 0 { 0.0 } else { remaining as f64 / total as f64 };
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    let empty = width - filled;
+    let color = if remaining <= 10 {
+        Color::Red
+    } else if remaining <= 30 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled("█".repeat(filled), Style::default().fg(color)),
+        Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("  {remaining}s"), Style::default().fg(color)),
+    ])
 }
 
 /// Leniently extract a string field's value from a raw (possibly truncated or
@@ -497,7 +538,7 @@ mod tests {
             agent_id: "abcdef12-3456-7890-abcd-ef1234567890".to_string(),
             tool_name: "bash".to_string(),
             risk_level: risk_level.to_string(),
-            arguments_preview: "rm -rf /tmp/workspace".to_string(),
+            arguments_preview: r#"{"argv":["rm","-rf","/tmp/workspace"]}"#.to_string(),
             timeout_secs: 30,
             received_at: Instant::now(),
         });
@@ -611,21 +652,21 @@ mod tests {
             })
             .unwrap_or_else(|_| unreachable!());
 
-        // Check that "bash" appears in the rendered buffer
+        // The bash action summary ("$ rm -rf …") should appear.
         let buf = terminal.backend().buffer().clone();
         let mut found = false;
         for y in 0..buf.area.height {
             let row: String = (0..buf.area.width)
                 .map(|x| buf[(x, y)].symbol().to_string())
                 .collect();
-            if row.contains("bash") {
+            if row.contains("rm -rf") {
                 found = true;
                 break;
             }
         }
         assert!(
             found,
-            "Tool name 'bash' should appear in the rendered modal"
+            "bash action summary ('$ rm -rf …') should appear in the rendered modal"
         );
     }
 
@@ -678,12 +719,13 @@ mod tests {
             let row: String = (0..buf.area.width)
                 .map(|x| buf[(x, y)].symbol().to_string())
                 .collect();
-            if row.contains("remaining") {
+            // Health bar shows remaining seconds ("30s") + bar glyphs.
+            if row.contains("30s") || row.contains('█') || row.contains('░') {
                 found = true;
                 break;
             }
         }
-        assert!(found, "Countdown timer should appear in the rendered modal");
+        assert!(found, "Countdown health bar should appear in the rendered modal");
     }
 
     #[test]

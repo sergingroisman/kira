@@ -960,26 +960,10 @@ pub fn render_layers_float(
     // Clear the background area before rendering (z-order above base, below overlays).
     frame.render_widget(Clear, panel_rect);
 
-    // Build the block with border and title.
-    let title = if state.disconnected {
-        "⚡ Layers [DISCONNECTED]"
-    } else {
-        "⚡ Layers"
-    };
-
-    let title_style = if state.disconnected {
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    };
-
+    // Border only — the title ("⚡ Layers" + [DISCONNECTED]) is rendered by the
+    // inner panel header (render_panel_header). Setting it here too duplicated it.
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Line::styled(title, title_style))
         .border_style(Style::default().fg(Color::DarkGray));
 
     // Compute the inner area (inside the block borders).

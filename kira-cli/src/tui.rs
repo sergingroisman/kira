@@ -487,9 +487,14 @@ pub fn apply_pillar_event_to_layers(state: &mut AppState, kind: &PillarEventKind
             };
             (p, phase.clone(), message.clone())
         }
+        // A HIGH-risk tool call awaiting operator approval is a Security-layer
+        // activity — surface it so the Security layer lights up (was dropped,
+        // leaving Security permanently idle).
+        PillarEventKind::AwaitingApproval { tool_name, risk_level, .. } => {
+            (Pillar::P5Guardrails, "start".to_string(), format!("aprovação [{risk_level}]: {tool_name}"))
+        }
         PillarEventKind::Heartbeat { .. }
         | PillarEventKind::Unknown(_)
-        | PillarEventKind::AwaitingApproval { .. }
         | PillarEventKind::ToolActivityStart { .. }
         | PillarEventKind::ToolActivity { .. }
         | PillarEventKind::AgentTerminal { .. } => {
