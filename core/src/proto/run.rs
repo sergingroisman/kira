@@ -79,6 +79,13 @@ pub struct WorkflowRun {
     /// `pending_questions` pause semantics.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub awaiting_plan_approval: bool,
+
+    /// Research notes pre-fetched once (research preflight) and reused across
+    /// phases so SPECIFY/DESIGN synthesize from real sources instead of each
+    /// re-running a reactive web search. `None` until the first phase computes
+    /// it (only for research-heavy goals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_notes: Option<String>,
 }
 
 impl WorkflowRun {

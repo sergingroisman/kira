@@ -646,6 +646,18 @@ impl Orchestrator {
             }
         }
 
+        // Research preflight (once per run): for research-heavy goals, plan +
+        // fetch sources in parallel UP FRONT and reuse across phases, so
+        // SPECIFY/DESIGN synthesize from real notes instead of each re-running
+        // a reactive web search (which spirals on guessed-URL 404s).
+        if run.research_notes.is_none() && crate::research::is_research_task(&run.goal) {
+            let cfg = crate::config::WebToolsConfig::default();
+            let notes = (crate::research::run_research(&self.router, &cfg, &run.goal).await)
+                .unwrap_or_default();
+            // Mark attempted (Some, possibly empty) so later phases don't re-run.
+            run.research_notes = Some(notes);
+        }
+
         // Load the prompt text.
         let prompt_text = load_prompt_by_key(prompt_key)?;
         let artifact_name = produces.clone().unwrap_or_else(|| format!("{phase_id}.out"));
@@ -675,6 +687,18 @@ impl Orchestrator {
             {
                 ctx.push_str(&format!("\nArtifact `{name}`: `{rel}` (read first)\n"));
             }
+        }
+
+        // Pre-fetched research notes — synthesize from these, don't re-search.
+        if let Some(notes) = run.research_notes.as_deref()
+            && !notes.trim().is_empty()
+        {
+            ctx.push_str(
+                "\n--- RESEARCH NOTES (pre-fetched; use these as your sources, \
+                 do NOT web_search/web_fetch again) ---\n",
+            );
+            ctx.push_str(notes);
+            ctx.push('\n');
         }
 
         let task = format!("{prompt_text}\n\n---\n\n{ctx}");

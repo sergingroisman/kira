@@ -193,24 +193,6 @@ fn looks_conceptual(prompt: &str) -> bool {
     !ACTIONS.iter().any(|kw| lower.contains(kw))
 }
 
-/// A research-heavy task (study a tool, learn install/usage, survey community
-/// use). Such tasks benefit from a research preflight (plan queries + parallel
-/// fetch) instead of a reactive search loop that burns iterations on 404s.
-fn looks_research(prompt: &str) -> bool {
-    let lower = prompt.to_lowercase();
-    const SIGNALS: &[&str] = &[
-        // PT
-        "estud", "pesquis", "documenta", "como instalar", "como usar",
-        "casos de uso", "como os outros", "como funciona", "tutorial",
-        "levantar", "investiga",
-        // EN
-        "study", "research", "how to install", "how to use", "getting started",
-        "user stories", "use cases", "community", "review", "survey", "learn ",
-        "investigate", "overview",
-    ];
-    SIGNALS.iter().any(|kw| lower.contains(kw))
-}
-
 #[instrument(skip(state, req), fields(yolo = true))]
 pub async fn chat_yolo(
     State(state): State<AppState>,
@@ -256,7 +238,7 @@ pub async fn chat_yolo(
     // sources in parallel UP FRONT, then hand the agent the notes. Avoids the
     // reactive 12-iter search spiral (guessed URLs → 404 → Failed, no output).
     let mut user_message = user_message;
-    if !conceptual && looks_research(&last_user_only) {
+    if !conceptual && crate::research::is_research_task(&last_user_only) {
         let cfg = crate::config::WebToolsConfig::default();
         match crate::research::run_research(&state.router, &cfg, &last_user_only).await {
             Ok(notes) if !notes.trim().is_empty() => {

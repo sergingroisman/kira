@@ -46,6 +46,25 @@ pub struct ResearchPlan {
     pub max_sources: usize,
 }
 
+/// A research-heavy task (study a tool, learn install/usage, survey community
+/// use). Such tasks benefit from a research preflight (plan queries + parallel
+/// fetch) instead of a reactive search loop that burns iterations on 404s.
+/// Shared by the YOLO route (chat) and the PLAN/SDD phases (orchestrator).
+pub fn is_research_task(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    const SIGNALS: &[&str] = &[
+        // PT
+        "estud", "pesquis", "documenta", "como instalar", "como usar",
+        "casos de uso", "como os outros", "como funciona", "tutorial",
+        "levantar", "investiga",
+        // EN
+        "study", "research", "how to install", "how to use", "getting started",
+        "user stories", "use cases", "community", "review", "survey", "learn ",
+        "investigate", "overview",
+    ];
+    SIGNALS.iter().any(|kw| lower.contains(kw))
+}
+
 /// Ask the planner model WHAT to search + HOW MANY sources. `standard` tier
 /// (capable + cheap); the local 3B emits malformed JSON too often.
 pub async fn plan_research(router: &Router, goal: &str) -> Result<ResearchPlan> {

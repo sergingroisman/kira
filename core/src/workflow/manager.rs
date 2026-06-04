@@ -266,6 +266,7 @@ impl WorkflowManager {
             question_answers: HashMap::new(),
             require_plan_approval: req.require_plan_approval.unwrap_or(false),
             awaiting_plan_approval: false,
+            research_notes: None,
         };
         self.persist(&run).await;
 
