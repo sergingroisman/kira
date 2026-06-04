@@ -256,11 +256,16 @@ fn tool_web_fetch() -> ToolDef {
         description: "Fetch a URL, extract main content via Mozilla Readability, \
          convert to Markdown. SSRF guard blocks private/loopback IPs \
          + cloud metadata endpoints. Falls back to Jina Reader on \
-         JS-heavy sites. Output wrapped in `<TOOL_OUTPUT untrusted>`.".into(),
+         JS-heavy sites. Output wrapped in `<TOOL_OUTPUT untrusted>`. \
+         RULE: only fetch URLs you actually obtained — from a web_search \
+         result, a link inside a page you already fetched, or the user's \
+         message. NEVER guess or construct doc paths (e.g. appending \
+         `/docs/features/<thing>` to a base URL): guessed URLs 404 and burn \
+         iterations. No real link? web_search first, or answer from what you have.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "Absolute URL (http/https only)." }
+                "url": { "type": "string", "description": "Absolute http/https URL taken from a search result, a fetched page's links, or the user — never guessed/constructed." }
             },
             "required": ["url"]
         }),
