@@ -25,6 +25,7 @@ pub mod orchestrator;
 pub mod pilot;
 pub mod proto;
 pub mod queue;
+pub mod research;
 pub mod router;
 pub mod safety;
 pub mod sandbox;

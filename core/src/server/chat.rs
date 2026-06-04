@@ -193,6 +193,24 @@ fn looks_conceptual(prompt: &str) -> bool {
     !ACTIONS.iter().any(|kw| lower.contains(kw))
 }
 
+/// A research-heavy task (study a tool, learn install/usage, survey community
+/// use). Such tasks benefit from a research preflight (plan queries + parallel
+/// fetch) instead of a reactive search loop that burns iterations on 404s.
+fn looks_research(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    const SIGNALS: &[&str] = &[
+        // PT
+        "estud", "pesquis", "documenta", "como instalar", "como usar",
+        "casos de uso", "como os outros", "como funciona", "tutorial",
+        "levantar", "investiga",
+        // EN
+        "study", "research", "how to install", "how to use", "getting started",
+        "user stories", "use cases", "community", "review", "survey", "learn ",
+        "investigate", "overview",
+    ];
+    SIGNALS.iter().any(|kw| lower.contains(kw))
+}
+
 #[instrument(skip(state, req), fields(yolo = true))]
 pub async fn chat_yolo(
     State(state): State<AppState>,
@@ -228,11 +246,32 @@ pub async fn chat_yolo(
     // (file_read/web_search/web_fetch) but cannot write — so it *can* research
     // before answering "what is X?" without the cost/risk of a full Writer.
     let conceptual = looks_conceptual(&last_user_only);
-    let (kind, route) = if conceptual {
+    let (kind, mut route) = if conceptual {
         (AgentKind::Explorer, "lite")
     } else {
         (AgentKind::Writer, "full")
     };
+
+    // Research preflight: for research-heavy Writer tasks, plan queries + fetch
+    // sources in parallel UP FRONT, then hand the agent the notes. Avoids the
+    // reactive 12-iter search spiral (guessed URLs → 404 → Failed, no output).
+    let mut user_message = user_message;
+    if !conceptual && looks_research(&last_user_only) {
+        let cfg = crate::config::WebToolsConfig::default();
+        match crate::research::run_research(&state.router, &cfg, &last_user_only).await {
+            Ok(notes) if !notes.trim().is_empty() => {
+                tracing::info!(bytes = notes.len(), "yolo: research preflight attached notes");
+                user_message = format!(
+                    "{user_message}\n\n--- RESEARCH NOTES (pre-fetched for you; \
+                     synthesize the deliverable FROM THESE. Do NOT web_search or \
+                     web_fetch again — the research is done) ---\n{notes}"
+                );
+                route = "research";
+            }
+            Ok(_) => tracing::info!("yolo: research preflight produced no notes — proceeding plain"),
+            Err(e) => tracing::warn!(error = %e, "yolo: research preflight failed — proceeding plain"),
+        }
+    }
 
     // Honour the requested tier for conceptual Q&A. The local 3B model
     // (qwen2.5:3b) is too weak to understand user questions ("O que é MCP e
