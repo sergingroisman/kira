@@ -8,6 +8,17 @@
 > Este arquivo é o **estado da execução**. O agente que retomar o trabalho lê este
 > arquivo primeiro, escolhe **um** item aberto, executa, roda os gates, e marca.
 
+## Decisões do dono (10/Nov/2026 — aprovadas, valem sobre qualquer opinião minha)
+
+1. **Ordem das fases** F0→F5 como está; **dashboard depois do loop** (F4 > F2). ✅
+2. **Wiki nasce commitada** em `docs/wiki/`; ciclo autônomo só grava em
+   `.kira/wiki-staging/` e depende de `kira wiki promote` (ADR-0013).
+3. **Modelo local**: ≤4B q4_K_M, `KIRA_NUM_CTX=4096` (RTX 2060 6 GB e M1 8 GB). ✅
+4. **Agendamento** só com o KIRA vivo (sem serviço do Windows no MVP). ✅
+5. **Budget = 50 CHAMADAS LLM/dia, não R$.** Ollama local = custo zero; teto em
+   dinheiro (`max_cost_per_day_brl`) só com provedor pago (PR11).
+6. **Cadência do cron `kira-autobuild`: a cada 3 h**, um PR por ciclo. ✅
+
 ## Regras duras do programa (valem para todo ciclo, sem exceção)
 
 1. **Um item por ciclo.** Nunca dois PRs num mesmo ciclo.
@@ -41,7 +52,15 @@
 - [ ] **PR4** taxonomia de erro acionável única em `src/error.rs`; zero
       `unwrap`/`expect` em rede/parse/input.
 
-### F1 — contexto e medição (W2 + W2-bis)
+### F1 — contexto e medição (W2 + W2.5 wiki + W2-bis)
+- [ ] **PR28** `kira wiki` em **`docs/wiki/` (commitada)**: páginas
+      contexto/decisoes/padroes/glossario/bugs, escrita via `redact` + `guard/path`;
+      ciclo autônomo só grava em `.kira/wiki-staging/`.
+- [ ] **PR29** índice FTS5 (`wiki_page`, `wiki_fts`) + `kira wiki reindex` (derivado,
+      descartável; sem FTS5 cai para substring).
+- [ ] **PR30** captura episódica pós-`triage` + decay 30 dias + `kira wiki forget`.
+- [ ] **PR31** retrieval da wiki → context packer (top-k com caminho e idade).
+- [ ] **PR32** `kira wiki export` (bundle opcional) + `kira wiki promote` (staging → docs).
 - [ ] **PR5** context packer v1: item + findings do arquivo + trechos, teto de
       tokens. **Sem vetor, sem embedding** (markdown + FTS5 no SQLite existente).
 - [ ] **PR6** prompt de triage v1 + fixtures entrada/saída.

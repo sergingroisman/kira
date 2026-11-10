@@ -47,9 +47,11 @@ chama Azure. `loop` não fala com LLM direto, fala com `triage`.
 
 ## 3. A wiki (o pedido novo) — ADR-0013
 
-- **Onde**: `<projeto>/.kira/wiki/*.md` — local, não comitado (regra vigente).
-- **Páginas**: `contexto.md`, `decisoes.md`, `padroes.md`, `glossario.md`,
-  `bugs/<item-id>.md`.
+- **Onde**: `<projeto>/docs/wiki/*.md` — **commitada** (decisão do dono). Páginas:
+  `contexto.md`, `decisoes.md`, `padroes.md`, `glossario.md`, `bugs/<item-id>.md`.
+- **Escrita ≠ autonomia**: comando invocado por você grava direto em `docs/wiki/`;
+  o ciclo autônomo grava só em `.kira/wiki-staging/` e depende de `kira wiki promote`
+  (humano). Autonomia nunca escreve no seu repo, mesmo com a wiki versionada.
 - **Verdade x índice**: markdown manda; `wiki_page` + `wiki_fts` no `store.db` são
   **derivados e descartáveis** (`kira wiki reindex` reconstrói; apagar o índice
   nunca perde conhecimento).
@@ -139,7 +141,10 @@ detectada, idade do último dado bom do Ollama e se o perfil bate com o hardware
   verifying → gated → reported`, com `discarded` por falha/budget.
 - **Escrita no mundo**: só em `applying`, só com `--apply`, só depois de
   `kira approve <id>`. Autonomia nunca aprova a si mesma.
-- **Budget**: 50 chamadas LLM/dia (default), checado antes de cada transição.
+- **Budget**: **50 chamadas LLM/dia** (não é R$ — é contagem de chamada). Com
+  Ollama local o custo é **zero**; o teto existe para o loop não girar sem fim e
+  para limitar custo quando o Copilot entrar. Teto em dinheiro
+  (`max_cost_per_day_brl`) só faz sentido com provedor pago e entra junto com o PR11.
 - **Falha de provedor**: 429 → 5 min de silêncio; último resultado bom fica
   visível e marcado `stale`.
 
