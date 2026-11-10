@@ -1,14 +1,14 @@
 //! Configuration diagnosis for `kira doctor`.
 //!
 //! All output formatting lives in pure functions so the ✓/✗ messages are
-//! unit-tested with local data. The only network call is delegated to
-//! [`crate::ado`] and happens exclusively after every required environment
-//! variable is present, so an incomplete setup never touches the network.
+//! unit-tested with local data. The only network call goes through the
+//! [`BoardProvider`] trait and happens exclusively after every required
+//! setting is present, so an incomplete setup never touches the network.
 
-use std::env;
 use std::process::ExitCode;
 
-use crate::ado;
+use crate::board;
+use crate::credentials::{self, Source};
 use crate::error::Error;
 
 /// Maximum number of existing project names listed when the configured
@@ -32,14 +32,42 @@ pub fn format_pat_env_check(pat: &str) -> String {
     )
 }
 
+/// ✓ line for a PAT found in the OS keyring.
+pub fn format_pat_keyring_check(pat: &str) -> String {
+    format!(
+        "✓ AZURE_DEVOPS_PAT presente no keyring do OS ({} chars: {})",
+        pat.chars().count(),
+        mask_pat(pat)
+    )
+}
+
+/// ✓ line for a plain setting resolved from an explicit source.
+pub fn format_setting_source_check(name: &str, value: &str, source: Source) -> String {
+    match source {
+        Source::Env => format!("✓ {name} ({value})"),
+        other => format!("✓ {name} ({value} — de {})", other.label()),
+    }
+}
+
 /// ✓ line for a plain (non-secret) environment variable.
 pub fn format_env_ok(name: &str, value: &str) -> String {
     format!("✓ {name} ({value})")
 }
 
-/// ✗ line for a missing environment variable, including the concrete fix.
+/// ✗ line for a missing setting, including the concrete fix.
 pub fn format_missing_env_check(name: &str, fix: &str) -> String {
     format!("✗ {name} não definida — {fix}")
+}
+
+/// Concrete fix for a missing setting.
+pub fn missing_setting_fix(name: &str) -> String {
+    let export = match name {
+        "AZURE_DEVOPS_PAT" => "export AZURE_DEVOPS_PAT=<pat>",
+        "AZURE_DEVOPS_ORG" => "export AZURE_DEVOPS_ORG=nome-da-org",
+        "AZURE_DEVOPS_PROJECT" => "export AZURE_DEVOPS_PROJECT=nome-do-projeto",
+        other => return format!("defina {other}"),
+    };
+    format!("rode `kira setup` (ou {export})")
 }
 
 /// Final summary for an incomplete setup.
@@ -105,74 +133,76 @@ pub fn format_project_check(wanted: &str, available: &[String]) -> String {
     }
 }
 
+/// Resolves one setting for display: ✓ with source, or ✗ with the fix.
+fn format_resolved_check(
+    name: &str,
+    resolved: &Result<credentials::Resolved, Error>,
+) -> (String, bool) {
+    match resolved {
+        Ok(found) if name == "AZURE_DEVOPS_PAT" => match found.source {
+            Source::Keyring => (format_pat_keyring_check(&found.value), true),
+            _ => (format_pat_env_check(&found.value), true),
+        },
+        Ok(found) => (
+            format_setting_source_check(name, &found.value, found.source),
+            true,
+        ),
+        Err(_) => (
+            format_missing_env_check(name, &missing_setting_fix(name)),
+            false,
+        ),
+    }
+}
+
 /// Runs the `kira doctor` diagnosis and returns the process exit code.
 ///
-/// Step 1 never touches the network: when any environment variable is missing
+/// Step 1 never touches the network: when any required setting is missing
 /// the remaining steps are reported as skipped and the command exits offline.
 pub async fn run() -> ExitCode {
-    let pat = read_env("AZURE_DEVOPS_PAT");
-    let organization = read_env("AZURE_DEVOPS_ORG");
-    let project = read_env("AZURE_DEVOPS_PROJECT");
+    let pat = credentials::resolve_pat_with_source();
+    let organization = credentials::resolve_org_with_source();
+    let project = credentials::resolve_project_with_source(None);
 
-    println!("1. Variáveis de ambiente");
+    println!("1. Configuração (env, keyring do OS ou config.toml)");
     let mut missing: Vec<&str> = Vec::new();
-    match &pat {
-        Some(value) => println!("   {}", format_pat_env_check(value)),
-        None => {
-            println!(
-                "   {}",
-                format_missing_env_check(
-                    "AZURE_DEVOPS_PAT",
-                    "gere um PAT com escopo Work Items (Read) em \
-                     https://dev.azure.com/<sua-org>/_usersSettings/tokens \
-                     e export AZURE_DEVOPS_PAT=<pat>"
-                )
-            );
-            missing.push("AZURE_DEVOPS_PAT");
-        }
-    }
-    match &organization {
-        Some(value) => println!("   {}", format_env_ok("AZURE_DEVOPS_ORG", value)),
-        None => {
-            println!(
-                "   {}",
-                format_missing_env_check("AZURE_DEVOPS_ORG", "export AZURE_DEVOPS_ORG=nome-da-org")
-            );
-            missing.push("AZURE_DEVOPS_ORG");
-        }
-    }
-    match &project {
-        Some(value) => println!("   {}", format_env_ok("AZURE_DEVOPS_PROJECT", value)),
-        None => {
-            println!(
-                "   {}",
-                format_missing_env_check(
-                    "AZURE_DEVOPS_PROJECT",
-                    "export AZURE_DEVOPS_PROJECT=nome-do-projeto"
-                )
-            );
-            missing.push("AZURE_DEVOPS_PROJECT");
+    let checks = [
+        ("AZURE_DEVOPS_PAT", &pat),
+        ("AZURE_DEVOPS_ORG", &organization),
+        ("AZURE_DEVOPS_PROJECT", &project),
+    ];
+    for (name, resolved) in checks {
+        let (line, ok) = format_resolved_check(name, resolved);
+        println!("   {line}");
+        if !ok {
+            missing.push(name);
         }
     }
 
     if !missing.is_empty() {
         println!("2. Conexão com a organização");
-        println!("   - ignorada: corrija as variáveis ausentes");
+        println!("   - ignorada: corrija os itens ✗ acima");
         println!("3. Projeto");
-        println!("   - ignorada: corrija as variáveis ausentes");
+        println!("   - ignorada: corrija os itens ✗ acima");
         println!();
         println!("{}", format_missing_env_summary(&missing));
         return ExitCode::FAILURE;
     }
 
-    // All three are Some at this point (checked above); no unwrap needed.
+    // All three are Ok at this point (checked above); no unwrap needed.
     let (pat, organization, project) = match (pat, organization, project) {
-        (Some(pat), Some(organization), Some(project)) => (pat, organization, project),
+        (Ok(pat), Ok(organization), Ok(project)) => (pat.value, organization.value, project.value),
         _ => return ExitCode::FAILURE,
+    };
+    let board = match board::for_board(&board::name_from_env(), &pat, &organization, &project) {
+        Ok(board) => board,
+        Err(err) => {
+            println!("   erro: {err}");
+            return ExitCode::FAILURE;
+        }
     };
 
     println!("2. Conexão com a organização");
-    let project_names = match ado::list_project_names(&pat, &organization).await {
+    let project_names = match board.project_names().await {
         Ok(names) => {
             println!("   {}", format_connection_check(&organization, names.len()));
             names
@@ -201,10 +231,6 @@ pub async fn run() -> ExitCode {
     println!();
     println!("Tudo ok — rode: kira inspect <id>");
     ExitCode::SUCCESS
-}
-
-fn read_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]

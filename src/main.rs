@@ -1,15 +1,17 @@
-use std::env;
 use std::error::Error as StdError;
+use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use kira::ado;
+use kira::board::{self, BoardProvider};
+use kira::credentials;
 use kira::doctor;
 use kira::error::Error;
 use kira::format;
 use kira::llm::ollama;
+use kira::setup;
 use kira::triage;
 
 /// KIRA — Knowledge-Informed Remediation Agent (*Keep It Running, Always*).
@@ -30,7 +32,7 @@ enum Command {
     Inspect {
         /// Work item id
         id: i32,
-        /// Azure DevOps project name (defaults to $AZURE_DEVOPS_PROJECT)
+        /// Azure DevOps project name (defaults to $AZURE_DEVOPS_PROJECT or config.toml)
         #[arg(long)]
         project: Option<String>,
     },
@@ -47,6 +49,18 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Save the Azure DevOps configuration and the PAT in the OS keyring
+    Setup {
+        /// Azure DevOps organization name (skips the prompt)
+        #[arg(long)]
+        org: Option<String>,
+        /// Azure DevOps project name (skips the prompt)
+        #[arg(long)]
+        project: Option<String>,
+        /// Remove the saved PAT from the keyring and exit
+        #[arg(long)]
+        reset: bool,
+    },
 }
 
 #[tokio::main]
@@ -62,6 +76,11 @@ async fn main() -> ExitCode {
         },
         Command::Doctor => doctor::run().await,
         Command::Triage { id, file, model } => triage_command(id, file, model).await,
+        Command::Setup {
+            org,
+            project,
+            reset,
+        } => setup_command(org, project, reset).await,
     }
 }
 
@@ -74,14 +93,21 @@ fn print_error(err: &Error) {
     }
 }
 
+/// Resolves org/project/PAT (flags > env > keyring/config.toml) and builds the
+/// board provider selected by `KIRA_BOARD` (default `azure`).
+fn resolve_board(project_override: Option<&str>) -> Result<Box<dyn BoardProvider>, Error> {
+    let config = credentials::resolve_azure_config(project_override)?;
+    board::for_board(
+        &board::name_from_env(),
+        &config.pat,
+        &config.organization,
+        &config.project,
+    )
+}
+
 async fn inspect(id: i32, project_flag: Option<String>) -> Result<(), Error> {
-    let pat = read_env("AZURE_DEVOPS_PAT", Error::MissingPat)?;
-    let organization = read_env("AZURE_DEVOPS_ORG", Error::MissingOrg)?;
-    let project = match project_flag {
-        Some(project) => project,
-        None => read_env("AZURE_DEVOPS_PROJECT", Error::MissingProject)?,
-    };
-    let item = ado::get_work_item(&pat, &organization, &project, id).await?;
+    let board = resolve_board(project_flag.as_deref())?;
+    let item = board.work_item(id).await?;
     print!("{}", format::format_work_item(&item));
     Ok(())
 }
@@ -139,15 +165,37 @@ async fn triage_command(
 }
 
 async fn triage_live(base_url: &str, model: &str, id: i32) -> Result<String, Error> {
-    let pat = read_env("AZURE_DEVOPS_PAT", Error::MissingPat)?;
-    let organization = read_env("AZURE_DEVOPS_ORG", Error::MissingOrg)?;
-    let project = read_env("AZURE_DEVOPS_PROJECT", Error::MissingProject)?;
-    triage::triage_live(&pat, &organization, &project, id, base_url, model).await
+    let board = resolve_board(None)?;
+    triage::triage_live(board.as_ref(), id, base_url, model).await
 }
 
-fn read_env(name: &str, error: Error) -> Result<String, Error> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(error)
+async fn setup_command(org: Option<String>, project: Option<String>, reset: bool) -> ExitCode {
+    // Fail fast (before the user creates a token) when there is nowhere to
+    // save it; on machines without a keyring the env var remains the path.
+    let store = match credentials::open_default_store() {
+        Ok(store) => store,
+        Err(err) => {
+            print_error(&err);
+            return ExitCode::FAILURE;
+        }
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = stdin.lock();
+    let mut output = BufWriter::new(stdout.lock());
+    setup::run(
+        &setup::SetupOptions {
+            org,
+            project,
+            reset,
+        },
+        store.as_ref(),
+        credentials::config_path().as_deref(),
+        &setup::env_lookup,
+        &mut input,
+        &mut output,
+        &setup::default_board_factory,
+        &setup::open_url_in_browser,
+    )
+    .await
 }
