@@ -53,7 +53,7 @@
       (`awaiting_approval`, `kira approve`), gate de medição e TUI pós-M2.
 - [x] **PR2** `src/redact.rs`: máscara de PAT/token/CPF/e-mail antes de log,
       erro e prompt. Teste prova que o prompt não leva segredo.
-- [ ] **PR3** `src/guard/path.rs`: deny-list de escrita + path traversal. Erro
+- [x] **PR3** `src/guard/path.rs`: deny-list de escrita + path traversal. Erro
       acionável, não toca o disco.
 - [ ] **PR4** taxonomia de erro acionável única em `src/error.rs`; zero
       `unwrap`/`expect` em rede/parse/input.
