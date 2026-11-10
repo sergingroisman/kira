@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Isolated sandbox: `cwd` (project root, detected like in real usage) and a
 /// separate store directory.
 struct Sandbox {
+    /// `…/e2e-…` — removed as a whole on Drop.
+    base: PathBuf,
     cwd: PathBuf,
     store: PathBuf,
 }
@@ -32,6 +34,7 @@ impl Sandbox {
         let cwd = base.join("proj");
         std::fs::create_dir_all(&cwd).unwrap_or_else(|err| panic!("criar workdir {cwd:?}: {err}"));
         Sandbox {
+            base: base.clone(),
             cwd,
             store: base.join("store"),
         }
@@ -49,20 +52,7 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(self.cwd.remove_last_two());
-    }
-}
-
-trait RemoveLastTwo {
-    /// `…/e2e-…/proj` → `…/e2e-…` (the sandbox base, removed as a whole).
-    fn remove_last_two(&self) -> PathBuf;
-}
-
-impl RemoveLastTwo for Path {
-    fn remove_last_two(&self) -> PathBuf {
-        self.ancestors()
-            .nth(2)
-            .map_or_else(|| self.to_path_buf(), Path::to_path_buf)
+        let _ = std::fs::remove_dir_all(&self.base);
     }
 }
 
