@@ -5,19 +5,19 @@ use thiserror::Error;
 pub enum Error {
     /// `AZURE_DEVOPS_PAT` is unset or empty.
     #[error(
-        "defina a variável de ambiente AZURE_DEVOPS_PAT com um Personal Access Token que tenha permissão de leitura de Work Items (ex.: export AZURE_DEVOPS_PAT=...)"
+        "defina a variável de ambiente AZURE_DEVOPS_PAT com um Personal Access Token que tenha permissão de leitura de Work Items (ex.: export AZURE_DEVOPS_PAT=...)\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
     )]
     MissingPat,
 
     /// `AZURE_DEVOPS_ORG` is unset or empty.
     #[error(
-        "defina a variável de ambiente AZURE_DEVOPS_ORG com o nome da organização (ex.: export AZURE_DEVOPS_ORG=minha-org)"
+        "defina a variável de ambiente AZURE_DEVOPS_ORG com o nome da organização (ex.: export AZURE_DEVOPS_ORG=minha-org)\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
     )]
     MissingOrg,
 
     /// Neither `--project` nor `AZURE_DEVOPS_PROJECT` provided a project name.
     #[error(
-        "informe o projeto com --project <nome> ou defina a variável de ambiente AZURE_DEVOPS_PROJECT"
+        "informe o projeto com --project <nome> ou defina a variável de ambiente AZURE_DEVOPS_PROJECT\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
     )]
     MissingProject,
 
