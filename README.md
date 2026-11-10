@@ -147,6 +147,32 @@ To remove the saved PAT from the keyring:
 kira setup --reset
 ```
 
+#### Already have a token?
+
+Skip the browser flow and hand the PAT straight to the CLI. Read the token
+from a secure file or the environment instead of typing it bare (PowerShell):
+
+```powershell
+$pat = Get-Content "$env:USERPROFILE\.secrets\ado-pat.txt"   # ou $env:ADO_PAT
+kira setup --org minha-org --project MeuProjeto --pat $pat
+```
+
+or, passing it directly (--pat skips every prompt and never echoes the token):
+
+```powershell
+kira setup --org minha-org --project MeuProjeto --pat <your-token>
+```
+
+Use `--no-browser` to skip the instruction steps and the browser open but
+still paste the token when asked:
+
+```bash
+kira setup --no-browser
+```
+
+If the token is already exported as `AZURE_DEVOPS_PAT`, no setup step is
+needed at all: the env var wins over the keyring and `config.toml` at runtime.
+
 ### Option B — manual (env vars, for CI / headless)
 
 Create a PAT with the **Work Items (Read)** scope at
