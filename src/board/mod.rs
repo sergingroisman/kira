@@ -99,9 +99,12 @@ mod tests {
         assert!(message.contains("KIRA_BOARD=azure"), "mensagem: {message}");
     }
 
+    /// Guard against the parallel test-runner race on the shared BOARD_ENV.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn name_from_env_defaults_to_azure() {
-        // The var is only read here and nowhere else in the test process.
+        let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::remove_var(BOARD_ENV);
         }
@@ -110,6 +113,7 @@ mod tests {
 
     #[test]
     fn name_from_env_reads_the_override() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
             std::env::set_var(BOARD_ENV, "jira");
         }
