@@ -7,6 +7,7 @@
 //! The board seam (`src/board/`) wraps these functions: it delegates instead
 //! of duplicating them.
 
+use azure_core::error::ErrorKind;
 use azure_devops_rust_api::{Credential, core, wit};
 
 use crate::error::Error;
@@ -46,16 +47,65 @@ pub(crate) async fn get_work_item_with(
         builder = builder.endpoint(parse_endpoint(endpoint)?);
     }
     let client = builder.build();
-    let model = client
+    let response = client
         .work_items_client()
         .get_work_item(organization, id, project)
         .send()
         .await
-        .map_err(|err| Error::Ado(Box::new(err)))?
+        .map_err(|err| map_work_item_error(err, organization, project, id))?;
+    let model = response
         .into_body()
         .map_err(|err| Error::Ado(Box::new(err)))?;
     let body = serde_json::to_string(&model)?;
     WorkItem::from_api_json(&body)
+}
+
+/// Maps an `azure_core` error from the `wit` path into a compact, actionable
+/// [`Error`] — same mapping the `core` path uses in [`list_project_names_with`],
+/// plus the `TF401232` detection (work item does not exist / no read access).
+/// The response body is read only to detect the code; it is never propagated.
+fn map_work_item_error(
+    err: azure_core::Error,
+    organization: &str,
+    project: &str,
+    id: i32,
+) -> Error {
+    let status = err.http_status().map(u16::from);
+    match status {
+        Some(401) => Error::AdoUnauthorized {
+            organization: organization.to_string(),
+        },
+        Some(status) => {
+            if status == 404
+                && raw_response_body(&err).as_deref().is_some_and(|body| {
+                    body.contains("TF401232")
+                        || body.contains("WorkItemUnauthorizedAccessException")
+                })
+            {
+                Error::WorkItemInacessivel {
+                    id,
+                    organization: organization.to_string(),
+                    project: project.to_string(),
+                }
+            } else {
+                Error::AdoStatus {
+                    status,
+                    organization: organization.to_string(),
+                }
+            }
+        }
+        None => Error::Ado(Box::new(err)),
+    }
+}
+
+/// Extracts the raw response body of an HTTP error, if the SDK kept it.
+fn raw_response_body(err: &azure_core::Error) -> Option<String> {
+    match err.kind() {
+        ErrorKind::HttpResponse { raw_response, .. } => raw_response
+            .as_ref()
+            .map(|raw| String::from_utf8_lossy(raw.body().as_ref()).into_owned()),
+        _ => None,
+    }
 }
 
 /// Lists the names of all projects in an organization (read-only).

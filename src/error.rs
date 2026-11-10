@@ -67,6 +67,20 @@ pub enum Error {
     )]
     AdoStatus { status: u16, organization: String },
 
+    /// The work item returned HTTP 404 with `TF401232`/`WorkItemUnauthorizedAccessException`:
+    /// it does not exist or the PAT cannot read it. The response body is never echoed.
+    #[error(
+        "o work item #{id} não existe ou você não pode lê-lo — corrige uma destas hipóteses: \
+         (1) o PAT não tem o escopo Work Items (Read) — edite/gere o token em https://dev.azure.com/{organization}/_usersSettings/tokens; \
+         (2) o item pertence a outro projeto — rode com --project <nome> (confira no browser em https://dev.azure.com/{organization}/{project}/_workitems/edit/{id}); \
+         (3) o id está errado"
+    )]
+    WorkItemInacessivel {
+        id: i32,
+        organization: String,
+        project: String,
+    },
+
     /// Azure DevOps answered with an unexpected JSON shape.
     #[error("resposta inesperada do Azure DevOps: {0}")]
     Api(#[from] serde_json::Error),
@@ -150,6 +164,33 @@ mod tests {
         assert!(
             !message.contains('<'),
             "mensagem não pode conter HTML: {message}"
+        );
+    }
+
+    #[test]
+    fn work_item_inacessivel_error_names_all_three_hypotheses_without_body() {
+        let err = Error::WorkItemInacessivel {
+            id: 523373,
+            organization: "minha-org".to_string(),
+            project: "Kira".to_string(),
+        };
+        let message = err.to_string();
+        assert!(message.contains("#523373"), "mensagem: {message}");
+        assert!(
+            message.contains("https://dev.azure.com/minha-org/_usersSettings/tokens"),
+            "hipótese (1) deve apontar a página do token: {message}"
+        );
+        assert!(
+            message.contains("--project <nome>"),
+            "hipótese (2) deve sugerir --project: {message}"
+        );
+        assert!(
+            message.contains("o id está errado"),
+            "hipótese (3) precisa existir: {message}"
+        );
+        assert!(
+            !message.contains('"'),
+            "mensagem não pode conter corpo cru de resposta HTTP: {message}"
         );
     }
 
