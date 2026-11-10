@@ -1,0 +1,10 @@
+{
+  "id": 42,
+  "rev": 1,
+  "fields": {
+    "System.Id": 42,
+    "System.WorkItemType": "Task",
+    "System.Title": "Somente o essencial",
+    "System.State": "New"
+  }
+}
