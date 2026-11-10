@@ -376,7 +376,10 @@ pub(crate) fn relative_path(root: &Path, raw: &str) -> String {
         return String::new();
     }
     let candidate = Path::new(trimmed);
-    let joined = if candidate.is_absolute() {
+    // Rooted paths (absolute, or drive-less `/…`/`\…` on Windows) must NOT be
+    // joined: on Windows `root.join("/x")` re-anchors to the current drive and
+    // silently changes the path. They leave as they came.
+    let joined = if candidate.has_root() {
         candidate.to_path_buf()
     } else {
         root.join(candidate)
