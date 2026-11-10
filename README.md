@@ -118,28 +118,35 @@ lives:
 kira setup
 ```
 
-The command walks you through it:
+The command walks you through four questions:
 
-1. It asks for your **organization** and **project** (you can also pass them
-   with `--org <name> --project <name>`, or have them in
-   `AZURE_DEVOPS_ORG` / `AZURE_DEVOPS_PROJECT` or `config.toml` — anything
-   already known is not asked again).
-2. It prints the PAT page URL
-   (`https://dev.azure.com/{your-org}/_usersSettings/tokens`) and opens it in
-   your browser. Create a token with the **Work Items (Read)** +
-   **Project and Team (Read)** scopes; prefer the shortest expiration that
-   fits your workflow (e.g. 90 days) and rotate it when it expires.
-3. You paste the PAT (one line, visible input — it works with piped stdin too).
+1. **organization** and **project** (you can also pass them with
+   `--org <name> --project <name>`, or have them in `AZURE_DEVOPS_ORG` /
+   `AZURE_DEVOPS_PROJECT` or `config.toml` — anything already known is not
+   asked again);
+2. **"Você já tem um PAT pronto? [S/n]"** — with `Enter = S`;
+   - **S**: paste the token straight away, with no steps and no browser;
+   - **N**: KIRA prints the token page
+     (`https://dev.azure.com/{your-org}/_usersSettings/tokens`) and the
+     **Work Items (Read)** + **Project and Team (Read)** scopes, then asks
+     **"Abrir no navegador agora? [S/n]"** — the browser only opens after your
+     confirmation and never blocks the terminal (`(se não abrir, a URL está
+     acima)`); prefer the shortest expiration that fits your workflow (e.g. 90
+     days) and rotate it when it expires;
+3. you paste the PAT (one line, visible input);
 4. KIRA **validates before saving**: it lists your projects and checks the
    project name. Only when that succeeds does it store the PAT in the OS
    keyring (service `kira`) and save org/project to
    `~/.config/kira/config.toml` (mode 0600). If validation fails (401), nothing
    is saved and the command tells you what to review.
-5. Done:
 
    ```text
    setup concluído — rode kira triage <id>
    ```
+
+Piped stdin skips the *"já tem um PAT?"* question and keeps the old fast path;
+`--no-browser` skips the steps and the browser open entirely, going straight to
+the paste prompt; `--pat` skips every token prompt.
 
 To remove the saved PAT from the keyring:
 
@@ -149,8 +156,9 @@ kira setup --reset
 
 #### Already have a token?
 
-Skip the browser flow and hand the PAT straight to the CLI. Read the token
-from a secure file or the environment instead of typing it bare (PowerShell):
+In the interactive flow just answer **`S`** to "Você já tem um PAT pronto?" and
+paste it when asked — or skip every prompt from the CLI. Read the token from
+a secure file or the environment instead of typing it bare (PowerShell):
 
 ```powershell
 $pat = Get-Content "$env:USERPROFILE\.secrets\ado-pat.txt"   # ou $env:ADO_PAT
