@@ -16,6 +16,46 @@ M0 — one command. No AI, no Copilot, no MCP, no writes to Azure DevOps.
 cargo install --path .
 ```
 
+## Setup
+
+KIRA talks to Azure DevOps with a Personal Access Token (PAT) stored in
+environment variables.
+
+1. Create a PAT with the **Work Items (Read)** scope at
+   `https://dev.azure.com/{your-organization}/_usersSettings/tokens`.
+   Prefer the shortest expiration that fits your workflow (e.g. 90 days) and
+   rotate it when it expires.
+
+2. Export the three variables.
+
+   bash:
+
+   ```bash
+   export AZURE_DEVOPS_PAT=your-pat
+   export AZURE_DEVOPS_ORG=your-org
+   export AZURE_DEVOPS_PROJECT=your-project
+   ```
+
+   PowerShell:
+
+   ```powershell
+   $env:AZURE_DEVOPS_PAT = "your-pat"
+   $env:AZURE_DEVOPS_ORG = "your-org"
+   $env:AZURE_DEVOPS_PROJECT = "your-project"
+   ```
+
+3. Verify the configuration:
+
+   ```bash
+   kira doctor
+   ```
+
+4. Then inspect a work item:
+
+   ```bash
+   kira inspect 4821
+   ```
+
 ## Usage
 
 ```bash
