@@ -3,13 +3,43 @@
 KIRA — Knowledge-Informed Remediation Agent (*Keep It Running, Always*).
 
 A Rust CLI for assisted maintenance of repositories hosted on Azure DevOps.
-In M0 it does exactly one thing, read-only: fetch a work item and print a
-readable summary in the terminal.
+Read-only by default: fetch a work item, scan the stack for vulnerable and
+outdated dependencies, and plan a triage — without ever writing to the board.
 
 ## Status
 
-M1.0 — pluggable board (`BoardProvider`, Azure DevOps MVP), local triage, and
-`kira setup` (PAT in the OS keyring). Read-only: no writes to Azure DevOps.
+M1 shipped — pluggable board (`BoardProvider`, Azure DevOps MVP), deterministic
+`kira scan` (.NET + npm/pnpm, stable fingerprints), local triage, `kira doctor`,
+SQLite trail and `kira setup` (PAT in the OS keyring). Read-only: no writes to
+Azure DevOps.
+
+Next: the port waves (W1→W6). The PR-by-PR ledger with acceptance criteria is
+[`docs/roadmap-prs.md`](docs/roadmap-prs.md); the autonomous build state is
+[`docs/BUILD-PROGRAM.md`](docs/BUILD-PROGRAM.md); the governing mandate is
+[`docs/kira-mandato.md`](docs/kira-mandato.md).
+
+## Autonomy, approval and measurement (the contract)
+
+KIRA is meant to become a living agent — a loop and a scheduled mode under a
+game-style dashboard — but autonomy is gated, not automatic:
+
+- **Read is free, write is not.** Every command is read-only unless it takes an
+  explicit `--apply`. There is no path where a scheduled run writes to the world
+  on its own.
+- **`awaiting_approval` is a state, not a suggestion.** Before any world write
+  (Azure DevOps, the target repo) the cycle stops in `awaiting_approval` in the
+  SQLite store and waits for a human: `kira approve <id>`. Exceeding a budget is
+  not approval; `--apply` alone is not approval.
+- **The M2 gate is measured, not asserted.** `kira triage --eval <dir>` scores the
+  triage against closed bugs with the owner's root-cause labels, and reports the
+  percentage. Autonomy does not start before that number clears 70%.
+- **The dashboard never replaces the text mode.** The Ratatui UI is a rich mode of
+  the same binary: the loop and the scheduled mode stay consumable as logs, and
+  errors stay copyable text.
+- **Budget has a number.** `max_llm_calls_per_day = 50` by default, checked before
+  every state transition.
+- **Nothing leaves the machine by default.** Ollama runs on localhost; Copilot is
+  opt-in via flag/env. Secrets never reach a log, a prompt or the store.
 
 ## Install
 
