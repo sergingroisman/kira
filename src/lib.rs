@@ -5,6 +5,7 @@
 //! in [`ado`].
 
 pub mod ado;
+pub mod board;
 pub mod doctor;
 pub mod error;
 pub mod format;

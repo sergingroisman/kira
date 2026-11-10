@@ -7,11 +7,24 @@ license = "MIT"
 
 [dependencies]
 azure_devops_rust_api = { version = "0.39", features = ["wit", "core"] }
+# Already a transitive dependency of azure_devops_rust_api (same version); now
+# declared so src/ado can build `Url` values for the endpoint override used by
+# the tests with a fake Azure DevOps server on 127.0.0.1.
+azure_core = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Direct dependency: OS keyring storage for the PAT (src/credentials.rs).
+# Platform features kept minimal (Windows native + Linux secret-service via
+# pure-Rust zbus, no C dependency); elsewhere Entry::new fails at runtime and
+# the code falls back to the AZURE_DEVOPS_PAT env var with a clear message.
+keyring = { version = "4", default-features = false, features = [
+    "v1",
+    "windows-native-keyring-store",
+    "zbus-secret-service-keyring-store",
+] }
 # Direct dependency: the Ollama backend (src/llm/ollama.rs) performs its own
 # HTTP calls to localhost; before this it was only transitive via azure_core.
 reqwest = { version = "0.13", features = ["json"] }

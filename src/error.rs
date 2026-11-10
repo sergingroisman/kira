@@ -3,23 +3,53 @@ use thiserror::Error;
 /// Errors produced by KIRA. Every message says what to do next.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// `AZURE_DEVOPS_PAT` is unset or empty.
+    /// `AZURE_DEVOPS_PAT` is unset or empty (and not found in the OS keyring).
     #[error(
-        "defina a variável de ambiente AZURE_DEVOPS_PAT com um Personal Access Token que tenha permissão de leitura de Work Items (ex.: export AZURE_DEVOPS_PAT=...)\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
+        "PAT não encontrado — defina a variável de ambiente AZURE_DEVOPS_PAT com um Personal Access Token que tenha permissão de leitura de Work Items (ex.: export AZURE_DEVOPS_PAT=...), ou rode `kira setup` para salvar o PAT no keyring do sistema\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
     )]
     MissingPat,
 
-    /// `AZURE_DEVOPS_ORG` is unset or empty.
+    /// `AZURE_DEVOPS_ORG` is unset or empty (and absent from config.toml).
     #[error(
-        "defina a variável de ambiente AZURE_DEVOPS_ORG com o nome da organização (ex.: export AZURE_DEVOPS_ORG=minha-org)\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
+        "defina a variável de ambiente AZURE_DEVOPS_ORG com o nome da organização (ex.: export AZURE_DEVOPS_ORG=minha-org), ou rode `kira setup` para salvar a configuração\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
     )]
     MissingOrg,
 
     /// Neither `--project` nor `AZURE_DEVOPS_PROJECT` provided a project name.
     #[error(
-        "informe o projeto com --project <nome> ou defina a variável de ambiente AZURE_DEVOPS_PROJECT\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
+        "informe o projeto com --project <nome> ou defina a variável de ambiente AZURE_DEVOPS_PROJECT\nou rode `kira setup` para salvar a configuração (rode `kira doctor` para diagnosticar esta máquina)"
     )]
     MissingProject,
+
+    /// The requested board provider is not implemented in this phase.
+    #[error(
+        "board '{name}' ainda não é suportado — o Azure DevOps é o board desta fase (MVP); use KIRA_BOARD=azure ou remova a variável"
+    )]
+    UnknownBoard { name: String },
+
+    /// The OS keyring is not usable on this machine (no daemon, unsupported
+    /// platform, ...). The keyring error itself never contains the secret.
+    #[error(
+        "keyring indisponível ({action}) — use a variável de ambiente AZURE_DEVOPS_PAT ou rode `kira setup` de novo"
+    )]
+    KeyringUnavailable {
+        action: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// The config file `$HOME/.config/kira/config.toml` could not be read.
+    #[error("não foi possível ler o arquivo '{path}' — corrija o arquivo ou remova-o: {source}")]
+    ConfigRead {
+        path: String,
+        source: std::io::Error,
+    },
+
+    /// The config file has a line that does not follow `key = "value"`.
+    #[error(
+        "linha {line} inválida em '{path}' — use o formato chave = \"valor\" (ex.: organization = \"minha-org\")"
+    )]
+    ConfigParse { path: String, line: usize },
 
     /// Azure DevOps request failed (network, authentication, not found, ...).
     #[error("falha ao consultar o Azure DevOps: {0}")]
