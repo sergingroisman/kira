@@ -18,6 +18,12 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Operações de leitura por padrão. Escrita no Azure exige flag explícita (`--apply`).
 - Erro precisa dizer o que fazer: "defina AZURE_DEVOPS_PAT ou rode `kira setup`" > "credencial ausente".
 - Sem `unsafe` no código de runtime. Exceção única e test-only: testes que mexem em variáveis de ambiente (edition 2024 torna `env::set_var`/`remove_var` unsafe). Sem dependência nova sem justificar no PR.
+## Setup
+- `kira setup` pergunta "Você já tem um PAT pronto? [S/n]" SEMPRE no modo interativo (stdin é TTY — `stdin().is_terminal()`, injetado como `SetupOptions::interactive`); stdin pipado mantém o fast path antigo (passos + abrir + colar). Enter = 's'; respostas inválidas repetem no máximo 2x e então assumem 's', com aviso.
+- 'n' na pergunta imprime os passos (URL `https://dev.azure.com/{org}/_usersSettings/tokens` + escopos Work Items Read + Project and Team Read) e confirma "Abrir no navegador agora? [S/n]" — o navegador SÓ abre com confirmação.
+- Abertura de navegador NUNCA bloqueia: `Command::spawn` (handle descartado — nunca `.status()`/`.output()`); spawn falhou ⇒ só re-imprime a URL e continua.
+- `--no-browser` pula os passos e nunca pergunta sobre navegador (vai direto ao "Cole o PAT"); `--pat` é zero-prompts de token e o valor nunca é ecoado (só máscara).
+
 ## Boards plugáveis
 - Todo acesso a work item passa pela trait `BoardProvider` (`src/board/`): `work_item(id)` e `project_names()`. A fábrica é `board::for_board(<nome>, ...)`; nome vem de `KIRA_BOARD` (default `azure`), board desconhecido => erro acionável.
 - O Azure DevOps é o MVP: `azure::AdoBoard` apenas delega para `src/ado` — nada de lógica de API fora de `src/ado/`. Jira/Trello virarão novos módulos em `src/board/`.

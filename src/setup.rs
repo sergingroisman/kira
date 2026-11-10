@@ -1,12 +1,16 @@
 //! `kira setup` — interactive first-time configuration.
 //!
-//! Flow: org/project (flags > env > config.toml > prompt) → short instructions
-//! with the PAT URL (skipped by `--no-browser`, opened in the browser; both
-//! steps are skipped when the PAT already came via `--pat`) → PAT from stdin
-//! (visible, one line; works piped) or straight from `--pat` → validate
-//! against the board BEFORE saving → save to the credential store + org/project
-//! to `config.toml` (0600). A PAT passed via `--pat` is never echoed in the
-//! output: only the masked form (first 4 chars + `****`) is ever shown.
+//! Flow: org/project (flags > env > config.toml > prompt) → in interactive
+//! mode (TTY) a "Você já tem um PAT pronto?" question BEFORE anything browser:
+//! yes ⇒ straight to the paste prompt; no ⇒ the instruction steps (PAT URL +
+//! scopes) and a CONFIRMED browser open ("Abrir no navegador agora?"). The
+//! open is fire-and-forget (spawn) and never blocks the terminal. Piped stdin
+//! keeps the old fast path (steps + open, then paste); `--no-browser` skips
+//! the steps/open entirely; `--pat` skips every token prompt. → PAT from
+//! stdin (visible, one line) → validate against the board BEFORE saving →
+//! save to the credential store + org/project to `config.toml` (0600). A PAT
+//! passed via `--pat` is never echoed in the output: only the masked form
+//! (first 4 chars + `****`) is ever shown.
 //!
 //! Every input/output is injected (stdin, stdout, store, config path, board
 //! factory, browser opener), so tests drive the full flow with fake stdin, an
@@ -39,6 +43,11 @@ pub struct SetupOptions {
     /// `--no-browser`: skip the instruction steps and the browser open; go
     /// straight to the "paste the PAT" stdin prompt.
     pub no_browser: bool,
+    /// stdin é interativo (TTY), injetado pelo binário real via
+    /// `stdin().is_terminal()`; só no modo interativo o fluxo pergunta
+    /// "Você já tem um PAT pronto?" antes de qualquer abertura de navegador —
+    /// stdin pipado mantém o fast path antigo (passos + abrir, colar no fim).
+    pub interactive: bool,
 }
 
 /// Builds the board used to validate the PAT: `(pat, org, project) -> board`.
@@ -88,52 +97,49 @@ pub async fn run(
         None => return ExitCode::FAILURE,
     };
 
-    // With `--pat` the token arrived on the command line: nothing to browse,
-    // nothing to prompt. With `--no-browser` the steps and the browser open
-    // are skipped and the flow goes straight to the paste prompt.
+    // Com `--pat` o token veio na linha de comando: nada de navegador, nada de
+    // prompt. Com `--no-browser` os passos e o navegador são pulados. No modo
+    // interativo (TTY) vem a pergunta "Você já tem um PAT pronto?": o navegador
+    // só abre após confirmação. Stdin pipado mantém o fast path antigo.
     let pat = if let Some(pat) = options.pat.as_deref() {
         pat.to_string()
+    } else if options.interactive && !options.no_browser {
+        if ask_yes_no("Você já tem um PAT pronto? [S/n]: ", input, output) {
+            // Já tem token: direto ao prompt de colar — sem passos, sem navegador.
+            match prompt_for_pat(input, output) {
+                Some(pat) => pat,
+                None => return ExitCode::FAILURE,
+            }
+        } else {
+            let url = pat_url(&organization);
+            print_pat_steps(&url, output);
+            if ask_yes_no("Abrir no navegador agora? [S/n]: ", input, output) {
+                open_pat_page(&url, output, open_url);
+            }
+            match prompt_for_pat(input, output) {
+                Some(pat) => pat,
+                None => return ExitCode::FAILURE,
+            }
+        }
     } else {
         if !options.no_browser {
-            // Step-by-step instructions with the PAT URL, opened in the browser.
-            let url = format!("https://dev.azure.com/{organization}/_usersSettings/tokens");
-            let _ = writeln!(
-                output,
-                "Para o KIRA ler work items, crie um Personal Access Token (PAT):"
-            );
-            let _ = writeln!(output, "  1. Abra {url}");
+            let url = pat_url(&organization);
+            print_pat_steps(&url, output);
             match open_url(&url) {
                 Ok(()) => {
-                    let _ = writeln!(output, "     (a URL já foi aberta no navegador)");
+                    let _ = writeln!(output, "     (se não abrir, a URL está acima)");
                 }
                 Err(_) => {
                     let _ = writeln!(
                         output,
-                        "     (não foi possível abrir o navegador — copie a URL acima)"
+                        "     (não foi possível abrir o navegador — a URL está acima)"
                     );
                 }
             }
-            let _ = writeln!(
-                output,
-                "  2. Clique em \"+ New Token\" e marque os escopos:"
-            );
-            let _ = writeln!(output, "       Work Items (Read) + Project and Team (Read)");
-            let _ = writeln!(output, "  3. Copie o token gerado.");
         }
-
-        let _ = writeln!(
-            output,
-            "Cole o PAT e pressione Enter (a entrada fica visível):"
-        );
-        match read_line(input) {
-            Some(pat) if !pat.is_empty() => pat,
-            _ => {
-                let _ = writeln!(
-                    output,
-                    "erro: nenhum PAT informado — rode `kira setup` de novo."
-                );
-                return ExitCode::FAILURE;
-            }
+        match prompt_for_pat(input, output) {
+            Some(pat) => pat,
+            None => return ExitCode::FAILURE,
         }
     };
 
@@ -194,7 +200,7 @@ pub async fn run(
     }
     let _ = writeln!(
         output,
-        "PAT salvo no keyring do OS ({} chars: {}).",
+        "✓ PAT salvo no keyring do OS ({} chars: {}).",
         pat.chars().count(),
         doctor::mask_pat(&pat)
     );
@@ -292,6 +298,95 @@ fn read_line(input: &mut dyn BufRead) -> Option<String> {
     match input.read_line(&mut line) {
         Ok(0) | Err(_) => None,
         Ok(_) => Some(line.trim().to_string()),
+    }
+}
+
+/// URL da página de criação de PAT da organização.
+fn pat_url(organization: &str) -> String {
+    format!("https://dev.azure.com/{organization}/_usersSettings/tokens")
+}
+
+/// Passos de criação do token: URL da página e os escopos mínimos.
+fn print_pat_steps(url: &str, output: &mut dyn Write) {
+    let _ = writeln!(
+        output,
+        "Para o KIRA ler work items, crie um Personal Access Token (PAT):"
+    );
+    let _ = writeln!(output, "  1. Abra {url}");
+    let _ = writeln!(
+        output,
+        "  2. Clique em \"+ New Token\" e marque os escopos:"
+    );
+    let _ = writeln!(output, "       Work Items (Read) + Project and Team (Read)");
+    let _ = writeln!(output, "  3. Copie o token gerado.");
+}
+
+/// Pergunta 's'/'n' com default 's' (Enter); respostas inválidas repetem no
+/// máximo 2 vezes e então assumem o padrão, com aviso.
+fn ask_yes_no(question: &str, input: &mut dyn BufRead, output: &mut dyn Write) -> bool {
+    let mut invalid = 0;
+    loop {
+        let _ = write!(output, "{question}");
+        let _ = output.flush();
+        match read_line(input) {
+            Some(line) => match line.to_lowercase().as_str() {
+                "" | "s" | "sim" | "y" | "yes" => return true,
+                "n" | "não" | "nao" | "no" => return false,
+                _ => {
+                    invalid += 1;
+                    let _ = writeln!(
+                        output,
+                        "resposta inválida ('{line}') — responda 's' ou 'n'."
+                    );
+                    if invalid >= 2 {
+                        let _ = writeln!(
+                            output,
+                            "resposta inválida de novo — assumindo 's' (padrão)."
+                        );
+                        return true;
+                    }
+                }
+            },
+            None => return true,
+        }
+    }
+}
+
+/// Prompt "Cole o PAT": uma linha visível de stdin; vazia ⇒ erro acionável.
+fn prompt_for_pat(input: &mut dyn BufRead, output: &mut dyn Write) -> Option<String> {
+    let _ = writeln!(
+        output,
+        "Cole o PAT e pressione Enter (a entrada fica visível):"
+    );
+    match read_line(input) {
+        Some(pat) if !pat.is_empty() => Some(pat),
+        _ => {
+            let _ = writeln!(
+                output,
+                "erro: nenhum PAT informado — rode `kira setup` de novo."
+            );
+            None
+        }
+    }
+}
+
+/// Abertura de navegador CONFIRMADA e nunca bloqueante: o opener injetado usa
+/// `Command::spawn` (fire-and-forget, handle descartado); em qualquer falha do
+/// spawn a URL é impressa de novo e o fluxo simplesmente continua.
+fn open_pat_page(
+    url: &str,
+    output: &mut dyn Write,
+    open_url: &dyn Fn(&str) -> Result<(), std::io::Error>,
+) {
+    let _ = writeln!(
+        output,
+        "Abrindo {url} no navegador (se não abrir, a URL está acima)..."
+    );
+    if open_url(url).is_err() {
+        let _ = writeln!(
+            output,
+            "não foi possível abrir o navegador — cole esta URL: {url}"
+        );
     }
 }
 

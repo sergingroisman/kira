@@ -108,6 +108,7 @@ async fn run_setup(
     opened: &std::sync::Mutex<Vec<String>>,
     pat_flag: Option<String>,
     no_browser: bool,
+    interactive: bool,
 ) -> (ExitCode, String) {
     let make_board =
         move |pat: &str, org: &str, project: &str| -> Result<Box<dyn BoardProvider>, Error> {
@@ -136,6 +137,7 @@ async fn run_setup(
         reset: false,
         pat: pat_flag,
         no_browser,
+        interactive,
     };
     let code = setup::run(
         &options,
@@ -171,10 +173,17 @@ async fn setup_prompts_org_project_validates_and_saves_the_pat() {
         &opened,
         None,
         false,
+        false, /* interactive: stdin pipado = fast path */
     )
     .await;
 
     assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    // Piped stdin = fast path do jeito antigo: a pergunta "já tem um PAT?"
+    // NÃO aparece no modo não-interativo.
+    assert!(
+        !out.contains("Você já tem um PAT pronto?"),
+        "stdin pipado não deve mostrar a pergunta nova: {out}"
+    );
     // Prompts were shown, the PAT URL was printed and opened in the browser.
     assert!(
         out.contains("Organização do Azure DevOps"),
@@ -255,6 +264,7 @@ async fn setup_with_401_shows_what_to_review_and_does_not_save() {
         &opened,
         None,
         false,
+        false, /* interactive: stdin pipado = fast path */
     )
     .await;
 
@@ -294,6 +304,7 @@ async fn setup_with_wrong_project_name_does_not_save() {
         &opened,
         None,
         false,
+        false, /* interactive: stdin pipado = fast path */
     )
     .await;
 
@@ -329,6 +340,7 @@ async fn setup_uses_flags_and_env_before_prompting() {
         &opened,
         None,
         false,
+        false, /* interactive: stdin pipado = fast path */
     )
     .await;
 
@@ -370,6 +382,7 @@ async fn setup_pat_flag_is_fully_non_interactive() {
         &opened,
         Some("Aa2xTOKENCOMPLETO".to_string()),
         false,
+        false, /* interactive: stdin pipado = fast path */
     )
     .await;
 
@@ -452,6 +465,7 @@ async fn setup_no_browser_skips_steps_and_opener_but_still_prompts() {
         &opened,
         None,
         true,
+        false, /* interactive: stdin pipado = fast path */
     )
     .await;
 
@@ -506,6 +520,7 @@ async fn setup_pat_flag_with_401_does_not_save_or_echo_the_token() {
         &opened,
         Some("PATRUIMSEGREDO".to_string()),
         true,
+        false, /* interactive: stdin pipado = fast path */
     )
     .await;
 
@@ -559,6 +574,235 @@ async fn setup_reset_removes_the_pat_from_the_store() {
     assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
     assert!(out.contains("PAT removido"), "saída: {out}");
     assert_eq!(store.get(CRED_KEY_PAT).ok().flatten(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Fluxo interativo (TTY): "Você já tem um PAT pronto?" antes de qualquer
+// navegador; o opener só é chamado com confirmação. O modo interativo é
+// injetado (`interactive: true`) — o binário real usa `stdin().is_terminal()`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn setup_interactive_yes_past_the_pat_question_takes_the_paste_path() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("interactive-yes");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // 's' na pergunta: NÃO abre navegador, NÃO imprime os passos — direto ao
+    // prompt de colar; o PAT é validado e salvo.
+    let (code, out) = run_setup(
+        "s\nAa2xTOKENCOMPLETO\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        true, /* interactive */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("Você já tem um PAT pronto? [S/n]"),
+        "deve fazer a pergunta do PAT: {out}"
+    );
+    assert!(
+        out.contains("Cole o PAT e pressione Enter"),
+        "deve ir direto ao prompt de colar: {out}"
+    );
+    assert!(
+        !out.contains("_usersSettings/tokens"),
+        "nada de passos/URL do PAT: {out}"
+    );
+    assert!(!out.contains("Work Items (Read)"), "nada de escopos: {out}");
+    assert!(
+        !out.contains("Abrir no navegador agora"),
+        "não deve perguntar sobre abrir o navegador: {out}"
+    );
+    assert!(
+        opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "'s' não pode chamar o opener: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "PAT deve estar no store"
+    );
+    assert!(
+        !out.contains("Aa2xTOKENCOMPLETO"),
+        "o PAT completo nunca pode aparecer na saída: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_interactive_no_then_enter_opens_the_browser_once() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("interactive-no-enter");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // 'n' na pergunta + Enter na pergunta de abrir (comando default 's'): o
+    // opener é chamado EXATAMENTE 1x com a URL correta; o fluxo continua
+    // colando o PAT.
+    let (code, out) = run_setup(
+        "n\n\nAa2xTOKENCOMPLETO\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        true, /* interactive */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(out.contains("Você já tem um PAT pronto? [S/n]"), "{out}");
+    assert!(
+        out.contains("https://dev.azure.com/minha-org/_usersSettings/tokens"),
+        "deve imprimir os passos com a URL: {out}"
+    );
+    assert!(
+        out.contains("Abrir no navegador agora? [S/n]"),
+        "deve perguntar antes de abrir: {out}"
+    );
+    assert!(
+        out.contains("se não abrir, a URL está acima"),
+        "deve avisar sobre o navegador: {out}"
+    );
+    assert_eq!(
+        *opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["https://dev.azure.com/minha-org/_usersSettings/tokens"],
+        "opener deve ser chamado exatamente 1x com a URL correta: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "PAT deve estar no store"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_interactive_no_and_no_never_opens_the_browser() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("interactive-no-no");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // 'n' + 'n': passos impressos, mas o opener NUNCA é chamado; o fluxo
+    // simplesmente continua até o prompt de colar.
+    let (code, out) = run_setup(
+        "n\nn\nAa2xTOKENCOMPLETO\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        true, /* interactive */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("Abrir no navegador agora? [S/n]"),
+        "deve perguntar antes de abrir: {out}"
+    );
+    assert!(
+        opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "'n' na confirmação não pode abrir o navegador: {out}"
+    );
+    assert!(
+        !out.contains("não foi possível abrir o navegador"),
+        "não deve reportar falha de spawn: {out}"
+    );
+    assert!(
+        out.contains("Cole o PAT e pressione Enter"),
+        "fluxo deve continuar para colar o PAT: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "PAT deve estar no store"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_interactive_invalid_answers_fall_back_to_the_default_s() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("interactive-invalid");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // 'x' duas vezes: aviso em cada resposta inválida e, ao esgotar as 2
+    // repetições, assume o default 's' (tem o PAT) e vai para o prompt de colar.
+    let (code, out) = run_setup(
+        "x\nx\nAa2xTOKENCOMPLETO\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        true, /* interactive */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("resposta inválida ('x') — responda 's' ou 'n'."),
+        "deve avisar sobre a resposta inválida: {out}"
+    );
+    assert!(
+        out.contains("assumindo 's' (padrão)"),
+        "deve dizer que assumiu o default: {out}"
+    );
+    assert!(
+        out.contains("Cole o PAT e pressione Enter"),
+        "default 's' deve levar ao prompt de colar: {out}"
+    );
+    assert!(
+        !out.contains("Abrir no navegador agora"),
+        "default 's' não pode perguntar sobre navegador: {out}"
+    );
+    assert!(
+        opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "nada de navegador com o default: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "PAT deve estar no store"
+    );
+    let _ = std::fs::remove_file(&config);
 }
 
 #[tokio::test]

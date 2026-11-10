@@ -1,5 +1,5 @@
 use std::error::Error as StdError;
-use std::io::BufWriter;
+use std::io::{BufWriter, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -56,7 +56,7 @@ enum Command {
     },
     /// Save the Azure DevOps configuration and the PAT in the OS keyring
     #[command(
-        after_help = "Exemplos:\n  kira setup                    # interativo (padrão)\n  kira setup --no-browser       # pede org/projeto/PAT sem abrir o navegador\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas"
+        after_help = "Exemplos:\n  kira setup                    # organização, projeto e a pergunta 'Já tem um PAT pronto? [S/n]'\n                                #   S: cole o PAT | n: passos + confirmar abrir no navegador\n  kira setup --no-browser       # pede org/projeto/PAT sem abrir o navegador\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas"
     )]
     Setup {
         /// Azure DevOps organization name (skips the prompt)
@@ -611,6 +611,9 @@ async fn setup_command(
             return ExitCode::FAILURE;
         }
     };
+    // Modo interativo = stdin é um TTY: só nele o fluxo pergunta
+    // "Você já tem um PAT pronto?"; stdin pipado mantém o fast path antigo.
+    let interactive = std::io::stdin().is_terminal();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
@@ -622,6 +625,7 @@ async fn setup_command(
             reset,
             pat,
             no_browser,
+            interactive,
         },
         store.as_ref(),
         credentials::config_path().as_deref(),
