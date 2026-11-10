@@ -8,7 +8,8 @@ readable summary in the terminal.
 
 ## Status
 
-M0 — one command. No AI, no Copilot, no MCP, no writes to Azure DevOps.
+M1.0 — pluggable board (`BoardProvider`, Azure DevOps MVP), local triage, and
+`kira setup` (PAT in the OS keyring). Read-only: no writes to Azure DevOps.
 
 ## Install
 
@@ -103,15 +104,54 @@ memory and the default `num_ctx` of 4096 is conservative.
 
 ## Setup
 
-KIRA talks to Azure DevOps with a Personal Access Token (PAT) stored in
-environment variables.
+KIRA talks to Azure DevOps with a Personal Access Token (PAT). Where your PAT
+lives:
 
-1. Create a PAT with the **Work Items (Read)** scope at
-   `https://dev.azure.com/{your-organization}/_usersSettings/tokens`.
-   Prefer the shortest expiration that fits your workflow (e.g. 90 days) and
-   rotate it when it expires.
+| Where | How | Best for |
+| --- | --- | --- |
+| OS keyring (Windows Credential Manager / secret service) | `kira setup` | Your machine — interactive use |
+| `AZURE_DEVOPS_PAT` env var | exported by hand | CI / headless machines |
 
-2. Export the three variables.
+### Option A — `kira setup` (recommended, interactive)
+
+```bash
+kira setup
+```
+
+The command walks you through it:
+
+1. It asks for your **organization** and **project** (you can also pass them
+   with `--org <name> --project <name>`, or have them in
+   `AZURE_DEVOPS_ORG` / `AZURE_DEVOPS_PROJECT` or `config.toml` — anything
+   already known is not asked again).
+2. It prints the PAT page URL
+   (`https://dev.azure.com/{your-org}/_usersSettings/tokens`) and opens it in
+   your browser. Create a token with the **Work Items (Read)** +
+   **Project and Team (Read)** scopes; prefer the shortest expiration that
+   fits your workflow (e.g. 90 days) and rotate it when it expires.
+3. You paste the PAT (one line, visible input — it works with piped stdin too).
+4. KIRA **validates before saving**: it lists your projects and checks the
+   project name. Only when that succeeds does it store the PAT in the OS
+   keyring (service `kira`) and save org/project to
+   `~/.config/kira/config.toml` (mode 0600). If validation fails (401), nothing
+   is saved and the command tells you what to review.
+5. Done:
+
+   ```text
+   setup concluído — rode kira triage <id>
+   ```
+
+To remove the saved PAT from the keyring:
+
+```bash
+kira setup --reset
+```
+
+### Option B — manual (env vars, for CI / headless)
+
+Create a PAT with the **Work Items (Read)** scope at
+`https://dev.azure.com/{your-organization}/_usersSettings/tokens`, then export
+the three variables.
 
    bash:
 
@@ -129,17 +169,21 @@ environment variables.
    $env:AZURE_DEVOPS_PROJECT = "your-project"
    ```
 
-3. Verify the configuration:
+The env var wins over the keyring and over `config.toml`, so Option B also
+works on a machine configured with Option A (handy for one-shot CI runs).
 
-   ```bash
-   kira doctor
-   ```
+### Verify the configuration
 
-4. Then inspect a work item:
+```bash
+kira doctor
+```
 
-   ```bash
-   kira inspect 4821
-   ```
+It shows where each setting came from (env, keyring or `config.toml`), tests
+the connection and checks the project name. Then inspect a work item:
+
+```bash
+kira inspect 4821
+```
 
 ## Usage
 
@@ -149,9 +193,10 @@ kira inspect <work-item-id> [--project <name>]
 
 | Variable | Description |
 | --- | --- |
-| `AZURE_DEVOPS_PAT` | Personal Access Token with **Work Items (Read)** permission |
-| `AZURE_DEVOPS_ORG` | Azure DevOps organization name |
-| `AZURE_DEVOPS_PROJECT` | Default project; overridden by `--project <name>` |
+| `AZURE_DEVOPS_PAT` | Personal Access Token with **Work Items (Read)** permission (env var or saved by `kira setup` in the OS keyring) |
+| `AZURE_DEVOPS_ORG` | Azure DevOps organization name (env var or `config.toml`) |
+| `AZURE_DEVOPS_PROJECT` | Default project; overridden by `--project <name>` (env var or `config.toml`) |
+| `KIRA_BOARD` | Board provider to use; `azure` is the only one in this phase |
 
 Example:
 
