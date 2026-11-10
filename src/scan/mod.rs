@@ -675,17 +675,18 @@ mod tests {
         assert_eq!(pnpm.get_program(), expected);
     }
 
-    /// The override always spawns DIRECT on Linux/macOS — even a path that
-    /// ends in `.cmd`. On Windows only `.cmd`/`.bat` values go via `cmd /C`.
+    /// An override WITHOUT `.cmd`/`.bat` spawns DIRECT on every OS: on
+    /// Windows only `.cmd`/`.bat` values go via `cmd /C` (a bare path might be
+    /// anything), and elsewhere `cmd` does not exist.
     #[test]
     fn binary_override_spawns_direct_outside_windows() {
         let shim = "/opt/shims/npm";
         let command = command_for(ToolKind::Npm, Some(shim));
-        if cfg!(windows) {
-            assert_eq!(command.get_program(), "cmd");
-        } else {
-            assert_eq!(command.get_program(), shim);
-        }
+        assert_eq!(
+            command.get_program(),
+            shim,
+            "sem .cmd/.bat o spawn é direto em qualquer OS"
+        );
         let dotnet_shim = "/opt/shims/dotnet";
         let command = command_for(ToolKind::Dotnet, Some(dotnet_shim));
         assert_eq!(
