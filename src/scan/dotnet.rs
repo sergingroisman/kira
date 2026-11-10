@@ -6,12 +6,14 @@
 //! error, and a non-zero exit code never echoes the raw stderr/stdout body.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::Value;
 
-use super::finding::Finding;
-use super::{ScanError, exit_code_label, relative_path};
+use super::{
+    Finding, ScanError, ToolKind, exit_code_label, relative_path, spawn_error, stderr_hint,
+    tool_command,
+};
 
 /// The exact command executed on each detected .NET scope.
 pub const DOTNET_ARGS: [&str; 6] = [
@@ -25,24 +27,16 @@ pub const DOTNET_ARGS: [&str; 6] = [
 
 /// Runs the command in `dir` and parses the JSON into findings.
 pub fn scan_dir(dir: &Path) -> Result<Vec<Finding>, ScanError> {
-    let output = Command::new("dotnet")
-        .args(DOTNET_ARGS)
-        .current_dir(dir)
+    let mut command = tool_command(ToolKind::Dotnet);
+    command.args(DOTNET_ARGS).current_dir(dir);
+    let output = command
         .output()
-        .map_err(|source| {
-            if matches!(source.kind(), std::io::ErrorKind::NotFound) {
-                ScanError::DotnetMissing
-            } else {
-                ScanError::Runtime {
-                    message: format!("não foi possível executar o dotnet: {source}"),
-                }
-            }
-        })?;
+        .map_err(|source| spawn_error(ToolKind::Dotnet, source))?;
     if !output.status.success() {
-        return Err(ScanError::ToolFail {
+        return Err(ScanError::ToolFailure {
             tool: "dotnet list package",
-            code: exit_code_label(output.status.code()),
-            dir: dir.display().to_string(),
+            exit: exit_code_label(output.status.code()),
+            hint: stderr_hint(&String::from_utf8_lossy(&output.stderr)),
         });
     }
     parse_output(&output_stdout(&output), dir)
@@ -282,24 +276,35 @@ mod tests {
             "erro deve apontar a instalação: {message}"
         );
 
-        let failed = ScanError::ToolFail {
+        let failed = ScanError::ToolFailure {
             tool: "dotnet list package",
-            code: "-1".to_string(),
-            dir: "/pipeline/app".to_string(),
+            exit: "-1".to_string(),
+            hint: super::super::stderr_hint("MSBUILD : error MSB1009\nat line 2\n"),
         };
         let message = failed.to_string();
-        assert!(message.contains("código -1"), "{message}");
         assert!(
-            message.contains("/pipeline/app"),
-            "erro deve dizer onde rodar à mão: {message}"
+            message.contains("a ferramenta dotnet list package falhou"),
+            "{message}"
         );
+        assert!(message.contains("(exit -1)"), "{message}");
         assert!(
-            message.contains("output cru foi omitido"),
-            "erro deve dizer que o body cru ficou de fora: {message}"
+            message.contains("(dica: MSBUILD : error MSB1009)"),
+            "{message}"
         );
         assert!(
             !message.contains('\n'),
             "erros de scan são compactos: {message}"
+        );
+
+        let without_hint = ScanError::ToolFailure {
+            tool: "dotnet list package",
+            exit: "1".to_string(),
+            hint: String::new(),
+        };
+        let message = without_hint.to_string();
+        assert!(
+            message.ends_with("rode kira scan de novo"),
+            "sem stderr não existe dica: {message}"
         );
     }
 }

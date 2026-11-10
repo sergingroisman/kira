@@ -8,12 +8,12 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 
-use super::finding::Finding;
-use super::{ScanError, exit_code_label};
+use super::{
+    Finding, ScanError, ToolKind, exit_code_label, spawn_error, stderr_hint, tool_command,
+};
 
 /// Which package manager audit to run: choice made in the stack detection
 /// (pnpm-lock.yaml => pnpm, otherwise npm).
@@ -24,46 +24,23 @@ pub enum NodeAuditTool {
 }
 
 impl NodeAuditTool {
-    /// Executable on the PATH.
-    fn program(self) -> &'static str {
+    /// The invocation kind of this audit (command build + env override).
+    fn kind(self) -> ToolKind {
         match self {
-            Self::Pnpm => "pnpm",
-            Self::Npm => "npm",
-        }
-    }
-
-    /// Actionable message of a tool that is not on the PATH.
-    fn missing(self) -> String {
-        match self {
-            Self::Pnpm => {
-                "o scan Node/TS via pnpm exige o pnpm — instale com `npm install -g pnpm` e rode de novo"
-                    .to_string()
-            }
-            Self::Npm => {
-                "o scan Node/TS via npm exige o npm — instale em https://nodejs.org/download e rode de novo"
-                    .to_string()
-            }
+            Self::Pnpm => ToolKind::Pnpm,
+            Self::Npm => ToolKind::Npm,
         }
     }
 }
 
 /// Runs `<pnpm|npm> audit --json` in `dir` and parses the JSON into findings.
 pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanError> {
-    let output = Command::new(tool.program())
-        .args(["audit", "--json"])
-        .current_dir(dir)
+    let kind = tool.kind();
+    let mut command = tool_command(kind);
+    command.args(["audit", "--json"]).current_dir(dir);
+    let output = command
         .output()
-        .map_err(|source| {
-            if matches!(source.kind(), std::io::ErrorKind::NotFound) {
-                ScanError::ToolMissing {
-                    message: tool.missing(),
-                }
-            } else {
-                ScanError::Runtime {
-                    message: format!("não foi possível executar o {}: {source}", tool.program()),
-                }
-            }
-        })?;
+        .map_err(|source| spawn_error(kind, source))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let parsed = match tool {
         NodeAuditTool::Npm => parse_npm_output(&stdout),
@@ -73,14 +50,14 @@ pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanErr
         Ok(findings) => Ok(findings),
         // Audit CLIs exit non-zero exactly when vulnerabilities exist: the
         // JSON parse has already been tried — if it failed, the compact error
-        // (never the raw body) points to the manual run in the dir.
-        Err(_source) if !output.status.success() => Err(ScanError::ToolFail {
+        // (never the raw body) carries at most one stderr line as a hint.
+        Err(_source) if !output.status.success() => Err(ScanError::ToolFailure {
             tool: match tool {
                 NodeAuditTool::Npm => "npm audit",
                 NodeAuditTool::Pnpm => "pnpm audit",
             },
-            code: exit_code_label(output.status.code()),
-            dir: dir.display().to_string(),
+            exit: exit_code_label(output.status.code()),
+            hint: stderr_hint(&String::from_utf8_lossy(&output.stderr)),
         }),
         Err(source) => Err(source),
     }
@@ -306,13 +283,10 @@ mod tests {
 
     #[test]
     fn missing_tool_error_is_actionable() {
-        let message = ScanError::ToolMissing {
-            message: NodeAuditTool::Npm.missing(),
-        };
-        let message = message.to_string();
+        let message = ToolKind::Npm.missing_error().to_string();
         assert!(message.contains("npm"), "{message}");
         assert!(message.contains("nodejs.org"), "{message}");
-        let message = NodeAuditTool::Pnpm.missing();
+        let message = ToolKind::Pnpm.missing_error().to_string();
         assert!(message.contains("npm install -g pnpm"), "{message}");
     }
 
@@ -320,15 +294,21 @@ mod tests {
     /// is still tried before any error. Here only the compact error shape.
     #[test]
     fn tool_fail_error_is_compact_without_body() {
-        let failed = ScanError::ToolFail {
+        let failed = ScanError::ToolFailure {
             tool: "npm audit",
-            code: "1".to_string(),
-            dir: "/srv/api".to_string(),
+            exit: "1".to_string(),
+            hint: stderr_hint("npm error! something specific\nignored line\n"),
         };
         let message = failed.to_string();
-        assert!(message.contains("npm audit"), "{message}");
-        assert!(message.contains("código 1"), "{message}");
-        assert!(message.contains("/srv/api"), "{message}");
+        assert!(
+            message.contains("a ferramenta npm audit falhou"),
+            "{message}"
+        );
+        assert!(message.contains("(exit 1)"), "{message}");
+        assert!(
+            message.contains("(dica: npm error! something specific)"),
+            "{message}"
+        );
         assert!(!message.contains('\n'), "compacto: {message}");
     }
 }

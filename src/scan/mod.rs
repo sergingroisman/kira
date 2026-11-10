@@ -18,6 +18,7 @@ pub use finding::Finding;
 pub use node::NodeAuditTool;
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -47,15 +48,16 @@ pub enum ScanError {
     #[error("{message}")]
     ToolMissing { message: String },
 
-    /// The tool exited non-zero and produced no parseable JSON — the raw
-    /// output is never echoed; the message points to the manual run.
+    /// The tool ran and exited non-zero (or an audit exited non-zero with
+    /// unparseable JSON): compact and actionable, never the raw body — at
+    /// most the FIRST line of stderr (trimmed, ≤200 chars) as a hint.
     #[error(
-        "\"{tool}\" falhou (código {code}) no diretório '{dir}' — rode o comando à mão no diretório para ver o erro completo (o output cru foi omitido)"
+        "a ferramenta {tool} falhou (exit {exit}) — confira versão/instalação e rode kira scan de novo{hint}"
     )]
-    ToolFail {
+    ToolFailure {
         tool: &'static str,
-        code: String,
-        dir: String,
+        exit: String,
+        hint: String,
     },
 
     /// The tool answered something that is not valid JSON.
@@ -114,6 +116,141 @@ impl Stack {
         } else {
             root.join(&self.dir)
         }
+    }
+}
+
+/// Which tool the scan invokes, for command construction, binary overrides
+/// and the actionable "install X" error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolKind {
+    Dotnet,
+    Npm,
+    Pnpm,
+}
+
+impl ToolKind {
+    /// Default executable on the PATH (no `KIRA_SCAN_*_BIN` set).
+    fn program(self) -> &'static str {
+        match self {
+            Self::Dotnet => "dotnet",
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+        }
+    }
+
+    /// Env var (`KIRA_SCAN_<TOOL>_BIN`) that overrides the binary: value is
+    /// the FULL path of an executable/shim. Documents CI without the tool,
+    /// custom packaging and offline tests.
+    pub fn bin_env(self) -> &'static str {
+        match self {
+            Self::Dotnet => "KIRA_SCAN_DOTNET_BIN",
+            Self::Npm => "KIRA_SCAN_NPM_BIN",
+            Self::Pnpm => "KIRA_SCAN_PNPM_BIN",
+        }
+    }
+
+    /// Actionable error of a tool that could not be spawned because it does
+    /// not exist ("instale o X"), not a tool that ran and failed.
+    fn missing_error(self) -> ScanError {
+        match self {
+            Self::Dotnet => ScanError::DotnetMissing,
+            Self::Npm => ScanError::ToolMissing {
+                message:
+                    "o scan Node/TS via npm exige o npm — instale em https://nodejs.org/download e rode de novo"
+                        .to_string(),
+            },
+            Self::Pnpm => ScanError::ToolMissing {
+                message:
+                    "o scan Node/TS via pnpm exige o pnpm — instale com `npm install -g pnpm` e rode de novo"
+                        .to_string(),
+            },
+        }
+    }
+}
+
+/// Builds the command that runs the tool of `kind` (callers add their own
+/// args and `current_dir`, never touching the program).
+///
+/// Windows: the std `Command` only looks for `.exe`, so `npm`/`pnpm` (which
+/// ship as `.cmd` shims on real machines) would NEVER be found by spawning
+/// them directly — these Node tools spawn wrapped in `cmd /C`, which resolves
+/// PATHEXT. `dotnet` is a real `.exe` and spawns directly. The env var
+/// `KIRA_SCAN_<TOOL>_BIN` (full executable/shim path — used by offline tests
+/// and CI without the tool) wins over the PATH; on Windows a `.cmd`/`.bat`
+/// value also spawns via `cmd /C`, anything else spawns directly. On
+/// Linux/macOS the override (and the defaults) always spawn directly.
+pub(crate) fn tool_command(kind: ToolKind) -> Command {
+    let override_bin = std::env::var(kind.bin_env())
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    command_for(kind, override_bin.as_deref())
+}
+
+/// Pure command builder used by [`tool_command`] (unit-testable without env).
+fn command_for(kind: ToolKind, bin: Option<&str>) -> Command {
+    let program = bin.map_or_else(|| kind.program().to_string(), str::to_owned);
+    if wraps_in_cmd(kind, bin) {
+        let mut command = Command::new("cmd");
+        command.args(["/C", &program]);
+        command
+    } else {
+        Command::new(program)
+    }
+}
+
+/// `cmd /C` wrapper needed? Node tools on Windows always (the std never
+/// resolves `npm.cmd` on the PATH); `dotnet` never (a real `.exe`); and a
+/// `.cmd`/`.bat` OVERRIDE only on Windows (on Linux/macOS it spawns direct).
+fn wraps_in_cmd(kind: ToolKind, bin: Option<&str>) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    match bin {
+        Some(script) => is_cmd_script(script),
+        None => matches!(kind, ToolKind::Npm | ToolKind::Pnpm),
+    }
+}
+
+/// True when the path points to a `.cmd`/`.bat` script (std would try to exec
+/// it as a binary instead of handing it to the shell).
+fn is_cmd_script(bin: &str) -> bool {
+    match Path::new(bin).extension() {
+        Some(ext) => ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"),
+        None => false,
+    }
+}
+
+/// Maps a failed spawn to the actionable error: never-confuse "could not run
+/// the tool" with "tool is missing" — only a real NotFound (tool/nonexistent
+/// binary) is "instale o X"; anything else stays a compact runtime message
+/// (no raw OS noise about the tool internals).
+pub(crate) fn spawn_error(kind: ToolKind, source: std::io::Error) -> ScanError {
+    if matches!(source.kind(), std::io::ErrorKind::NotFound) {
+        kind.missing_error()
+    } else {
+        ScanError::Runtime {
+            message: format!("não foi possível executar o {}: {source}", kind.program()),
+        }
+    }
+}
+
+/// Compact hint for the [`ScanError::ToolFailure`] message: first non-empty
+/// line of the tool stderr, trimmed, control chars removed, capped at 200
+/// chars. Empty stderr => empty string (no hint at all). Never the raw body.
+pub(crate) fn stderr_hint(stderr: &str) -> String {
+    let Some(line) = stderr.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return String::new();
+    };
+    let hint: String = line
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(200)
+        .collect();
+    if hint.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" (dica: {})", hint.trim_end())
     }
 }
 
@@ -515,5 +652,96 @@ mod tests {
         assert_eq!(exit_code_label(Some(1)), "1");
         assert_eq!(exit_code_label(Some(-1)), "-1");
         assert_eq!(exit_code_label(None), "desconhecido");
+    }
+
+    /// Command construction: no override => default program (node tools only
+    /// wrapped in `cmd /C` on Windows, where the std never finds `npm.cmd`).
+    #[test]
+    fn default_tool_program_by_kind() {
+        let dotnet = command_for(ToolKind::Dotnet, None);
+        assert_eq!(dotnet.get_program(), "dotnet");
+        let npm = command_for(ToolKind::Npm, None);
+        let expected = if cfg!(windows) { "cmd" } else { "npm" };
+        assert_eq!(npm.get_program(), expected);
+        if cfg!(windows) {
+            let args: Vec<String> = npm
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args, vec!["/C", "npm"], "{args:?}");
+        }
+        let pnpm = command_for(ToolKind::Pnpm, None);
+        let expected = if cfg!(windows) { "cmd" } else { "pnpm" };
+        assert_eq!(pnpm.get_program(), expected);
+    }
+
+    /// The override always spawns DIRECT on Linux/macOS — even a path that
+    /// ends in `.cmd`. On Windows only `.cmd`/`.bat` values go via `cmd /C`.
+    #[test]
+    fn binary_override_spawns_direct_outside_windows() {
+        let shim = "/opt/shims/npm";
+        let command = command_for(ToolKind::Npm, Some(shim));
+        if cfg!(windows) {
+            assert_eq!(command.get_program(), "cmd");
+        } else {
+            assert_eq!(command.get_program(), shim);
+        }
+        let dotnet_shim = "/opt/shims/dotnet";
+        let command = command_for(ToolKind::Dotnet, Some(dotnet_shim));
+        assert_eq!(
+            command.get_program(),
+            dotnet_shim,
+            "dotnet nunca via cmd /C"
+        );
+        let dotnet_cmd = command_for(ToolKind::Dotnet, Some("C:\\tools\\dotnet.cmd"));
+        let expected = if cfg!(windows) {
+            "cmd"
+        } else {
+            "C:\\tools\\dotnet.cmd"
+        };
+        assert_eq!(dotnet_cmd.get_program(), expected);
+    }
+
+    /// On Windows (and only there) a `.cmd`/`.bat` override runs via `cmd /C`
+    /// — case-insensitive; other extensions spawn direct.
+    #[test]
+    fn cmd_bat_override_wraps_only_on_windows() {
+        for script in [
+            "C:\\tools\\npm.CMD",
+            "C:\\tools\\tool.Bat",
+            "/shims/npm.cmd",
+        ] {
+            let command = command_for(ToolKind::Npm, Some(script));
+            let expected = if cfg!(windows) { "cmd" } else { script };
+            assert_eq!(command.get_program(), expected, "{script}");
+        }
+        let command = command_for(ToolKind::Npm, Some("/shims/npm.ps1"));
+        assert_eq!(command.get_program(), "/shims/npm.ps1");
+        let command = command_for(ToolKind::Npm, None);
+        // Valor vazio nunca chega aqui (tool_command filtra) — sem override é
+        // o programa padrão do PATH.
+        let expected = if cfg!(windows) { "cmd" } else { "npm" };
+        assert_eq!(command.get_program(), expected);
+    }
+
+    /// Hint of `ToolFailure`: first non-empty stderr line, trimmed, control
+    /// chars out, ≤200 chars — never more, never the raw body.
+    #[test]
+    fn stderr_hint_is_one_short_line_or_absent() {
+        assert_eq!(stderr_hint(""), "");
+        assert_eq!(stderr_hint("\n\n  \n"), "");
+        assert_eq!(
+            stderr_hint("\n  erro específico da ferramenta \nsegunda linha\n"),
+            " (dica: erro específico da ferramenta)"
+        );
+        assert_eq!(stderr_hint("a\u{1}b\tc"), " (dica: abc)");
+        let long = "x".repeat(500);
+        let hint = stderr_hint(&long);
+        assert_eq!(
+            hint.chars().count(),
+            200 + " (dica: )".chars().count(),
+            "{hint}"
+        );
+        assert!(hint.chars().all(|ch| ch != '\n' && ch != '\r'));
     }
 }
