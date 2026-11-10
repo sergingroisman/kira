@@ -285,7 +285,24 @@ fn scan_of_the_fake_npm_audit_is_deterministic_and_recorded() {
     let findings_path = sandbox.cwd.join(".kira").join("findings.json");
     let first = std::fs::read_to_string(&findings_path)
         .unwrap_or_else(|err| panic!("ler {findings_path:?}: {err}"));
-    assert!(out.contains(&findings_path.display().to_string()), "{out}");
+    let printed = out
+        .lines()
+        .find_map(|line| {
+            // "arquivo: <caminho>" pode estar no meio de uma linha.
+            line.find("arquivo: ")
+                .map(|index| line[index + "arquivo: ".len()..].to_string())
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| panic!("'arquivo:' ausente no stdout: {out}"));
+    let printed_file = std::fs::canonicalize(&printed)
+        .unwrap_or_else(|err| panic!("o caminho impresso deve existir: {err}"));
+    let expected_file = std::fs::canonicalize(&findings_path)
+        .unwrap_or_else(|err| panic!("ler findings path: {err}"));
+    assert_eq!(
+        printed_file, expected_file,
+        "o caminho impresso é o arquivo escrito (indiferente ao formato no Windows): {out}"
+    );
 
     // Segunda execução no MESMO estado: arquivo byte-idêntico.
     let (code, _, _) = run_kira(&sandbox, None, &[(npm_bin.as_str(), &shim)], &["scan"]);

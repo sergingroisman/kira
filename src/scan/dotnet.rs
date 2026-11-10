@@ -11,8 +11,8 @@ use std::process::Output;
 use serde_json::Value;
 
 use super::{
-    Finding, ScanError, ToolKind, exit_code_label, relative_path, spawn_error, stderr_hint,
-    tool_command,
+    Finding, ScanError, ToolKind, exit_code_label, relative_path, spawn_error, tool_command,
+    tool_run_failure,
 };
 
 /// The exact command executed on each detected .NET scope.
@@ -33,11 +33,13 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<Finding>, ScanError> {
         .output()
         .map_err(|source| spawn_error(ToolKind::Dotnet, source))?;
     if !output.status.success() {
-        return Err(ScanError::ToolFailure {
-            tool: "dotnet list package",
-            exit: exit_code_label(output.status.code()),
-            hint: stderr_hint(&String::from_utf8_lossy(&output.stderr)),
-        });
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
+        return Err(tool_run_failure(
+            ToolKind::Dotnet,
+            "dotnet list package",
+            exit_code_label(output.status.code()),
+            &stderr_text,
+        ));
     }
     parse_output(&output_stdout(&output), dir)
 }

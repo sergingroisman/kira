@@ -12,7 +12,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    Finding, ScanError, ToolKind, exit_code_label, spawn_error, stderr_hint, tool_command,
+    Finding, ScanError, ToolKind, exit_code_label, spawn_error, tool_command, tool_run_failure,
 };
 
 /// Which package manager audit to run: choice made in the stack detection
@@ -46,19 +46,24 @@ pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanErr
         NodeAuditTool::Npm => parse_npm_output(&stdout),
         NodeAuditTool::Pnpm => parse_pnpm_output(&stdout),
     };
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
     match parsed {
         Ok(findings) => Ok(findings),
         // Audit CLIs exit non-zero exactly when vulnerabilities exist: the
         // JSON parse has already been tried — if it failed, the compact error
-        // (never the raw body) carries at most one stderr line as a hint.
-        Err(_source) if !output.status.success() => Err(ScanError::ToolFailure {
-            tool: match tool {
+        // (never the raw body) carries at most one stderr line as a hint. On
+        // Windows the `cmd /C` wrapper may also be reporting that the tool
+        // itself is missing ("is not recognized") — that becomes the
+        // actionable "instale o X" instead.
+        Err(_source) if !output.status.success() => Err(tool_run_failure(
+            kind,
+            match tool {
                 NodeAuditTool::Npm => "npm audit",
                 NodeAuditTool::Pnpm => "pnpm audit",
             },
-            exit: exit_code_label(output.status.code()),
-            hint: stderr_hint(&String::from_utf8_lossy(&output.stderr)),
-        }),
+            exit_code_label(output.status.code()),
+            &stderr_text,
+        )),
         Err(source) => Err(source),
     }
 }
@@ -195,7 +200,7 @@ pub fn parse_pnpm_output(raw: &str) -> Result<Vec<Finding>, ScanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::finding;
+    use crate::scan::{finding, stderr_hint};
 
     const NPM: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),

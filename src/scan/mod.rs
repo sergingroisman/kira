@@ -235,6 +235,45 @@ pub(crate) fn spawn_error(kind: ToolKind, source: std::io::Error) -> ScanError {
     }
 }
 
+/// Markers of the Windows `cmd /C` wrapper reporting an unknown command. When
+/// the tool itself is absent, `cmd.exe` starts fine, prints this to stderr and
+/// exits 1 — the Rust side never sees a spawn NotFound, so absence is only
+/// visible in the wrapper's own text (localized per cmd's system language).
+const CMD_MISSING_MARKERS: [&str; 4] = [
+    "is not recognized",
+    "não é reconhecido como",
+    "no se reconoce como",
+    "не является внутренней",
+];
+
+fn is_missing_command_text(stderr: &str) -> bool {
+    let lowered = stderr.to_lowercase();
+    CMD_MISSING_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// Classifies a run that started but exited non-zero: on Windows, absence of
+/// the tool shows itself as the `cmd` wrapper's "is not recognized" text and
+/// MUST be reported as "instale o X" (the user did nothing wrong — the tool is
+/// simply not installed); any other failure stays the compact `ToolFailure`.
+pub(crate) fn tool_run_failure(
+    kind: ToolKind,
+    tool_label: &'static str,
+    exit: String,
+    stderr: &str,
+) -> ScanError {
+    if is_missing_command_text(stderr) {
+        kind.missing_error()
+    } else {
+        ScanError::ToolFailure {
+            tool: tool_label,
+            exit,
+            hint: stderr_hint(stderr),
+        }
+    }
+}
+
 /// Compact hint for the [`ScanError::ToolFailure`] message: first non-empty
 /// line of the tool stderr, trimmed, control chars removed, capped at 200
 /// chars. Empty stderr => empty string (no hint at all). Never the raw body.
@@ -652,6 +691,38 @@ mod tests {
         assert_eq!(exit_code_label(Some(1)), "1");
         assert_eq!(exit_code_label(Some(-1)), "-1");
         assert_eq!(exit_code_label(None), "desconhecido");
+    }
+
+    /// Windows: `cmd /C` never reports the tool absence as spawn NotFound —
+    /// it prints "is not recognized" and exits 1. That text MUST classify as
+    /// the actionable "instale o X", not as a tool failure.
+    #[test]
+    fn windows_missing_command_text_becomes_instale() {
+        let error = tool_run_failure(
+            ToolKind::Npm,
+            "npm audit",
+            "1".to_string(),
+            "'npm' is not recognized as an internal or external command,\r\noperable program or batch file.",
+        );
+        let message = error.to_string();
+        assert!(message.contains("exige o npm"), "{message}");
+        assert!(message.contains("nodejs.org"), "{message}");
+
+        // ANY other failure text (a real tool error) stays a compact
+        // ToolFailure with the first stderr line as hint.
+        match tool_run_failure(
+            ToolKind::Npm,
+            "npm audit",
+            "1".to_string(),
+            "EACCES permission denied on root file\nsecond line ignored\n",
+        ) {
+            ScanError::ToolFailure { tool, exit, hint } => {
+                assert_eq!(tool, "npm audit");
+                assert_eq!(exit, "1");
+                assert!(hint.contains("EACCES"), "{hint}");
+            }
+            other => panic!("esperado ToolFailure, foi {other:?}"),
+        }
     }
 
     /// Command construction: no override => default program (node tools only
