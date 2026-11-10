@@ -51,7 +51,7 @@
 ### F0 — W1 segurança/erros (base para tudo)
 - [x] **PR1** docs: README + AGENTS.md ao v3 — incluir seção de autonomia
       (`awaiting_approval`, `kira approve`), gate de medição e TUI pós-M2.
-- [ ] **PR2** `src/redact.rs`: máscara de PAT/token/CPF/e-mail antes de log,
+- [x] **PR2** `src/redact.rs`: máscara de PAT/token/CPF/e-mail antes de log,
       erro e prompt. Teste prova que o prompt não leva segredo.
 - [ ] **PR3** `src/guard/path.rs`: deny-list de escrita + path traversal. Erro
       acionável, não toca o disco.
