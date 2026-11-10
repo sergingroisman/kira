@@ -40,3 +40,10 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Comandos `inspect`, `triage` (vivo e `--file`) e `doctor` gravam sessão automaticamente; `history`/`note`/`profile` fazem consulta e NÃO gravam sessão.
 - Timestamps no DB em RFC 3339 UTC; exibição local usa SQLite `datetime(x, 'localtime')` (sem dependência de fuso próprio).
 - Sobrescrever o diretório do DB com a env `KIRA_STORE_DIR` (testes e execuções portáveis) — envs novas só com justificativa no PR.
+## Scan
+- `kira scan` roda as ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). KIRA NÃO analisa — orquestra, normaliza e mantém determinismo. NADA de IA nesta rodada (triage grounded entra depois).
+- DETERMINISMO OBRIGATÓRIO (gate do M1): `fingerprint` = FNV-1a 64 sobre `tool|rule|package|version|message` (trimado); a lista gravada fica em ordem crescente por fingerprint — duas execuções no mesmo estado produzem o MESMO conjunto de fingerprints. `findings.json` não contém timestamp nem nada dependente de máquina.
+- Findings gravados em `<root>/.kira/findings.json`; `.kira/` é LOCAL: nunca comitar (KIRA escreve a nota `.kira/README.md` de que o diretório é local). Resumo no stdout: achados por severidade com contagem por ferramenta + caminho do arquivo.
+- `tool: dotnet` com regras `vulnerable` (advisory em `.vulnerabilities`) e `outdated` (pacote deprecado); `tool: audit` com `vulnerable` (advisory do npm/pnpm). `severity` grava-se exatamente como veio no JSON da ferramenta.
+- Ferramenta ausente OU comando falhou: erro acionável (instalar/apontar; nunca parse nem eco de body cru — nem stderr cru de `dotnet`). Saída de `npm/pnpm audit` com exit-code errado: parse é tentado primeiro — o exit-code 1 do audit é a forma normal de dizer que há vulnerabilidades.
+- Toda extração dos JSON é função pura de uma `String` (src/scan/), testada com fixtures em `tests/fixtures/scan/` (sem executar nenhuma ferramenta real em testes); testes de CLI cobrem os caminhos "ferramenta ausente" e "nenhum achado" (shim de tool no PATH que imprime fixture) e o arquivo determinístico (duas execuções byte-idênticas).
