@@ -57,7 +57,7 @@
       acionável, não toca o disco.
 - [ ] **PR4** taxonomia de erro acionável única em `src/error.rs`; zero
       `unwrap`/`expect` em rede/parse/input.
-- [ ] **PR33** teste de allowlist do LLM (ADR-0016): um teste que varre `src/` e
+- [x] **PR33** teste de allowlist do LLM (ADR-0016): um teste que varre `src/` e
       reprova se algum módulo fora de `triage.rs`/`loop/`/`wiki/` importar `llm::*`;
       e reprova chamada de LLM sem o comentário `// LLM porque:`. Aceite:
       `cargo test` falha se alguém adicionar LLM em `scan`/`store`/`tui`.
