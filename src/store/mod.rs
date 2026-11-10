@@ -477,7 +477,7 @@ pub fn detect_project_root_from(base: &Path) -> PathBuf {
     let mut profile_fallback: Option<PathBuf> = None;
     for dir in base.ancestors() {
         if dir.join(".git").exists() {
-            return dir.to_path_buf();
+            return canonical_if_exists(dir);
         }
         if profile_fallback.is_none()
             && (dir.join("Cargo.toml").exists() || dir.join("package.json").exists())
@@ -485,7 +485,14 @@ pub fn detect_project_root_from(base: &Path) -> PathBuf {
             profile_fallback = Some(dir.to_path_buf());
         }
     }
-    profile_fallback.unwrap_or_else(|| base.to_path_buf())
+    canonical_if_exists(&profile_fallback.unwrap_or_else(|| base.to_path_buf()))
+}
+
+/// Canonical form for symlinks (`/var` -> `/private/var` on macOS, `\\?\C:\` on
+/// Windows) so the returned root matches `ensure_project`'s canonical project
+/// id. Falls back to the raw path if canonicalization fails.
+fn canonical_if_exists(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
 /// [`detect_project_root_from`] starting at the current working directory.
