@@ -42,6 +42,7 @@ Porta conceitual da `dev`: `core/src/safety/{secrets_filter,path_guard,ssrf_guar
 | **PR2** | Filtro de segredos: máscara de PAT/token/CPF/e-mail em qualquer log, erro ou prompt | `src/redact.rs` (novo), chamadas em `format.rs`/`triage.rs`/`llm/prompts.rs` | Fixtures de segredo (PAT, token em URL, CPF, e-mail) saem mascaradas; teste prova que o prompt não contém segredo | **proposto** |
 | **PR3** | Guarda de caminho: deny-list de escrita (ex.: `.git/`, `target/`, `.kira/` fora do root, `~/.config/kira`) | `src/guard/path.rs` (novo) | Escrita em deny-list retorna erro acionável e **não toca o disco**; teste com path traversal | **proposto** |
 | **PR4** | Taxonomia de erro acionável única em `src/error.rs`: toda falha diz o que fazer; nunca body/stderr cru | `src/error.rs`, `src/ado/`, `src/scan/` | Teste por categoria de erro asserting a mensagem acionável; zero `unwrap`/`expect` em rede/parse/input | **proposto** |
+| **PR27** | Jail mínimo do `fix --apply`: confinamento por canonicalização + rlimits (`cfg(unix)`); Windows sem rlimits no MVP | `src/guard/jail.rs` (novo) | Escrita fora do root canonicalizado é recusada mesmo com `..`, symlink e junction; ADR-0011 | **aceito** (dono, 10/Nov) — entra no M3 |
 
 `ssrf_guard` (bloquear URL de terceiro) fica para quando existir fetch arbitrário
 (pós-PR11); **não** entra na W1 — hoje o único destino é Azure/Ollama.
@@ -59,6 +60,19 @@ ausência: "Arquivos prováveis" saiu descritivo).
 | PR6 | Prompt de triage v1 + fixtures de entrada/saída | **a confirmar** |
 | PR7 | Prompt review: `prompts.rs` público, revisado, com teste de regressão de texto | **a confirmar** |
 | PR8 | Backend LLM por trait (`LlmBackend`): ollama + caminho explícito para copilot/byok | **a confirmar** |
+
+## W2.5 — Wiki do KIRA (PR28–32) — inspirada no ai-memory
+
+Markdown é a fonte de verdade; FTS5 no `store.db` é índice **derivado e
+descartável**. Sem servidor, sem MCP, sem embeddings até o M2. Ver `ADR-0013`.
+
+| PR | Objetivo | Aceite |
+|---|---|---|
+| **PR28** | `kira wiki` + páginas `contexto/decisoes/padroes/glossario/bugs/*` em `.kira/wiki/`, toda escrita passando por `redact` | Nenhum segredo no disco; página criada/atualizada por comando; fail-open se o store quebrar |
+| **PR29** | Índice FTS5 (`wiki_page`, `wiki_fts`) + `kira wiki reindex` reconstruindo do zero | Apagar o índice e reindexar devolve o mesmo resultado de busca; sem FTS5 cai para substring sem erro fatal |
+| **PR30** | Captura episódica pós-`triage` + decay de 30 dias + `kira wiki forget` | Episódio gravado sem interação; página antiga colapsada em resumo; forget apaga página e índice |
+| **PR31** | Retrieval para o context packer (liga no PR5) | Prompt recebe top-k páginas com caminho e idade; respeita `KIRA_NUM_CTX` |
+| **PR32** | `kira wiki export` (bundle `.md` para o usuário comitar onde quiser) | Export não escreve no repo do usuário sem caminho explícito |
 
 ## W2-bis — gate de medição do M2 (antes do PR15)
 
