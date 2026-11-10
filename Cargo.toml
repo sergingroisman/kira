@@ -25,6 +25,13 @@ keyring = { version = "4", default-features = false, features = [
     "windows-native-keyring-store",
     "zbus-secret-service-keyring-store",
 ] }
+# Direct dependency: local session/fact store (src/store/). The `bundled`
+# feature compiles SQLite into the kira binary, so `kira history`, `kira note`
+# and the automatic session trail work out of the box with zero extra
+# installation — which matters on Windows, where there is no system sqlite3
+# package to rely on. Version pinned exactly to the current stable 0.41 line
+# (M1.1 of the v2 plan §3).
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
 # Direct dependency: the Ollama backend (src/llm/ollama.rs) performs its own
 # HTTP calls to localhost; before this it was only transitive via azure_core.
 reqwest = { version = "0.13", features = ["json"] }
