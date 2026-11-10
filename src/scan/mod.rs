@@ -161,7 +161,7 @@ impl ToolKind {
             },
             Self::Pnpm => ScanError::ToolMissing {
                 message:
-                    "o scan Node/TS via pnpm exige o pnpm — instale com `npm install -g pnpm` e rode de novo"
+                    "o scan Node/TS via pnpm exige o pnpm — instale com `npm install -g pnpm` (ou `corepack enable pnpm`) e rode de novo"
                         .to_string(),
             },
         }
@@ -192,7 +192,12 @@ fn command_for(kind: ToolKind, bin: Option<&str>) -> Command {
     let program = bin.map_or_else(|| kind.program().to_string(), str::to_owned);
     if wraps_in_cmd(kind, bin) {
         let mut command = Command::new("cmd");
-        command.args(["/C", &program]);
+        // `chcp 65001` before the tool: without it cmd.exe speaks the OEM
+        // codepage (cp850 etc.), so "is not recognized" arrives mojibaked and
+        // the missing-tool classification never matches. Forcing UTF-8 keeps
+        // the wrapper text readable AND classifiable. `&` runs the tool after
+        // chcp and the tool's own exit code is what the run reports.
+        command.args(["/C", "chcp 65001 >nul 2>&1 &", &program]);
         command
     } else {
         Command::new(program)
@@ -708,6 +713,18 @@ mod tests {
         assert!(message.contains("exige o npm"), "{message}");
         assert!(message.contains("nodejs.org"), "{message}");
 
+        // Mesma frase, em português (cmd PT-BR com codepage 65001 forçado
+        // pelo wrapper) — também tem que classificar como ausência.
+        let error_pt = tool_run_failure(
+            ToolKind::Pnpm,
+            "pnpm audit",
+            "1".to_string(),
+            "'pnpm' não é reconhecido como um comando interno ou externo, um programa operável ou um arquivo em lotes.",
+        );
+        let message_pt = error_pt.to_string();
+        assert!(message_pt.contains("exige o pnpm"), "{message_pt}");
+        assert!(message_pt.contains("corepack"), "{message_pt}");
+
         // ANY other failure text (a real tool error) stays a compact
         // ToolFailure with the first stderr line as hint.
         match tool_run_failure(
@@ -739,7 +756,11 @@ mod tests {
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
-            assert_eq!(args, vec!["/C", "npm"], "{args:?}");
+            assert_eq!(
+                args,
+                vec!["/C", "chcp 65001 >nul 2>&1 &", "npm"],
+                "{args:?}"
+            );
         }
         let pnpm = command_for(ToolKind::Pnpm, None);
         let expected = if cfg!(windows) { "cmd" } else { "pnpm" };
