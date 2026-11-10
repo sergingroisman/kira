@@ -26,29 +26,34 @@ struct Patterns {
     cpf: Regex,
 }
 
+/// Compiles a pattern that is a literal in this file.
+fn compile(pattern: &str) -> Regex {
+    // allow-expect: o padrão é constante de código, nunca dado de usuário; um erro aqui é
+    // bug de build (coberto pelos testes de redact). Devolver Result obrigaria todo chamador
+    // a tratar uma falha impossível, e falhar em silêncio na privacidade seria pior.
+    Regex::new(pattern).expect("regex constante")
+}
+
 fn patterns() -> &'static Patterns {
     static PATTERNS: OnceLock<Patterns> = OnceLock::new();
     PATTERNS.get_or_init(|| Patterns {
         // `Authorization: Bearer <token>` and bare `bearer <token>`.
-        bearer: Regex::new(r"(?i)\b(bearer\s+)([A-Za-z0-9._\-]{8,})").expect("regex bearer"),
+        bearer: compile(r"(?i)\b(bearer\s+)([A-Za-z0-9._\-]{8,})"),
         // `token=...`, `pat: ...`, `api_key=...`, `password = ...`, `secret: ...`
-        keyed: Regex::new(
+        keyed: compile(
             r"(?i)\b(pat|token|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|passwd|pwd|sig|signature)\b(\s*[=:]\s*)([^\s&,;\x22']{3,})",
-        )
-        .expect("regex keyed"),
+        ),
         // Secret carried in a URL query string.
-        url_query: Regex::new(
+        url_query: compile(
             r"(?i)([?&](?:token|access_token|refresh_token|sig|signature|code|key|api_key)=)([^&\s#]+)",
-        )
-        .expect("regex url_query"),
+        ),
         // Well-known token shapes.
-        known_prefixes: Regex::new(
+        known_prefixes: compile(
             r"(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9\-]{8,})",
-        )
-        .expect("regex known_prefixes"),
-        email: Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").expect("regex email"),
+        ),
+        email: compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
         // Formatted CPF only; bare 11 digits collide with ids and timestamps.
-        cpf: Regex::new(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b").expect("regex cpf"),
+        cpf: compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b"),
     })
 }
 

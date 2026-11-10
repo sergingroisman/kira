@@ -52,7 +52,9 @@ pub enum Error {
     ConfigParse { path: String, line: usize },
 
     /// Azure DevOps request failed (network, authentication, not found, ...).
-    #[error("falha ao consultar o Azure DevOps: {0}")]
+    #[error(
+        "falha ao consultar o Azure DevOps: {0} — rode `kira doctor` para diagnosticar credencial e conectividade (a resposta crua do servidor não é exibida)"
+    )]
     Ado(#[from] Box<dyn std::error::Error + Send + Sync>),
 
     /// Azure DevOps rejected the PAT with HTTP 401.
@@ -82,7 +84,9 @@ pub enum Error {
     },
 
     /// Azure DevOps answered with an unexpected JSON shape.
-    #[error("resposta inesperada do Azure DevOps: {0}")]
+    #[error(
+        "resposta inesperada do Azure DevOps: {0} — rode `kira doctor` e, se persistir, atualize o KIRA (o formato da API pode ter mudado)"
+    )]
     Api(#[from] serde_json::Error),
 
     /// The local Ollama server is not reachable (nothing listening).
@@ -110,7 +114,9 @@ pub enum Error {
     LlmBadResponse(String),
 
     /// The HTTP request to Ollama failed without a response.
-    #[error("falha na chamada ao Ollama: {0}")]
+    #[error(
+        "falha na chamada ao Ollama: {0} — confira se `ollama serve` está no ar e se KIRA_OLLAMA_URL aponta para http://localhost:11434 (rode `kira doctor`)"
+    )]
     LlmRequest(String),
 
     /// A local work-item file could not be read (`kira triage --file`).
@@ -120,6 +126,13 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    /// A filesystem write was refused by the guard (ADR-0011, layer 1).
+    ///
+    /// The rendered message is the guard's own actionable text, so callers can
+    /// surface it directly: refusing a write must explain how to proceed.
+    #[error("{0}")]
+    Guard(#[from] crate::guard::path::GuardError),
 }
 
 #[cfg(test)]
@@ -227,5 +240,111 @@ mod tests {
             !message.contains('<'),
             "mensagem não pode conter HTML/corpo: {message}"
         );
+    }
+
+    /// Acceptance of W1-PR4: **every** variant tells the user what to do next.
+    ///
+    /// The check is a cue list rather than exact wording, so improving a message
+    /// never breaks the test — but a variant that only says "failed" does.
+    #[test]
+    fn every_variant_is_actionable() {
+        const CUES: [&str; 14] = [
+            "defina", "rode", "informe", "use ", "corrija", "remova", "instale", "gere", "confira",
+            "crie", "escolha", "atualize", "execute", "recusado",
+        ];
+
+        let cases: Vec<(&str, Error)> = vec![
+            ("MissingPat", Error::MissingPat),
+            ("MissingOrg", Error::MissingOrg),
+            ("MissingProject", Error::MissingProject),
+            (
+                "UnknownBoard",
+                Error::UnknownBoard {
+                    name: "jira".to_string(),
+                },
+            ),
+            (
+                "KeyringUnavailable",
+                Error::KeyringUnavailable {
+                    action: "ler",
+                    source: Box::new(std::io::Error::other("sem daemon")),
+                },
+            ),
+            (
+                "ConfigRead",
+                Error::ConfigRead {
+                    path: "/tmp/config.toml".to_string(),
+                    source: std::io::Error::other("negado"),
+                },
+            ),
+            (
+                "ConfigParse",
+                Error::ConfigParse {
+                    path: "/tmp/config.toml".to_string(),
+                    line: 3,
+                },
+            ),
+            (
+                "Ado",
+                Error::Ado(Box::new(std::io::Error::other("conexão recusada"))),
+            ),
+            (
+                "AdoUnauthorized",
+                Error::AdoUnauthorized {
+                    organization: "minha-org".to_string(),
+                },
+            ),
+            (
+                "AdoStatus",
+                Error::AdoStatus {
+                    status: 503,
+                    organization: "minha-org".to_string(),
+                },
+            ),
+            (
+                "WorkItemInacessivel",
+                Error::WorkItemInacessivel {
+                    id: 4821,
+                    organization: "minha-org".to_string(),
+                    project: "Projeto".to_string(),
+                },
+            ),
+            (
+                "Api",
+                Error::Api(serde_json::from_str::<i32>("não é json").expect_err("json inválido")),
+            ),
+            ("LlmNotRunning", Error::LlmNotRunning),
+            ("LlmTimeout", Error::LlmTimeout),
+            ("LlmStatus", Error::LlmStatus { status: 404 }),
+            (
+                "LlmBadResponse",
+                Error::LlmBadResponse("corpo omitido".to_string()),
+            ),
+            (
+                "LlmRequest",
+                Error::LlmRequest("conexão recusada".to_string()),
+            ),
+            (
+                "Io",
+                Error::Io {
+                    path: "/tmp/item.json".to_string(),
+                    source: std::io::Error::other("ausente"),
+                },
+            ),
+            (
+                "Guard",
+                Error::Guard(crate::guard::path::GuardError::ParentTraversal {
+                    candidate: "../escape.txt".to_string(),
+                }),
+            ),
+        ];
+
+        for (name, err) in cases {
+            let message = err.to_string();
+            assert!(
+                CUES.iter().any(|cue| message.contains(cue)),
+                "{name} não diz o que fazer (W1-PR4): {message}"
+            );
+        }
     }
 }
