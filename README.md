@@ -242,6 +242,78 @@ Responsável: —
 Descrição: first 400 chars of the text, HTML removed, line breaks preserved
 ```
 
+## Local store
+
+Every KIRA run leaves a persistent trail in a single local SQLite database —
+no server, no account, project-scoped and offline.
+
+### Where the DB lives
+
+| Platform | Path |
+| --- | --- |
+| Windows | `%USERPROFILE%\.config\kira\store.db` |
+| Linux / macOS | `~/.config/kira/store.db` |
+
+The same folder already holds `config.toml`. Override the directory with the
+`KIRA_STORE_DIR` env var (handy for tests and portable runs):
+
+```bash
+KIRA_STORE_DIR=/tmp/kira kira history
+```
+
+### Schema (summary)
+
+| Table | Columns | Written by |
+| --- | --- | --- |
+| `projects` | `id`, `root_path`, `name`, `first_seen_at` | automatic (first run in a repo root) |
+| `sessions` | `id`, `project_id`, `command`, `args`, `model`, `started_at`, `duration_ms`, `ok`, `summary` | automatic (`inspect`/`doctor`/`triage`) |
+| `facts` | `project_id`, `key`, `value`, `updated_at` | `kira note` |
+
+The project id is a FNV-1a 64-bit hash (implemented by hand, no extra
+dependency) of the canonical project root: the first ancestor of the current
+directory that contains `.git`, falling back to the nearest ancestor with
+`Cargo.toml`/`package.json`, falling back to the current directory itself.
+Timestamps are RFC 3339 UTC; commands display local time via SQLite's
+`datetime(x, 'localtime')`.
+
+### Commands
+
+```bash
+kira history [--last N]        # recent sessions of the current project (N = 10 by default)
+kira note "text of the fact"   # add a profile fact (append-only: note-1, note-2, ...)
+kira note --remove 2           # remove the fact with that number
+kira profile                   # project root/name/first-seen + all stored facts
+```
+
+`inspect`, `triage` (both the live and the `--file` path) and `doctor` record
+their session automatically — including failed runs (✗, with the error text as
+summary, first 2000 chars, capped).
+
+### Fail-open
+
+A broken store never breaks the main command. If the trail cannot be written
+(disk full, bad `KIRA_STORE_DIR`, corrupt DB...), KIRA prints one warning on
+stderr and continues with the same output and exit code:
+
+```text
+aviso: trilha não foi gravada (não foi possível criar o diretório do store em '...': ...)
+```
+
+### Privacy
+
+- Never stored: the PAT, any token/credential or env var contents.
+- Never stored: the full work-item description — only the truncated command
+  output (at most 2000 characters, and the PAT is masked by `doctor`).
+- `kira note` stores exactly what you type.
+
+### Clean-up
+
+Delete the single file to wipe every session, fact and project profile:
+
+```powershell
+Remove-Item "$env:USERPROFILE\.config\kira\store.db"
+```
+
 ## Development
 
 ```bash

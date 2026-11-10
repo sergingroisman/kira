@@ -27,3 +27,10 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Nunca enviar segredos ao LLM: PAT, env e credenciais não entram no prompt — o prompt só contém campos do work item.
 - `kira triage` é somente leitura: o prompt do sistema nunca pede para escrever/editar código e o comando nunca altera o Azure DevOps.
 - Segredos no keyring: `src/credentials.rs` concentra `CredStore` (`OsKeyring` no runtime, `InMemory` só em testes). Testes NUNCA tocam o keyring do OS.
+## Store
+- Trilha local por projeto em SQLite (rusqlite, feature `bundled` — binário sem instalação externa); tudo em `src/store/`; DB único central `~/.config/kira/store.db` (Windows: `%USERPROFILE%\.config\kira\store.db`), modo WAL, migração idempotente via `PRAGMA user_version` com `CREATE TABLE IF NOT EXISTS`.
+- FAIL-OPEN OBRIGATÓRIO: erro do store nunca quebra o comando principal — só `aviso: trilha não foi gravada (<causa>)` no stderr (emitido só no `main.rs`, em lugar nenhum outro) e o código de saída/saída do comando permanece.
+- NUNCA gravar segredos no DB: PAT, tokens, env. NUNCA gravar a description completa do work item — summary = primeiros 2000 chars do output do comando (o `doctor` já maska o PAT).
+- Comandos `inspect`, `triage` (vivo e `--file`) e `doctor` gravam sessão automaticamente; `history`/`note`/`profile` fazem consulta e NÃO gravam sessão.
+- Timestamps no DB em RFC 3339 UTC; exibição local usa SQLite `datetime(x, 'localtime')` (sem dependência de fuso próprio).
+- Sobrescrever o diretório do DB com a env `KIRA_STORE_DIR` (testes e execuções portáveis) — envs novas só com justificativa no PR.
