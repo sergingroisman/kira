@@ -6,7 +6,7 @@ description = "KIRA — Knowledge-Informed Remediation Agent (Keep It Running, A
 license = "MIT"
 
 [dependencies]
-azure_devops_rust_api = { version = "0.39", features = ["wit"] }
+azure_devops_rust_api = { version = "0.39", features = ["wit", "core"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use kira::ado;
+use kira::doctor;
 use kira::error::Error;
 use kira::format;
 
@@ -30,6 +31,8 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Diagnose the Azure DevOps configuration of this machine
+    Doctor,
 }
 
 #[tokio::main]
@@ -48,6 +51,7 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Doctor => doctor::run().await,
     }
 }
 
