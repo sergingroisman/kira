@@ -32,7 +32,7 @@
 ## Fases e ordem de execução
 
 ### F0 — W1 segurança/erros (base para tudo)
-- [ ] **PR1** docs: README + AGENTS.md ao v3 — incluir seção de autonomia
+- [x] **PR1** docs: README + AGENTS.md ao v3 — incluir seção de autonomia
       (`awaiting_approval`, `kira approve`), gate de medição e TUI pós-M2.
 - [ ] **PR2** `src/redact.rs`: máscara de PAT/token/CPF/e-mail antes de log,
       erro e prompt. Teste prova que o prompt não leva segredo.
@@ -71,9 +71,12 @@
       confinamento por canonicalização (std) + rlimits em `cfg(unix)`; Windows
       sem rlimits no MVP. **Sem bwrap/Landlock.** Deny-list do PR3 é a camada 1.
 
-### F4 — dashboard Ratatui (estilo jogo)
-- [ ] **PR21** shell do TUI: loop de render 30 fps, layout de "sala de controle",
-      teclas, tema colorido; modo texto continua funcionando (não substitui).
+### F4 — dashboard Ratatui (estilo jogo, base = statui MIT · ADR-0014)
+- [ ] **PR21** vendor da casca do statui: copiar `app/keymap/theme/fx/state` +
+      `widgets/{table,inspector,footer}` para `src/tui/`, **com atribuição**
+      (`third_party/statui/{LICENSE,NOTICE.md}`, header em cada arquivo derivado),
+      removendo `backend.rs`/config HTTP; adicionar `ratatui 0.29` (justificar no PR).
+      Aceite: `kira tui` abre, renderiza um painel vazio e sai com `q`.
 - [ ] **PR22** painel de **bugs encontrados** (findings do `scan` + triage), com
       contagem por severidade e animação de "novo achado".
 - [ ] **PR23** painel de **arquivos criados/alterados pelo KIRA** (do store),

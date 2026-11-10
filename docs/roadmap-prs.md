@@ -116,8 +116,12 @@ Não bateu? **Pare e conserte o context packer.** Sem isso não se pinta a nave.
 
 ## W6 — TUI + mascote (só pós-M2)
 
-- TUI = **Ratatui, modo interativo do mesmo binário**. Ratatui é conceito; o código
-  Bun/Ink da `dev` é **referência de UX apenas**.
+- **Base: shell do `statui` (MIT) adaptado** — `src/tui/{app,keymap,theme,fx,state}.rs`
+  e `widgets/{table,inspector,footer}`. Atribuição obrigatória em
+  `third_party/statui/{LICENSE,NOTICE.md}`. Ver `ADR-0014`. Não entra o
+  `backend.rs` (probes HTTP) nem o modelo de config deles.
+- TUI = **Ratatui, modo interativo do mesmo binário**. Ratatui é o shell do statui;
+  o código Bun/Ink da `dev` é **referência de UX apenas**.
 - 3 leis: (a) não substitui o modo texto (loop/agendado continua consumível por log;
   erro em texto copiável); (b) mesmo contrato, read-only; (c) 1 PR por campo do painel.
 - Mascote pixel art = **arte**, não PR de código: sprites gerados/desenhados e
