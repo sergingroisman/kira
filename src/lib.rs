@@ -10,6 +10,7 @@ pub mod credentials;
 pub mod doctor;
 pub mod error;
 pub mod format;
+pub mod guard;
 pub mod html;
 pub mod llm;
 pub mod redact;
