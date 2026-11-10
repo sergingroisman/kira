@@ -253,8 +253,11 @@ impl Store {
                  FROM sessions WHERE project_id = ?1 ORDER BY id DESC LIMIT ?2",
             )
             .map_err(StoreError::Sql)?;
+        // Saturate instead of wrapping: `usize as i64` above i64::MAX turns
+        // negative, and SQLite reads `LIMIT -1` as "no limit" — an unbounded dump.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = statement
-            .query_map(rusqlite::params![project_id, limit as i64], |row| {
+            .query_map(rusqlite::params![project_id, limit], |row| {
                 let summary: String = row.get(7)?;
                 Ok(SessionRow {
                     id: row.get(0)?,
@@ -721,6 +724,13 @@ mod tests {
             .unwrap_or_else(|err| panic!("last_sessions: {err}"));
         assert_eq!(limited.len(), 1, "limit respeitado");
         assert_eq!(limited[0].command, "doctor");
+
+        // Regression: `usize::MAX as i64` wraps to -1 and SQLite reads `LIMIT -1`
+        // as "no limit". Saturation must keep the query bounded.
+        let saturated = store
+            .last_sessions(&project.id, usize::MAX)
+            .unwrap_or_else(|err| panic!("last_sessions com usize::MAX: {err}"));
+        assert_eq!(saturated.len(), 2, "LIMIT negativo viraria dump sem limite");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
