@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::ado;
+use crate::board::BoardProvider;
 use crate::error::Error;
 use crate::format::DESCRIPTION_MAX_CHARS;
 use crate::html::html_to_text;
@@ -20,9 +20,9 @@ const SECTION_NAMES: [&str; 3] = ["Causa raiz provável", "Arquivos prováveis",
 /// Placeholder used when the model left a section empty.
 const SECTION_EMPTY: &str = "—";
 
-/// Fixed system prompt: read-only by contract. It never asks the model to
-/// write, edit or fix code, and never mentions Azure DevOps writes.
-pub const SYSTEM_PROMPT: &str = "Você é o assistente de triage do KIRA. Você analisa work items do Azure DevOps apenas para leitura e diagnóstico: nunca sugira escrever, editar ou corrigir código; nunca proponha ou execute alterações no Azure DevOps. Responda em português, exatamente com três seções, cada título em sua própria linha, com o conteúdo logo abaixo:\nCausa raiz provável:\nArquivos prováveis:\nConfiança:";
+/// The read-only triage system prompt lives in [`crate::llm::prompts`] so it
+/// is versioned in one place; this alias keeps the command code readable.
+pub use crate::llm::prompts::TRIAGE_SYSTEM_PROMPT as SYSTEM_PROMPT;
 
 /// Builds the user prompt for a work item: title, type, state, area and the
 /// description with the raw HTML cleaned by [`html_to_text`].
@@ -160,16 +160,15 @@ pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<Str
     triage_item(base_url, model, &item).await
 }
 
-/// Runs triage for a work item fetched live from Azure DevOps (read-only).
+/// Runs triage for a work item fetched live through the board provider
+/// (read-only).
 pub async fn triage_live(
-    pat: &str,
-    organization: &str,
-    project: &str,
+    board: &dyn BoardProvider,
     id: i32,
     base_url: &str,
     model: &str,
 ) -> Result<String, Error> {
-    let item = ado::get_work_item(pat, organization, project, id).await?;
+    let item = board.work_item(id).await?;
     triage_item(base_url, model, &item).await
 }
 

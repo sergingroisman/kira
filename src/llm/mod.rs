@@ -6,6 +6,7 @@
 //! server on localhost and never sends secrets (PAT, env) in the prompt.
 
 pub mod ollama;
+pub mod prompts;
 
 use std::future::Future;
 
