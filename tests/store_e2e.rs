@@ -137,13 +137,20 @@ fn notes_flow_through_note_and_profile() {
     let (code, profile, _) = run_kira(&sandbox, &sandbox.store, &["profile"]);
     assert_eq!(code, 0);
     assert!(profile.contains("projeto: proj"), "{profile}");
+    let expected_root = {
+        let canonical = std::fs::canonicalize(&sandbox.cwd)
+            .unwrap_or_else(|err| panic!("canonicalizar cwd: {err}"))
+            .to_string_lossy()
+            .to_string();
+        // Same transform the CLI applies when displaying (drop the Windows
+        // extended-length prefix).
+        match canonical.strip_prefix("\\\\?\\") {
+            Some(inner) => inner.to_string(),
+            None => canonical,
+        }
+    };
     assert!(
-        profile.contains(&format!(
-            "root: {}",
-            std::fs::canonicalize(&sandbox.cwd)
-                .unwrap_or_else(|err| panic!("canonicalizar cwd: {err}"))
-                .display()
-        )),
+        profile.contains(&format!("root: {expected_root}")),
         "root canônico do projeto: {profile}"
     );
     assert!(profile.contains("primeira sessão:"), "{profile}");
