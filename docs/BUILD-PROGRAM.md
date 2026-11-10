@@ -63,6 +63,9 @@
 - [ ] **PR32** `kira wiki export` (bundle opcional) + `kira wiki promote` (staging → docs).
 - [ ] **PR5** context packer v1: item + findings do arquivo + trechos, teto de
       tokens. **Sem vetor, sem embedding** (markdown + FTS5 no SQLite existente).
+      **Retrieval-first determinístico (ADR-0015):** KIRA faz o grep (`walkdir` +
+      `regex`, já no lock) e a busca FTS5, monta trechos com `caminho:linha` e faz
+      **uma** chamada ao Ollama. Sem LangGraph, sem tool-calling no MVP.
 - [ ] **PR6** prompt de triage v1 + fixtures entrada/saída.
 - [ ] **PR7** `prompts.rs` público, revisado, teste de regressão de texto.
 - [ ] **PR8** `LlmBackend` explícito: ollama + caminho preparado para copilot/byok.
