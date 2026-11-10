@@ -23,8 +23,12 @@ O KIRA ganha uma wiki local por projeto, em markdown, indexada por FTS5.
 
 ### Onde os arquivos vivem
 
+Decisão do dono (10/Nov/2026): a wiki **nasce commitada**, em `docs/wiki/` do
+repositório do projeto — o conhecimento é parte do repo e versiona junto com o
+código.
+
 ```
-<projeto>/.kira/wiki/
+<projeto>/docs/wiki/
 ├── contexto.md       # arquitetura detectada: stack, módulos, comandos de build/test
 ├── decisoes.md       # decision log append-only (o "porquê" — o DeltaDB do KIRA)
 ├── padroes.md        # convenções inferidas e confirmadas pelo dono
@@ -33,9 +37,22 @@ O KIRA ganha uma wiki local por projeto, em markdown, indexada por FTS5.
     └── <item-id>.md  # causa raiz (prevista + aceita), arquivos, evidência
 ```
 
-`.kira/` continua **local e não comitado** (regra vigente do AGENTS.md). Quem
-quiser compartilhar usa `kira wiki export` (PR32), que gera um bundle `.md` para
-o usuário comitar onde quiser — a escrita no repo do usuário nunca é automática.
+**Consequência que o mandato impõe**: escrever em `docs/wiki/` é escrever no repo
+do usuário — portanto é *mundo*. A regra de `awaiting_approval` vale aqui:
+
+- **Comando invocado pelo humano** (`kira triage`, `kira wiki add`): grava direto
+  em `docs/wiki/` — o humano está na frente do terminal, é a ação dele.
+- **Ciclo autônomo** (`kira loop`, modo agendado): grava em
+  `<projeto>/.kira/wiki-staging/` (local, não comitado). Nada entra em `docs/wiki/`
+  sem `kira wiki promote` — que é humano, ou aprovado por `kira approve <id>`.
+  Isso mantém a autonomia incapaz de escrever no repo sem permissão, mesmo com a
+  wiki versionada.
+- A wiki nunca é escrita por caminho relativo não canonicalizado: passa pelo
+  `guard/path` (PR3) como qualquer outra escrita.
+
+`.kira/` continua local e não comitado (regra vigente do AGENTS.md); `docs/wiki/` é
+o artefato versionado. `kira wiki export` (PR32) fica como bundle opcional para
+quem não quer commitar a wiki.
 
 ### Toda escrita passa pela fronteira de privacidade
 
