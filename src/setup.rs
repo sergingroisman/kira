@@ -1,9 +1,12 @@
 //! `kira setup` — interactive first-time configuration.
 //!
 //! Flow: org/project (flags > env > config.toml > prompt) → short instructions
-//! with the PAT URL (opened in the browser) → PAT read from stdin (visible, one
-//! line; works piped) → validate against the board BEFORE saving → save to the
-//! credential store + org/project to `config.toml` (0600).
+//! with the PAT URL (skipped by `--no-browser`, opened in the browser; both
+//! steps are skipped when the PAT already came via `--pat`) → PAT from stdin
+//! (visible, one line; works piped) or straight from `--pat` → validate
+//! against the board BEFORE saving → save to the credential store + org/project
+//! to `config.toml` (0600). A PAT passed via `--pat` is never echoed in the
+//! output: only the masked form (first 4 chars + `****`) is ever shown.
 //!
 //! Every input/output is injected (stdin, stdout, store, config path, board
 //! factory, browser opener), so tests drive the full flow with fake stdin, an
@@ -30,6 +33,12 @@ pub struct SetupOptions {
     pub project: Option<String>,
     /// `--reset`: remove the PAT from the store and exit.
     pub reset: bool,
+    /// `--pat <token>`: PAT passed straight on the command line (skips the
+    /// stdin prompt; the value is never echoed in output, error or log).
+    pub pat: Option<String>,
+    /// `--no-browser`: skip the instruction steps and the browser open; go
+    /// straight to the "paste the PAT" stdin prompt.
+    pub no_browser: bool,
 }
 
 /// Builds the board used to validate the PAT: `(pat, org, project) -> board`.
@@ -79,43 +88,52 @@ pub async fn run(
         None => return ExitCode::FAILURE,
     };
 
-    // Step-by-step instructions with the PAT URL, opened in the browser.
-    let url = format!("https://dev.azure.com/{organization}/_usersSettings/tokens");
-    let _ = writeln!(
-        output,
-        "Para o KIRA ler work items, crie um Personal Access Token (PAT):"
-    );
-    let _ = writeln!(output, "  1. Abra {url}");
-    match open_url(&url) {
-        Ok(()) => {
-            let _ = writeln!(output, "     (a URL já foi aberta no navegador)");
-        }
-        Err(_) => {
+    // With `--pat` the token arrived on the command line: nothing to browse,
+    // nothing to prompt. With `--no-browser` the steps and the browser open
+    // are skipped and the flow goes straight to the paste prompt.
+    let pat = if let Some(pat) = options.pat.as_deref() {
+        pat.to_string()
+    } else {
+        if !options.no_browser {
+            // Step-by-step instructions with the PAT URL, opened in the browser.
+            let url = format!("https://dev.azure.com/{organization}/_usersSettings/tokens");
             let _ = writeln!(
                 output,
-                "     (não foi possível abrir o navegador — copie a URL acima)"
+                "Para o KIRA ler work items, crie um Personal Access Token (PAT):"
             );
+            let _ = writeln!(output, "  1. Abra {url}");
+            match open_url(&url) {
+                Ok(()) => {
+                    let _ = writeln!(output, "     (a URL já foi aberta no navegador)");
+                }
+                Err(_) => {
+                    let _ = writeln!(
+                        output,
+                        "     (não foi possível abrir o navegador — copie a URL acima)"
+                    );
+                }
+            }
+            let _ = writeln!(
+                output,
+                "  2. Clique em \"+ New Token\" e marque os escopos:"
+            );
+            let _ = writeln!(output, "       Work Items (Read) + Project and Team (Read)");
+            let _ = writeln!(output, "  3. Copie o token gerado.");
         }
-    }
-    let _ = writeln!(
-        output,
-        "  2. Clique em \"+ New Token\" e marque os escopos:"
-    );
-    let _ = writeln!(output, "       Work Items (Read) + Project and Team (Read)");
-    let _ = writeln!(output, "  3. Copie o token gerado.");
 
-    let _ = writeln!(
-        output,
-        "Cole o PAT e pressione Enter (a entrada fica visível):"
-    );
-    let pat = match read_line(input) {
-        Some(pat) if !pat.is_empty() => pat,
-        _ => {
-            let _ = writeln!(
-                output,
-                "erro: nenhum PAT informado — rode `kira setup` de novo."
-            );
-            return ExitCode::FAILURE;
+        let _ = writeln!(
+            output,
+            "Cole o PAT e pressione Enter (a entrada fica visível):"
+        );
+        match read_line(input) {
+            Some(pat) if !pat.is_empty() => pat,
+            _ => {
+                let _ = writeln!(
+                    output,
+                    "erro: nenhum PAT informado — rode `kira setup` de novo."
+                );
+                return ExitCode::FAILURE;
+            }
         }
     };
 

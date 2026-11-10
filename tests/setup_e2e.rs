@@ -106,6 +106,8 @@ async fn run_setup(
     config_path: Option<&std::path::Path>,
     store: &dyn CredStore,
     opened: &std::sync::Mutex<Vec<String>>,
+    pat_flag: Option<String>,
+    no_browser: bool,
 ) -> (ExitCode, String) {
     let make_board =
         move |pat: &str, org: &str, project: &str| -> Result<Box<dyn BoardProvider>, Error> {
@@ -132,6 +134,8 @@ async fn run_setup(
         org: org_flag,
         project: project_flag,
         reset: false,
+        pat: pat_flag,
+        no_browser,
     };
     let code = setup::run(
         &options,
@@ -165,6 +169,8 @@ async fn setup_prompts_org_project_validates_and_saves_the_pat() {
         Some(&config),
         &store,
         &opened,
+        None,
+        false,
     )
     .await;
 
@@ -247,6 +253,8 @@ async fn setup_with_401_shows_what_to_review_and_does_not_save() {
         Some(&config),
         &store,
         &opened,
+        None,
+        false,
     )
     .await;
 
@@ -284,6 +292,8 @@ async fn setup_with_wrong_project_name_does_not_save() {
         Some(&config),
         &store,
         &opened,
+        None,
+        false,
     )
     .await;
 
@@ -317,6 +327,8 @@ async fn setup_uses_flags_and_env_before_prompting() {
         Some(&config),
         &store,
         &opened,
+        None,
+        false,
     )
     .await;
 
@@ -335,6 +347,183 @@ async fn setup_uses_flags_and_env_before_prompting() {
         .find(|(k, _)| k == "organization")
         .map(|(_, v)| v.clone());
     assert_eq!(org.as_deref(), Some("minha-org"));
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_pat_flag_is_fully_non_interactive() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("pat-flag");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // org, project and PAT all via flags: zero prompts (stdin empty), no
+    // instructions, no browser open — validate and save.
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        Some("Aa2xTOKENCOMPLETO".to_string()),
+        false,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        !out.contains("Organização do Azure DevOps (ex."),
+        "não deve pedir org: {out}"
+    );
+    assert!(
+        !out.contains("Projeto do Azure DevOps (ex."),
+        "não deve pedir projeto: {out}"
+    );
+    assert!(
+        !out.contains("Cole o PAT e pressione Enter"),
+        "não deve pedir o PAT por stdin: {out}"
+    );
+    assert!(
+        !out.contains("_usersSettings/tokens"),
+        "não deve imprimir os passos do PAT: {out}"
+    );
+    assert!(
+        !out.contains("Work Items (Read)"),
+        "não deve imprimir os escopos: {out}"
+    );
+    assert!(
+        opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "o navegador não pode ser aberto com --pat"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "PAT da CLI deve estar no store"
+    );
+    assert!(
+        out.contains("Aa2x****"),
+        "confirmação deve mascarar o PAT: {out}"
+    );
+    assert!(
+        !out.contains("Aa2xTOKENCOMPLETO"),
+        "o PAT completo nunca pode aparecer na saída: {out}"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "organization" && v == "minha-org"),
+        "config.toml deve ser escrito: {pairs:?}"
+    );
+    assert!(
+        pairs.iter().any(|(k, v)| k == "project" && v == "Kira"),
+        "config.toml deve ser escrito: {pairs:?}"
+    );
+    assert!(
+        out.contains("setup concluído — rode kira triage <id>"),
+        "mensagem final: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_no_browser_skips_steps_and_opener_but_still_prompts() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("no-browser");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // --no-browser: no instruction steps, no browser open; org/project come
+    // from flags and the PAT is still pasted via stdin.
+    let (code, out) = run_setup(
+        "Aa2xTOKENCOMPLETO\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        true,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        !out.contains("_usersSettings/tokens"),
+        "não deve imprimir a URL do PAT: {out}"
+    );
+    assert!(
+        !out.contains("Work Items (Read)"),
+        "não deve imprimir os escopos: {out}"
+    );
+    assert!(
+        opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "o navegador não pode ser aberto com --no-browser"
+    );
+    assert!(
+        out.contains("Cole o PAT e pressione Enter"),
+        "deve pedir o PAT: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "PAT deve validado e salvo"
+    );
+    assert!(
+        out.contains("setup concluído — rode kira triage <id>"),
+        "mensagem final: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_pat_flag_with_401_does_not_save_or_echo_the_token() {
+    let (endpoint, _server) =
+        spawn_fake_ado("HTTP/1.1 401 Unauthorized", r#"{"message":"TF400813"}"#);
+    let store = credentials::InMemory::new();
+    let config = temp_config("pat-flag-401");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        Some("PATRUIMSEGREDO".to_string()),
+        true,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains("PAT não aceito (401)"),
+        "deve explicar o 401: {out}"
+    );
+    assert!(
+        !out.contains("PATRUIMSEGREDO"),
+        "o PAT passado por CLI nunca pode aparecer na saída: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "PAT rejeitado NÃO pode ser salvo"
+    );
+    assert!(!out.contains("setup concluído"), "não pode concluir: {out}");
     let _ = std::fs::remove_file(&config);
 }
 

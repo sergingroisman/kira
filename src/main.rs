@@ -50,6 +50,9 @@ enum Command {
         model: Option<String>,
     },
     /// Save the Azure DevOps configuration and the PAT in the OS keyring
+    #[command(
+        after_help = "Exemplos:\n  kira setup                    # interativo (padrão)\n  kira setup --no-browser       # pede org/projeto/PAT sem abrir o navegador\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas"
+    )]
     Setup {
         /// Azure DevOps organization name (skips the prompt)
         #[arg(long)]
@@ -60,6 +63,12 @@ enum Command {
         /// Remove the saved PAT from the keyring and exit
         #[arg(long)]
         reset: bool,
+        /// PAT passed straight on the command line (skips the prompt; never echoed)
+        #[arg(long)]
+        pat: Option<String>,
+        /// Skip the PAT steps and the browser open; paste the PAT when asked
+        #[arg(long)]
+        no_browser: bool,
     },
 }
 
@@ -80,7 +89,9 @@ async fn main() -> ExitCode {
             org,
             project,
             reset,
-        } => setup_command(org, project, reset).await,
+            pat,
+            no_browser,
+        } => setup_command(org, project, reset, pat, no_browser).await,
     }
 }
 
@@ -169,7 +180,13 @@ async fn triage_live(base_url: &str, model: &str, id: i32) -> Result<String, Err
     triage::triage_live(board.as_ref(), id, base_url, model).await
 }
 
-async fn setup_command(org: Option<String>, project: Option<String>, reset: bool) -> ExitCode {
+async fn setup_command(
+    org: Option<String>,
+    project: Option<String>,
+    reset: bool,
+    pat: Option<String>,
+    no_browser: bool,
+) -> ExitCode {
     // Fail fast (before the user creates a token) when there is nowhere to
     // save it; on machines without a keyring the env var remains the path.
     let store = match credentials::open_default_store() {
@@ -188,6 +205,8 @@ async fn setup_command(org: Option<String>, project: Option<String>, reset: bool
             org,
             project,
             reset,
+            pat,
+            no_browser,
         },
         store.as_ref(),
         credentials::config_path().as_deref(),
