@@ -177,12 +177,12 @@ pub fn detect_stacks(root: &Path) -> Result<Vec<Stack>, ScanError> {
     let mut stacks = Vec::new();
     for scope in scopes_up_to_two_levels(root)? {
         let relative = scope.strip_prefix(root).map_or_else(
-            |_| scope.to_string_lossy().into_owned(),
+            |_| posix_slashes(&scope.to_string_lossy()),
             |rest| {
                 if rest.as_os_str().is_empty() {
                     ".".to_string()
                 } else {
-                    rest.to_string_lossy().into_owned()
+                    posix_slashes(&rest.to_string_lossy())
                 }
             },
         );
@@ -359,10 +359,17 @@ pub(crate) fn exit_code_label(code: Option<i32>) -> String {
     code.map_or_else(|| "desconhecido".to_string(), |code| code.to_string())
 }
 
-/// Path of one tool relation relative to the scan root: absolute under the
-/// root become relative; relative ones stay as they came (trimmed). The
+/// Normalizes backslashes to forward slashes so path strings (stack dirs,
+/// findings paths) look identical on every OS and stay stable in
+/// `findings.json` — readability and determinism depend on this.
+fn posix_slashes(text: &str) -> String {
+    text.replace('\\', "/")
+}
+
+/// Path of one tool relation relative to the scan root: absolute paths under
+/// the root become relative; relative ones stay as they came (trimmed). The
 /// `path` value keeps the finding report usable without leaking the machine
-/// layout when possible.
+/// layout when possible, and separators are normalized to `/`.
 pub(crate) fn relative_path(root: &Path, raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -375,8 +382,8 @@ pub(crate) fn relative_path(root: &Path, raw: &str) -> String {
         root.join(candidate)
     };
     match joined.strip_prefix(root) {
-        Ok(rest) if !rest.as_os_str().is_empty() => rest.to_string_lossy().into_owned(),
-        _ => joined.to_string_lossy().into_owned(),
+        Ok(rest) if !rest.as_os_str().is_empty() => posix_slashes(&rest.to_string_lossy()),
+        _ => posix_slashes(&joined.to_string_lossy()),
     }
 }
 
