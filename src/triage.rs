@@ -177,6 +177,9 @@ pub async fn triage_live(
 }
 
 async fn triage_item(base_url: &str, model: &str, item: &WorkItem) -> Result<String, Error> {
+    // LLM porque: hipótese de causa raiz é julgamento sobre texto — nenhuma CLI
+    // nem parser responde "por que este bug acontece". Todo o resto do comando
+    // (campos, HTML, fingerprint, store) é determinístico (ADR-0016).
     let backend = OllamaBackend::new(base_url, model);
     let text = backend.complete(SYSTEM_PROMPT, &build_prompt(item)).await?;
     Ok(format_triage(&text))
