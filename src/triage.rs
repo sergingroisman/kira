@@ -33,7 +33,9 @@ pub fn build_prompt(item: &WorkItem) -> String {
     );
     prompt.push_str(&format!("ID: {}\n", item.id));
     prompt.push_str(&format!("Tipo: {}\n", item.work_item_type));
-    prompt.push_str(&format!("Título: {}\n", item.title));
+    // Privacy boundary: the work item is author-controlled text and can carry a
+    // pasted token, e-mail or CPF. Masked before it can reach the model.
+    prompt.push_str(&format!("Título: {}\n", crate::redact::redact(&item.title)));
     prompt.push_str(&format!("Estado: {}\n", item.state));
     prompt.push_str(&format!(
         "Área: {}\n",
@@ -64,7 +66,9 @@ fn description_for_prompt(description: Option<&str>) -> String {
     if total_chars > DESCRIPTION_MAX_CHARS {
         text.push('…');
     }
-    text
+    // Same privacy boundary as the title: descriptions routinely carry pasted
+    // PATs, connection strings and customer data.
+    crate::redact::redact(&text)
 }
 
 /// Formats the model answer into the fixed three-section template:
@@ -230,6 +234,40 @@ mod tests {
         assert!(
             !prompt.contains("&amp;"),
             "prompt não pode conter entidade crua: {prompt}"
+        );
+    }
+
+    /// Privacy boundary: a description with a pasted PAT, e-mail and CPF must not
+    /// reach the model verbatim (W1-PR2, AGENTS.md).
+    #[test]
+    fn build_prompt_masks_secrets_from_title_and_description() {
+        let item = WorkItem {
+            id: 4821,
+            title: "Erro com token=AbC123XyZ789QqQ no header".to_string(),
+            state: "Active".to_string(),
+            work_item_type: "Bug".to_string(),
+            assigned_to: Some("Maria Souza".to_string()),
+            description: Some(
+                "<div>Contato serjota@proton.me CPF 123.456.789-01 \
+                 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6</div>"
+                    .to_string(),
+            ),
+            area_path: Some("Kira\\Backend".to_string()),
+        };
+        let prompt = build_prompt(&item);
+        assert!(!prompt.contains("AbC123XyZ789QqQ"), "PAT vazou: {prompt}");
+        assert!(
+            !prompt.contains("serjota@proton.me"),
+            "e-mail vazou: {prompt}"
+        );
+        assert!(!prompt.contains("123.456.789-01"), "CPF vazou: {prompt}");
+        assert!(
+            !prompt.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6"),
+            "token vazou: {prompt}"
+        );
+        assert!(
+            prompt.contains("Maria Souza"),
+            "campo não secreto preservado: {prompt}"
         );
     }
 

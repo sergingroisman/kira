@@ -12,6 +12,7 @@ pub mod error;
 pub mod format;
 pub mod html;
 pub mod llm;
+pub mod redact;
 pub mod scan;
 pub mod setup;
 pub mod store;
