@@ -13,5 +13,6 @@ pub mod format;
 pub mod html;
 pub mod llm;
 pub mod setup;
+pub mod store;
 pub mod triage;
 pub mod work_item;

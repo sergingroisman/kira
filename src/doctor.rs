@@ -5,8 +5,6 @@
 //! [`BoardProvider`] trait and happens exclusively after every required
 //! setting is present, so an incomplete setup never touches the network.
 
-use std::process::ExitCode;
-
 use crate::board;
 use crate::credentials::{self, Source};
 use crate::error::Error;
@@ -154,16 +152,31 @@ fn format_resolved_check(
     }
 }
 
-/// Runs the `kira doctor` diagnosis and returns the process exit code.
+/// Runs the `kira doctor` diagnosis and returns `(success, output)`.
+///
+/// The full printed output is returned as the second item so the caller (e.g.
+/// the automatic session trail in `main.rs`) can store a summary of what was
+/// shown — without retyping it.
 ///
 /// Step 1 never touches the network: when any required setting is missing
 /// the remaining steps are reported as skipped and the command exits offline.
-pub async fn run() -> ExitCode {
+pub async fn run() -> (bool, String) {
+    // Emits the line to stdout AND collects it for the session summary.
+    let mut out = String::new();
+    let emit = |out: &mut String, line: &str| {
+        println!("{line}");
+        out.push_str(line);
+        out.push('\n');
+    };
+
     let pat = credentials::resolve_pat_with_source();
     let organization = credentials::resolve_org_with_source();
     let project = credentials::resolve_project_with_source(None);
 
-    println!("1. Configuração (env, keyring do OS ou config.toml)");
+    emit(
+        &mut out,
+        "1. Configuração (env, keyring do OS ou config.toml)",
+    );
     let mut missing: Vec<&str> = Vec::new();
     let checks = [
         ("AZURE_DEVOPS_PAT", &pat),
@@ -172,65 +185,83 @@ pub async fn run() -> ExitCode {
     ];
     for (name, resolved) in checks {
         let (line, ok) = format_resolved_check(name, resolved);
-        println!("   {line}");
+        emit(&mut out, &format!("   {line}"));
         if !ok {
             missing.push(name);
         }
     }
 
     if !missing.is_empty() {
-        println!("2. Conexão com a organização");
-        println!("   - ignorada: corrija os itens ✗ acima");
-        println!("3. Projeto");
-        println!("   - ignorada: corrija os itens ✗ acima");
-        println!();
-        println!("{}", format_missing_env_summary(&missing));
-        return ExitCode::FAILURE;
+        emit(&mut out, "2. Conexão com a organização");
+        emit(&mut out, "   - ignorada: corrija os itens ✗ acima");
+        emit(&mut out, "3. Projeto");
+        emit(&mut out, "   - ignorada: corrija os itens ✗ acima");
+        emit(&mut out, "");
+        emit(&mut out, &format_missing_env_summary(&missing));
+        return (false, out);
     }
 
     // All three are Ok at this point (checked above); no unwrap needed.
     let (pat, organization, project) = match (pat, organization, project) {
         (Ok(pat), Ok(organization), Ok(project)) => (pat.value, organization.value, project.value),
-        _ => return ExitCode::FAILURE,
+        _ => return (false, out),
     };
     let board = match board::for_board(&board::name_from_env(), &pat, &organization, &project) {
         Ok(board) => board,
         Err(err) => {
-            println!("   erro: {err}");
-            return ExitCode::FAILURE;
+            emit(&mut out, &format!("   erro: {err}"));
+            return (false, out);
         }
     };
 
-    println!("2. Conexão com a organização");
+    emit(&mut out, "2. Conexão com a organização");
     let project_names = match board.project_names().await {
         Ok(names) => {
-            println!("   {}", format_connection_check(&organization, names.len()));
+            emit(
+                &mut out,
+                &format!("   {}", format_connection_check(&organization, names.len())),
+            );
             names
         }
         Err(Error::AdoUnauthorized { organization: org }) => {
-            println!("   {}", format_unauthorized_check(&org));
-            println!();
-            println!("PAT inválido — gere um novo token e rode `kira doctor` de novo.");
-            return ExitCode::FAILURE;
+            emit(&mut out, &format!("   {}", format_unauthorized_check(&org)));
+            emit(&mut out, "");
+            emit(
+                &mut out,
+                "PAT inválido — gere um novo token e rode `kira doctor` de novo.",
+            );
+            return (false, out);
         }
         Err(err) => {
-            println!("   ✗ falha ao acessar a org {organization}: {err}");
-            println!();
-            println!("Falha de conexão — resolva o item ✗ acima e rode `kira doctor` de novo.");
-            return ExitCode::FAILURE;
+            emit(
+                &mut out,
+                &format!("   ✗ falha ao acessar a org {organization}: {err}"),
+            );
+            emit(&mut out, "");
+            emit(
+                &mut out,
+                "Falha de conexão — resolva o item ✗ acima e rode `kira doctor` de novo.",
+            );
+            return (false, out);
         }
     };
 
-    println!("3. Projeto");
-    println!("   {}", format_project_check(&project, &project_names));
+    emit(&mut out, "3. Projeto");
+    emit(
+        &mut out,
+        &format!("   {}", format_project_check(&project, &project_names)),
+    );
     if find_project_case_insensitive(&project, &project_names).is_none() {
-        println!();
-        println!("Projeto incorreto — use um dos nomes listados e rode `kira inspect <id>`.");
-        return ExitCode::FAILURE;
+        emit(&mut out, "");
+        emit(
+            &mut out,
+            "Projeto incorreto — use um dos nomes listados e rode `kira inspect <id>`.",
+        );
+        return (false, out);
     }
-    println!();
-    println!("Tudo ok — rode: kira inspect <id>");
-    ExitCode::SUCCESS
+    emit(&mut out, "");
+    emit(&mut out, "Tudo ok — rode: kira inspect <id>");
+    (true, out)
 }
 
 #[cfg(test)]

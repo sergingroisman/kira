@@ -206,21 +206,22 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Directory of the KIRA config folder: `{home}/.config/kira`
+/// (`USERPROFILE` fallback on Windows).
+pub fn config_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))?;
+    Some(PathBuf::from(home).join(".config").join("kira"))
+}
+
 /// Path of the KIRA config file: `$HOME/.config/kira/config.toml`
 /// (`USERPROFILE` fallback on Windows), or the `KIRA_CONFIG` override.
 pub fn config_path() -> Option<PathBuf> {
     if let Some(path) = non_empty_env("KIRA_CONFIG") {
         return Some(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("kira")
-            .join("config.toml"),
-    )
+    config_dir().map(|dir| dir.join("config.toml"))
 }
 
 /// Parses the config file into ordered `key = value` pairs.
