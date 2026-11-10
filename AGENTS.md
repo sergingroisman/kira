@@ -16,7 +16,7 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Segredo (PAT) vive em env `AZURE_DEVOPS_PAT` OU no keyring do OS (salvo por `kira setup`, service `kira`). NUNCA em arquivo pleno, log, `Debug`, mensagem de erro ou teste.
 - Configuração (org, projeto) tem prioridade flag > env > `$HOME/.config/kira/config.toml` (0600, escrito por `kira setup`).
 - Operações de leitura por padrão. Escrita no Azure exige flag explícita (`--apply`).
-- Erro precisa dizer o que fazer: "defina AZURE_DEVOPS_PAT ou rode `kira setup`" > "credencial ausente".
+- Erro precisa dizer o que fazer: "defina AZURE_DEVOPS_PAT ou rode `kira setup`" > "credencial ausente". Falhas de API do ADO aparecem como acionáveis: nunca body cru de resposta HTTP em execução.
 - Sem `unsafe` no código de runtime. Exceção única e test-only: testes que mexem em variáveis de ambiente (edition 2024 torna `env::set_var`/`remove_var` unsafe). Sem dependência nova sem justificar no PR.
 ## Setup
 - `kira setup` pergunta "Você já tem um PAT pronto? [S/n]" SEMPRE no modo interativo (stdin é TTY — `stdin().is_terminal()`, injetado como `SetupOptions::interactive`); stdin pipado mantém o fast path antigo (passos + abrir + colar). Enter = 's'; respostas inválidas repetem no máximo 2x e então assumem 's', com aviso.
