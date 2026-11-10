@@ -1,0 +1,56 @@
+{
+  "version": 2,
+  "problems": {},
+  "projects": [
+    {
+      "version": 2,
+      "problems": {},
+      "sources": [],
+      "filePath": "App.csproj",
+      "frameworks": [
+        {
+          "framework": "net8.0",
+          "transitivePackages": [
+            {
+              "vulnerabilities": [],
+              "deprecated": true,
+              "resolvedVersion": "8.0.4",
+              "version": "8.0.4",
+              "name": "Npgsql.Webty"
+            }
+          ],
+          "topLevelPackages": [
+            {
+              "vulnerabilities": [
+                {
+                  "versions": [ "8.0.6" ],
+                  "advisoryTitle": "Information disclosure in generated OpenAPI documents",
+                  "advisoryURL": "https://github.com/advisories/GHSA-8x7c-qw9p-v8cq",
+                  "severity": "Moderate"
+                }
+              ],
+              "deprecated": false,
+              "resolvedVersion": "8.0.6",
+              "version": "8.0.6",
+              "name": "Microsoft.AspNetCore.OpenApi"
+            },
+            {
+              "vulnerabilities": [
+                {
+                  "versions": [ "<13.0.3" ],
+                  "advisoryTitle": "Vulnerable to Denial of Service via crafted nested JSON",
+                  "advisoryURL": "https://github.com/advisories/GHSA-5qjj-594f-75mg",
+                  "severity": "High"
+                }
+              ],
+              "deprecated": false,
+              "resolvedVersion": "13.0.1",
+              "version": "13.0.1",
+              "name": "Newtonsoft.Json"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

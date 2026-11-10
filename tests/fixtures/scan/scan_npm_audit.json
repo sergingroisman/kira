@@ -1,0 +1,77 @@
+{
+  "findings": [
+    {
+      "name": "lodash",
+      "severity": "moderate",
+      "version": "4.17.15",
+      "paths": [ ". > lodash" ],
+      "flags": []
+    },
+    {
+      "name": "minimist",
+      "severity": "high",
+      "version": "1.2.0",
+      "paths": [ ". > minimist" ],
+      "flags": []
+    }
+  ],
+  "vulnerabilities": {
+    "lodash": {
+      "name": "lodash",
+      "severity": "moderate",
+      "range": "<4.17.21",
+      "nodes": [ "node_modules/lodash" ],
+      "fixAvailable": {
+        "name": "lodash",
+        "version": "4.17.21",
+        "isSemVerMajor": false
+      },
+      "via": [
+        {
+          "source": 1086079,
+          "name": "lodash",
+          "dependencyOf": [],
+          "title": "Regular Expression Denial of Service",
+          "url": "https://github.com/advisories/GHSA-p6mc-m468-83gw",
+          "severity": "moderate",
+          "range": "<4.17.21"
+        }
+      ],
+      "effects": []
+    },
+    "minimist": {
+      "name": "minimist",
+      "severity": "high",
+      "range": "<1.2.6",
+      "nodes": [ "node_modules/minimist" ],
+      "fixAvailable": {
+        "name": "minimist",
+        "version": "1.2.6",
+        "isSemVerMajor": true
+      },
+      "via": [
+        {
+          "source": 1085982,
+          "name": "minimist",
+          "dependencyOf": [],
+          "title": "Prototype Pollution",
+          "url": "https://github.com/advisories/GHSA-v2x2-cj3f-63xf",
+          "severity": "high",
+          "range": "<1.2.6"
+        }
+      ],
+      "effects": []
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 1,
+      "high": 1,
+      "critical": 0,
+      "total": 2
+    },
+    "dependencies": 218
+  }
+}

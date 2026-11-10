@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "problems": {},
+  "projects": [
+    {
+      "version": 2,
+      "problems": {},
+      "sources": [],
+      "filePath": "App.csproj",
+      "frameworks": [
+        {
+          "framework": "net8.0",
+          "topLevelPackages": [],
+          "transitivePackages": []
+        }
+      ]
+    }
+  ]
+}
