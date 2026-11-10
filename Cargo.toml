@@ -12,6 +12,9 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Direct dependency: the Ollama backend (src/llm/ollama.rs) performs its own
+# HTTP calls to localhost; before this it was only transitive via azure_core.
+reqwest = { version = "0.13", features = ["json"] }
 
 [profile.release]
 strip = true

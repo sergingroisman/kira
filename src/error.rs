@@ -40,6 +40,42 @@ pub enum Error {
     /// Azure DevOps answered with an unexpected JSON shape.
     #[error("resposta inesperada do Azure DevOps: {0}")]
     Api(#[from] serde_json::Error),
+
+    /// The local Ollama server is not reachable (nothing listening).
+    #[error(
+        "Ollama não está rodando — instale em https://ollama.com e execute 'ollama serve' (no Windows ele roda como serviço)"
+    )]
+    LlmNotRunning,
+
+    /// The local Ollama server did not answer within the 120s timeout.
+    #[error(
+        "Ollama não respondeu em 120s — rode `ollama ps` para conferir se o modelo está carregado (100% GPU), teste com `ollama run <modelo>` e, se continuar lento, reduza o contexto com KIRA_NUM_CTX=2048"
+    )]
+    LlmTimeout,
+
+    /// Ollama answered with a non-2xx status; the body is never echoed.
+    #[error(
+        "HTTP {status} do Ollama — confira se o modelo existe com `ollama list` (o corpo da resposta foi omitido)"
+    )]
+    LlmStatus { status: u16 },
+
+    /// Ollama answered with an unexpected JSON shape.
+    #[error(
+        "resposta inesperada do Ollama: {0} — confira KIRA_OLLAMA_URL e atualize o Ollama se necessário"
+    )]
+    LlmBadResponse(String),
+
+    /// The HTTP request to Ollama failed without a response.
+    #[error("falha na chamada ao Ollama: {0}")]
+    LlmRequest(String),
+
+    /// A local work-item file could not be read (`kira triage --file`).
+    #[error("não foi possível ler o arquivo '{path}' — confira o caminho e tente de novo")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[cfg(test)]
@@ -84,6 +120,41 @@ mod tests {
         assert!(
             !message.contains('<'),
             "mensagem não pode conter HTML: {message}"
+        );
+    }
+
+    #[test]
+    fn ollama_not_running_error_tells_how_to_start_it() {
+        let message = Error::LlmNotRunning.to_string();
+        assert!(
+            message.contains("Ollama não está rodando"),
+            "mensagem: {message}"
+        );
+        assert!(message.contains("ollama serve"), "mensagem: {message}");
+        assert!(
+            message.contains("https://ollama.com"),
+            "mensagem deve apontar a instalação: {message}"
+        );
+    }
+
+    #[test]
+    fn ollama_timeout_error_mentions_the_deadline_and_next_step() {
+        let message = Error::LlmTimeout.to_string();
+        assert!(message.contains("120s"), "mensagem: {message}");
+        assert!(message.contains("ollama ps"), "mensagem: {message}");
+    }
+
+    #[test]
+    fn ollama_status_error_is_compact_without_body() {
+        let message = Error::LlmStatus { status: 404 }.to_string();
+        assert!(message.contains("HTTP 404"), "mensagem: {message}");
+        assert!(
+            message.contains("ollama list"),
+            "mensagem deve sugerir a checagem do modelo: {message}"
+        );
+        assert!(
+            !message.contains('<'),
+            "mensagem não pode conter HTML/corpo: {message}"
         );
     }
 }

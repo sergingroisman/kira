@@ -9,4 +9,5 @@ pub mod doctor;
 pub mod error;
 pub mod format;
 pub mod html;
+pub mod llm;
 pub mod work_item;
