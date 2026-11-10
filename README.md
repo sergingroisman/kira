@@ -250,6 +250,65 @@ Responsável: —
 Descrição: first 400 chars of the text, HTML removed, line breaks preserved
 ```
 
+## Scanning (determinístico)
+
+`kira scan` runs the **standard tools of each stack** of the project, normalizes
+them into findings and writes a deterministic file. **No AI in this step** —
+KIRA does not analyze; it orchestrates and normalizes (grounded triage comes
+later).
+
+### Requirements
+
+| Stack | Tool | Where it comes from |
+| --- | --- | --- |
+| .NET | `dotnet list package --vulnerable --include-transitive --format json` | .NET SDK 8+ — [dotnet.com/download](https://dotnet.com/download) |
+| Node/TS (pnpm) | `pnpm audit --json` | `npm install -g pnpm` |
+| Node/TS (npm) | `npm audit --json` | [nodejs.org/download](https://nodejs.org/download) |
+
+Windows examples:
+
+```powershell
+kira scan                    # uses the project root (detected like the store)
+kira scan --path C:\repos\api
+```
+
+### What it detects
+
+In the folder given (`--path <dir>`, up to 2 levels deep) KIRA detects:
+
+- **.NET** — any `*.csproj`, `*.sln` or `global.json`;
+- **Node/TS** — `package.json` (pnpm when there is `pnpm-lock.yaml`, npm with
+  `package-lock.json` or no lock at all).
+
+No marker found => actionable error ("nenhum stack detectado ...").
+
+### Output
+
+- `<root>\.kira\findings.json` — findings normalized as
+  `{ tool, rule, package, version, severity, path, message, fingerprint }`.
+  `tool` is `dotnet` (rules `vulnerable`/`outdated` — packages with
+  vulnerabilities or deprecated) or `audit` (npm/pnpm user, rule
+  `vulnerable`). **`.kira/` é local — nunca comite este diretório**: adicione
+  `.kira/` ao `.gitignore` do projeto (o `.gitignore` da KIRA não precisa
+  mudar).
+- the stdout prints the summary: total findings, count by severity with count
+  per tool, and the file path.
+
+### Determinism (M1 gate)
+
+The `fingerprint` is FNV-1a 64-bit (hand-implemented, shared with the project
+store's project id) over `tool|rule|package|version|message` (trimmed), and
+the list is stored **ascending by fingerprint**. Two runs over the same state
+produce the same fingerprints in the same order — the M1 reproducibility gate
+of the plan v2 (§5/§8). The `.kira/README.md` note explains that the folder
+is local.
+
+### When the tool is missing
+
+The scan does not install anything and never parses the raw stderr of the
+tool: a missing SDK/npm points to how to install and to run again; a failed
+tool points to the tool itself being run by hand in the failed directory.
+
 ## Local store
 
 Every KIRA run leaves a persistent trail in a single local SQLite database —
@@ -274,7 +333,7 @@ KIRA_STORE_DIR=/tmp/kira kira history
 | Table | Columns | Written by |
 | --- | --- | --- |
 | `projects` | `id`, `root_path`, `name`, `first_seen_at` | automatic (first run in a repo root) |
-| `sessions` | `id`, `project_id`, `command`, `args`, `model`, `started_at`, `duration_ms`, `ok`, `summary` | automatic (`inspect`/`doctor`/`triage`) |
+| `sessions` | `id`, `project_id`, `command`, `args`, `model`, `started_at`, `duration_ms`, `ok`, `summary` | automatic (`inspect`/`doctor`/`triage`/`scan`) |
 | `facts` | `project_id`, `key`, `value`, `updated_at` | `kira note` |
 
 The project id is a FNV-1a 64-bit hash (implemented by hand, no extra
@@ -293,7 +352,8 @@ kira note --remove 2           # remove the fact with that number
 kira profile                   # project root/name/first-seen + all stored facts
 ```
 
-`inspect`, `triage` (both the live and the `--file` path) and `doctor` record
+`inspect`, `triage` (both the live and the `--file` path), `doctor` and
+`scan` record
 their session automatically — including failed runs (✗, with the error text as
 summary, first 2000 chars, capped).
 
