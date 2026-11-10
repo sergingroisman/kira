@@ -265,6 +265,41 @@ later).
 | Node/TS (pnpm) | `pnpm audit --json` | `npm install -g pnpm` |
 | Node/TS (npm) | `npm audit --json` | [nodejs.org/download](https://nodejs.org/download) |
 
+Note: `kira scan` runs on Windows too — see "Windows invocation" below.
+
+### Windows invocation
+
+Windows spawns differ from Unix: the standard library only looks for `.exe`,
+so the Node tools spawn wrapped in `cmd /C` (which resolves `npm.cmd`/
+`pnpm.cmd` through PATHEXT):
+
+- `npm audit --json` → `cmd /C npm audit --json`
+- `pnpm audit --json` → `cmd /C pnpm audit --json`
+- `dotnet list package ...` → spawned directly (`dotnet.exe` is a real exe).
+
+### Binary overrides (`KIRA_SCAN_*_BIN`)
+
+Any scan tool's binary can be replaced without PATH shadowing (`dotnet`
+shadowing is unreliable anyway). The value is the FULL path of an
+executable/shim:
+
+| Env var | Replaces |
+| --- | --- |
+| `KIRA_SCAN_DOTNET_BIN` | `dotnet list package` |
+| `KIRA_SCAN_NPM_BIN` | `npm audit --json` |
+| `KIRA_SCAN_PNPM_BIN` | `pnpm audit --json` |
+
+Uses: CI runners without the tool installed, custom packaging, offline tests
+(the e2e suite points its fake shims exactly through these). An
+`.cmd`/`.bat` value on Windows spawns via `cmd /C`; anything else (and all
+values on Linux/macOS) spawns directly. No override set => the default
+PATH lookup above.
+
+```sh
+# CI runner without a .NET SDK: point to the packaged binary
+KIRA_SCAN_DOTNET_BIN=/usr/local/packaged/bin/dotnet kira scan
+```
+
 Windows examples:
 
 ```powershell
@@ -303,11 +338,23 @@ produce the same fingerprints in the same order — the M1 reproducibility gate
 of the plan v2 (§5/§8). The `.kira/README.md` note explains that the folder
 is local.
 
-### When the tool is missing
+### Troubleshooting
 
-The scan does not install anything and never parses the raw stderr of the
-tool: a missing SDK/npm points to how to install and to run again; a failed
-tool points to the tool itself being run by hand in the failed directory.
+The scan does not install anything and never echoes the raw stdio of the tool:
+errors are separate and actionable.
+
+- **Tool missing** (`spawn` NotFound): "o scan .NET exige o SDK do .NET …" or
+  "o scan Node/TS via npm exige o npm — instale em https://nodejs.org/download …".
+  Install the tool and run again.
+- **Tool present but failed** (exit code ≠ 0 on an audit whose JSON did not
+  parse, or a failed `dotnet list package`): `a ferramenta <tool> falhou
+  (exit <N>) — confira versão/instalação e rode kira scan de novo (dica: …)` —
+  the hint is at most the FIRST line of the tool stderr (≤200 chars), never
+  the raw body. Check the tool version/installation (e.g. `dotnet --info`,
+  `npm --version`) and run `kira scan` again.
+- Note: `npm/pnpm audit` exits 1 exactly when vulnerabilities are FOUND —
+  that is the normal, healthy case (KIRA parses the JSON); only a run whose
+  output cannot be parsed is reported as a failure.
 
 ## Local store
 
