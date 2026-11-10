@@ -55,7 +55,7 @@
       erro e prompt. Teste prova que o prompt não leva segredo.
 - [x] **PR3** `src/guard/path.rs`: deny-list de escrita + path traversal. Erro
       acionável, não toca o disco.
-- [ ] **PR4** taxonomia de erro acionável única em `src/error.rs`; zero
+- [x] **PR4** taxonomia de erro acionável única em `src/error.rs`; zero
       `unwrap`/`expect` em rede/parse/input.
 - [x] **PR33** teste de allowlist do LLM (ADR-0016): um teste que varre `src/` e
       reprova se algum módulo fora de `triage.rs`/`loop/`/`wiki/` importar `llm::*`;
