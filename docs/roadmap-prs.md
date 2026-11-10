@@ -43,6 +43,7 @@ Porta conceitual da `dev`: `core/src/safety/{secrets_filter,path_guard,ssrf_guar
 | **PR3** | Guarda de caminho: deny-list de escrita (ex.: `.git/`, `target/`, `.kira/` fora do root, `~/.config/kira`) | `src/guard/path.rs` (novo) | Escrita em deny-list retorna erro acionável e **não toca o disco**; teste com path traversal | **proposto** |
 | **PR4** | Taxonomia de erro acionável única em `src/error.rs`: toda falha diz o que fazer; nunca body/stderr cru | `src/error.rs`, `src/ado/`, `src/scan/` | Teste por categoria de erro asserting a mensagem acionável; zero `unwrap`/`expect` em rede/parse/input | **proposto** |
 | **PR27** | Jail mínimo do `fix --apply`: confinamento por canonicalização + rlimits (`cfg(unix)`); Windows sem rlimits no MVP | `src/guard/jail.rs` (novo) | Escrita fora do root canonicalizado é recusada mesmo com `..`, symlink e junction; ADR-0011 | **aceito** (dono, 10/Nov) — entra no M3 |
+| **PR33** | Enforcement do CLI-first/LLM-last (ADR-0016): teste de allowlist de módulos + comentário `// LLM porque:` obrigatório | `tests/llm_allowlist.rs` (novo) | `cargo test` reprova `llm::*` fora de `triage.rs`/`loop/`/`wiki/`, e reprova call site sem justificativa | **aceito** (dono, 10/Nov) |
 
 `ssrf_guard` (bloquear URL de terceiro) fica para quando existir fetch arbitrário
 (pós-PR11); **não** entra na W1 — hoje o único destino é Azure/Ollama.
