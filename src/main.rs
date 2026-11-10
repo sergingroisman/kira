@@ -12,6 +12,7 @@ use kira::doctor;
 use kira::error::Error;
 use kira::format;
 use kira::llm::ollama;
+use kira::scan;
 use kira::setup;
 use kira::store::{self, Store, StoreError};
 use kira::triage;
@@ -91,6 +92,13 @@ enum Command {
     },
     /// Print the project profile: root, first seen date and all facts
     Profile,
+    /// Scan the project with the stack-standard tools (dotnet, npm/pnpm) and
+    /// write a deterministic findings.json — no AI in this phase
+    Scan {
+        /// Project folder (defaults to the project root detected like in the store)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
 
 /// Result of one command run: exit code, plain success flag (kept separate
@@ -186,6 +194,7 @@ async fn run(command: Command) -> Outcome {
         Command::History { last } => store_command(history_output(last)),
         Command::Note { text, remove } => store_command(note_output(text, remove)),
         Command::Profile => store_command(profile_output()),
+        Command::Scan { path } => scan_command(path.as_deref()),
     }
 }
 
@@ -266,6 +275,13 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
         ),
         Command::Note { text, remove } => ("note".to_string(), note_args_text(text, remove), None),
         Command::Profile => ("profile".to_string(), String::new(), None),
+        Command::Scan { path } => (
+            "scan".to_string(),
+            path.as_ref()
+                .map(|path| format!("--path {}", path.display()))
+                .unwrap_or_default(),
+            None,
+        ),
     }
 }
 
@@ -522,6 +538,22 @@ fn note_output(text: Option<String>, remove: Option<i64>) -> Result<String, Stor
 // ---------------------------------------------------------------------------
 // Network/keyring commands
 // ---------------------------------------------------------------------------
+
+/// `kira scan [--path <dir>]`: the scan reports its session like
+/// inspect/doctor/triage (success or failure). The stdout first line doubles
+/// as the trail summary (stacks + counts).
+fn scan_command(path: Option<&Path>) -> Outcome {
+    match scan::run(path) {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
 
 /// Resolves org/project/PAT (flags > env > keyring/config.toml) and builds the
 /// board provider selected by `KIRA_BOARD` (default `azure`).
