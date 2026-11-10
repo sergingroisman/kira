@@ -438,13 +438,28 @@ fn list_files(dir: &Path) -> Result<Vec<String>, ScanError> {
     Ok(names)
 }
 
+/// Case-insensitive marker test on purpose: NTFS is case-insensitive, so
+/// `App.CSPROJ`, `MinhaSolucao.SLN` and `GLOBAL.JSON` are valid on Windows and
+/// must be detected as .NET markers — a byte-wise comparison silently skipped
+/// `dotnet` tooling on those projects.
+fn is_dotnet_marker(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("global.json") {
+        return true;
+    }
+    match std::path::Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+    {
+        Some(ext) => ext.eq_ignore_ascii_case("csproj") || ext.eq_ignore_ascii_case("sln"),
+        None => false,
+    }
+}
+
 /// .NET stack of a scope: any `*.csproj`, `*.sln` or a `global.json` (SDK).
 fn dotnet_stack(relative: &str, file_names: &[String]) -> Option<Stack> {
     let markers: Vec<String> = file_names
         .iter()
-        .filter(|name| {
-            name.ends_with(".csproj") || name.ends_with(".sln") || name.as_str() == "global.json"
-        })
+        .filter(|name| is_dotnet_marker(name))
         .cloned()
         .collect();
     if markers.is_empty() {
@@ -598,6 +613,29 @@ mod tests {
         assert_eq!(stacks[0].kind, StackKind::Dotnet);
         assert_eq!(stacks[0].dir, ".");
         assert_eq!(stacks[0].markers, vec!["App.csproj".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows (NTFS) is case-insensitive: `App.CSPROJ` and `GLOBAL.JSON` are the
+    /// same files as their lowercase forms and must be detected as .NET markers.
+    #[test]
+    fn detect_dotnet_stack_with_uppercase_markers() {
+        let dir = temp_dir("dotnet-upper");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        touch(&dir, "App.CSPROJ");
+        touch(&dir, "MinhaSolucao.SLN");
+        touch(&dir, "GLOBAL.JSON");
+        let stacks = detect_stacks(&dir).unwrap_or_else(|err| panic!("detectar: {err}"));
+        assert_eq!(stacks.len(), 1, "{stacks:?}");
+        assert_eq!(stacks[0].kind, StackKind::Dotnet);
+        assert_eq!(
+            stacks[0].markers,
+            vec![
+                "App.CSPROJ".to_string(),
+                "GLOBAL.JSON".to_string(),
+                "MinhaSolucao.SLN".to_string()
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
