@@ -42,6 +42,12 @@
 
 ## Fases e ordem de execução
 
+> **Lei transversal (ADR-0016):** tudo que um comando de linha resolve, o KIRA faz
+> por comando de linha. Escada obrigatória de baixo para cima: CLI → parser/SQL/FTS5
+> → cálculo em Rust → **LLM só quando 1–3 não respondem**. Todo PR que introduzir
+> chamada de LLM precisa do comentário `// LLM porque: <razão>` e respeitar a
+> allowlist de módulos. Comando determinístico não consome budget.
+
 ### F0 — W1 segurança/erros (base para tudo)
 - [x] **PR1** docs: README + AGENTS.md ao v3 — incluir seção de autonomia
       (`awaiting_approval`, `kira approve`), gate de medição e TUI pós-M2.
@@ -51,6 +57,10 @@
       acionável, não toca o disco.
 - [ ] **PR4** taxonomia de erro acionável única em `src/error.rs`; zero
       `unwrap`/`expect` em rede/parse/input.
+- [ ] **PR33** teste de allowlist do LLM (ADR-0016): um teste que varre `src/` e
+      reprova se algum módulo fora de `triage.rs`/`loop/`/`wiki/` importar `llm::*`;
+      e reprova chamada de LLM sem o comentário `// LLM porque:`. Aceite:
+      `cargo test` falha se alguém adicionar LLM em `scan`/`store`/`tui`.
 
 ### F1 — contexto e medição (W2 + W2.5 wiki + W2-bis)
 - [ ] **PR28** `kira wiki` em **`docs/wiki/` (commitada)**: páginas
