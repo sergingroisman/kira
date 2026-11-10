@@ -35,6 +35,12 @@ rusqlite = { version = "=0.41.1", features = ["bundled"] }
 # Direct dependency: the Ollama backend (src/llm/ollama.rs) performs its own
 # HTTP calls to localhost; before this it was only transitive via azure_core.
 reqwest = { version = "0.13", features = ["json"] }
+# Direct dependency: the privacy boundary (src/redact.rs) masks PATs, tokens,
+# e-mails and CPFs before any log, error or LLM prompt (AGENTS.md). Already a
+# transitive dependency of the Azure SDK at this exact version; declared so the
+# masking layer is explicit and cannot silently change behaviour on an upstream
+# bump. Masking is parser work, never an LLM task (ADR-0016).
+regex = "1.13.1"
 
 [profile.release]
 strip = true
