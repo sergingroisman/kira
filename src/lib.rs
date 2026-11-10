@@ -10,4 +10,5 @@ pub mod error;
 pub mod format;
 pub mod html;
 pub mod llm;
+pub mod triage;
 pub mod work_item;
