@@ -67,6 +67,9 @@
       perfil (2060 6 GB / M1 / CPU), `kira doctor` reportando o perfil efetivo.
 - [ ] **PR11** Copilot SDK atrás de flag/env (pin preview, módulo isolado,
       fallback spawn de CLI). Bloqueado por policy Avanade → ollama-only é válido.
+- [ ] **PR27** jail mínimo do `fix --apply` (ADR-0011, decisão do dono 10/Nov):
+      confinamento por canonicalização (std) + rlimits em `cfg(unix)`; Windows
+      sem rlimits no MVP. **Sem bwrap/Landlock.** Deny-list do PR3 é a camada 1.
 
 ### F4 — dashboard Ratatui (estilo jogo)
 - [ ] **PR21** shell do TUI: loop de render 30 fps, layout de "sala de controle",

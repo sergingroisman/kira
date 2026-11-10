@@ -42,6 +42,7 @@ Porta conceitual da `dev`: `core/src/safety/{secrets_filter,path_guard,ssrf_guar
 | **PR2** | Filtro de segredos: máscara de PAT/token/CPF/e-mail em qualquer log, erro ou prompt | `src/redact.rs` (novo), chamadas em `format.rs`/`triage.rs`/`llm/prompts.rs` | Fixtures de segredo (PAT, token em URL, CPF, e-mail) saem mascaradas; teste prova que o prompt não contém segredo | **proposto** |
 | **PR3** | Guarda de caminho: deny-list de escrita (ex.: `.git/`, `target/`, `.kira/` fora do root, `~/.config/kira`) | `src/guard/path.rs` (novo) | Escrita em deny-list retorna erro acionável e **não toca o disco**; teste com path traversal | **proposto** |
 | **PR4** | Taxonomia de erro acionável única em `src/error.rs`: toda falha diz o que fazer; nunca body/stderr cru | `src/error.rs`, `src/ado/`, `src/scan/` | Teste por categoria de erro asserting a mensagem acionável; zero `unwrap`/`expect` em rede/parse/input | **proposto** |
+| **PR27** | Jail mínimo do `fix --apply`: confinamento por canonicalização + rlimits (`cfg(unix)`); Windows sem rlimits no MVP | `src/guard/jail.rs` (novo) | Escrita fora do root canonicalizado é recusada mesmo com `..`, symlink e junction; ADR-0011 | **aceito** (dono, 10/Nov) — entra no M3 |
 
 `ssrf_guard` (bloquear URL de terceiro) fica para quando existir fetch arbitrário
 (pós-PR11); **não** entra na W1 — hoje o único destino é Azure/Ollama.
