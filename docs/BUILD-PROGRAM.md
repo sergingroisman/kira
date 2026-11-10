@@ -110,6 +110,15 @@
 
 ## Bloqueios (precisam do dono)
 
+> **Como pedir**: todo bloqueio vira um pedido no Slack do dono no formato
+> `🔴 KIRA · APROVAÇÃO [kira-N]` (o que / por que / risco de aprovar / risco de
+> recusar). Ele responde `aprovo kira-N` ou `recuso kira-N <motivo>`.
+> **Silêncio não é aprovação**: sem resposta, marque o item como bloqueado aqui e
+> siga para o próximo item independente. Protocolo completo em `docs/APPROVALS.md`.
+> Já pré-autorizado (não perguntar): scan/triage/doctor, testes, gates, branch,
+> commit, PR, **merge com CI 3 SOs verde**, docs e ADRs do repo do KIRA, e corrigir
+> bug com teste que reproduz o defeito.
+
 | # | Bloqueio | Trava |
 |---|---|---|
 | B1 | 20 bugs fechados + causa raiz rotulada por ele | F5 inteira (gate M2) |
