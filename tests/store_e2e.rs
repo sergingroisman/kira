@@ -138,7 +138,12 @@ fn notes_flow_through_note_and_profile() {
     assert_eq!(code, 0);
     assert!(profile.contains("projeto: proj"), "{profile}");
     assert!(
-        profile.contains(&format!("root: {}", sandbox.cwd.display())),
+        profile.contains(&format!(
+            "root: {}",
+            std::fs::canonicalize(&sandbox.cwd)
+                .unwrap_or_else(|err| panic!("canonicalizar cwd: {err}"))
+                .display()
+        )),
         "root canônico do projeto: {profile}"
     );
     assert!(profile.contains("primeira sessão:"), "{profile}");

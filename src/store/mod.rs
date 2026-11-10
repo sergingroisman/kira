@@ -468,6 +468,17 @@ pub fn project_id_for_root(root: &Path) -> Result<String, StoreError> {
     Ok(project_id_for_root_str(&canonical))
 }
 
+/// A path for display: stored roots are canonical, which on Windows means the
+/// `\\?\` extended-length prefix; trim it for humans. The stored value keeps
+/// the canonical form (project identity must be stable).
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    match text.strip_prefix("\\\\?\\") {
+        Some(inner) if inner.len() >= 2 => inner.to_string(),
+        _ => text.to_string(),
+    }
+}
+
 /// Detects the project root: climbs from `base` to the first ancestor with a
 /// `.git` marker (file or directory); falls back to the *nearest* ancestor
 /// with `Cargo.toml` or `package.json`; falls back to `base` itself.

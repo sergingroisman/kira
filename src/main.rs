@@ -1,6 +1,6 @@
 use std::error::Error as StdError;
 use std::io::{BufWriter, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -426,7 +426,10 @@ fn profile_output() -> Result<String, StoreError> {
     let facts = store.facts(&project.id)?;
     let mut text = format!(
         "projeto: {}\nroot: {}\nid: {}\nprimeira sessão: {}",
-        project.name, project.root_path, project.id, project.first_seen_at
+        project.name,
+        store::display_path(Path::new(&project.root_path)),
+        project.id,
+        project.first_seen_at
     );
     if let Some(local) = store.local_display(&project.first_seen_at)? {
         text.push_str(&format!(" ({local} local)"));
