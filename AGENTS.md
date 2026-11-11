@@ -1,6 +1,18 @@
 # KIRA — contrato do repositório
 CLI em Rust para manutenção assistida de repositórios hospedados no Azure DevOps.
 Nome: KIRA = Knowledge-Informed Remediation Agent.
+
+## Princípios
+- Read-only por padrão. Escrita no mundo só com `--apply` explícito — e, para autonomia, só depois de `awaiting_approval` + `kira approve` (humano).
+- Erro acionável: toda falha diz o que fazer; nunca body cru de HTTP/stderr no output.
+- Segredo nunca vai para prompt, DB ou log — PAT/token vive só em env ou keyring.
+- Determinismo antes de inteligência: mesma entrada = mesmo `findings.json` byte a byte (e mesmo context pack).
+- LLM é o último recurso: CLI real → parser/SQL → cálculo em Rust; só então modelo (ADR-0016), com `// LLM porque:` no call site.
+- Ollama local (localhost) é o default; provedor caro (Copilot) só sob flag explícita.
+- Ferramenta resolvida no PATH antes do spawn (which-style, PATH × PATHEXT) — sem classificar por texto de OS/cmd localizado.
+- Wiki local em `.kira/wiki/`: markdown é a fonte de verdade, índice FTS5 é derivado e descartável; ciclo autônomo só grava em `.kira/wiki-staging/`.
+- Um item = um PR com gates (`cargo fmt --check`, `clippy -D warnings`, `test`, `build`, CI 3 SOs).
+
 ## Stack fixa
 - Rust 2024, cargo, binário único `kira`
 - `azure_devops_rust_api` 0.39 (API gerada, assíncrona) — todo uso isolado em `src/ado/`
