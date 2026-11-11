@@ -108,8 +108,8 @@
 - [x] **PR-F2** triage: resposta sem nenhum dos 3 cabeçalhos => `Error::LlmFormat`
       (exit 1, acionável), nunca três `—` com exit 0; placeholder `—` só em seção
       ausente/vazia de resposta no formato. PR #27.
-- [ ] **PR-F3** wiki: episódio vazio não vira página; destino em `.kira/wiki/`;
-      `display_path` sem `\\?\`.
+- [x] **PR-F3** wiki: episódio vazio não vira página; destino em `.kira/wiki/`;
+      `display_path` sem `\\?\`. PR #28.
 - [ ] **PR-F4** detecção de ferramenta sem depender de texto localizado (resolver
       o binário antes de executar; remover marcadores de texto do cmd).
 
