@@ -241,3 +241,52 @@ fn a_broken_wiki_never_breaks_the_triage_command() {
     );
     assert!(!sandbox.page().exists(), "nada pode ser gravado");
 }
+
+/// Constantes do teste do context packer: um achado `high` apontando para o
+/// arquivo que existe no sandbox.
+const FINDINGS_JSON: &str = r#"{"findings":[{"tool":"dotnet","rule":"vulnerable","package":"Newtonsoft.Json","version":"12.0.1","severity":"High","path":"src/App.csproj","message":"advisory","fingerprint":"0000000000000001"}],"stacks":[]}"#;
+
+/// PR5 (ADR-0015): o `kira triage` do CLI monta o pack com o repositório real —
+/// trechos `caminho:linha` e achados do scan — e diz no stderr o que enviou.
+#[test]
+fn triage_command_reports_the_context_it_sent() {
+    let sandbox = Sandbox::new("context");
+    let src = sandbox.cwd.join("src");
+    std::fs::create_dir_all(src.join("auth")).unwrap_or_else(|err| panic!("criar src/auth: {err}"));
+    std::fs::write(
+        src.join("auth").join("session.rs"),
+        "pub fn ttl() {\n    let token = refresh_token();\n}\n",
+    )
+    .unwrap_or_else(|err| panic!("escrever session.rs: {err}"));
+    std::fs::write(src.join("App.csproj"), "<Project />\n")
+        .unwrap_or_else(|err| panic!("escrever App.csproj: {err}"));
+    let kira_dir = sandbox.cwd.join(".kira");
+    std::fs::create_dir_all(&kira_dir).unwrap_or_else(|err| panic!("criar .kira: {err}"));
+    std::fs::write(kira_dir.join("findings.json"), FINDINGS_JSON)
+        .unwrap_or_else(|err| panic!("escrever findings.json: {err}"));
+
+    let (code, stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.starts_with("Causa raiz provável:"),
+        "saída do triage intacta: {stdout}"
+    );
+    assert!(
+        stderr.contains("contexto: "),
+        "o stderr diz o que foi enviado: {stderr}"
+    );
+    assert!(
+        stderr.contains("trecho(s) de repositório"),
+        "o grep do repositório entrou no pack: {stderr}"
+    );
+    assert!(
+        stderr.contains("findings do scan"),
+        "os achados entraram no pack: {stderr}"
+    );
+}

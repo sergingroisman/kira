@@ -173,7 +173,10 @@ fn section_header_index(line: &str) -> Option<(usize, String)> {
 /// three-section answer.
 ///
 /// The item id travels with the text so the caller can anchor the episodic
-/// capture (PR30) without reading the work item twice.
+/// capture (PR30) without reading the work item twice. The [`ContextPack`]
+/// travels too, so `kira triage` can print which evidence was sent (ADR-0015).
+///
+/// [`ContextPack`]: crate::context::ContextPack
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriageReport {
     /// Id of the analyzed work item.
@@ -181,6 +184,8 @@ pub struct TriageReport {
     /// Formatted answer (`Causa raiz provável` / `Arquivos prováveis` /
     /// `Confiança`).
     pub output: String,
+    /// Context that was retrieved and sent with the prompt.
+    pub context: crate::context::ContextPack,
 }
 
 /// The three sections of an already formatted triage, trimmed — in the fixed
@@ -198,7 +203,7 @@ pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<Tri
         source,
     })?;
     let item = WorkItem::from_api_json(&body)?;
-    triage_item(base_url, model, &item).await
+    triage_item(base_url, model, &item, Some(path)).await
 }
 
 /// Runs triage for a work item fetched live through the board provider
@@ -210,34 +215,41 @@ pub async fn triage_live(
     model: &str,
 ) -> Result<TriageReport, Error> {
     let item = board.work_item(id).await?;
-    triage_item(base_url, model, &item).await
+    triage_item(base_url, model, &item, None).await
 }
 
-async fn triage_item(base_url: &str, model: &str, item: &WorkItem) -> Result<TriageReport, Error> {
+async fn triage_item(
+    base_url: &str,
+    model: &str,
+    item: &WorkItem,
+    exclude_from_grep: Option<&Path>,
+) -> Result<TriageReport, Error> {
     // LLM porque: hipótese de causa raiz é julgamento sobre texto — nenhuma CLI
     // nem parser responde "por que este bug acontece". Todo o resto do comando
-    // (campos, HTML, fingerprint, store) é determinístico (ADR-0016).
+    // (campos, HTML, fingerprint, store, grep do repositório) é determinístico
+    // (ADR-0016).
     let backend = OllamaBackend::new(base_url, model);
-    let pack = context_pack(item);
+    let pack = context_pack(item, exclude_from_grep);
     let text = backend
         .complete(SYSTEM_PROMPT, &build_prompt_with_context(item, &pack))
         .await?;
     Ok(TriageReport {
         item_id: item.id,
         output: format_triage(&text),
+        context: pack,
     })
 }
 
-/// Retrieval for the prompt (PR31).
+/// Retrieval for the prompt (PR31 + PR5).
 ///
 /// Fail-open by design: without a project root, store or wiki the pack is empty
 /// and `triage` behaves exactly as before — context is an improvement, never a
 /// new way to fail.
-fn context_pack(item: &WorkItem) -> crate::context::ContextPack {
+fn context_pack(item: &WorkItem, exclude: Option<&Path>) -> crate::context::ContextPack {
     let Some(root) = crate::store::detect_project_root() else {
         return crate::context::ContextPack::default();
     };
-    crate::context::pack(&root, item)
+    crate::context::pack_excluding(&root, item, exclude)
 }
 
 #[cfg(test)]
@@ -342,7 +354,13 @@ mod tests {
                 age_days: Some(3),
                 excerpt: "token renovado sem rotacionar".to_string(),
             }],
+            code: vec![crate::context::CodeExcerpt {
+                path: "src/auth/session.rs".to_string(),
+                line: 42,
+                text: "let ttl = Duration::minutes(5);".to_string(),
+            }],
             findings_brief: Some("high 1".to_string()),
+            findings: vec!["high · Newtonsoft.Json 12.0.1 (src/App.csproj)".to_string()],
             used_chars: 120,
             budget_chars: 12_288,
             notes: Vec::new(),
@@ -357,6 +375,12 @@ mod tests {
         assert!(with.contains("token renovado sem rotacionar"), "{with}");
         assert!(
             with.contains("findings do último `kira scan`: high 1"),
+            "{with}"
+        );
+        // PR5: o trecho de repositório chega com caminho:linha auditável.
+        assert!(with.contains("src/auth/session.rs:42 —"), "{with}");
+        assert!(
+            with.contains("achado: high · Newtonsoft.Json 12.0.1"),
             "{with}"
         );
         // O work item continua antes do contexto.

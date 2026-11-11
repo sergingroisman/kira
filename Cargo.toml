@@ -41,6 +41,11 @@ reqwest = { version = "0.13", features = ["json"] }
 # masking layer is explicit and cannot silently change behaviour on an upstream
 # bump. Masking is parser work, never an LLM task (ADR-0016).
 regex = "1.13.1"
+# Direct dependency: deterministic repository walk for the context packer
+# (src/context/repo.rs, ADR-0015). Already in Cargo.lock at this version as a
+# transitive dependency of the Azure SDK, so the tree does not grow — declared
+# so the grep layer cannot change behaviour silently on an upstream bump.
+walkdir = "2"
 
 [profile.release]
 strip = true
