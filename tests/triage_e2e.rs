@@ -5,7 +5,8 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use kira::triage;
 
@@ -73,6 +74,8 @@ async fn triage_file_prints_the_three_sections_with_the_model_text() {
     let output = triage::triage_file(&base_url, "qwen3.5:4b", Path::new(FIXTURE_PATH))
         .await
         .unwrap_or_else(|err| panic!("triage --file deve funcionar offline: {err}"));
+    assert_eq!(output.item_id, 4821, "o id acompanha o texto (PR30)");
+    let output = output.output;
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines.first(), Some(&"Causa raiz provável:"), "{output}");
     assert!(
@@ -99,4 +102,142 @@ async fn triage_file_prints_the_three_sections_with_the_model_text() {
         !request.contains("<div>"),
         "prompt não pode conter HTML cru: {request}"
     );
+}
+
+/// Sandbox of the CLI path: a temp project + isolated store, no Azure env.
+struct Sandbox {
+    cwd: PathBuf,
+    store: PathBuf,
+    base_url: String,
+}
+
+impl Sandbox {
+    fn new(tag: &str) -> Self {
+        let (base_url, server) = spawn_fake_ollama();
+        // O handle fica solto de propósito: a thread do servidor falso acaba
+        // quando o processo termina, e um `join` poderia esperar para sempre.
+        drop(server);
+        let base = std::env::temp_dir().join(format!(
+            "kira-triage-e2e-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let cwd = base.join("projeto");
+        let store = base.join("store");
+        std::fs::create_dir_all(&cwd).unwrap_or_else(|err| panic!("criar {cwd:?}: {err}"));
+        std::fs::create_dir_all(&store).unwrap_or_else(|err| panic!("criar {store:?}: {err}"));
+        Self {
+            cwd,
+            store,
+            base_url,
+        }
+    }
+
+    fn fixture(&self) -> String {
+        format!("{}/{}", env!("CARGO_MANIFEST_DIR"), FIXTURE_PATH)
+    }
+
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_kira"))
+            .args(args)
+            .current_dir(&self.cwd)
+            .env("KIRA_OLLAMA_URL", &self.base_url)
+            .env("KIRA_STORE_DIR", &self.store)
+            .env("KIRA_CONFIG", self.store.join("absent-config.toml"))
+            .env_remove("AZURE_DEVOPS_PAT")
+            .env_remove("AZURE_DEVOPS_ORG")
+            .env_remove("AZURE_DEVOPS_PROJECT")
+            .env_remove("KIRA_MODEL")
+            .output()
+            .unwrap_or_else(|err| panic!("executar kira {args:?}: {err}"));
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    fn page(&self) -> PathBuf {
+        self.cwd
+            .join("docs")
+            .join("wiki")
+            .join("bugs")
+            .join("4821.md")
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        if let Some(base) = self.cwd.parent() {
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+}
+
+/// PR30: the triage command leaves an episode in docs/wiki without asking
+/// anything (ADR-0013), and the printed answer does not change.
+#[test]
+fn triage_file_captures_an_episode_in_the_project_wiki() {
+    let sandbox = Sandbox::new("capture");
+    let (code, stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.starts_with("Causa raiz provável:"),
+        "saída do triage intacta: {stdout}"
+    );
+    assert!(
+        stderr.contains("episódio do item 4821"),
+        "o aviso vai para stderr: {stderr}"
+    );
+
+    let page = std::fs::read_to_string(sandbox.page())
+        .unwrap_or_else(|err| panic!("ler a página do episódio: {err}"));
+    assert!(page.contains("# Bug 4821"), "{page}");
+    assert!(
+        page.contains("- Causa raiz prevista: TTL do token muito curto."),
+        "causa raiz prevista gravada: {page}"
+    );
+    assert!(
+        page.contains("- Arquivos prováveis: src/auth/session.rs"),
+        "{page}"
+    );
+    assert!(page.contains("- Confiança: média"), "{page}");
+}
+
+/// Fail-open: a wiki que não pode ser escrita vira um `aviso:` em stderr e nada
+/// mais — a saída e o código de saída do triage continuam os mesmos.
+#[test]
+fn a_broken_wiki_never_breaks_the_triage_command() {
+    let sandbox = Sandbox::new("fail-open");
+    // `docs` como arquivo: criar `docs/wiki/bugs` é impossível.
+    std::fs::write(sandbox.cwd.join("docs"), "não sou um diretório")
+        .unwrap_or_else(|err| panic!("criar docs: {err}"));
+
+    let (code, stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+    assert_eq!(code, 0, "fail-open: stderr: {stderr}");
+    assert!(
+        stdout.contains("Causa raiz provável:"),
+        "saída do triage preservada: {stdout}"
+    );
+    assert!(
+        stderr.contains("aviso: wiki não registrou o episódio"),
+        "aviso acionável no stderr: {stderr}"
+    );
+    assert!(!sandbox.page().exists(), "nada pode ser gravado");
 }

@@ -57,6 +57,8 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - **Toda escrita passa por `redact` (segredos nunca vão para o disco) e por `guard::path` (confinamento na raiz).** Id de página inválido (`..`, absoluto, maiúscula, slug fora de `[a-z0-9_-]`) é recusado antes de qualquer I/O.
 - **Ciclo autônomo nunca escreve em `docs/wiki/`**: grava em `.kira/wiki-staging/` e depende de promoção humana (`kira wiki promote`, PR32).
 - Páginas não são log de conversa: guardam conhecimento reutilizável (arquitetura, decisões, padrões, glossário, causa raiz de bug). Nada de transcrição.
+- `kira triage` (comando humano) anexa um **episódio** em `docs/wiki/bugs/<item-id>.md` com causa raiz prevista, arquivos, confiança e o brief do `kira scan` — sem perguntar nada. Episódio repetido (mesmo conteúdo) não duplica; episódios com mais de 30 dias colapsam numa linha em `## Histórico colapsado`. O ciclo autônomo usa `.kira/wiki-staging/` (`EpisodeTarget::Staging`), nunca `docs/wiki/`.
+- `kira wiki forget <página>` apaga o markdown e as entradas do índice (LGPD: dado do dono); página inexistente não é erro. O índice é derivado — falha ao limpá-lo vira aviso, nunca erro do comando.
 
 ## Autonomia e aprovação
 - **Leitura é livre, escrita nunca.** Todo comando é read-only por padrão; escrita no mundo exige flag explícita `--apply`. Modo agendado e `kira loop` NUNCA ganham escrita implícita.

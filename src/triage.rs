@@ -153,9 +153,30 @@ fn section_header_index(line: &str) -> Option<(usize, String)> {
     None
 }
 
+/// Result of one triage run: the work item that was analyzed and the formatted
+/// three-section answer.
+///
+/// The item id travels with the text so the caller can anchor the episodic
+/// capture (PR30) without reading the work item twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriageReport {
+    /// Id of the analyzed work item.
+    pub item_id: i32,
+    /// Formatted answer (`Causa raiz provável` / `Arquivos prováveis` /
+    /// `Confiança`).
+    pub output: String,
+}
+
+/// The three sections of an already formatted triage, trimmed — in the fixed
+/// order (causa raiz, arquivos, confiança). `—` when a section was empty.
+#[must_use]
+pub fn sections_of(formatted: &str) -> [String; 3] {
+    split_sections(formatted).map(|section| section.trim().to_string())
+}
+
 /// Runs triage for a work item read from a local JSON file — the offline path
 /// that needs no PAT and no Azure DevOps access.
-pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<String, Error> {
+pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<TriageReport, Error> {
     let body = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,
@@ -171,18 +192,21 @@ pub async fn triage_live(
     id: i32,
     base_url: &str,
     model: &str,
-) -> Result<String, Error> {
+) -> Result<TriageReport, Error> {
     let item = board.work_item(id).await?;
     triage_item(base_url, model, &item).await
 }
 
-async fn triage_item(base_url: &str, model: &str, item: &WorkItem) -> Result<String, Error> {
+async fn triage_item(base_url: &str, model: &str, item: &WorkItem) -> Result<TriageReport, Error> {
     // LLM porque: hipótese de causa raiz é julgamento sobre texto — nenhuma CLI
     // nem parser responde "por que este bug acontece". Todo o resto do comando
     // (campos, HTML, fingerprint, store) é determinístico (ADR-0016).
     let backend = OllamaBackend::new(base_url, model);
     let text = backend.complete(SYSTEM_PROMPT, &build_prompt(item)).await?;
-    Ok(format_triage(&text))
+    Ok(TriageReport {
+        item_id: item.id,
+        output: format_triage(&text),
+    })
 }
 
 #[cfg(test)]
@@ -330,5 +354,23 @@ mod tests {
         assert!(out.contains("Causa raiz provável:\n—\n"), "{out}");
         assert!(out.contains("Arquivos prováveis:\n—\n"), "{out}");
         assert!(out.contains("Confiança:\n—\n"), "{out}");
+    }
+
+    /// The episodic capture (PR30) reads back exactly what was printed: the
+    /// three sections, in the fixed order, trimmed.
+    #[test]
+    fn sections_of_returns_the_three_sections_in_order() {
+        let formatted = format_triage(
+            "Causa raiz provável:\nTTL curto\nArquivos prováveis:\nsrc/a.rs, src/b.rs\nConfiança:\nalta",
+        );
+        let sections = sections_of(&formatted);
+        assert_eq!(sections[0], "TTL curto");
+        assert_eq!(sections[1], "src/a.rs, src/b.rs");
+        assert_eq!(sections[2], "alta");
+
+        let empty = sections_of(&format_triage(
+            "Causa raiz provável:\n\nArquivos prováveis:\n\nConfiança:\n",
+        ));
+        assert_eq!(empty, ["—", "—", "—"], "seções vazias voltam como —");
     }
 }

@@ -469,6 +469,25 @@ impl Store {
         }
         Ok(hits)
     }
+
+    /// Removes one page from the derived index (`kira wiki forget`, LGPD).
+    ///
+    /// The markdown is deleted by the wiki itself; this only drops the derived
+    /// copy, so a failure here never loses knowledge (`kira wiki reindex`
+    /// rebuilds everything from the files). Returns `true` when the page row
+    /// existed.
+    pub fn wiki_forget(&self, slug: &str) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction().map_err(StoreError::Sql)?;
+        let deleted = tx
+            .execute("DELETE FROM wiki_page WHERE slug = ?1", [slug])
+            .map_err(StoreError::Sql)?;
+        if self.wiki_fts5_enabled() {
+            tx.execute("DELETE FROM wiki_fts WHERE slug = ?1", [slug])
+                .map_err(StoreError::Sql)?;
+        }
+        tx.commit().map_err(StoreError::Sql)?;
+        Ok(deleted > 0)
+    }
 }
 
 /// One wiki page as stored in the derived index.
@@ -742,6 +761,45 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year + i64::from(month <= 2), month, day)
 }
 
+/// Parses the one RFC 3339 shape this store ever writes
+/// (`YYYY-MM-DDTHH:MM:SSZ`) into Unix seconds.
+///
+/// `None` for anything else — including offsets and fractional seconds — so a
+/// caller can treat an unparsable stamp as "age unknown" instead of silently
+/// pretending it is 1970.
+pub fn rfc3339_utc_to_unix_seconds(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    let date = trimmed.get(..10)?;
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let rest = trimmed.get(10..)?.strip_prefix('T')?;
+    let hour: i64 = rest.get(..2)?.parse().ok()?;
+    let minute: i64 = rest.get(3..5)?.parse().ok()?;
+    let second: i64 = rest.get(6..8)?.parse().ok()?;
+    if !rest.get(8..)?.starts_with('Z') || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some(seconds)
+}
+
+/// (year, month, day) → days since 1970-01-01 (Howard Hinnant's
+/// `days_from_civil`), the exact inverse of [`civil_from_days`].
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 /// Keeps the first [`SUMMARY_MAX_CHARS`] characters of the summary.
 fn cap_summary(summary: &str) -> String {
     if summary.chars().count() <= SUMMARY_MAX_CHARS {
@@ -851,6 +909,78 @@ mod tests {
             "2001-09-09T01:46:40Z"
         );
         assert!(now_rfc3339_utc().ends_with('Z'));
+    }
+
+    #[test]
+    fn rfc3339_utc_round_trips_through_unix_seconds() {
+        for seconds in [0, 951_782_400, 1_000_000_000, 1_774_000_000, 1_800_000_000] {
+            let stamp = rfc3339_utc_from_unix_seconds(seconds);
+            assert_eq!(
+                rfc3339_utc_to_unix_seconds(&stamp),
+                Some(seconds),
+                "ida e volta de {seconds} falhou ({stamp})"
+            );
+        }
+        assert_eq!(rfc3339_utc_to_unix_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            rfc3339_utc_to_unix_seconds("2026-11-10T22:18:00Z"),
+            Some(1_794_349_080),
+            "carimbo do decay precisa casar com o calendário civil"
+        );
+    }
+
+    #[test]
+    fn rfc3339_utc_rejects_anything_that_is_not_the_stored_shape() {
+        for invalid in [
+            "",
+            "2026-11-10",
+            "2026-11-10 22:18:00Z",
+            "2026-11-10T22:18:00+03:00",
+            "2026-11-10T22:18:00.500Z",
+            "2026-13-10T22:18:00Z",
+            "2026-11-10T25:18:00Z",
+            "10/11/2026 22:18",
+        ] {
+            assert_eq!(
+                rfc3339_utc_to_unix_seconds(invalid),
+                None,
+                "'{invalid}' não é o formato gravado"
+            );
+        }
+    }
+
+    #[test]
+    fn wiki_forget_removes_the_page_and_its_index_rows() {
+        let (store, dir) = open_temp_store("wiki-forget");
+        let row = WikiPageRow {
+            slug: "bugs/4821".to_string(),
+            kind: "bug".to_string(),
+            path: "docs/wiki/bugs/4821.md".to_string(),
+            title: "Bug 4821".to_string(),
+            updated_at: "2026-11-10T22:00:00Z".to_string(),
+            content_hash: "0000000000000001".to_string(),
+            body: "TTL do token curto".to_string(),
+        };
+        store
+            .wiki_replace(&[row])
+            .unwrap_or_else(|err| panic!("wiki_replace: {err}"));
+        assert!(!store.wiki_search("TTL", 5).unwrap_or_default().is_empty());
+
+        let deleted = store
+            .wiki_forget("bugs/4821")
+            .unwrap_or_else(|err| panic!("wiki_forget: {err}"));
+        assert!(deleted, "a página existia no índice");
+        assert!(
+            store.wiki_search("TTL", 5).unwrap_or_default().is_empty(),
+            "nada pode sobrar no índice (FTS5 ou LIKE)"
+        );
+        assert!(
+            !store
+                .wiki_forget("bugs/4821")
+                .unwrap_or_else(|err| panic!("wiki_forget repetido: {err}")),
+            "esquecer duas vezes é no-op, não erro"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

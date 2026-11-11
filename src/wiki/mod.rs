@@ -22,6 +22,8 @@ use thiserror::Error;
 
 use crate::guard::path::{Guard, GuardError};
 
+pub mod episode;
+
 /// Committed wiki root, relative to the project root.
 pub const WIKI_DIR: &str = "docs/wiki";
 
@@ -305,6 +307,26 @@ impl Wiki {
         Ok(store.wiki_search(query, limit)?)
     }
 
+    /// Deletes a page from the committed wiki (`kira wiki forget`).
+    ///
+    /// The id is validated first (no `..`, no absolute path, known page or
+    /// `bugs/<slug>`) and the destination goes through the write guard, so a
+    /// forget can never remove anything outside `docs/wiki/`. `Ok(false)` means
+    /// the page did not exist — nothing to do, not an error.
+    pub fn forget(&self, page: &str) -> Result<bool, WikiError> {
+        let path = self.page_path(page)?;
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let destination = self.guard.check_write(&path)?;
+        fs::remove_file(&destination).map_err(|source| WikiError::Io {
+            action: "apagar",
+            path: destination.display().to_string(),
+            source,
+        })?;
+        Ok(true)
+    }
+
     /// Creates the page's parent directory inside `docs/wiki`.
     ///
     /// Only fixed, code-owned names are created here, so a typo in a page id can
@@ -569,6 +591,47 @@ mod tests {
             .search(&store, "qualquer", 5)
             .unwrap_or_else(|err| panic!("search: {err}"));
         assert!(hits.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_deletes_the_page_and_reports_when_it_was_missing() {
+        let dir = temp_project("forget");
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        let path = wiki
+            .write("bugs/4821", "# Bug 4821\ncausa: TTL curto")
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(path.is_file());
+
+        assert!(
+            wiki.forget("bugs/4821")
+                .unwrap_or_else(|err| panic!("forget: {err}")),
+            "a página existia"
+        );
+        assert!(!path.exists(), "arquivo deveria sumir do disco");
+        assert!(
+            !wiki
+                .forget("bugs/4821")
+                .unwrap_or_else(|err| panic!("forget repetido: {err}")),
+            "esquecer de novo é no-op"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_refuses_unknown_and_traversing_ids_without_deleting_anything() {
+        let dir = temp_project("forget-denied");
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        let inside = wiki
+            .write("contexto", "# Contexto")
+            .unwrap_or_else(|err| panic!("{err}"));
+        for page in ["../../etc/passwd", "/etc/passwd", "Contexto", "bugs/../x"] {
+            assert!(
+                wiki.forget(page).is_err(),
+                "'{page}' deveria ser recusado antes de qualquer I/O"
+            );
+        }
+        assert!(inside.is_file(), "nada pode ser apagado por um id inválido");
         let _ = fs::remove_dir_all(&dir);
     }
 }

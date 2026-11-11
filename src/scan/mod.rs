@@ -15,6 +15,7 @@ mod finding;
 mod node;
 
 pub use finding::Finding;
+pub use finding::severity_brief;
 pub use node::NodeAuditTool;
 
 use std::path::{Path, PathBuf};
@@ -550,6 +551,40 @@ fn write_findings_file(
     Ok(file_path)
 }
 
+/// Reads the last `.kira/findings.json` of the project.
+///
+/// `Ok(None)` when the file does not exist (no scan has run yet) — never an
+/// error for the caller that only wants context. The file is written by
+/// [`run`] and carries only deterministic data, so this stays a pure parser
+/// over one `String` plus a read.
+pub fn read_findings_file(root: &Path) -> Result<Option<Vec<Finding>>, ScanError> {
+    let path = root.join(".kira").join("findings.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ScanError::Io {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    };
+    Ok(Some(parse_findings_document(&text)?))
+}
+
+/// Extracts the findings from the `{ findings, stacks }` document (the
+/// `stacks` half is irrelevant here and ignored on purpose).
+fn parse_findings_document(text: &str) -> Result<Vec<Finding>, ScanError> {
+    #[derive(Deserialize)]
+    struct Document {
+        findings: Vec<Finding>,
+    }
+    let document: Document = serde_json::from_str(text).map_err(|source| ScanError::Runtime {
+        message: format!("findings.json ilegível ({source}) — rode `kira scan` de novo"),
+    })?;
+    Ok(document.findings)
+}
+
 /// Exit code of one tool run as a compact label (`0`, `-1`, `desconhecido`).
 pub(crate) fn exit_code_label(code: Option<i32>) -> String {
     code.map_or_else(|| "desconhecido".to_string(), |code| code.to_string())
@@ -601,6 +636,35 @@ mod tests {
 
     fn touch(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), "").unwrap_or_else(|err| panic!("criar {name}: {err}"));
+    }
+
+    /// Reading back the file `kira scan` writes: absent file is `None`, and a
+    /// present one yields exactly the findings (stacks half ignored).
+    #[test]
+    fn findings_file_is_read_back_or_absent_without_error() {
+        let dir = temp_dir("findings-read");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        assert!(
+            read_findings_file(&dir)
+                .unwrap_or_else(|err| panic!("ler ausente: {err}"))
+                .is_none(),
+            "sem scan, o caller recebe None (não erro)"
+        );
+
+        std::fs::create_dir_all(dir.join(".kira"))
+            .unwrap_or_else(|err| panic!("criar .kira: {err}"));
+        std::fs::write(
+            dir.join(".kira").join("findings.json"),
+            r#"{"findings":[{"tool":"audit","rule":"vulnerable","package":"lodash","version":"4.17.20","severity":"high","path":"web","message":"prototype pollution","fingerprint":"0000000000000001"}],"stacks":[]}"#,
+        )
+        .unwrap_or_else(|err| panic!("escrever findings: {err}"));
+        let findings = read_findings_file(&dir)
+            .unwrap_or_else(|err| panic!("ler findings: {err}"))
+            .unwrap_or_else(|| panic!("findings.json existia"));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].package, "lodash");
+        assert_eq!(severity_brief(&findings), "high 1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
