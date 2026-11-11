@@ -68,7 +68,11 @@
       ciclo autônomo só grava em `.kira/wiki-staging/`.
 - [x] **PR29** índice FTS5 (`wiki_page`, `wiki_fts`) + `kira wiki reindex` (derivado,
       descartável; sem FTS5 cai para substring).
-- [ ] **PR30** captura episódica pós-`triage` + decay 30 dias + `kira wiki forget`.
+- [x] **PR30** captura episódica pós-`triage` + decay 30 dias + `kira wiki forget`.
+      `docs/wiki/bugs/<id>.md` com causa raiz prevista + arquivos + confiança +
+      brief do scan, sem perguntar nada; episódio repetido não duplica; >30 dias
+      colapsa em `## Histórico colapsado`; `forget` apaga markdown + índice
+      (página ausente = exit 0). Ciclo autônomo usa `EpisodeTarget::Staging`.
 - [ ] **PR31** retrieval da wiki → context packer (top-k com caminho e idade).
 - [ ] **PR32** `kira wiki export` (bundle opcional) + `kira wiki promote` (staging → docs).
 - [ ] **PR5** context packer v1: item + findings do arquivo + trechos, teto de
