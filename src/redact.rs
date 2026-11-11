@@ -40,8 +40,10 @@ fn patterns() -> &'static Patterns {
         // `Authorization: Bearer <token>` and bare `bearer <token>`.
         bearer: compile(r"(?i)\b(bearer\s+)([A-Za-z0-9._\-]{8,})"),
         // `token=...`, `pat: ...`, `api_key=...`, `password = ...`, `secret: ...`
+        // — including the quoted form that is the norm in source code
+        // (`password = "..."`), since PR5 sends repository lines to the prompt.
         keyed: compile(
-            r"(?i)\b(pat|token|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|passwd|pwd|sig|signature)\b(\s*[=:]\s*)([^\s&,;\x22']{3,})",
+            r#"(?i)\b(pat|token|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|passwd|pwd|sig|signature)\b(\s*[=:]\s*)(["']?)([^\s&,;"']{3,})"#,
         ),
         // Secret carried in a URL query string.
         url_query: compile(
@@ -76,7 +78,7 @@ pub fn redact(text: &str) -> String {
     out = p.known_prefixes.replace_all(&out, MASKED).into_owned();
     out = p
         .keyed
-        .replace_all(&out, format!("${{1}}${{2}}{MASKED}").as_str())
+        .replace_all(&out, format!("${{1}}${{2}}${{3}}{MASKED}").as_str())
         .into_owned();
     out = p
         .url_query
@@ -106,6 +108,16 @@ mod tests {
             out.contains("token="),
             "a chave deve continuar legível: {out}"
         );
+    }
+
+    #[test]
+    fn masks_quoted_assignments_in_source_code() {
+        let out = redact("let pat = \"AbC123XyZ789QqQ\";");
+        assert!(!out.contains("AbC123XyZ789QqQ"), "{out}");
+        assert!(out.contains("pat = \""), "a chave e a aspa ficam: {out}");
+        assert!(out.contains(MASKED), "{out}");
+        // Valor curto demais para ser segredo não é mascarado.
+        assert_eq!(redact("let token = \"{}\";"), "let token = \"{}\";");
     }
 
     #[test]

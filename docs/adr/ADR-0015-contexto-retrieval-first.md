@@ -78,3 +78,15 @@ e reprodutível — o mesmo requisito de determinismo do gate M1.
 - Enviar o `findings.json` inteiro ou arquivos inteiros no prompt (estoura 4096 e
   piora a precisão por diluição).
 - Busca vetorial/embeddings antes do gate M2 (ADR-0013 já fixa FTS5 primeiro).
+
+## Nota de implementação (PR5 + PR31, 11/Nov/2026)
+
+- `src/context/mod.rs` monta o pack: findings do último `kira scan` → achados
+  individuais → páginas da wiki (FTS5) → trechos do repositório.
+- `src/context/repo.rs` é o grep determinístico: `walkdir` ordenado por nome,
+  extensões de fonte, arquivos citados por um finding na frente, tudo ancorado em
+  `caminho:linha` e redigido por `redact` antes de entrar no prompt.
+- Orçamento (`KIRA_NUM_CTX` × 3 caracteres): o que não cabe vira nota, nunca erro.
+- `kira triage` imprime `contexto: …` no stderr — o usuário vê o que o modelo viu.
+- O arquivo do work item (`--file`) e `docs/wiki/` nunca são greppados: o primeiro
+  já está inteiro no prompt, a segunda já vem do FTS5.

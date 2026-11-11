@@ -30,9 +30,17 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 ## IA
 - Backend LLM plugável via trait `LlmBackend` (`src/llm/`), previsto para copilot-sdk | byok-http | ollama. Nesta fase só existe `OllamaBackend`, sempre localhost (default `http://localhost:11434`).
 - Prompts são versados no repo, em `src/llm/prompts.rs` (constantes públicas, revisadas em PR) — sem framework de orquestração.
-- Nunca enviar segredos ao LLM: PAT, env e credenciais não entram no prompt — o prompt só contém campos do work item.
+- Nunca enviar segredos ao LLM: PAT, env e credenciais não entram no prompt. Além dos campos do work item, o prompt leva só o **context packer** (abaixo), já redigido por `redact`.
 - `kira triage` é somente leitura: o prompt do sistema nunca pede para escrever/editar código e o comando nunca altera o Azure DevOps.
 - Segredos no keyring: `src/credentials.rs` concentra `CredStore` (`OsKeyring` no runtime, `InMemory` só em testes). Testes NUNCA tocam o keyring do OS.
+## Contexto (context packer, ADR-0015)
+- RETRIEVAL-FIRST: o KIRA busca, o modelo só interpreta. Nada de tool-calling, embedding, LangGraph ou índice vetorial — `walkdir` + casamento de termos e FTS5 da wiki, tudo em `src/context/`.
+- Todo trecho sai ancorado: repositório como `caminho:linha`, wiki como caminho + idade em dias. Blob anônimo no prompt é proibido.
+- Ordem de prioridade do orçamento (`KIRA_NUM_CTX`), fixa: brief do `kira scan` → achados individuais → páginas da wiki → trechos do repositório. Orçamento estourado vira nota, nunca erro.
+- DETERMINISMO: caminhada ordenada por nome, ranking = arquivo citado em `findings.json` primeiro, depois termos casados, caminho e linha. Mesmo estado ⇒ mesmo pack (gate do M1).
+- Toda linha do repositório passa por `redact`; linha de atribuição (`token = ...`, `password = ...`) sai mascarada mesmo quando é código — privacidade acima de utilidade.
+- Nunca greppar `docs/wiki/` (já vem do FTS5), dot-dirs, `target/`, `node_modules/`, build output, nem o arquivo do work item passado em `--file`.
+- FAIL-OPEN por fonte: wiki, store, findings ou grep que falham só geram nota; `kira triage` continua e imprime `contexto: ...` no stderr dizendo o que foi enviado.
 ## Store
 - Trilha local por projeto em SQLite (rusqlite, feature `bundled` — binário sem instalação externa); tudo em `src/store/`; DB único central `~/.config/kira/store.db` (Windows: `%USERPROFILE%\.config\kira\store.db`), modo WAL, migração idempotente via `PRAGMA user_version` com `CREATE TABLE IF NOT EXISTS`.
 - FAIL-OPEN OBRIGATÓRIO: erro do store nunca quebra o comando principal — só `aviso: trilha não foi gravada (<causa>)` no stderr (emitido só no `main.rs`, em lugar nenhum outro) e o código de saída/saída do comando permanece.

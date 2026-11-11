@@ -839,6 +839,14 @@ async fn triage_command(
     match result {
         Ok(report) => {
             print!("{}", report.output);
+            // ADR-0015: the user sees exactly which evidence the model got. Goes
+            // to stderr so the three-section answer stays pipeable.
+            if !report.context.is_empty() {
+                eprintln!("{}", report.context.summary());
+            }
+            for note in &report.context.notes {
+                eprintln!("aviso: contexto — {note}");
+            }
             // Episodic capture (ADR-0013, PR30): fail-open, never changes the
             // output or the exit code.
             if let Some(note) = record_triage_episode(&report) {
