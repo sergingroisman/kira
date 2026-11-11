@@ -99,6 +99,20 @@
       (schema + leitor + % de acerto). Harness testado com fixtures sintéticas;
       **medição real espera os 20 bugs rotulados pelo dono**.
 
+### W2-FIX — correções do primeiro uso real (brief em `docs/kira-w2-fix.md`)
+
+> Corrigir o que o uso real quebrou, um PR por vez, sem feature nova. Entra
+> antes dos itens novos de F2 porque o defeito aparece no caminho principal.
+- [x] **PR-F1** scan: `package.json` sem lockfile sob workspace pnpm é MEMBRO
+      (dobra em `members`, não spawna `npm audit` próprio). PR #26.
+- [x] **PR-F2** triage: resposta sem nenhum dos 3 cabeçalhos => `Error::LlmFormat`
+      (exit 1, acionável), nunca três `—` com exit 0; placeholder `—` só em seção
+      ausente/vazia de resposta no formato. PR #27.
+- [ ] **PR-F3** wiki: episódio vazio não vira página; destino em `.kira/wiki/`;
+      `display_path` sem `\\?\`.
+- [ ] **PR-F4** detecção de ferramenta sem depender de texto localizado (resolver
+      o binário antes de executar; remover marcadores de texto do cmd).
+
 ### F2 — agente vivo (W5) — pedido explícito do dono
 - [ ] **PR15** `kira loop`: modo do binário (sem daemon), ciclos com estado no
       SQLite; teste de 2 ciclos idênticos = nada a fazer (anti PR inócuo).

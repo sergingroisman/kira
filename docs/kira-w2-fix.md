@@ -26,6 +26,10 @@ Correção:
 
 ## PR-F2 — triage: resposta fora do formato degrada em silêncio (real, reproduzido)
 
+> **FEITO** — PR #27, merge `6968704`. `format_triage` retorna `Result`;
+> resposta sem nenhum dos 3 cabeçalhos => `Error::LlmFormat` (exit 1), e2e com
+> Ollama falso provando stdout vazio + nenhuma página de wiki.
+
 Sintoma real: `kira triage 529511` imprimiu as 3 seções TODAS com `—`
 (sem erro, exit 0) e a wiki registrou o episódio vazio como válido.
 
