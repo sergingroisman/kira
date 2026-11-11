@@ -63,7 +63,7 @@
       `cargo test` falha se alguém adicionar LLM em `scan`/`store`/`tui`.
 
 ### F1 — contexto e medição (W2 + W2.5 wiki + W2-bis)
-- [ ] **PR28** `kira wiki` em **`docs/wiki/` (commitada)**: páginas
+- [x] **PR28** `kira wiki` em **`docs/wiki/` (commitada)**: páginas
       contexto/decisoes/padroes/glossario/bugs, escrita via `redact` + `guard/path`;
       ciclo autônomo só grava em `.kira/wiki-staging/`.
 - [ ] **PR29** índice FTS5 (`wiki_page`, `wiki_fts`) + `kira wiki reindex` (derivado,
