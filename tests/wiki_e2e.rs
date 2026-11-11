@@ -160,3 +160,65 @@ fn search_without_reindex_is_actionable_not_silent() {
     assert!(stdout.contains("nenhuma página"), "{stdout}");
     assert!(stdout.contains("kira wiki reindex"), "acionável: {stdout}");
 }
+
+/// Writes a bug page the way the episodic capture does, so the test never needs
+/// a model: the contract under test is `forget`, not the capture.
+fn write_bug_page(sandbox: &Sandbox, slug: &str, body: &str) -> PathBuf {
+    let path = sandbox.wiki_dir().join("bugs").join(format!("{slug}.md"));
+    fs::create_dir_all(path.parent().unwrap_or(&sandbox.cwd))
+        .unwrap_or_else(|err| panic!("criar bugs/: {err}"));
+    fs::write(
+        &path,
+        format!("<!-- kira-wiki page=bugs/{slug} updated_at=2026-11-10T22:18:00Z -->\n\n{body}\n"),
+    )
+    .unwrap_or_else(|err| panic!("escrever {path:?}: {err}"));
+    path
+}
+
+#[test]
+fn forget_deletes_the_page_and_its_search_entries() {
+    let sandbox = Sandbox::new("forget");
+    let path = write_bug_page(
+        &sandbox,
+        "4821",
+        "# Bug 4821\n\n## Episódio 2026-11-10T22:18:00Z · item 4821\n- Causa raiz prevista: TTL do token curto\n",
+    );
+
+    let (code, _, stderr) = sandbox.run(&["wiki", "reindex"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let (code, stdout, stderr) = sandbox.run(&["wiki", "search", "TTL"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("bugs/4821"), "indexado antes: {stdout}");
+
+    let (code, stdout, stderr) = sandbox.run(&["wiki", "forget", "bugs/4821"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("apagada"), "{stdout}");
+    assert!(!path.exists(), "o markdown deveria sumir do disco");
+
+    let (code, stdout, stderr) = sandbox.run(&["wiki", "search", "TTL"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("nenhuma página"),
+        "o índice não pode guardar a página esquecida: {stdout}"
+    );
+}
+
+#[test]
+fn forget_of_a_missing_page_is_not_an_error() {
+    let sandbox = Sandbox::new("forget-missing");
+    let (code, stdout, stderr) = sandbox.run(&["wiki", "forget", "bugs/9999"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("não existe"), "{stdout}");
+    assert!(stdout.contains("kira wiki list"), "acionável: {stdout}");
+}
+
+#[test]
+fn forget_refuses_a_traversing_page_id() {
+    let sandbox = Sandbox::new("forget-denied");
+    let victim = sandbox.cwd.join("importante.txt");
+    fs::write(&victim, "não pode sumir").unwrap_or_else(|err| panic!("criar {victim:?}: {err}"));
+    let (code, _, stderr) = sandbox.run(&["wiki", "forget", "../../importante.txt"]);
+    assert_ne!(code, 0, "id com '..' deveria falhar");
+    assert!(stderr.contains("erro:"), "{stderr}");
+    assert!(victim.is_file(), "nada fora de docs/wiki pode ser apagado");
+}

@@ -16,7 +16,7 @@ use kira::scan;
 use kira::setup;
 use kira::store::{self, Store, StoreError};
 use kira::triage;
-use kira::wiki::{Wiki, WikiError};
+use kira::wiki::{WIKI_DIR, Wiki, WikiError, episode};
 
 /// Hard cap for the summary line shown by `kira history`.
 const HISTORY_SUMMARY_LINE_CHARS: usize = 160;
@@ -137,6 +137,11 @@ enum WikiAction {
         /// Maximum hits (default 5)
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Delete a page from docs/wiki and from the search index (LGPD)
+    Forget {
+        /// Page id (e.g. bugs/4821-sessao-expirada)
+        page: String,
     },
 }
 
@@ -332,6 +337,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                     Some(limit) => format!("search {query} --limit {limit}"),
                     None => format!("search {query}"),
                 },
+                WikiAction::Forget { page } => format!("forget {page}"),
             };
             let args = match path {
                 Some(path) => format!("{args} --path {}", path.display()),
@@ -703,6 +709,31 @@ fn wiki_output(action: &WikiAction, root: &Path) -> Result<String, WikiError> {
             }
             Ok(text)
         }
+        WikiAction::Forget { page } => {
+            if !wiki.forget(page)? {
+                return Ok(format!(
+                    "página '{page}' não existe em {} — nada a apagar (veja `kira wiki list`)\n",
+                    root.join(WIKI_DIR).display()
+                ));
+            }
+            Ok(format!(
+                "página '{page}' apagada de docs/wiki{}\n",
+                forget_index(page)
+            ))
+        }
+    }
+}
+
+/// Cleans the derived index after a `wiki forget`.
+///
+/// Never an error: markdown is the truth and `kira wiki reindex` rebuilds the
+/// index from the files, so a store problem only becomes a warning in the same
+/// line the command already prints.
+fn forget_index(page: &str) -> String {
+    match Store::open_default().and_then(|store| store.wiki_forget(page)) {
+        Ok(true) => " e do índice".to_string(),
+        Ok(false) => " (o índice não tinha essa página)".to_string(),
+        Err(err) => format!("; aviso: índice não foi limpo ({err}) — rode `kira wiki reindex`"),
     }
 }
 
@@ -765,9 +796,14 @@ async fn triage_command(
         TriageSource::File(path) => triage::triage_file(&base_url, &model, &path).await,
     };
     match result {
-        Ok(output) => {
-            print!("{output}");
-            Outcome::success(output)
+        Ok(report) => {
+            print!("{}", report.output);
+            // Episodic capture (ADR-0013, PR30): fail-open, never changes the
+            // output or the exit code.
+            if let Some(note) = record_triage_episode(&report) {
+                eprint!("{note}");
+            }
+            Outcome::success(report.output)
         }
         Err(err) => {
             print_error(&err);
@@ -776,7 +812,53 @@ async fn triage_command(
     }
 }
 
-async fn triage_live(base_url: &str, model: &str, id: i32) -> Result<String, Error> {
+/// Episodic capture after a triage: a wiki problem is one `aviso:` line on
+/// stderr, never a failed command (same fail-open contract as the session
+/// trail).
+fn record_triage_episode(report: &triage::TriageReport) -> Option<String> {
+    match record_triage_episode_inner(report) {
+        Ok(Some(path)) => Some(format!(
+            "wiki: episódio do item {} registrado em {}\n",
+            report.item_id,
+            path.display()
+        )),
+        Ok(None) => None,
+        Err(cause) => Some(format!("aviso: wiki não registrou o episódio ({cause})\n")),
+    }
+}
+
+/// Builds the episode from what the command already produced and writes it to
+/// the committed wiki — a human ran `kira triage` (ADR-0013). An unattended
+/// cycle must use [`episode::EpisodeTarget::Staging`] instead (PR15).
+fn record_triage_episode_inner(report: &triage::TriageReport) -> Result<Option<PathBuf>, String> {
+    let Some(root) = store::detect_project_root() else {
+        return Ok(None);
+    };
+    let wiki = Wiki::open(&root).map_err(|err| err.to_string())?;
+    let sections = triage::sections_of(&report.output);
+    let findings_brief = scan::read_findings_file(&root)
+        .ok()
+        .flatten()
+        .filter(|findings| !findings.is_empty())
+        .map(|findings| scan::severity_brief(&findings));
+    let episode = episode::Episode {
+        item_id: report.item_id,
+        root_cause: sections[0].clone(),
+        files: sections[1].clone(),
+        confidence: sections[2].clone(),
+        findings_brief,
+    };
+    let path = episode::record(
+        &wiki,
+        &episode,
+        episode::EpisodeTarget::Committed,
+        &store::now_rfc3339_utc(),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(Some(path))
+}
+
+async fn triage_live(base_url: &str, model: &str, id: i32) -> Result<triage::TriageReport, Error> {
     let board = resolve_board(None)?;
     triage::triage_live(board.as_ref(), id, base_url, model).await
 }
