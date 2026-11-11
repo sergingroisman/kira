@@ -69,6 +69,33 @@ detalhe · `Esc` volta · `/` busca na wiki · `r` recarrega (relê disco; sem r
 | W6-PR5 | Mascote + tema + `NO_COLOR` + `--about` |
 | W6-PR6 | README: seção do dashboard com captura (arte ASCII no próprio markdown) |
 
+### Entregue no W6-PR1 (branch `w6/pr1-dashboard-shell`)
+
+- `src/tui/{mod,app,keymap,theme,state}.rs` + `src/tui/widgets/header.rs`:
+  loop draw→poll→ação (crossterm + ratatui 0.29), keymap completo (`q`,
+  `Tab`/`Shift+Tab`, `j`/`k` e `↑`/`↓`, `g`/`G`, `r`, `?`), tema com fallback
+  mono (`NO_COLOR`/`TERM=dumb`), snapshot imutável lido do disco no início e no
+  `r` (nunca por frame).
+- `kira dashboard` em `src/main.rs`: TUI **somente com stdout TTY**; sem TTY ou
+  com `--snapshot` imprime o mesmo conteúdo em texto e sai 0; NUNCA grava
+  sessão na trilha (`records: false`).
+- Cabeçalho: nome, root (`display_path`), id FNV, `dev:` (`dev_name` do
+  config), `llm: ollama (default)`, PAT mascarado via `doctor::mask_pat`,
+  idade do último `scan` pela trilha, contagem de achados de
+  `.kira/findings.json`. Ausente ⇒ `— (causa)`.
+- Store aberta em **read-only real**: nova `Store::open_readonly_at`
+  (`SQLITE_OPEN_READ_ONLY` — sem pragma WAL, sem migração).
+- Degradação < 80×24: lista única com aviso. Overlay `?` com os atalhos.
+- Testes: unit de keymap/state/theme + widget com `TestBackend`;
+  `tests/dashboard_e2e.rs` (snapshot com fixtures, **hash do `store.db`
+  antes/depois byte-idêntico** com e sem `--snapshot`, `KIRA_OLLAMA_URL` em
+  porta morta, causa "nunca rodou kira scan", store ausente ⇒ exit 0).
+- **Não copiado nada do statui** nesta PR — ver `third_party/statui/NOTICE.md`
+  (a licença MIT passa a ser redistribuída no primeiro PR que copiar trechos).
+- Ainda não entregue desta spec: painéis Achados/Sessões/Wiki, mascote,
+  `--about`, busca `/`, teste de snapshot de buffer por painel (o `TestBackend`
+  já existe no widget do cabeçalho), smoke manual do dono no Windows.
+
 ## Fora de escopo (rejeitado por ora)
 
 Mouse · edição de qualquer dado · gráfico temporal além de contagem · múltiplos

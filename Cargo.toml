@@ -46,6 +46,16 @@ regex = "1.13.1"
 # transitive dependency of the Azure SDK, so the tree does not grow — declared
 # so the grep layer cannot change behaviour silently on an upstream bump.
 walkdir = "2"
+# Direct dependency: the read-only TUI shell of `kira dashboard` (src/tui/,
+# ADR-0014). Ratatui is the de-facto terminal UI in Rust: pure Rust over
+# crossterm, no system libs — CI-safe on the 3 SOs. Feature `crossterm` is
+# what the shell draws on; no statui dependency of any kind enters.
+ratatui = { version = "0.29", features = ["crossterm"] }
+# Direct dependency: event polling and raw-mode/screen control of the
+# dashboard loop (src/tui/app.rs). Pinned to the same 0.28 line ratatui 0.29
+# builds on — mixing crossterm versions would make event/backend types
+# incompatible at compile time.
+crossterm = "0.28"
 
 [dev-dependencies]
 # Direct read of the store DB inside the `kira context` e2e (ADR-0021 redaction

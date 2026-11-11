@@ -93,5 +93,6 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - **Medição antes de autonomia (previsto — W2-bis, ainda não implementado):** `kira triage --eval <dir>` compara a causa raiz prevista com o rótulo do dono em `tests/fixtures/triage_gold/` e imprime o percentual. Sem ≥70% medido, `kira loop` e o modo agendado não são promovidos a "autônomo".
 - **Falha de quota não apaga dado:** provedor que responde 429 fica intocado por 5 minutos; o último resultado bom continua visível marcado como `stale` (`kira doctor` mostra a idade do último sucesso).
 - **TUI é modo do binário, não substituto:** o dashboard (Ratatui) é read-only sobre o store; o modo texto do loop/agendado continua sendo a saída canônica e erros permanecem texto copiável.
+- **Dashboard é read-only PROVADO:** `kira dashboard` não escreve em disco (store aberta em `SQLITE_OPEN_READ_ONLY`), não toca rede/LLM e NÃO grava sessão na trilha; o e2e compara o hash do `store.db` antes/depois de rodar com e sem `--snapshot` — deve ser byte-idêntico (`tests/dashboard_e2e.rs`). Dado ausente aparece como `—` com a causa, nunca inventado.
 - **Proibido copiar código de projeto GPL** (ex.: ai-jail) para este repo MIT. Conceito sim, código não.
 

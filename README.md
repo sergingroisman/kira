@@ -225,6 +225,34 @@ próximo com `Cargo.toml`/`package.json`, senão o diretório atual).
   `kira note` grava exatamente o que você digitou.
 - Apagar `store.db` limpa toda a trilha.
 
+## Dashboard — `kira dashboard` (W6-PR1, read-only)
+
+O dashboard é a mesma TUI do binário (ratatui/crossterm, ADR-0014) mostrando o
+estado vivo do projeto atual — nesta PR, o **painel de cabeçalho**: nome do
+projeto, root, id FNV, `dev:` (chave `dev_name` do `config.toml` quando
+existir), backend LLM default (`ollama`), PAT mascarado (`Aa2x****`) e idade do
+último `kira scan` pela trilha.
+
+- **Read-only provado**: o dashboard não escreve em nada — a store abre em modo
+  `SQLITE_OPEN_READ_ONLY`, não toca rede nem LLM, e NÃO grava sessão na trilha.
+  O e2e (`tests/dashboard_e2e.rs`) prova: hash do `store.db` antes/depois de
+  rodar com e sem `--snapshot` é byte-idêntico.
+- **Honestidade**: dado ausente aparece como `—` com a causa
+  (`achados: — (nunca rodou kira scan)`), nunca inventado ou estimado.
+- **Interativo só em TTY**: `kira dashboard` com stdout de terminal abre a TUI;
+  sem TTY (pipe/CI) imprime o mesmo conteúdo em texto e sai 0.
+- **`--snapshot`**: sempre a forma de texto, para o CI e para redirecionamento —
+  nunca desenha na tela.
+- **Teclas** (setas E vim; nenhuma tecla escreve): `q` sair ·
+  `Tab`/`Shift+Tab` ciclar painel · `j`/`k` ou `↑`/`↓` mover · `g`/`G` topo/fim ·
+  `r` reler o disco (sem rede, sem escrita) · `?` ajuda.
+- **Terminal pequeno**: abaixo de 80×24 o layout degrada para lista única com
+  aviso claro.
+- **Cores**: `NO_COLOR` (ou `TERM=dumb`) ⇒ paleta mono com a mesma informação.
+
+Atribuição: a casca é inspirada no statui (MIT, Mohamed Badry) — nenhum trecho
+foi copiado nesta PR; ver `third_party/statui/NOTICE.md`.
+
 ## Wiki — `.kira/wiki/`
 
 O KIRA mantém conhecimento reutilizável (não log de conversa) em markdown
