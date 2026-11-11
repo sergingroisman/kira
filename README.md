@@ -142,23 +142,26 @@ e `<root>/.kira/wiki/bugs/<slug>.md` (ADR-0013).
 
 ## Windows
 
-Spawns no Windows diferem do Unix: a std só resolve `.exe`, então:
+A ferramenta é **resolvida no PATH antes de qualquer spawn** (which-style):
 
-- **npm/pnpm** spawnam via wrapper `cmd /C chcp 65001 >nul 2>&1 & <ferramenta>` —
-  o `cmd /C` resolve `npm.cmd`/`pnpm.cmd` pelo PATHEXT, e o `chcp 65001` força
-  UTF-8 para o stderr do cmd localizado não virar mojibake.
-- **dotnet** é um `.exe` real e spawna direto.
-- **Override `KIRA_SCAN_*_BIN`**: valor `.cmd`/`.bat` no Windows roda via
-  `cmd /C`; qualquer outro (e todo valor em Linux/macOS) spawna direto.
-- Ferramenta ausente × ferramenta que falhou são erros **acionáveis
-  distintos** — "instale o X" ou `a ferramenta <tool> falhou (exit <N>)` com no
-  máximo a primeira linha do stderr (≤200 chars) como dica; nunca body cru.
-  `npm/pnpm audit` sai com exit 1 exatamente quando há vulnerabilidades — isso
-  é caso normal (o JSON é parseado).
-
-A resolução **which-style** do binário antes de qualquer spawn (PATH × PATHEXT,
-sem classificação por texto de cmd localizado) está em andamento — veja
-[Roadmap](#roadmap).
+- **Procura**: cada diretório do `PATH` × `PATHEXT` (`.COM/.EXE/.BAT/.CMD`,
+  comparação case-insensitive como no NTFS) no Windows; arquivo com bit de
+  execução no Linux/macOS. O caminho devolvido é o **nome real no disco**.
+- **Ausente ⇒ erro acionável sem spawn**: `o scan Node/TS via npm exige o npm —
+  instale em https://nodejs.org/download e rode de novo`. Nenhuma mensagem
+  localizada do sistema operacional é interpretada — funciona em qualquer
+  locale/codepage (o caso clássico era `'npm' não é reconhecido` em pt-BR virar
+  "ferramenta falhou").
+- **Presente**: `.cmd`/`.bat` spawnam via wrapper `cmd /C` (o `chcp 65001` no
+  wrapper mantém o stderr da ferramenta legível); `.exe` e binários Unix
+  spawnam direto, pelo caminho completo.
+- **Override `KIRA_SCAN_*_BIN`**: o arquivo apontado é verificado; inexistente
+  cai no mesmo "instale o X". `.cmd`/`.bat` rodam via `cmd /C`.
+- Ferramenta ausente × ferramenta que falhou são erros **distintos** — "instale
+  o X" ou `a ferramenta <tool> falhou (exit <N>)` com no máximo a primeira
+  linha do stderr (≤200 chars) como dica; nunca body cru. `npm/pnpm audit` sai
+  com exit 1 exatamente quando há vulnerabilidades — isso é caso normal (o JSON
+  é parseado).
 
 ## Scanning (determinístico)
 
