@@ -30,8 +30,15 @@ fn case_dir(slug: &str) -> PathBuf {
         .join(slug)
 }
 
+/// Reads a fixture with line endings normalized to LF.
+///
+/// The goldens are written with LF and `.gitattributes` pins them, but a Windows
+/// checkout with `core.autocrlf` can still hand back CRLF: the comparison is
+/// about prompt content, never about the platform's newline convention.
 fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|err| panic!("ler {:?}: {err}", path.display()))
+    let raw =
+        fs::read_to_string(path).unwrap_or_else(|err| panic!("ler {:?}: {err}", path.display()));
+    raw.replace("\r\n", "\n")
 }
 
 fn assert_matches_golden(path: &Path, actual: &str) {
