@@ -141,55 +141,71 @@ pub fn parse_npm_output(raw: &str) -> Result<Vec<Finding>, ScanError> {
     Ok(out)
 }
 
-/// Pure parse of `pnpm audit --json`: array of events with
-/// `code: "audit-advisory"` and the advisory's data in `data` (github security
-/// advisory registry format).
+/// Pure parse of `pnpm audit --json` (real pnpm shape, captured on
+/// 11/Nov/2026): a top-level object whose `advisories` is a map keyed by
+/// advisory id, each entry carrying `module_name`, `severity`, `title` and
+/// `findings` (installed `version` plus dependency `paths`). One Finding per
+/// advisory. Real pnpm workspace audits leave `findings[].paths` EMPTY, so the
+/// dependency path falls back to `pnpm-lock.yaml`; a path recorded by pnpm
+/// wins when present.
+///
+/// The yarn-style "array of events" shape is NOT supported: it never existed
+/// in real pnpm, so an output without the `advisories` object is a parse
+/// error — never silent zero findings (W2-fix PR-F1b).
 pub fn parse_pnpm_output(raw: &str) -> Result<Vec<Finding>, ScanError> {
     let value: Value = serde_json::from_str(raw).map_err(|source| ScanError::BadToolJson {
         tool: "pnpm audit",
         detail: source.to_string(),
     })?;
-    let empty = Vec::new();
-    let events = value.as_array().unwrap_or(&empty);
+    let Some(advisories) = value.get("advisories").and_then(Value::as_object) else {
+        return Err(ScanError::BadToolJson {
+            tool: "pnpm audit",
+            detail: "saída sem o objeto 'advisories' (não é o formato do pnpm audit)".to_string(),
+        });
+    };
     let mut out = Vec::new();
-    for event in events {
-        if event.get("code").and_then(Value::as_str) != Some("audit-advisory") {
-            continue;
-        }
-        let data = event.get("data").cloned().unwrap_or(Value::Null.clone());
-        let package = data
+    for advisory in advisories.values() {
+        let package = advisory
             .get("module_name")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let severity = data
+        let severity = advisory
             .get("severity")
             .and_then(Value::as_str)
-            .or_else(|| event.get("severity").and_then(Value::as_str))
             .unwrap_or("desconhecida");
-        let message = data
+        let message = advisory
             .get("title")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|title| !title.is_empty())
             .unwrap_or("advisory do pnpm audit");
-        let version = data
-            .get("version")
-            .and_then(Value::as_str)
-            .or_else(|| data.get("vulnerable_versions").and_then(Value::as_str))
-            .unwrap_or_default();
-        let path = data
-            .get("paths")
+        let (version, path) = advisory
+            .get("findings")
             .and_then(Value::as_array)
-            .and_then(|paths| paths.first())
-            .and_then(Value::as_str)
-            .unwrap_or("pnpm-lock.yaml");
+            .and_then(|findings| findings.first())
+            .map(|first| {
+                let version = first
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let path = first
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .and_then(|paths| paths.first())
+                    .and_then(Value::as_str)
+                    .unwrap_or("pnpm-lock.yaml")
+                    .to_string();
+                (version, path)
+            })
+            .unwrap_or_else(|| (String::new(), "pnpm-lock.yaml".to_string()));
         out.push(Finding {
             tool: "audit".to_string(),
             rule: "vulnerable".to_string(),
             package: package.to_string(),
-            version: version.to_string(),
+            version,
             severity: severity.to_string(),
-            path: path.to_string(),
+            path,
             message: message.to_string(),
             fingerprint: String::new(),
         });
@@ -216,8 +232,24 @@ mod tests {
     ));
     const PNPM: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/scan/scan_pnpm_audit.json"
+        "/tests/fixtures/scan/scan_pnpm_audit_real.json"
     ));
+
+    /// The yarn-style array-of-events shape that real pnpm NEVER emits
+    /// (W2-fix PR-F1b: it was the documented-format guess, not reality).
+    const PNPM_GHOST: &str = r#"[
+        {
+            "code": "audit-advisory",
+            "severity": "high",
+            "data": {
+                "id": 1086079,
+                "title": "Prototype Pollution",
+                "module_name": "lodash",
+                "severity": "high",
+                "paths": [". > lodash"]
+            }
+        }
+    ]"#;
 
     #[test]
     fn parses_npm_vulnerabilities_with_formal_data() {
@@ -265,25 +297,112 @@ mod tests {
         assert!(findings.is_empty(), "nenhum achado: {findings:?}");
     }
 
+    /// Real `pnpm audit --json` capture (teishoku, 11/Nov/2026, W2-fix
+    /// PR-F1b): 39 advisories whose severity counts match the report's own
+    /// `metadata`, and every `findings[].paths` EMPTY — so the
+    /// `pnpm-lock.yaml` fallback applies everywhere.
     #[test]
-    fn parses_pnpm_advisories() {
+    fn parses_real_pnpm_audit_capture() {
         let findings = finding::finalize(
-            parse_pnpm_output(PNPM).unwrap_or_else(|err| panic!("parse pnpm: {err}")),
+            parse_pnpm_output(PNPM).unwrap_or_else(|err| panic!("parse pnpm real: {err}")),
         );
-        assert_eq!(findings.len(), 2, "2 audit-advisory: {findings:?}");
-        let lodash = findings
+        assert_eq!(
+            findings.len(),
+            39,
+            "um finding por advisory: {:?}",
+            findings.len()
+        );
+        let mut counts = std::collections::BTreeMap::new();
+        for finding in &findings {
+            *counts
+                .entry(finding.severity.trim().to_lowercase())
+                .or_insert(0usize) += 1;
+        }
+        assert_eq!(
+            counts,
+            std::collections::BTreeMap::from([
+                ("low".to_string(), 8),
+                ("moderate".to_string(), 16),
+                ("high".to_string(), 13),
+                ("critical".to_string(), 2),
+            ]),
+            "severidades batem com o metadata da própria captura: {counts:?}"
+        );
+        // Two DIFFERENT advisories for the same package/version produce two
+        // findings (one per advisory, not one per package).
+        let tmp_findings: Vec<&finding::Finding> =
+            findings.iter().filter(|f| f.package == "tmp").collect();
+        assert_eq!(
+            tmp_findings.len(),
+            2,
+            "tmp tem 2 advisories: {tmp_findings:?}"
+        );
+        let write = tmp_findings
             .iter()
-            .find(|f| f.package == "lodash")
-            .unwrap_or_else(|| panic!("finding do lodash: {findings:?}"));
-        assert_eq!(lodash.tool, "audit");
-        assert_eq!(lodash.rule, "vulnerable");
-        assert_eq!(lodash.severity, "high");
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.package == "shelljs" && f.version == "<0.8.5"),
-            "versão vem do advisory: {findings:?}"
+            .find(|f| f.message.contains("temporary file"))
+            .unwrap_or_else(|| panic!("finding do advisory de escrita: {tmp_findings:?}"));
+        assert_eq!(write.tool, "audit");
+        assert_eq!(write.rule, "vulnerable");
+        assert_eq!(
+            write.version, "0.0.33",
+            "versão instalada vem de findings[0]"
         );
+        assert_eq!(write.severity, "low");
+        assert_eq!(
+            write.path, "pnpm-lock.yaml",
+            "paths vazio no pnpm real => fallback"
+        );
+        assert!(
+            tmp_findings
+                .iter()
+                .any(|f| f.severity == "high" && f.message.contains("Path Traversal")),
+            "o segundo advisory do tmp: {tmp_findings:?}"
+        );
+    }
+
+    /// A dependency path recorded by pnpm (`findings[0].paths[0]`) wins over
+    /// the fallback (synthetic in the REAL object shape — the 11/Nov capture
+    /// had every `paths` empty).
+    #[test]
+    fn pnpm_dependency_path_wins_over_the_fallback() {
+        let raw = r#"{
+            "advisories": {
+                "1086079": {
+                    "id": 1086079,
+                    "title": "Prototype Pollution",
+                    "module_name": "lodash",
+                    "severity": "high",
+                    "findings": [{ "version": "4.17.19", "paths": [". > lodash"] }]
+                }
+            }
+        }"#;
+        let findings = finding::finalize(
+            parse_pnpm_output(raw).unwrap_or_else(|err| panic!("parse pnpm paths: {err}")),
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].package, "lodash");
+        assert_eq!(findings[0].version, "4.17.19");
+        assert_eq!(findings[0].path, ". > lodash");
+    }
+
+    /// The yarn-style array-of-events shape is rejected with a parse error,
+    /// never silently degraded to zero findings.
+    #[test]
+    fn ghost_array_format_is_rejected_not_silently_empty() {
+        let error = parse_pnpm_output(PNPM_GHOST).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("pnpm audit"), "{message}");
+        assert!(message.contains("advisories"), "{message}");
+    }
+
+    /// pnpm audit without vulnerabilities: real shape with an empty
+    /// `advisories` map (the same shape the e2e shim emits).
+    #[test]
+    fn pnpm_without_vulnerabilities_is_empty() {
+        let raw = r#"{"advisories":{},"muted":[],"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":0,"critical":0},"dependencies":0}}"#;
+        let findings =
+            parse_pnpm_output(raw).unwrap_or_else(|err| panic!("parse pnpm vazio: {err}"));
+        assert!(findings.is_empty(), "nenhum achado: {findings:?}");
     }
 
     #[test]

