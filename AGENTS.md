@@ -12,6 +12,11 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Ferramenta resolvida no PATH antes do spawn (which-style, PATH × PATHEXT) — sem classificar por texto de OS/cmd localizado.
 - Wiki local em `.kira/wiki/`: markdown é a fonte de verdade, índice FTS5 é derivado e descartável; ciclo autônomo só grava em `.kira/wiki-staging/`.
 - Um item = um PR com gates (`cargo fmt --check`, `clippy -D warnings`, `test`, `build`, CI 3 SOs).
+- Persona e limites do dono estão em [`docs/kira-persona.md`](docs/kira-persona.md) — em caso de dúvida de tom, prioridade ou permissão, esse arquivo manda.
+- **Nunca sem autorização**: escrever no board, mexer em git remoto, apagar branch ou reverter branch importante, instalar pacote sem checagem de segurança, chamar LLM caro fora do configurado, apagar arquivo do usuário. **Merge é sempre humano.**
+- PT-BR na fala ao usuário (professor paciente, emoji quando couber ironia, erro admitido detalhando sem drama); código e commits em inglês; comentário em português explicando o **porquê**.
+- PR por item agrupado por onda; commit atômico com mensagem ≤100 palavras; toda decisão relevante vira ADR.
+- Módulos por **domínio** agora (`ado/`, `scan/`, `wiki/`); camadas (`domain/`, `infra/`) só quando houver código realmente compartilhado (ADR-0022).
 
 ## Stack fixa
 - Rust 2024, cargo, binário único `kira`
