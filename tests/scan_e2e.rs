@@ -382,3 +382,83 @@ fn scan_of_no_findings_is_positive_and_empty() {
         .unwrap_or_else(|err| panic!("ler nota do .kira: {err}"));
     assert!(note.contains("LOCAL"), "{note}");
 }
+
+/// Real-shaped `pnpm audit --json` without vulnerabilities (the same shape the
+/// teishoku capture has: `advisories` map + `metadata`) — parseable by both the
+/// old event-array parser and the real-format one (0 findings either way).
+const PNPM_EMPTY_REAL: &str = r#"{"advisories":{},"muted":[],"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":0,"critical":0},"dependencies":0,"devDependencies":0,"optionalDependencies":0,"totalDependencies":0}}"#;
+
+/// W2-fix PR-F1 (real bug of the teishoku monorepo): a pnpm WORKSPACE scans
+/// as ONE pnpm stack — `pnpm audit` runs once at the root and `npm audit`
+/// NEVER runs on the members. The failing npm shim makes any npm invocation
+/// fail the whole run, so exit 0 is the proof it was never invoked.
+#[test]
+fn pnpm_workspace_scans_once_at_the_root_and_never_runs_npm() {
+    let sandbox = Sandbox::new("pnpm-workspace");
+    std::fs::write(sandbox.cwd.join("package.json"), "{ \"name\": \"root\" }")
+        .unwrap_or_else(|err| panic!("escrever package.json: {err}"));
+    std::fs::write(
+        sandbox.cwd.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap_or_else(|err| panic!("escrever pnpm-lock: {err}"));
+    std::fs::write(
+        sandbox.cwd.join("pnpm-workspace.yaml"),
+        "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+    )
+    .unwrap_or_else(|err| panic!("escrever pnpm-workspace: {err}"));
+    for member in ["apps/api", "packages/shared"] {
+        let dir = sandbox.cwd.join(member);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {member}: {err}"));
+        std::fs::write(dir.join("package.json"), "{ \"name\": \"member\" }")
+            .unwrap_or_else(|err| panic!("escrever package.json do membro: {err}"));
+    }
+    let pnpm_shim = sandbox.install_fake_tool("pnpm", PNPM_EMPTY_REAL, "pnpm_output.json");
+    let npm_shim = sandbox.install_failing_tool("npm", "npm NÃO podia ser invocado aqui");
+    let pnpm_bin = bin_env("pnpm");
+    let npm_bin = bin_env("npm");
+    let envs: [(&str, &Path); 2] = [
+        (pnpm_bin.as_str(), &pnpm_shim),
+        (npm_bin.as_str(), &npm_shim),
+    ];
+
+    let (code, out, err) = run_kira(&sandbox, None, &envs, &["scan"]);
+    assert_eq!(code, 0, "o scan do workspace não pode falhar: {out}{err}");
+    assert!(
+        out.contains("stacks: pnpm |"),
+        "UMA stack pnpm no resumo (não 'pnpm, npm, npm'): {out}"
+    );
+    assert!(
+        !out.contains("pnpm, npm"),
+        "membros não são stacks npm: {out}"
+    );
+    assert!(
+        out.contains("members: apps/api, packages/shared"),
+        "membros dobrados na raiz, ordenados: {out}"
+    );
+    assert!(out.contains("achados: 0"), "{out}");
+
+    let findings_path = sandbox.cwd.join(".kira").join("findings.json");
+    let first =
+        std::fs::read_to_string(&findings_path).unwrap_or_else(|err| panic!("ler findings: {err}"));
+    let document: serde_json::Value =
+        serde_json::from_str(&first).unwrap_or_else(|err| panic!("parse findings.json: {err}"));
+    assert_eq!(
+        document.pointer("/stacks/0/kind").and_then(|k| k.as_str()),
+        Some("pnpm"),
+        "{document}"
+    );
+    let members: Vec<&str> = document
+        .pointer("/stacks/0/members")
+        .and_then(|m| m.as_array())
+        .map(|items| items.iter().filter_map(|item| item.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(members, ["apps/api", "packages/shared"], "{document}");
+
+    // Duas execuções no mesmo estado são byte-idênticas (gate do M1).
+    let (code, _, _) = run_kira(&sandbox, None, &envs, &["scan"]);
+    assert_eq!(code, 0);
+    let second = std::fs::read_to_string(&findings_path)
+        .unwrap_or_else(|err| panic!("ler findings de novo: {err}"));
+    assert_eq!(first, second, "gate de determinismo do M1");
+}

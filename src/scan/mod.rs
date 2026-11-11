@@ -107,6 +107,13 @@ pub struct Stack {
     pub dir: String,
     /// Marker files (project manifests/locks) that detected this stack.
     pub markers: Vec<String>,
+    /// Workspace members folded into this stack (pnpm/npm workspaces): a
+    /// `package.json` without its own lockfile under a workspace root is NOT
+    /// a stack — the root's single `audit` run already covers it. Dirs are
+    /// relative to the scan root and sorted; omitted from the JSON when empty
+    /// so non-workspace `findings.json` files stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
 }
 
 impl Stack {
@@ -355,9 +362,17 @@ fn resolve_root(path_flag: Option<&Path>) -> Result<PathBuf, ScanError> {
 /// Stack detection: the folder itself and up to 2 levels of subdirectories;
 /// .NET on any `*.csproj`/`*.sln`/`global.json`; Node/TS on `package.json`
 /// (pnpm when `pnpm-lock.yaml`, npm otherwise — including `package-lock.json`).
+///
+/// Workspace rule (W2-fix PR-F1): a `package.json` WITHOUT a lockfile of its
+/// own whose ancestor (inside the scan) is a workspace root — `pnpm-lock.yaml`,
+/// `pnpm-workspace.yaml` or a root `package.json` with a `workspaces` field —
+/// is a MEMBER of that workspace, never an npm project: no `audit` runs on it,
+/// because the root's single `pnpm|npm audit` already covers the workspace.
 pub fn detect_stacks(root: &Path) -> Result<Vec<Stack>, ScanError> {
-    let mut stacks = Vec::new();
-    for scope in scopes_up_to_two_levels(root)? {
+    let scopes = scopes_up_to_two_levels(root)?;
+    // File names of every scope, listed once: dotnet and node share it.
+    let mut per_scope: Vec<(String, Vec<String>)> = Vec::with_capacity(scopes.len());
+    for scope in &scopes {
         let relative = scope.strip_prefix(root).map_or_else(
             |_| posix_slashes(&scope.to_string_lossy()),
             |rest| {
@@ -368,14 +383,15 @@ pub fn detect_stacks(root: &Path) -> Result<Vec<Stack>, ScanError> {
                 }
             },
         );
-        let file_names = list_files(&scope)?;
-        if let Some(stack) = dotnet_stack(&relative, &file_names) {
-            stacks.push(stack);
-        }
-        if let Some(stack) = node_stack(&relative, &file_names) {
+        per_scope.push((relative, list_files(scope)?));
+    }
+    let mut stacks = Vec::new();
+    for (relative, file_names) in &per_scope {
+        if let Some(stack) = dotnet_stack(relative, file_names) {
             stacks.push(stack);
         }
     }
+    stacks.extend(node_stacks(&scopes, &per_scope));
     if stacks.is_empty() {
         return Err(ScanError::NothingDetected {
             path: display_path(root),
@@ -470,46 +486,135 @@ fn dotnet_stack(relative: &str, file_names: &[String]) -> Option<Stack> {
         kind: StackKind::Dotnet,
         dir: relative.to_string(),
         markers,
+        members: Vec::new(),
     })
 }
 
-/// Node/TS stack of a scope: `package.json` (pnpm with its lock, npm otherwise).
-fn node_stack(relative: &str, file_names: &[String]) -> Option<Stack> {
-    if !file_names.iter().any(|name| name == "package.json") {
-        return None;
-    }
-    if file_names.iter().any(|name| name == "pnpm-lock.yaml") {
-        return Some(Stack {
-            kind: StackKind::Pnpm,
+/// Node/TS stacks of every scope, folding workspace members into their root.
+///
+/// A scope with `package.json` is:
+///
+/// - a workspace ROOT — and its own stack — when it also has `pnpm-lock.yaml`,
+///   `pnpm-workspace.yaml` or a `workspaces` field in `package.json`; pnpm wins
+///   the kind when either pnpm marker is present, npm otherwise;
+/// - a MEMBER of the nearest ancestor workspace root when it has NO lockfile
+///   of its own — it folds into the root's `members` and never spawns a stack
+///   or an `audit` call (the root's single run covers the workspace);
+/// - a standalone npm project otherwise (the `audit` uses what exists).
+fn node_stacks(scopes: &[PathBuf], per_scope: &[(String, Vec<String>)]) -> Vec<Stack> {
+    let is_workspace_root: Vec<bool> = scopes
+        .iter()
+        .zip(per_scope)
+        .map(|(scope, (_, files))| {
+            files.iter().any(|name| name == "package.json")
+                && (files
+                    .iter()
+                    .any(|name| name == "pnpm-lock.yaml" || name == "pnpm-workspace.yaml")
+                    || package_json_has_workspaces(scope))
+        })
+        .collect();
+
+    let mut stacks: Vec<Stack> = Vec::new();
+    let mut members: Vec<Vec<String>> = vec![Vec::new(); scopes.len()];
+    for (index, (relative, files)) in per_scope.iter().enumerate() {
+        if !files.iter().any(|name| name == "package.json") {
+            continue;
+        }
+        let has_pnpm_lock = files.iter().any(|name| name == "pnpm-lock.yaml");
+        let has_npm_lock = files.iter().any(|name| name == "package-lock.json");
+        if !has_pnpm_lock && !has_npm_lock && !is_workspace_root[index] {
+            // Sem lock próprio: membro do workspace do ancestor, se houver um.
+            if let Some(root_index) = nearest_workspace_root(scopes, &is_workspace_root, index) {
+                members[root_index].push(relative.clone());
+                continue;
+            }
+        }
+        let kind = if has_pnpm_lock
+            || (files.iter().any(|name| name == "pnpm-workspace.yaml") && !has_npm_lock)
+        {
+            StackKind::Pnpm
+        } else {
+            StackKind::Npm
+        };
+        stacks.push(Stack {
+            kind,
             dir: relative.to_string(),
-            markers: vec!["package.json".to_string(), "pnpm-lock.yaml".to_string()],
+            markers: files
+                .iter()
+                .filter(|name| {
+                    matches!(
+                        name.as_str(),
+                        "package.json"
+                            | "package-lock.json"
+                            | "pnpm-lock.yaml"
+                            | "pnpm-workspace.yaml"
+                    )
+                })
+                .cloned()
+                .collect(),
+            members: Vec::new(),
         });
     }
-    // npm: lock canonicamente se chama `package-lock.json`; `package.json`
-    // sem nenhum lock também roda com o npm (o `audit` usa o que existir).
-    Some(Stack {
-        kind: StackKind::Npm,
-        dir: relative.to_string(),
-        markers: file_names
-            .iter()
-            .filter(|name| name.as_str() == "package.json" || name.as_str() == "package-lock.json")
-            .cloned()
-            .collect(),
-    })
+    // Attach the folded members to their roots, sorted (deterministic).
+    for stack in &mut stacks {
+        let Some(index) = per_scope.iter().position(|(dir, _)| dir == &stack.dir) else {
+            continue;
+        };
+        members[index].sort();
+        stack.members = std::mem::take(&mut members[index]);
+    }
+    stacks
 }
 
-/// One line per stack `kind (dir) — markers`.
+/// Nearest ancestor of `scopes[index]` that is a workspace root (never the
+/// scope itself); `None` outside workspaces.
+fn nearest_workspace_root(
+    scopes: &[PathBuf],
+    is_workspace_root: &[bool],
+    index: usize,
+) -> Option<usize> {
+    let mut ancestor = scopes[index].parent();
+    while let Some(dir) = ancestor {
+        if let Some(candidate) = scopes.iter().position(|scope| scope == dir)
+            && is_workspace_root[candidate]
+        {
+            return Some(candidate);
+        }
+        ancestor = dir.parent();
+    }
+    None
+}
+
+/// Does this scope's `package.json` declare a `workspaces` field (monorepo
+/// root marker)? An unreadable or invalid manifest answers "no" — detection
+/// must never fail on a file the other markers can still classify.
+fn package_json_has_workspaces(scope: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(scope.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    value.get("workspaces").is_some()
+}
+
+/// One line per stack `kind (dir) — markers`, plus ` — members: a, b` when the
+/// stack folds workspace members.
 fn stack_lines(root: &Path, stacks: &[Stack]) -> String {
     stacks
         .iter()
         .map(|stack| {
             let scope = stack.scope_of(root);
-            format!(
+            let mut line = format!(
                 "{} ({}) — {}",
                 stack.kind.label(),
                 display_path(&scope),
                 stack.markers.join(", ")
-            )
+            );
+            if !stack.members.is_empty() {
+                line.push_str(&format!(" — members: {}", stack.members.join(", ")));
+            }
+            line
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -732,6 +837,170 @@ mod tests {
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].kind, StackKind::Npm);
         assert_eq!(stacks[0].markers, vec!["package.json".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W2-fix PR-F1, reproduzido do teishoku real (11/Nov/2026): raiz pnpm
+    /// (`package.json` + `pnpm-lock.yaml` + `pnpm-workspace.yaml`) e membros
+    /// `apps/api` e `packages/shared` com `package.json` sem lock. Antes:
+    /// "pnpm, npm, npm" e `npm audit` nos membros. Depois: UMA stack pnpm com
+    /// 2 members — o `pnpm audit` da raiz cobre o workspace.
+    #[test]
+    fn pnpm_workspace_members_fold_into_the_root_stack() {
+        let dir = temp_dir("pnpm-ws");
+        let api = dir.join("apps").join("api");
+        let shared = dir.join("packages").join("shared");
+        std::fs::create_dir_all(&api).unwrap_or_else(|err| panic!("criar api: {err}"));
+        std::fs::create_dir_all(&shared).unwrap_or_else(|err| panic!("criar shared: {err}"));
+        touch(&dir, "package.json");
+        touch(&dir, "pnpm-lock.yaml");
+        touch(&dir, "pnpm-workspace.yaml");
+        touch(&api, "package.json");
+        touch(&shared, "package.json");
+        let stacks = detect_stacks(&dir).unwrap_or_else(|err| panic!("detectar: {err}"));
+        assert_eq!(stacks.len(), 1, "só a raiz é stack: {stacks:?}");
+        assert_eq!(stacks[0].kind, StackKind::Pnpm);
+        assert_eq!(stacks[0].dir, ".");
+        assert_eq!(
+            stacks[0].markers,
+            vec![
+                "package.json".to_string(),
+                "pnpm-lock.yaml".to_string(),
+                "pnpm-workspace.yaml".to_string()
+            ]
+        );
+        assert_eq!(
+            stacks[0].members,
+            vec!["apps/api".to_string(), "packages/shared".to_string()],
+            "membros dobrados na raiz, ordenados"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cada uma das três pistas de workspace basta sozinha: `pnpm-lock.yaml`
+    /// no ancestor (o caso do teishoku), `workspaces` no package.json raiz
+    /// ou `pnpm-workspace.yaml` presente.
+    #[test]
+    fn every_workspace_hint_alone_is_enough_to_fold_members() {
+        for (tag, root_files, kind) in [
+            (
+                "lock",
+                vec!["package.json", "pnpm-lock.yaml"],
+                StackKind::Pnpm,
+            ),
+            (
+                "yaml",
+                vec!["package.json", "pnpm-workspace.yaml"],
+                StackKind::Pnpm,
+            ),
+            ("field", vec!["package.json"], StackKind::Npm),
+        ] {
+            let dir = temp_dir(&format!("hint-{tag}"));
+            let member = dir.join("packages").join("shared");
+            std::fs::create_dir_all(&member).unwrap_or_else(|err| panic!("criar: {err}"));
+            for name in root_files {
+                touch(&dir, name);
+            }
+            if tag == "field" {
+                std::fs::write(
+                    dir.join("package.json"),
+                    r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+                )
+                .unwrap_or_else(|err| panic!("escrever workspaces: {err}"));
+            }
+            touch(&member, "package.json");
+            let stacks = detect_stacks(&dir).unwrap_or_else(|err| panic!("detectar: {err}"));
+            assert_eq!(stacks.len(), 1, "{tag}: só a raiz: {stacks:?}");
+            assert_eq!(stacks[0].kind, kind, "{tag}: kind da raiz");
+            assert_eq!(
+                stacks[0].members,
+                vec!["packages/shared".to_string()],
+                "{tag}: membro dobrado"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Monorepo npm (`workspaces` + `package-lock.json` na raiz): a raiz é npm
+    /// válido, os membros dobram nela e nenhum `npm audit` roda nos membros.
+    #[test]
+    fn npm_workspace_stays_npm_and_folds_members() {
+        let dir = temp_dir("npm-ws");
+        let member = dir.join("packages").join("shared");
+        std::fs::create_dir_all(&member).unwrap_or_else(|err| panic!("criar: {err}"));
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+        )
+        .unwrap_or_else(|err| panic!("escrever package.json: {err}"));
+        touch(&dir, "package-lock.json");
+        touch(&member, "package.json");
+        let stacks = detect_stacks(&dir).unwrap_or_else(|err| panic!("detectar: {err}"));
+        assert_eq!(stacks.len(), 1, "{stacks:?}");
+        assert_eq!(stacks[0].kind, StackKind::Npm, "npm válido");
+        assert_eq!(
+            stacks[0].markers,
+            vec!["package-lock.json".to_string(), "package.json".to_string()],
+            "markers na ordem byte-wise do list_files"
+        );
+        assert_eq!(stacks[0].members, vec!["packages/shared".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O membro com lockfile PRÓPRIO é um projeto independente (não dobra).
+    #[test]
+    fn member_with_its_own_lockfile_stays_its_own_stack() {
+        let dir = temp_dir("own-lock");
+        let api = dir.join("apps").join("api");
+        std::fs::create_dir_all(&api).unwrap_or_else(|err| panic!("criar: {err}"));
+        touch(&dir, "package.json");
+        touch(&dir, "pnpm-lock.yaml");
+        touch(&api, "package.json");
+        touch(&api, "package-lock.json");
+        let stacks = detect_stacks(&dir).unwrap_or_else(|err| panic!("detectar: {err}"));
+        assert_eq!(
+            stacks.len(),
+            2,
+            "raiz pnpm + membro independente: {stacks:?}"
+        );
+        assert_eq!(stacks[0].kind, StackKind::Pnpm);
+        assert!(stacks[0].members.is_empty(), "{stacks:?}");
+        assert_eq!(stacks[1].kind, StackKind::Npm);
+        assert_eq!(stacks[1].dir, "apps/api");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fora de workspace, `package.json` sem lock continua npm (standalone).
+    #[test]
+    fn package_json_without_lock_outside_a_workspace_is_still_npm() {
+        let dir = temp_dir("standalone");
+        let nested = dir.join("tools").join("script");
+        std::fs::create_dir_all(&nested).unwrap_or_else(|err| panic!("criar: {err}"));
+        touch(&dir, "App.csproj");
+        touch(&nested, "package.json");
+        let stacks = detect_stacks(&dir).unwrap_or_else(|err| panic!("detectar: {err}"));
+        assert_eq!(stacks.len(), 2, "{stacks:?}");
+        assert_eq!(stacks[1].kind, StackKind::Npm);
+        assert_eq!(stacks[1].dir, "tools/script");
+        assert!(stacks[1].members.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `package.json` inválido na raiz não derruba a detecção: a pista
+    /// `workspaces` falha aberta e os outros markers ainda classificam.
+    #[test]
+    fn invalid_root_package_json_fails_open_on_the_workspaces_hint() {
+        let dir = temp_dir("invalid-pkg");
+        let member = dir.join("packages").join("shared");
+        std::fs::create_dir_all(&member).unwrap_or_else(|err| panic!("criar: {err}"));
+        std::fs::write(dir.join("package.json"), "não é json")
+            .unwrap_or_else(|err| panic!("escrever: {err}"));
+        touch(&dir, "pnpm-lock.yaml");
+        touch(&member, "package.json");
+        let stacks = detect_stacks(&dir).unwrap_or_else(|err| panic!("detectar: {err}"));
+        assert_eq!(stacks.len(), 1, "{stacks:?}");
+        assert_eq!(stacks[0].kind, StackKind::Pnpm);
+        assert_eq!(stacks[0].members, vec!["packages/shared".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
