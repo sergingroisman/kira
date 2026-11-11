@@ -66,7 +66,7 @@
 - [x] **PR28** `kira wiki` em **`docs/wiki/` (commitada)**: páginas
       contexto/decisoes/padroes/glossario/bugs, escrita via `redact` + `guard/path`;
       ciclo autônomo só grava em `.kira/wiki-staging/`.
-- [ ] **PR29** índice FTS5 (`wiki_page`, `wiki_fts`) + `kira wiki reindex` (derivado,
+- [x] **PR29** índice FTS5 (`wiki_page`, `wiki_fts`) + `kira wiki reindex` (derivado,
       descartável; sem FTS5 cai para substring).
 - [ ] **PR30** captura episódica pós-`triage` + decay 30 dias + `kira wiki forget`.
 - [ ] **PR31** retrieval da wiki → context packer (top-k com caminho e idade).
