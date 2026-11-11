@@ -22,7 +22,7 @@
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -119,18 +119,54 @@ fn timeout_from_env() -> u64 {
 
 /// Windows only: `.cmd`/`.bat` need the shell wrapper (same contract as the
 /// scan tools), everything else spawns directly.
+///
+/// `cmd /C` takes **one** command line, not an argv: passing `chcp ... &` as a
+/// separate argument made `cmd` re-join the tokens with spaces, so the `&`
+/// became a command separator and any prompt containing quotes or line breaks
+/// blew up with "The filename, directory name, or volume label syntax is
+/// incorrect" (caught by the Windows CI job). The line is therefore built once,
+/// every token quoted, embedded quotes doubled, and line breaks flattened —
+/// `cmd.exe` treats a newline inside a quoted argument as the end of the
+/// command. Consequence worth documenting: through the `cmd` shim the prompt
+/// loses its line breaks; the direct spawn (Ollama/Foundry, and non-`.cmd`
+/// binaries) keeps them intact.
 fn build_command(bin: &PathBuf, args: &[OsString]) -> Command {
     if binresolve::is_cmd_script(&bin.to_string_lossy()) {
         let mut command = Command::new("cmd");
-        command.args(["/C", "chcp 65001 >nul 2>&1 &"]);
-        command.arg(bin);
-        command.args(args);
+        command.args(["/C", &cmd_command_line(bin.as_path(), args)]);
         command
     } else {
         let mut command = Command::new(bin);
         command.args(args);
         command
     }
+}
+
+/// Builds the single command line handed to `cmd /C`.
+fn cmd_command_line(bin: &Path, args: &[OsString]) -> String {
+    let mut line = String::from("chcp 65001 >nul 2>&1 & ");
+    line.push_str(&cmd_quote(&bin.to_string_lossy()));
+    for arg in args {
+        line.push(' ');
+        line.push_str(&cmd_quote(&arg.to_string_lossy()));
+    }
+    line
+}
+
+/// Quotes one token for `cmd.exe`: wrapped in double quotes, embedded quotes
+/// doubled, CR/LF flattened to spaces (see [`build_command`]).
+fn cmd_quote(raw: &str) -> String {
+    let mut quoted = String::with_capacity(raw.len() + 2);
+    quoted.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '"' => quoted.push_str("\"\""),
+            '\r' | '\n' => quoted.push(' '),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Reads a child stream fully as bytes (never fails the caller on invalid
@@ -590,5 +626,44 @@ mod tests {
             started.elapsed()
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `cmd /C` recebe UMA linha: o `chcp` e o programa não podem ser
+    /// argumentos separados (o `&` viraria separador e o prompt com aspas
+    /// quebraria — falha real do job windows-latest).
+    #[test]
+    fn cmd_line_is_single_quoted_command_with_flattened_newlines() {
+        let bin = PathBuf::from(r"C:\Program Files\copilot\copilot.cmd");
+        let args = vec![
+            OsString::from("-p"),
+            OsString::from("linha 1\nlinha \"2\"\r\nfim"),
+            OsString::from("-s"),
+        ];
+        let line = cmd_command_line(&bin, &args);
+        assert!(line.starts_with("chcp 65001 >nul 2>&1 & "), "{line}");
+        assert!(
+            line.contains(r#""C:\Program Files\copilot\copilot.cmd""#),
+            "{line}"
+        );
+        assert!(
+            !line.contains('\n') && !line.contains('\r'),
+            "sem CR/LF: {line}"
+        );
+        assert!(
+            line.contains("linha 1 linha "),
+            "quebras viram espaço: {line}"
+        );
+        assert!(line.contains("\"\"2\"\""), "aspas dobradas: {line}");
+        assert!(
+            line.ends_with(r#"" -s""#) || line.ends_with("\"-s\""),
+            "{line}"
+        );
+    }
+
+    /// Token sem aspas especiais continua íntegro ao passar pelo quoting.
+    #[test]
+    fn cmd_quote_wraps_plain_tokens() {
+        assert_eq!(cmd_quote("gpt-5"), "\"gpt-5\"");
+        assert_eq!(cmd_quote("a b"), "\"a b\"");
     }
 }
