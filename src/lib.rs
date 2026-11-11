@@ -6,6 +6,8 @@
 
 pub mod ado;
 pub mod board;
+pub mod config;
+pub mod context;
 pub mod credentials;
 pub mod doctor;
 pub mod error;
