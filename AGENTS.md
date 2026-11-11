@@ -40,7 +40,8 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Todo acesso a work item passa pela trait `BoardProvider` (`src/board/`): `work_item(id)` e `project_names()`. A fábrica é `board::for_board(<nome>, ...)`; nome vem de `KIRA_BOARD` (default `azure`), board desconhecido => erro acionável.
 - O Azure DevOps é o MVP: `azure::AdoBoard` apenas delega para `src/ado` — nada de lógica de API fora de `src/ado/`. Jira/Trello virarão novos módulos em `src/board/`.
 ## IA
-- Backend LLM plugável via trait `LlmBackend` (`src/llm/`), previsto para copilot-sdk | byok-http | ollama. Nesta fase só existe `OllamaBackend`, sempre localhost (default `http://localhost:11434`).
+- Backend LLM plugável via trait `LlmBackend` (`src/llm/`), previsto para copilot-sdk | byok-http | ollama. Existem `OllamaBackend` (default, sempre localhost `http://localhost:11434`) e `CopilotBackend` (spawn do CLI `copilot -p`, ADR-0019).
+- **O backend caro nunca é implícito**: só roda sob flag explícita (`--llm copilot`) ou env (`KIRA_LLM=copilot`); default permanece Ollama. Erro de auth do Copilot é acionável (login, Grant na org, TI) e **nunca vira fallback silencioso** para o Ollama — o usuário pediu o backend caro, a ausência falha.
 - Prompts são versados no repo, em `src/llm/prompts.rs` (constantes públicas, revisadas em PR) — sem framework de orquestração.
 - Nunca enviar segredos ao LLM: PAT, env e credenciais não entram no prompt. Além dos campos do work item, o prompt leva só o **context packer** (abaixo), já redigido por `redact`.
 - `kira triage` é somente leitura: o prompt do sistema nunca pede para escrever/editar código e o comando nunca altera o Azure DevOps.

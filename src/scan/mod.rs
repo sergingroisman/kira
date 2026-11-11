@@ -24,6 +24,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::binresolve::{find_on_path, is_cmd_script};
 use crate::store::{self, display_path};
 
 /// Errors of `kira scan`: compact and actionable (no raw body of tool output).
@@ -238,68 +239,6 @@ fn resolve_tool_explicit(
     }
 }
 
-/// `which`-style search on the given PATH value (`None`/empty => not found).
-#[cfg(windows)]
-fn find_on_path(path_env: Option<&std::ffi::OsStr>, program: &str) -> Option<PathBuf> {
-    let path_env = path_env?;
-    let path_ext = std::env::var_os("PATHEXT")
-        .map(|value| value.to_string_lossy().into_owned())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
-    for dir in std::env::split_paths(path_env) {
-        for ext in path_ext.split(';') {
-            let probe = format!("{program}{ext}");
-            if dir.join(&probe).is_file() {
-                // NTFS matches case-insensitively (`npm.COM` finds `npm.cmd`):
-                // return the REAL on-disk name, never the probe, so messages
-                // and paths show what actually exists.
-                return Some(real_entry_name(&dir, &probe).unwrap_or_else(|| dir.join(&probe)));
-            }
-        }
-    }
-    None
-}
-
-/// On-disk entry in `dir` whose name matches `probe` case-insensitively.
-#[cfg(windows)]
-fn real_entry_name(dir: &Path, probe: &str) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.eq_ignore_ascii_case(probe) {
-            Some(entry.path())
-        } else {
-            None
-        }
-    })
-}
-
-/// Unix variant: `<tool>` must exist as a file with any execute bit.
-#[cfg(unix)]
-fn find_on_path(path_env: Option<&std::ffi::OsStr>, program: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let path_env = path_env?;
-    for dir in std::env::split_paths(path_env) {
-        let candidate = dir.join(program);
-        if let Ok(metadata) = std::fs::metadata(&candidate)
-            && metadata.is_file()
-            && metadata.permissions().mode() & 0o111 != 0
-        {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// Other platforms (not built here): plain existence, like the Windows one.
-#[cfg(not(any(windows, unix)))]
-fn find_on_path(path_env: Option<&std::ffi::OsStr>, program: &str) -> Option<PathBuf> {
-    let path_env = path_env?;
-    std::env::split_paths(path_env)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-}
-
 /// Builds the command that runs the tool of `kind` (callers add their own
 /// args and `current_dir`, never touching the program): resolution happens
 /// FIRST and the spawn always uses the RESOLVED full path.
@@ -323,15 +262,6 @@ fn command_from_resolved(resolved: &Resolved) -> Command {
     }
 }
 
-/// True when the path points to a `.cmd`/`.bat` script (std would try to exec
-/// it as a binary instead of handing it to the shell).
-fn is_cmd_script(bin: &str) -> bool {
-    match Path::new(bin).extension() {
-        Some(ext) => ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"),
-        None => false,
-    }
-}
-
 /// Maps a failed spawn to the actionable error: never-confuse "could not run
 /// the tool" with "tool is missing" — only a real NotFound (tool/nonexistent
 /// binary) is "instale o X"; anything else stays a compact runtime message
@@ -350,18 +280,11 @@ pub(crate) fn spawn_error(kind: ToolKind, source: std::io::Error) -> ScanError {
 /// line of the tool stderr, trimmed, control chars removed, capped at 200
 /// chars. Empty stderr => empty string (no hint at all). Never the raw body.
 pub(crate) fn stderr_hint(stderr: &str) -> String {
-    let Some(line) = stderr.lines().map(str::trim).find(|line| !line.is_empty()) else {
-        return String::new();
-    };
-    let hint: String = line
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(200)
-        .collect();
-    if hint.trim().is_empty() {
+    let hint = crate::binresolve::first_stderr_line(stderr);
+    if hint.is_empty() {
         String::new()
     } else {
-        format!(" (dica: {})", hint.trim_end())
+        format!(" (dica: {hint})")
     }
 }
 

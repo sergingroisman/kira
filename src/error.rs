@@ -127,6 +127,47 @@ pub enum Error {
     )]
     LlmFormat,
 
+    /// The Copilot CLI (`copilot`) was not found: neither the
+    /// `KIRA_COPILOT_BIN` override pointed at an existing file nor was a
+    /// `copilot` executable on the PATH.
+    #[error(
+        "backend Copilot indisponível — instale o Copilot CLI (https://github.com/github/copilot-cli) e rode `copilot auth login` para autenticar, defina KIRA_COPILOT_BIN para um caminho específico, ou use o default local com `--llm ollama`"
+    )]
+    CopilotMissing,
+
+    /// The Copilot CLI rejected the call for an auth reason (SAML/SSO, 401,
+    /// 403, login required). The stderr itself is never echoed — the message
+    /// lists the four steps in order instead.
+    #[error(
+        "o Copilot CLI negou o acesso (auth/SAML/SSO) — faça, nesta ordem: \
+(1) rode `copilot auth login`; \
+(2) autorize o app do Copilot para a organização em https://github.com/settings/connections/applications (botão 'Grant'/'Authorize' na org Avanade); \
+(3) se o admin bloquear apps OAuth, peça a aprovação à TI; \
+(4) enquanto isso use `--llm ollama` (o default local)"
+    )]
+    CopilotAuth,
+
+    /// The Copilot CLI exited non-zero for a non-auth reason. `hint` is the
+    /// first non-empty stderr line, capped at 200 chars — the raw body (and
+    /// the prompt) are never echoed.
+    #[error(
+        "o Copilot CLI falhou: {hint} — teste o CLI fora do KIRA com `copilot -p teste` e, se persistir, use `--llm ollama`"
+    )]
+    CopilotFailed { hint: String },
+
+    /// The Copilot CLI did not finish within the `KIRA_COPILOT_TIMEOUT`
+    /// budget (default 180s) and was killed.
+    #[error(
+        "o Copilot CLI excedeu {secs}s — aumente o limite com KIRA_COPILOT_TIMEOUT=<segundos> ou use `--llm ollama`"
+    )]
+    CopilotTimeout { secs: u64 },
+
+    /// `--llm`/`KIRA_LLM` carried a value that is not a known backend.
+    #[error(
+        "backend LLM '{name}' desconhecido — use `ollama` (o default, local e gratuito) ou `copilot` (caro, exige o CLI autenticado)"
+    )]
+    UnknownLlm { name: String },
+
     /// A local work-item file could not be read (`kira triage --file`).
     #[error("não foi possível ler o arquivo '{path}' — confira o caminho e tente de novo")]
     Io {
@@ -262,9 +303,9 @@ mod tests {
     /// never breaks the test — but a variant that only says "failed" does.
     #[test]
     fn every_variant_is_actionable() {
-        const CUES: [&str; 14] = [
+        const CUES: [&str; 15] = [
             "defina", "rode", "informe", "use ", "corrija", "remova", "instale", "gere", "confira",
-            "crie", "escolha", "atualize", "execute", "recusado",
+            "crie", "escolha", "atualize", "execute", "recusado", "aumente",
         ];
 
         let cases: Vec<(&str, Error)> = vec![
@@ -339,6 +380,21 @@ mod tests {
                 Error::LlmRequest("conexão recusada".to_string()),
             ),
             ("LlmFormat", Error::LlmFormat),
+            ("CopilotMissing", Error::CopilotMissing),
+            ("CopilotAuth", Error::CopilotAuth),
+            (
+                "CopilotFailed",
+                Error::CopilotFailed {
+                    hint: "segfault do CLI".to_string(),
+                },
+            ),
+            ("CopilotTimeout", Error::CopilotTimeout { secs: 180 }),
+            (
+                "UnknownLlm",
+                Error::UnknownLlm {
+                    name: "gpt".to_string(),
+                },
+            ),
             (
                 "Io",
                 Error::Io {

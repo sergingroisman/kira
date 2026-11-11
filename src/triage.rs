@@ -11,6 +11,8 @@ use crate::error::Error;
 use crate::format::DESCRIPTION_MAX_CHARS;
 use crate::html::html_to_text;
 use crate::llm::LlmBackend;
+use crate::llm::LlmKind;
+use crate::llm::copilot::CopilotBackend;
 use crate::llm::ollama::OllamaBackend;
 // Single source for the prompt contract: the system text, the section headers
 // and the user preamble all live in `llm::prompts` (versioned, golden-tested).
@@ -221,28 +223,60 @@ pub fn sections_of(formatted: &str) -> [String; 3] {
 
 /// Runs triage for a work item read from a local JSON file — the offline path
 /// that needs no PAT and no Azure DevOps access.
+///
+/// Kept with the Ollama default for existing callers; the backend is chosen
+/// with [`triage_file_llm`] (ADR-0019: the costly backend is never implicit).
 pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<TriageReport, Error> {
+    triage_file_llm(LlmKind::Ollama, base_url, model, path).await
+}
+
+/// Same as [`triage_file`] with an explicit backend choice.
+pub async fn triage_file_llm(
+    kind: LlmKind,
+    base_url: &str,
+    model: &str,
+    path: &Path,
+) -> Result<TriageReport, Error> {
     let body = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,
     })?;
     let item = WorkItem::from_api_json(&body)?;
-    triage_item(base_url, model, &item, Some(path)).await
+    triage_item(kind, base_url, model, &item, Some(path)).await
 }
 
 /// Runs triage for a work item fetched live through the board provider
-/// (read-only).
+/// (read-only), on the default Ollama backend.
 pub async fn triage_live(
     board: &dyn BoardProvider,
     id: i32,
     base_url: &str,
     model: &str,
 ) -> Result<TriageReport, Error> {
+    triage_live_llm(LlmKind::Ollama, board, id, base_url, model).await
+}
+
+/// Same as [`triage_live`] with an explicit backend choice.
+pub async fn triage_live_llm(
+    kind: LlmKind,
+    board: &dyn BoardProvider,
+    id: i32,
+    base_url: &str,
+    model: &str,
+) -> Result<TriageReport, Error> {
     let item = board.work_item(id).await?;
-    triage_item(base_url, model, &item, None).await
+    triage_item(kind, base_url, model, &item, None).await
+}
+
+/// A backend built for one triage call: wiring only — which backend runs is
+/// the caller's explicit choice ([`LlmKind`]), never decided here.
+enum TriageBackend {
+    Ollama(OllamaBackend),
+    Copilot(CopilotBackend),
 }
 
 async fn triage_item(
+    kind: LlmKind,
     base_url: &str,
     model: &str,
     item: &WorkItem,
@@ -252,14 +286,18 @@ async fn triage_item(
     // nem parser responde "por que este bug acontece". Todo o resto do comando
     // (campos, HTML, fingerprint, store, grep do repositório) é determinístico
     // (ADR-0016).
-    let backend = OllamaBackend::new(base_url, model);
+    let backend = match kind {
+        LlmKind::Ollama => TriageBackend::Ollama(OllamaBackend::new(base_url, model)),
+        // The costly path resolves its own binary/auth here and FAILS LOUDLY
+        // (CopilotMissing/CopilotAuth) — never a silent fallback to Ollama.
+        LlmKind::Copilot => TriageBackend::Copilot(CopilotBackend::from_env()?),
+    };
     let pack = context_pack(item, exclude_from_grep);
-    let text = backend
-        .complete(
-            TRIAGE_SYSTEM_PROMPT,
-            &build_prompt_with_context(item, &pack),
-        )
-        .await?;
+    let prompt = build_prompt_with_context(item, &pack);
+    let text = match &backend {
+        TriageBackend::Ollama(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await?,
+        TriageBackend::Copilot(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await?,
+    };
     Ok(TriageReport {
         item_id: item.id,
         output: format_triage(&text)?,

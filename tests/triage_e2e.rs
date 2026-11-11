@@ -454,3 +454,264 @@ fn triage_command_reports_the_prompt_generation() {
         "o stderr identifica a geração do prompt: {stderr}"
     );
 }
+
+// ===========================================================================
+// PR11 (ADR-0019): the Copilot backend — offline e2e with a fake `copilot`
+// CLI shim (`KIRA_COPILOT_BIN`, same contract as `KIRA_SCAN_<TOOL>_BIN`) and
+// a DEAD Ollama port, proving the explicit flag runs the CLI and never the
+// default backend. No network, no real login.
+// ===========================================================================
+
+/// Unique scratch dir for shims/captures.
+fn copilot_dir(tag: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!(
+        "kira-triage-e2e-copilot-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::remove_dir_all(&base).unwrap_or(());
+    std::fs::create_dir_all(&base).unwrap_or_else(|err| panic!("criar {base:?}: {err}"));
+    base
+}
+
+/// Writes a `copilot` shim (`.cmd` on Windows, shebang script elsewhere) and
+/// returns its path (to be set as `KIRA_COPILOT_BIN`).
+fn write_copilot_shim(dir: &Path, windows_script: &str, unix_script: &str) -> PathBuf {
+    let (name, script) = if cfg!(windows) {
+        (String::from("copilot.cmd"), windows_script)
+    } else {
+        (String::from("copilot"), unix_script)
+    };
+    let path = dir.join(&name);
+    std::fs::write(&path, script).unwrap_or_else(|err| panic!("escrever shim {path:?}: {err}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|err| panic!("chmod shim {path:?}: {err}"));
+    }
+    path
+}
+
+/// The success shim: captures its argv (proof the prompt went to the CLI,
+/// never to a fallback), prints an ANSI-styled banner and the clean report.
+fn success_shim(dir: &Path, capture: &Path) -> PathBuf {
+    let cap = capture.to_string_lossy().into_owned();
+    let unix = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{cap}'\nprintf '\\033[1m\\033[36mCopilot CLI v0.9\\033[0m\\n'\nprintf '\\033[32mCopilot: connected\\033[0m\\n'\nprintf 'Causa raiz provável:\\nTTL do token muito curto.\\nArquivos prováveis:\\nsrc/auth/session.rs\\nConfiança:\\nmédia\\n'\n"
+    );
+    let windows = format!(
+        "@echo %*>\"{cap}\"\r\n@echo Causa raiz provável:\r\n@echo TTL do token muito curto.\r\n@echo Arquivos prováveis:\r\n@echo src/auth/session.rs\r\n@echo Confiança:\r\n@echo media\r\n"
+    );
+    write_copilot_shim(dir, &windows, &unix)
+}
+
+/// The SAML shim: exit 1, harmless traceback + SAML/SSO text on stderr.
+fn saml_shim(dir: &Path) -> PathBuf {
+    let windows = "@echo Traceback (most recent call last): 1>&2\r\n@echo SAML SSO assertion required 1>&2\r\n@exit /b 1\r\n";
+    let unix = "#!/bin/sh\necho 'Traceback (most recent call last):' 1>&2\necho 'SAML SSO assertion required' 1>&2\nexit 1\n";
+    write_copilot_shim(dir, windows, unix)
+}
+
+/// Runs the built `kira` triage with explicit env pairs (the Ollama URL is
+/// ALWAYS the caller's — dead port for the Copilot tests).
+fn run_triage_with(
+    cwd: &Path,
+    store: &Path,
+    envs: &[(&str, Option<&Path>)],
+    args: &[&str],
+) -> (i32, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("KIRA_STORE_DIR", store)
+        .env("KIRA_CONFIG", store.join("absent-config.toml"))
+        .env_remove("KIRA_LLM")
+        .env_remove("KIRA_COPILOT_BIN")
+        .env_remove("KIRA_COPILOT_TIMEOUT")
+        .env_remove("AZURE_DEVOPS_PAT")
+        .env_remove("AZURE_DEVOPS_ORG")
+        .env_remove("AZURE_DEVOPS_PROJECT")
+        .env_remove("KIRA_MODEL");
+    for (name, value) in envs {
+        match value {
+            Some(path) => command.env(name, path),
+            None => command.env_remove(name),
+        };
+    }
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("executar kira {args:?}: {err}"));
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A port that will never answer: bound once and released.
+fn dead_ollama_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|err| panic!("bind na porta efêmera: {err}"));
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|err| panic!("endereço local: {err}"));
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// ADR-0019 e2e: `--llm copilot` with a fake CLI and a DEAD Ollama port —
+/// exit 0 with the report proves the CLI answered and Ollama was NEVER used
+/// (a fallback to the dead port would have failed loudly).
+#[test]
+fn copilot_flag_runs_the_fake_cli_and_never_the_ollama_port() {
+    let sandbox = Sandbox::new("copilot-success");
+    let dir = copilot_dir("success");
+    let capture = dir.join("argv.txt");
+    let shim = success_shim(&dir, &capture);
+    let (code, stdout, stderr) = run_triage_with(
+        &sandbox.cwd,
+        &sandbox.store,
+        &[
+            ("KIRA_COPILOT_BIN", Some(shim.as_path())),
+            ("KIRA_OLLAMA_URL", Some(Path::new(&dead_ollama_url()))),
+        ],
+        &["triage", "--file", &sandbox.fixture(), "--llm", "copilot"],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("Causa raiz provável:"),
+        "relatório do CLI na saída: {stdout}"
+    );
+    assert!(stdout.contains("Confiança:"), "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "ANSI do CLI não sobrevive: {stdout}"
+    );
+    assert!(
+        !stderr.contains("Ollama não está rodando"),
+        "nenhuma tentativa de fallback ao Ollama: {stderr}"
+    );
+    // The CLI really received the full prompt (`-p <system>\n\n<prompt> -s`).
+    assert!(capture.exists(), "shim deve capturar o argv");
+    #[cfg(unix)]
+    {
+        let argv = std::fs::read_to_string(&capture)
+            .unwrap_or_else(|err| panic!("ler argv capturado: {err}"));
+        assert!(argv.starts_with("-p\n"), "o prompt vai via -p: {argv}");
+        assert!(
+            argv.trim_end().ends_with("\n-s"),
+            "a flag silenciosa acompanha: {argv}"
+        );
+        assert!(
+            argv.contains("Sessão expirada com token válido"),
+            "o prompt real (título do item) chegou ao CLI: {argv}"
+        );
+        assert!(
+            argv.contains("TRIAGE") || argv.lines().count() >= 3,
+            "o system prompt acompanha o texto: {argv}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The no-copilot case: `KIRA_LLM=copilot` (env wiring) with NO binary
+/// anywhere — the run FAILS LOUDLY with the actionable CopilotMissing
+/// message; there is NO silent fallback to Ollama.
+#[test]
+fn copilot_env_without_any_binary_fails_loudly() {
+    let sandbox = Sandbox::new("copilot-missing");
+    let dir = copilot_dir("missing");
+    let empty_path = dir.join("path");
+    std::fs::create_dir_all(&empty_path).unwrap_or_else(|err| panic!("criar path vazio: {err}"));
+    let (code, _stdout, stderr) = run_triage_with(
+        &sandbox.cwd,
+        &sandbox.store,
+        &[
+            ("KIRA_COPILOT_BIN", None),
+            ("KIRA_LLM", Some(Path::new("copilot"))),
+            ("KIRA_OLLAMA_URL", Some(Path::new(&dead_ollama_url()))),
+            ("PATH", Some(empty_path.as_path())),
+        ],
+        &["triage", "--file", &sandbox.fixture()],
+    );
+    assert_ne!(code, 0, "sem CLI e sem override, deve falhar: {stderr}");
+    assert!(
+        stderr.contains("instale o Copilot CLI"),
+        "mensagem deve dizer como instalar: {stderr}"
+    );
+    assert!(
+        stderr.contains("copilot auth login"),
+        "mensagem deve apontar o login: {stderr}"
+    );
+    assert!(
+        stderr.contains("--llm ollama"),
+        "mensagem deve lembrar o default: {stderr}"
+    );
+    assert!(
+        stderr.contains("KIRA_COPILOT_BIN"),
+        "mensagem deve citar o override de testes: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The SAML case: the corporate CLI answers exit 1 with an SSO traceback —
+/// the message is the EXACT four-step script and never echoes the raw stderr.
+#[test]
+fn copilot_saml_stderr_becomes_the_four_step_message() {
+    let sandbox = Sandbox::new("copilot-saml");
+    let dir = copilot_dir("saml");
+    let shim = saml_shim(&dir);
+    let (code, _stdout, stderr) = run_triage_with(
+        &sandbox.cwd,
+        &sandbox.store,
+        &[
+            ("KIRA_COPILOT_BIN", Some(shim.as_path())),
+            ("KIRA_OLLAMA_URL", Some(Path::new(&dead_ollama_url()))),
+        ],
+        &["triage", "--file", &sandbox.fixture(), "--llm", "copilot"],
+    );
+    assert_ne!(code, 0, "SAML deve falhar: {stderr}");
+    assert!(stderr.contains("copilot auth login"), "passo 1: {stderr}");
+    assert!(
+        stderr.contains("https://github.com/settings/connections/applications"),
+        "passo 2: {stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("grant") || stderr.to_lowercase().contains("authorize"),
+        "passo 2 (botão): {stderr}"
+    );
+    assert!(stderr.contains("TI"), "passo 3: {stderr}");
+    assert!(stderr.contains("--llm ollama"), "passo 4: {stderr}");
+    assert!(
+        !stderr.contains("Traceback"),
+        "o stderr cru do CLI nunca é ecoado: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `KIRA_LLM` validates values outside clap: an unknown backend fails with
+/// the known-options message (never a silent default).
+#[test]
+fn unknown_kira_llm_value_fails_with_the_valid_options() {
+    let sandbox = Sandbox::new("copilot-unknown");
+    let (code, _stdout, stderr) = run_triage_with(
+        &sandbox.cwd,
+        &sandbox.store,
+        &[
+            ("KIRA_LLM", Some(Path::new("gpt"))),
+            ("KIRA_OLLAMA_URL", Some(Path::new(&dead_ollama_url()))),
+        ],
+        &["triage", "--file", &sandbox.fixture()],
+    );
+    assert_ne!(code, 0, "valor desconhecido deve falhar: {stderr}");
+    assert!(stderr.contains("desconhecido"), "mensagem: {stderr}");
+    assert!(
+        stderr.contains("ollama") && stderr.contains("copilot"),
+        "o erro lista as opções válidas: {stderr}"
+    );
+}
