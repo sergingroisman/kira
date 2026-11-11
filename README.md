@@ -2,474 +2,209 @@
 
 KIRA — Knowledge-Informed Remediation Agent (*Keep It Running, Always*).
 
-A Rust CLI for assisted maintenance of repositories hosted on Azure DevOps.
-Read-only by default: fetch a work item, scan the stack for vulnerable and
-outdated dependencies, and plan a triage — without ever writing to the board.
+CLI em Rust para manutenção assistida de repositórios hospedados no Azure DevOps.
+**Read-only por padrão; escrita só com `--apply` no futuro** — e só depois de
+aprovação humana explícita. Hoje nenhum comando escreve no Azure DevOps nem no
+seu código: o único disco que o KIRA toca é o dele (`~/.config/kira/`) e a
+pasta local do projeto (`.kira/`).
 
-## Status
+## Estado real do binário (M1 + ondas W2/W2-fix)
 
-M1 shipped — pluggable board (`BoardProvider`, Azure DevOps MVP), deterministic
-`kira scan` (.NET + npm/pnpm, stable fingerprints), local triage, `kira doctor`,
-SQLite trail and `kira setup` (PAT in the OS keyring). Read-only: no writes to
-Azure DevOps.
+O que existe de verdade, verificado em `src/main.rs`:
 
-Next: the port waves (W1→W6). The PR-by-PR ledger with acceptance criteria is
-[`docs/roadmap-prs.md`](docs/roadmap-prs.md); the autonomous build state is
-[`docs/BUILD-PROGRAM.md`](docs/BUILD-PROGRAM.md); the governing mandate is
-[`docs/kira-mandato.md`](docs/kira-mandato.md).
-
-## Autonomy, approval and measurement (the contract)
-
-KIRA is meant to become a living agent — a loop and a scheduled mode under a
-game-style dashboard — but autonomy is gated, not automatic:
-
-- **Read is free, write is not.** Every command is read-only unless it takes an
-  explicit `--apply`. There is no path where a scheduled run writes to the world
-  on its own.
-- **`awaiting_approval` is a state, not a suggestion.** Before any world write
-  (Azure DevOps, the target repo) the cycle stops in `awaiting_approval` in the
-  SQLite store and waits for a human: `kira approve <id>`. Exceeding a budget is
-  not approval; `--apply` alone is not approval.
-- **The M2 gate is measured, not asserted.** `kira triage --eval <dir>` scores the
-  triage against closed bugs with the owner's root-cause labels, and reports the
-  percentage. Autonomy does not start before that number clears 70%.
-- **The dashboard never replaces the text mode.** The Ratatui UI is a rich mode of
-  the same binary: the loop and the scheduled mode stay consumable as logs, and
-  errors stay copyable text.
-- **Budget has a number.** `max_llm_calls_per_day = 50` by default, checked before
-  every state transition.
-- **Nothing leaves the machine by default.** Ollama runs on localhost; Copilot is
-  opt-in via flag/env. Secrets never reach a log, a prompt or the store.
-
-## Install
-
-```bash
-cargo install --path .
-```
-
-## Try it locally (Windows, no Azure account)
-
-Triage runs 100% locally against an Ollama model: no PAT, no Azure account, no
-cloud. You only need a work-item JSON file — the repo ships with one at
-`tests\fixtures\work_item_4821.json`.
-
-1. Install Rust via rustup: download and run `rustup-init.exe` from
-   [rustup.rs](https://rustup.rs) (default options are fine).
-
-2. Install Ollama:
-
-   ```powershell
-   winget install Ollama.Ollama
-   ```
-
-   or download it from [ollama.com/download](https://ollama.com/download). It
-   runs as a Windows service automatically.
-
-3. Pull the default model (~3.3 GB):
-
-   ```powershell
-   ollama pull qwen3.5:4b
-   ```
-
-4. Build KIRA from the repository folder:
-
-   ```powershell
-   cargo install --path .
-   ```
-
-   Or run straight from source without installing:
-
-   ```powershell
-   cargo run -- triage --file tests\fixtures\work_item_4821.json
-   ```
-
-5. Triage the sample work item:
-
-   ```powershell
-   kira triage --file tests\fixtures\work_item_4821.json
-   ```
-
-   Expected output (the model text varies):
-
-   ```text
-   Causa raiz provável:
-   O token de sessão tem TTL curto (5 minutos) e não é renovado no refresh — a sessão cai mesmo com token válido.
-
-   Arquivos prováveis:
-   src/auth/session.rs
-   src/auth/token.rs
-
-   Confiança:
-   média
-   ```
-
-The live path (`kira triage <work-item-id>` and `kira inspect <id>`) still
-requires the Azure DevOps PAT — see [Setup](#setup).
-
-### Local LLM variables
-
-| Variable | Description | Default |
-| --- | --- | --- |
-| `KIRA_OLLAMA_URL` | Base URL of the local Ollama server | `http://localhost:11434` |
-| `KIRA_MODEL` | Model tag used by `kira triage` | `qwen3.5:4b` |
-| `KIRA_NUM_CTX` | Context window for the model | `4096` |
-
-The `--model` flag overrides `KIRA_MODEL`:
-
-```bash
-kira triage 4821 --model llama3.2:3b
-```
-
-### Troubleshooting
-
-| Symptom | Fix |
+| Comando | O que faz |
 | --- | --- |
-| `Ollama não está rodando` (connection refused) | The Ollama service is stopped — open Ollama from the Start menu (on Windows it runs as a service) or run `ollama serve`, then retry |
-| Slow answers / split GPU | Run `ollama ps` and check the model shows `100% GPU`; if it shows a CPU split, reduce the context with `KIRA_NUM_CTX=2048` and retry |
-| Not enough VRAM | Use a smaller model: `ollama pull llama3.2:3b` (2.0 GB) or `ollama pull phi4-mini` (2.5 GB), then run with `--model llama3.2:3b` |
-| `HTTP 404 do Ollama` | The model was not pulled — run `ollama pull <model>` and check `ollama list` |
+| `kira inspect <id> [--project <nome>]` | Resumo legível de um work item do Azure DevOps (requer PAT). |
+| `kira doctor` | Diagnóstico da configuração da máquina: de onde veio cada valor (env, keyring ou `config.toml`), testa a conexão e o nome do projeto (PAT sai mascarado). |
+| `kira triage <id>` | Triage **vivo**: busca o work item no Azure e pede causa raiz ao **Ollama local** (requer PAT + Ollama). Grava um episódio em `.kira/wiki/bugs/`. |
+| `kira triage --file <json>` | Triage **offline** do mesmo JSON de work item — sem PAT, sem Azure, 100% local. |
+| `kira triage <id\|--file> --model <tag>` | Troca o modelo do Ollama para esta execução. |
+| `kira setup [--org --project --pat --no-browser --reset]` | Wizard: org, projeto e PAT validados **antes** de salvar; PAT vai para o keyring do OS (service `kira`). `--reset` remove o PAT. |
+| `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
+| `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
+| `kira note "<texto>"` / `kira note --remove N` | Fato do perfil do projeto (append-only, numerado). |
+| `kira profile` | Root, nome, primeira vez visto e todos os fatos do projeto. |
+| `kira wiki list\|show\|decision\|reindex\|search\|forget\|promote\|export` | Wiki local do projeto (seção Wiki abaixo). |
 
-On a 6 GB RTX 2060, `qwen3.5:4b` (~3.3 GB, Q4_K_M) fits entirely in GPU
-memory and the default `num_ctx` of 4096 is conservative.
+O que **não existe ainda** vai no [Roadmap](#roadmap) — nada é prometido como
+pronto se não está no binário.
 
-## Setup
+## Requisitos
 
-KIRA talks to Azure DevOps with a Personal Access Token (PAT). Where your PAT
-lives:
-
-| Where | How | Best for |
+| Componente | Para quê | De onde |
 | --- | --- | --- |
-| OS keyring (Windows Credential Manager / secret service) | `kira setup` | Your machine — interactive use |
-| `AZURE_DEVOPS_PAT` env var | exported by hand | CI / headless machines |
+| Rust (via rustup) | build do binário | [rustup.rs](https://rustup.rs) |
+| Ollama | **obrigatório para `kira triage`** (LLM local) | `winget install Ollama.Ollama` ou [ollama.com/download](https://ollama.com/download) |
+| .NET SDK 8+ | `kira scan` em projetos .NET | [dotnet.microsoft.com/download](https://dotnet.microsoft.com/download) |
+| npm ou pnpm | `kira scan` em projetos Node/TS | [nodejs.org/download](https://nodejs.org/download) / `npm install -g pnpm` |
 
-### Option A — `kira setup` (recommended, interactive)
-
-```bash
-kira setup
-```
-
-The command walks you through four questions:
-
-1. **organization** and **project** (you can also pass them with
-   `--org <name> --project <name>`, or have them in `AZURE_DEVOPS_ORG` /
-   `AZURE_DEVOPS_PROJECT` or `config.toml` — anything already known is not
-   asked again);
-2. **"Você já tem um PAT pronto? [S/n]"** — with `Enter = S`;
-   - **S**: paste the token straight away, with no steps and no browser;
-   - **N**: KIRA prints the token page
-     (`https://dev.azure.com/{your-org}/_usersSettings/tokens`) and the
-     **Work Items (Read)** + **Project and Team (Read)** scopes, then asks
-     **"Abrir no navegador agora? [S/n]"** — the browser only opens after your
-     confirmation and never blocks the terminal (`(se não abrir, a URL está
-     acima)`); prefer the shortest expiration that fits your workflow (e.g. 90
-     days) and rotate it when it expires;
-3. you paste the PAT (one line, visible input);
-4. KIRA **validates before saving**: it lists your projects and checks the
-   project name. Only when that succeeds does it store the PAT in the OS
-   keyring (service `kira`) and save org/project to
-   `~/.config/kira/config.toml` (mode 0600). If validation fails (401), nothing
-   is saved and the command tells you what to review.
-
-   ```text
-   setup concluído — rode kira triage <id>
-   ```
-
-Piped stdin skips the *"já tem um PAT?"* question and keeps the old fast path;
-`--no-browser` skips the steps and the browser open entirely, going straight to
-the paste prompt; `--pat` skips every token prompt.
-
-To remove the saved PAT from the keyring:
-
-```bash
-kira setup --reset
-```
-
-#### Already have a token?
-
-In the interactive flow just answer **`S`** to "Você já tem um PAT pronto?" and
-paste it when asked — or skip every prompt from the CLI. Read the token from
-a secure file or the environment instead of typing it bare (PowerShell):
+Modelo default do triage: `qwen3.5:4b` (~3,3 GB, Q4_K_M):
 
 ```powershell
-$pat = Get-Content "$env:USERPROFILE\.secrets\ado-pat.txt"   # ou $env:ADO_PAT
-kira setup --org minha-org --project MeuProjeto --pat $pat
+ollama pull qwen3.5:4b
 ```
 
-or, passing it directly (--pat skips every prompt and never echoes the token):
+Trocável por env (`KIRA_MODEL`) ou por execução (`--model`). O triage roda
+100% na sua máquina: nada vai para nuvem. Para testar sem PAT:
 
 ```powershell
-kira setup --org minha-org --project MeuProjeto --pat <your-token>
+kira triage --file tests\fixtures\work_item_4821.json
 ```
 
-Use `--no-browser` to skip the instruction steps and the browser open but
-still paste the token when asked:
+## Instalação
 
 ```bash
-kira setup --no-browser
+cargo install --path .     # ou: cargo run -- <comando> direto do repo
 ```
 
-If the token is already exported as `AZURE_DEVOPS_PAT`, no setup step is
-needed at all: the env var wins over the keyring and `config.toml` at runtime.
+## Setup (PAT do Azure DevOps)
 
-### Option B — manual (env vars, for CI / headless)
+O PAT precisa dos escopos **Work Items (Read)** + **Project and Team (Read)**.
+Ele vive no keyring do OS (salvo por `kira setup`) ou na env
+`AZURE_DEVOPS_PAT` (CI/headless — vence keyring e `config.toml`).
 
-Create a PAT with the **Work Items (Read)** scope at
-`https://dev.azure.com/{your-organization}/_usersSettings/tokens`, then export
-the three variables.
+```bash
+kira setup          # interativo: org, projeto, pergunta "Você já tem um PAT pronto? [S/n]"
+kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas
+kira setup --reset  # remove o PAT do keyring
+```
 
-   bash:
+Fluxo: a resposta **S** cola o token direto; **N** imprime a página do token e
+os escopos e só abre o navegador **com confirmação** (nunca bloqueia o
+terminal). O KIRA valida a credencial (lista projetos, confere o nome) antes
+de salvar — 401 salva nada. Org/projeto ficam em
+`~/.config/kira/config.toml` (0600).
 
-   ```bash
-   export AZURE_DEVOPS_PAT=your-pat
-   export AZURE_DEVOPS_ORG=your-org
-   export AZURE_DEVOPS_PROJECT=your-project
-   ```
-
-   PowerShell:
-
-   ```powershell
-   $env:AZURE_DEVOPS_PAT = "your-pat"
-   $env:AZURE_DEVOPS_ORG = "your-org"
-   $env:AZURE_DEVOPS_PROJECT = "your-project"
-   ```
-
-The env var wins over the keyring and over `config.toml`, so Option B also
-works on a machine configured with Option A (handy for one-shot CI runs).
-
-### Verify the configuration
+Verificação:
 
 ```bash
 kira doctor
-```
-
-It shows where each setting came from (env, keyring or `config.toml`), tests
-the connection and checks the project name. Then inspect a work item:
-
-```bash
 kira inspect 4821
 ```
 
-## Usage
+## Variáveis de ambiente
 
-```bash
-kira inspect <work-item-id> [--project <name>]
-```
-
-| Variable | Description |
-| --- | --- |
-| `AZURE_DEVOPS_PAT` | Personal Access Token with **Work Items (Read)** permission (env var or saved by `kira setup` in the OS keyring) |
-| `AZURE_DEVOPS_ORG` | Azure DevOps organization name (env var or `config.toml`) |
-| `AZURE_DEVOPS_PROJECT` | Default project; overridden by `--project <name>` (env var or `config.toml`) |
-| `KIRA_BOARD` | Board provider to use; `azure` is the only one in this phase |
-
-Example:
-
-```bash
-export AZURE_DEVOPS_PAT=xxx
-export AZURE_DEVOPS_ORG=my-org
-export AZURE_DEVOPS_PROJECT=my-project
-kira inspect 4821
-```
-
-Output:
-
-```text
-#4821  Bug  Active  [Backend]
-Título: Sessão expirada com token válido
-Responsável: —
-Descrição: first 400 chars of the text, HTML removed, line breaks preserved
-```
-
-## Scanning (determinístico)
-
-`kira scan` runs the **standard tools of each stack** of the project, normalizes
-them into findings and writes a deterministic file. **No AI in this step** —
-KIRA does not analyze; it orchestrates and normalizes (grounded triage comes
-later).
-
-### Requirements
-
-| Stack | Tool | Where it comes from |
+| Variável | Descrição | Default |
 | --- | --- | --- |
-| .NET | `dotnet list package --vulnerable --include-transitive --format json` | .NET SDK 8+ — [dotnet.com/download](https://dotnet.com/download) |
-| Node/TS (pnpm) | `pnpm audit --json` | `npm install -g pnpm` |
-| Node/TS (npm) | `npm audit --json` | [nodejs.org/download](https://nodejs.org/download) |
+| `AZURE_DEVOPS_PAT` | PAT com Work Items (Read) (env vence keyring e `config.toml`) | — |
+| `AZURE_DEVOPS_ORG` | Organização do Azure DevOps | — |
+| `AZURE_DEVOPS_PROJECT` | Projeto padrão (o `--project` vence) | — |
+| `KIRA_SCAN_DOTNET_BIN` | Caminho completo que substitui o `dotnet` do scan | PATH |
+| `KIRA_SCAN_NPM_BIN` | Caminho completo que substitui o `npm` do scan | PATH |
+| `KIRA_SCAN_PNPM_BIN` | Caminho completo que substitui o `pnpm` do scan | PATH |
+| `KIRA_OLLAMA_URL` | URL do servidor Ollama | `http://localhost:11434` |
+| `KIRA_MODEL` | Tag do modelo do triage | `qwen3.5:4b` |
+| `KIRA_NUM_CTX` | Janela de contexto do modelo | `4096` |
+| `KIRA_STORE_DIR` | Sobrescreve o diretório do store (testes/execuções portáveis) | `~/.config/kira` |
+| `KIRA_BOARD` | Provedor de board (`azure` é o único nesta fase) | `azure` |
+| `KIRA_CONFIG` | Caminho alternativo do `config.toml` | `~/.config/kira/config.toml` |
 
-Note: `kira scan` runs on Windows too — see "Windows invocation" below.
+## Store local
 
-### Windows invocation
+Toda execução deixa trilha em um único SQLite — sem servidor, sem conta,
+offline.
 
-Windows spawns differ from Unix: the standard library only looks for `.exe`,
-so the Node tools spawn wrapped in `cmd /C` (which resolves `npm.cmd`/
-`pnpm.cmd` through PATHEXT):
-
-- `npm audit --json` → `cmd /C npm audit --json`
-- `pnpm audit --json` → `cmd /C pnpm audit --json`
-- `dotnet list package ...` → spawned directly (`dotnet.exe` is a real exe).
-
-### Binary overrides (`KIRA_SCAN_*_BIN`)
-
-Any scan tool's binary can be replaced without PATH shadowing (`dotnet`
-shadowing is unreliable anyway). The value is the FULL path of an
-executable/shim:
-
-| Env var | Replaces |
-| --- | --- |
-| `KIRA_SCAN_DOTNET_BIN` | `dotnet list package` |
-| `KIRA_SCAN_NPM_BIN` | `npm audit --json` |
-| `KIRA_SCAN_PNPM_BIN` | `pnpm audit --json` |
-
-Uses: CI runners without the tool installed, custom packaging, offline tests
-(the e2e suite points its fake shims exactly through these). An
-`.cmd`/`.bat` value on Windows spawns via `cmd /C`; anything else (and all
-values on Linux/macOS) spawns directly. No override set => the default
-PATH lookup above.
-
-```sh
-# CI runner without a .NET SDK: point to the packaged binary
-KIRA_SCAN_DOTNET_BIN=/usr/local/packaged/bin/dotnet kira scan
-```
-
-Windows examples:
-
-```powershell
-kira scan                    # uses the project root (detected like the store)
-kira scan --path C:\repos\api
-```
-
-### What it detects
-
-In the folder given (`--path <dir>`, up to 2 levels deep) KIRA detects:
-
-- **.NET** — any `*.csproj`, `*.sln` or `global.json`;
-- **Node/TS** — `package.json` (pnpm when there is `pnpm-lock.yaml`, npm with
-  `package-lock.json` or no lock at all).
-
-No marker found => actionable error ("nenhum stack detectado ...").
-
-### Output
-
-- `<root>\.kira\findings.json` — findings normalized as
-  `{ tool, rule, package, version, severity, path, message, fingerprint }`.
-  `tool` is `dotnet` (rules `vulnerable`/`outdated` — packages with
-  vulnerabilities or deprecated) or `audit` (npm/pnpm user, rule
-  `vulnerable`). **`.kira/` é local — nunca comite este diretório**: adicione
-  `.kira/` ao `.gitignore` do projeto (o `.gitignore` da KIRA não precisa
-  mudar).
-- the stdout prints the summary: total findings, count by severity with count
-  per tool, and the file path.
-
-### Determinism (M1 gate)
-
-The `fingerprint` is FNV-1a 64-bit (hand-implemented, shared with the project
-store's project id) over `tool|rule|package|version|message` (trimmed), and
-the list is stored **ascending by fingerprint**. Two runs over the same state
-produce the same fingerprints in the same order — the M1 reproducibility gate
-of the plan v2 (§5/§8). The `.kira/README.md` note explains that the folder
-is local.
-
-### Troubleshooting
-
-The scan does not install anything and never echoes the raw stdio of the tool:
-errors are separate and actionable.
-
-- **Tool missing** (`spawn` NotFound): "o scan .NET exige o SDK do .NET …" or
-  "o scan Node/TS via npm exige o npm — instale em https://nodejs.org/download …".
-  Install the tool and run again.
-- **Tool present but failed** (exit code ≠ 0 on an audit whose JSON did not
-  parse, or a failed `dotnet list package`): `a ferramenta <tool> falhou
-  (exit <N>) — confira versão/instalação e rode kira scan de novo (dica: …)` —
-  the hint is at most the FIRST line of the tool stderr (≤200 chars), never
-  the raw body. Check the tool version/installation (e.g. `dotnet --info`,
-  `npm --version`) and run `kira scan` again.
-- Note: `npm/pnpm audit` exits 1 exactly when vulnerabilities are FOUND —
-  that is the normal, healthy case (KIRA parses the JSON); only a run whose
-  output cannot be parsed is reported as a failure.
-
-## Local store
-
-Every KIRA run leaves a persistent trail in a single local SQLite database —
-no server, no account, project-scoped and offline.
-
-### Where the DB lives
-
-| Platform | Path |
+| Plataforma | Caminho |
 | --- | --- |
 | Windows | `%USERPROFILE%\.config\kira\store.db` |
 | Linux / macOS | `~/.config/kira/store.db` |
 
-The same folder already holds `config.toml`. Override the directory with the
-`KIRA_STORE_DIR` env var (handy for tests and portable runs):
+O mesmo diretório guarda `config.toml`. Tabelas: `projects`, `sessions`,
+`facts` (e índice derivado da wiki, `wiki_page`/`wiki_fts`). O id do projeto é
+FNV-1a 64 do root canônico (primeiro ancestral com `.git`, senão o mais
+próximo com `Cargo.toml`/`package.json`, senão o diretório atual).
 
-```bash
-KIRA_STORE_DIR=/tmp/kira kira history
-```
+- **Fail-open**: store quebrado nunca quebra o comando — só um
+  `aviso: trilha não foi gravada (<causa>)` no stderr, com a mesma saída e exit
+  code.
+- **Privacidade**: PAT/tokens/env nunca são gravados; o summary guarda no
+  máximo os primeiros 2000 chars do output (o `doctor` mascara o PAT);
+  `kira note` grava exatamente o que você digitou.
+- Apagar `store.db` limpa toda a trilha.
 
-### Schema (summary)
+## Wiki — `.kira/wiki/`
 
-| Table | Columns | Written by |
-| --- | --- | --- |
-| `projects` | `id`, `root_path`, `name`, `first_seen_at` | automatic (first run in a repo root) |
-| `sessions` | `id`, `project_id`, `command`, `args`, `model`, `started_at`, `duration_ms`, `ok`, `summary` | automatic (`inspect`/`doctor`/`triage`/`scan`) |
-| `facts` | `project_id`, `key`, `value`, `updated_at` | `kira note` |
+O KIRA mantém conhecimento reutilizável (não log de conversa) em markdown
+local, dentro do projeto: `<root>/.kira/wiki/{contexto,decisoes,padroes,glossario}.md`
+e `<root>/.kira/wiki/bugs/<slug>.md` (ADR-0013).
 
-The project id is a FNV-1a 64-bit hash (implemented by hand, no extra
-dependency) of the canonical project root: the first ancestor of the current
-directory that contains `.git`, falling back to the nearest ancestor with
-`Cargo.toml`/`package.json`, falling back to the current directory itself.
-Timestamps are RFC 3339 UTC; commands display local time via SQLite's
-`datetime(x, 'localtime')`.
+- `kira triage` anexa um **episódio** em `bugs/` (causa raiz prevista, arquivos,
+  confiança, brief do scan) sem perguntar nada. Episódio vazio não grava;
+  repetido não duplica; com mais de 30 dias colapsa em `## Histórico colapsado`.
+- `kira wiki reindex` reconstrói o índice FTS5 (derivado e descartável — o
+  markdown é a fonte de verdade); `kira wiki search` consulta esse índice.
+- `kira wiki forget <página>` apaga a página e o índice (LGPD — dado do dono).
+- `kira wiki promote` promove páginas do staging; o ciclo autônomo (futuro)
+  grava em `.kira/wiki-staging/`, nunca direto na wiki.
+- `kira wiki export` imprime/salva a wiki inteira como um bundle `.md`.
+- Toda escrita passa por `redact` (segredo não vai para o disco) e pela guarda
+  de caminho (confinamento na raiz).
 
-### Commands
+## Windows
 
-```bash
-kira history [--last N]        # recent sessions of the current project (N = 10 by default)
-kira note "text of the fact"   # add a profile fact (append-only: note-1, note-2, ...)
-kira note --remove 2           # remove the fact with that number
-kira profile                   # project root/name/first-seen + all stored facts
-```
+Spawns no Windows diferem do Unix: a std só resolve `.exe`, então:
 
-`inspect`, `triage` (both the live and the `--file` path), `doctor` and
-`scan` record
-their session automatically — including failed runs (✗, with the error text as
-summary, first 2000 chars, capped).
+- **npm/pnpm** spawnam via wrapper `cmd /C chcp 65001 >nul 2>&1 & <ferramenta>` —
+  o `cmd /C` resolve `npm.cmd`/`pnpm.cmd` pelo PATHEXT, e o `chcp 65001` força
+  UTF-8 para o stderr do cmd localizado não virar mojibake.
+- **dotnet** é um `.exe` real e spawna direto.
+- **Override `KIRA_SCAN_*_BIN`**: valor `.cmd`/`.bat` no Windows roda via
+  `cmd /C`; qualquer outro (e todo valor em Linux/macOS) spawna direto.
+- Ferramenta ausente × ferramenta que falhou são erros **acionáveis
+  distintos** — "instale o X" ou `a ferramenta <tool> falhou (exit <N>)` com no
+  máximo a primeira linha do stderr (≤200 chars) como dica; nunca body cru.
+  `npm/pnpm audit` sai com exit 1 exatamente quando há vulnerabilidades — isso
+  é caso normal (o JSON é parseado).
 
-### Fail-open
+A resolução **which-style** do binário antes de qualquer spawn (PATH × PATHEXT,
+sem classificação por texto de cmd localizado) está em andamento — veja
+[Roadmap](#roadmap).
 
-A broken store never breaks the main command. If the trail cannot be written
-(disk full, bad `KIRA_STORE_DIR`, corrupt DB...), KIRA prints one warning on
-stderr and continues with the same output and exit code:
+## Scanning (determinístico)
 
-```text
-aviso: trilha não foi gravada (não foi possível criar o diretório do store em '...': ...)
-```
+`kira scan` orquestra e normaliza; **não analisa, não usa IA**. Detecção de
+stack no diretório (`--path`, até 2 níveis): `.NET` = `*.csproj`, `*.sln` ou
+`global.json`; Node/TS = `package.json` (pnpm com `pnpm-lock.yaml`, npm com
+`package-lock.json` ou sem lock). Nenhum marcador ⇒ erro acionável.
 
-### Privacy
+Saída: `<root>/.kira/findings.json` —
+`{ tool, rule, package, version, severity, path, message, fingerprint }`.
+`fingerprint` = FNV-1a 64 sobre `tool|rule|package|version|message` (trimado),
+lista ordenada crescente por fingerprint: duas execuções no mesmo estado
+produzem o mesmo arquivo byte a byte (gate de reprodutibilidade do M1).
+**`.kira/` é local — nunca comite** (adicione ao `.gitignore` do projeto).
 
-- Never stored: the PAT, any token/credential or env var contents.
-- Never stored: the full work-item description — only the truncated command
-  output (at most 2000 characters, and the PAT is masked by `doctor`).
-- `kira note` stores exactly what you type.
-
-### Clean-up
-
-Delete the single file to wipe every session, fact and project profile:
-
-```powershell
-Remove-Item "$env:USERPROFILE\.config\kira\store.db"
-```
-
-## Development
+## Desenvolvimento
 
 ```bash
 cargo build
-cargo test                                   # unit tests only, no network
-cargo test -- --ignored                      # real integration test (needs the env vars above)
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo fmt
+cargo test                                  # unit + e2e com shims, sem rede
+cargo test -- --ignored                     # integração real (precisa das envs do Azure)
 ```
 
-See [AGENTS.md](AGENTS.md) for the repository contract.
+O CI (GitHub Actions) roda `fmt --check` + `clippy` + `test` em
+ubuntu/macos/windows. O contrato do repositório está em
+[AGENTS.md](AGENTS.md); as decisões de arquitetura em `docs/adr/`.
+
+## Roadmap
+
+O que ainda **não** existe no binário (fonte de verdade:
+[`docs/roadmap-prs.md`](docs/roadmap-prs.md)):
+
+- **Resolução which-style da ferramenta antes do spawn** (PR-F4, em
+  `w2-fix/pr-f4-tool-resolution`): PATH × PATHEXT em Rust puro, substituindo a
+  classificação por marcadores de texto do cmd localizado.
+- **Parser pnpm audit real** (PR-F1b): advisory-a-advisory com `paths`.
+- **`kira triage --eval <dir>`** + `tests/fixtures/triage_gold/` — 20 bugs
+  fechados rotulados pelo dono; gate do M2 é **≥70% medido** (W2-bis).
+- **Autonomia: `kira loop` / modo agendado** com estado `awaiting_approval` no
+  store e `kira approve <id>` (W5) — escrita só depois do gate M2 e do
+  `--apply` explícito.
+- **Backend Copilot** (`copilot -p`) como LLM caro sob flag explícita (PR11);
+  Ollama segue como default 100% local.
+- **TUI Ratatui** (W6) e `kira fix --apply` (M3) — só depois do M2.
 
 ## License
 
