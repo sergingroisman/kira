@@ -1,13 +1,16 @@
-//! End-to-end tests of `kira dashboard` (W6-PR1, ADR-0014).
+//! End-to-end tests of `kira dashboard` (W6-PR1..3, ADR-0014).
 //!
-//! Three proofs, all offline:
+//! Four proofs, all offline:
 //! 1. `--snapshot` with a store/config fixture prints the header (name, `dev:`,
 //!    masked PAT) and exits 0 — the raw PAT never appears;
 //! 2. **read-only proof**: running the dashboard with and without `--snapshot`
 //!    leaves the `store.db` hash byte-identical — nothing writes, not even the
 //!    automatic session trail (the command is `records: false`);
 //! 3. `KIRA_OLLAMA_URL` on a dead port still works — the dashboard never
-//!    touches the network (no probe, no LLM).
+//!    touches the network (no probe, no LLM);
+//! 4. `--snapshot` with 3 recorded sessions (W6-PR3) prints the sessions
+//!    table (#id, comando, modelo, duração, 1ª linha do summary) and the
+//!    store hash stays byte-identical.
 //!
 //! No process-global env var is mutated: every override is passed to the
 //! spawned binary only (same convention as `tests/store_e2e.rs`).
@@ -73,6 +76,59 @@ impl Sandbox {
                 )
                 .unwrap_or_else(|err| panic!("gravar sessão scan fixture: {err}"));
         }
+    }
+
+    /// Store fixture (W6-PR3): 3 sessões reais na trilha via `Store::record`
+    /// (scan ok, triage ok com modelo, doctor que falhou) — o painel de
+    /// sessões lê o MESMO banco que os comandos gravam. Fecha a store antes
+    /// de voltar para o hash ficar estável (WAL checkpointed).
+    fn seed_store_with_sessions(&self) {
+        let store_db = Store::open_in_dir(&self.store)
+            .unwrap_or_else(|err| panic!("abrir store fixture: {err}"));
+        let project = store_db
+            .ensure_project(&self.cwd)
+            .unwrap_or_else(|err| panic!("criar projeto fixture: {err}"));
+        let now = store::now_rfc3339_utc();
+        let record = |command: &str,
+                      args: &str,
+                      model: Option<&str>,
+                      started_at: &str,
+                      duration_ms: i64,
+                      ok: bool,
+                      summary: &str| {
+            store_db
+                .record(
+                    &project,
+                    command,
+                    args,
+                    model,
+                    started_at,
+                    duration_ms,
+                    ok,
+                    summary,
+                )
+                .unwrap_or_else(|err| panic!("gravar sessão {command} fixture: {err}"));
+        };
+        // Três sessões, ids 1..=3 na ordem: mais recente primeiro no painel.
+        record(
+            "scan",
+            "",
+            None,
+            "2026-11-09T09:00:00Z",
+            1_200,
+            true,
+            "scan fixture: 3 achados\nlinha 2 interna do summary",
+        );
+        record(
+            "triage",
+            "4821",
+            Some("qwen2.5:7b"),
+            "2026-11-10T09:00:00Z",
+            65_000,
+            true,
+            "nota gravada no episódio do bug",
+        );
+        record("doctor", "", None, &now, 400, false, "ollama não respondeu");
     }
 
     /// Config fixture with `dev_name` — the header shows it as `dev: <nome>`.
@@ -313,4 +369,67 @@ fn corrupted_findings_fail_open_to_dash_with_cause_and_exit_zero() {
     assert!(out.contains("achados: — ("), "{out}");
     assert!(out.contains("ilegível"), "causa real da leitura: {out}");
     assert!(!out.contains("Prototype Pollution"), "{out}");
+}
+
+#[test]
+fn snapshot_with_three_sessions_shows_the_table_and_keeps_the_store_readonly() {
+    // W6-PR3: painel de sessões no `--snapshot` com fixture de 3 sessões —
+    // `#id`, comando, modelo, duração e 1ª linha do summary, MAIS RECENTE
+    // PRIMEIRO — e a prova de read-only se mantém: o hash do `store.db` tem
+    // que ser idêntico antes/depois.
+    let sandbox = Sandbox::new("sessions");
+    sandbox.seed_store_with_sessions();
+    let before = sandbox.store_hash();
+    assert!(!before.is_empty(), "store fixture precisa existir");
+
+    let (code, out, err) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "saída: {out}{err}");
+
+    // Cabeçalho do painel com a contagem real do fixture.
+    assert!(
+        out.contains("painel sessões — últimas 3"),
+        "cabeçalho do painel de sessões esperado: {out}"
+    );
+    // Colunas da tabela.
+    assert!(out.contains("#ID"), "{out}");
+    assert!(out.contains("QUANDO"), "{out}");
+    assert!(out.contains("COMANDO"), "{out}");
+    assert!(out.contains("MODELO"), "{out}");
+    assert!(out.contains("DURAÇÃO"), "{out}");
+    assert!(out.contains("RESUMO"), "{out}");
+    // As três sessões com id, comando, modelo e duração.
+    assert!(out.contains("#3"), "{out}");
+    assert!(out.contains("#2"), "{out}");
+    assert!(out.contains("#1"), "{out}");
+    assert!(out.contains("doctor"), "{out}");
+    assert!(out.contains("triage"), "{out}");
+    assert!(out.contains("qwen2.5:7b"), "modelo na tabela: {out}");
+    assert!(out.contains("1m5s"), "duração humanizada: {out}");
+    // 1ª linha do summary — e NUNCA a segunda linha inteira na tabela.
+    assert!(out.contains("scan fixture: 3 achados"), "{out}");
+    assert!(
+        !out.contains("linha 2 interna"),
+        "a tabela só mostra a 1ª linha do summary: {out}"
+    );
+    // Mais recente primeiro (id 3, doctor, antes do id 1, scan).
+    let doctor = out.find("doctor").unwrap_or(usize::MAX);
+    let scan = out.find("#1").unwrap_or(usize::MAX);
+    assert!(doctor < scan, "mais recente primeiro: {out}");
+    // O achado cru NUNCA apaga o contrato read-only: nada de escrita.
+    let after = sandbox.store_hash();
+    assert_eq!(
+        before, after,
+        "dashboard --snapshot com painel de sessões mutou o store.db — violação do contrato read-only"
+    );
+}
+
+#[test]
+fn sessions_absent_store_shows_the_honest_cause() {
+    // Projeto existe, mas zero sessões: `—` com a causa concreta — nunca
+    // lista inventada nem causa genérica.
+    let sandbox = Sandbox::new("no-sessions");
+    sandbox.seed_store_with_scan(false);
+    let (code, out, _) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("sessões: — (store sem sessões)"), "{out}");
 }
