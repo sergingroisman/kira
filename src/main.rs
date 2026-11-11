@@ -16,6 +16,7 @@ use kira::scan;
 use kira::setup;
 use kira::store::{self, Store, StoreError};
 use kira::triage;
+use kira::wiki::{Wiki, WikiError};
 
 /// Hard cap for the summary line shown by `kira history`.
 const HISTORY_SUMMARY_LINE_CHARS: usize = 160;
@@ -98,6 +99,34 @@ enum Command {
         /// Project folder (defaults to the project root detected like in the store)
         #[arg(long)]
         path: Option<PathBuf>,
+    },
+    /// Read and grow the project wiki at docs/wiki (knowledge, not chat logs)
+    #[command(
+        after_help = "Exemplos:\n  kira wiki list\n  kira wiki show contexto\n  kira wiki decision \"fix roda em jail mínimo — ADR-0011\""
+    )]
+    Wiki {
+        #[command(subcommand)]
+        action: WikiAction,
+        /// Project root (defaults to the detected project root)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
+/// `kira wiki` actions (ADR-0013: markdown is the source of truth).
+#[derive(Debug, Subcommand)]
+enum WikiAction {
+    /// List the pages that exist in docs/wiki
+    List,
+    /// Print one page (e.g. contexto, decisoes, bugs/4821-sessao-expirada)
+    Show {
+        /// Page id
+        page: String,
+    },
+    /// Append a decision to decisoes.md (masked before writing)
+    Decision {
+        /// Decision text
+        text: String,
     },
 }
 
@@ -195,6 +224,7 @@ async fn run(command: Command) -> Outcome {
         Command::Note { text, remove } => store_command(note_output(text, remove)),
         Command::Profile => store_command(profile_output()),
         Command::Scan { path } => scan_command(path.as_deref()),
+        Command::Wiki { action, path } => wiki_command(action, path.as_deref()),
     }
 }
 
@@ -282,6 +312,18 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 .unwrap_or_default(),
             None,
         ),
+        Command::Wiki { action, path } => {
+            let args = match action {
+                WikiAction::List => "list".to_string(),
+                WikiAction::Show { page } => format!("show {page}"),
+                WikiAction::Decision { text } => format!("decision {text}"),
+            };
+            let args = match path {
+                Some(path) => format!("{args} --path {}", path.display()),
+                None => args,
+            };
+            ("wiki".to_string(), args, None)
+        }
     }
 }
 
@@ -551,6 +593,72 @@ fn scan_command(path: Option<&Path>) -> Outcome {
         Err(err) => {
             print_error(&err);
             Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira wiki <action>` — reads and appends to the project wiki (ADR-0013).
+///
+/// Deterministic: no model, no network (ADR-0016). Every write goes through
+/// `redact` (privacy) and `guard::path` (confinement), inside the Wiki type.
+fn wiki_command(action: WikiAction, path: Option<&Path>) -> Outcome {
+    let root = match path {
+        Some(root) => root.to_path_buf(),
+        None => store::detect_project_root().unwrap_or_else(|| PathBuf::from(".")),
+    };
+    match wiki_output(&action, &root) {
+        Ok(text) => {
+            print!("{text}");
+            Outcome {
+                code: ExitCode::SUCCESS,
+                ok: true,
+                records: false,
+                summary: text,
+            }
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome {
+                code: exit_code(false),
+                ok: false,
+                records: false,
+                summary: err.to_string(),
+            }
+        }
+    }
+}
+
+/// Pure-ish body of `kira wiki`: the only I/O is the wiki itself.
+fn wiki_output(action: &WikiAction, root: &Path) -> Result<String, WikiError> {
+    let wiki = Wiki::open(root)?;
+    match action {
+        WikiAction::List => {
+            let pages = wiki.list()?;
+            if pages.is_empty() {
+                return Ok(format!(
+                    "a wiki de '{}' está vazia — a primeira página nasce com `kira wiki decision \"...\"`\n",
+                    root.display()
+                ));
+            }
+            let mut text = format!(
+                "wiki de '{}' ({} páginas, em docs/wiki):\n",
+                root.display(),
+                pages.len()
+            );
+            for page in pages {
+                text.push_str(&format!("  {page}\n"));
+            }
+            Ok(text)
+        }
+        WikiAction::Show { page } => match wiki.read(page)? {
+            Some(content) => Ok(content),
+            None => Ok(format!(
+                "página '{page}' ainda não existe — registre conhecimento com `kira wiki decision \"...\"`\n"
+            )),
+        },
+        WikiAction::Decision { text } => {
+            let written = wiki.append("decisoes", text)?;
+            Ok(format!("decisão registrada em {}\n", written.display()))
         }
     }
 }

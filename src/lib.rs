@@ -18,4 +18,5 @@ pub mod scan;
 pub mod setup;
 pub mod store;
 pub mod triage;
+pub mod wiki;
 pub mod work_item;
