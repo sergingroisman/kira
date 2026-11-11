@@ -49,7 +49,7 @@ const MIN_KEYWORD_CHARS: usize = 5;
 pub struct ContextSection {
     /// Wiki page id (`bugs/4821`).
     pub page: String,
-    /// Path shown to the model and to the user (`docs/wiki/bugs/4821.md`).
+    /// Path shown to the model and to the user (`.kira/wiki/bugs/4821.md`).
     pub path: String,
     /// Age in days taken from the page header, when parseable.
     pub age_days: Option<i64>,
@@ -289,10 +289,12 @@ pub fn pack_partial(
                 // Normalised to `/` on purpose: the model reads this path and the
                 // pack must be identical across Windows, macOS and Linux. `\` in
                 // a prompt was exactly the kind of difference that made the
-                // Windows CI fail.
+                // Windows CI fail. `display_path` first (W2-fix PR-F3): the
+                // canonical root carries the `\\?\` prefix on Windows and the
+                // page path inherits it — humans read this path too.
                 let path = wiki
                     .page_path(&page)
-                    .map(|path| path.display().to_string().replace('\\', "/"))
+                    .map(|path| crate::store::display_path(&path).replace('\\', "/"))
                     .unwrap_or_else(|_| page.clone());
                 let age_days = age_days_of(&content);
                 let cost = excerpt.chars().count() + path.chars().count() + 32;
@@ -552,13 +554,13 @@ mod tests {
         assert!(
             pack.sections[0]
                 .path
-                .ends_with("docs/wiki/bugs/4821-sessao-expirada.md"),
+                .ends_with(".kira/wiki/bugs/4821-sessao-expirada.md"),
             "{}",
             pack.sections[0].path
         );
         assert_eq!(pack.sections[0].age_days, Some(0));
         let rendered = pack.render();
-        assert!(rendered.contains("docs/wiki/bugs/4821-sessao-expirada.md"));
+        assert!(rendered.contains(".kira/wiki/bugs/4821-sessao-expirada.md"));
         assert!(rendered.contains("0 dia(s) atrás"));
         let _ = fs::remove_dir_all(&dir);
     }

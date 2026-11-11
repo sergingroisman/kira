@@ -364,7 +364,7 @@ mod tests {
         let pack = crate::context::ContextPack {
             sections: vec![crate::context::ContextSection {
                 page: "bugs/4821".to_string(),
-                path: "docs/wiki/bugs/4821.md".to_string(),
+                path: ".kira/wiki/bugs/4821.md".to_string(),
                 age_days: Some(3),
                 excerpt: "token renovado sem rotacionar".to_string(),
             }],
@@ -381,10 +381,10 @@ mod tests {
         };
         let with = build_prompt_with_context(&item, &pack);
         assert!(
-            !without.contains("docs/wiki/bugs/4821.md"),
+            !without.contains(".kira/wiki/bugs/4821.md"),
             "sem pack não há wiki"
         );
-        assert!(with.contains("docs/wiki/bugs/4821.md"), "{with}");
+        assert!(with.contains(".kira/wiki/bugs/4821.md"), "{with}");
         assert!(with.contains("3 dia(s) atrás"), "{with}");
         assert!(with.contains("token renovado sem rotacionar"), "{with}");
         assert!(

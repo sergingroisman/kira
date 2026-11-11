@@ -243,10 +243,9 @@ pub fn grep(
             None => continue,
         };
         // The wiki is already retrieved through FTS5 (PR31): grepping it again
-        // would send the same knowledge twice and burn the budget.
-        if rel.starts_with("docs/wiki/") {
-            continue;
-        }
+        // would send the same knowledge twice and burn the budget. W2-fix
+        // PR-F3: the wiki lives inside the dot-directory `.kira/wiki/`, which
+        // the leading-dot rule already skips — no special case left here.
         if skipped.contains(&rel) || !is_source_file(&rel) || !seen.insert(rel.clone()) {
             continue;
         }
@@ -430,7 +429,7 @@ mod tests {
         write(&dir, "target/debug/b.rs", "token no build\n");
         write(&dir, "node_modules/pkg/c.js", "token na dependência\n");
         write(&dir, ".git/config", "token no git\n");
-        write(&dir, "docs/wiki/contexto.md", "token na wiki\n");
+        write(&dir, ".kira/wiki/contexto.md", "token na wiki\n");
 
         let found = grep(&dir, &terms(&["token"]), &[], &[], 10);
         let paths: Vec<&str> = found

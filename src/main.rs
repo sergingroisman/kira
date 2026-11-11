@@ -100,7 +100,7 @@ enum Command {
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    /// Read and grow the project wiki at docs/wiki (knowledge, not chat logs)
+    /// Read and grow the local project wiki at .kira/wiki (knowledge, not chat logs)
     #[command(
         after_help = "Exemplos:\n  kira wiki list\n  kira wiki show contexto\n  kira wiki decision \"fix roda em jail mínimo — ADR-0011\""
     )]
@@ -116,7 +116,7 @@ enum Command {
 /// `kira wiki` actions (ADR-0013: markdown is the source of truth).
 #[derive(Debug, Subcommand)]
 enum WikiAction {
-    /// List the pages that exist in docs/wiki
+    /// List the pages that exist in .kira/wiki
     List,
     /// Print one page (e.g. contexto, decisoes, bugs/4821-sessao-expirada)
     Show {
@@ -138,12 +138,12 @@ enum WikiAction {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Delete a page from docs/wiki and from the search index (LGPD)
+    /// Delete a page from .kira/wiki and from the search index (LGPD)
     Forget {
         /// Page id (e.g. bugs/4821-sessao-expirada)
         page: String,
     },
-    /// Promote pages staged by an unattended cycle into docs/wiki
+    /// Promote pages staged by an unattended cycle into .kira/wiki
     Promote,
     /// Print the whole wiki as one markdown bundle (or save it with --out)
     Export {
@@ -675,7 +675,7 @@ fn wiki_output(action: &WikiAction, root: &Path) -> Result<String, WikiError> {
                 ));
             }
             let mut text = format!(
-                "wiki de '{}' ({} páginas, em docs/wiki):\n",
+                "wiki de '{}' ({} páginas, em .kira/wiki):\n",
                 root.display(),
                 pages.len()
             );
@@ -730,7 +730,7 @@ fn wiki_output(action: &WikiAction, root: &Path) -> Result<String, WikiError> {
                 ));
             }
             Ok(format!(
-                "página '{page}' apagada de docs/wiki{}\n",
+                "página '{page}' apagada de .kira/wiki{}\n",
                 forget_index(page)
             ))
         }
@@ -744,7 +744,7 @@ fn wiki_output(action: &WikiAction, root: &Path) -> Result<String, WikiError> {
                 );
             }
             let mut text = format!(
-                "{} página(s) promovida(s) para docs/wiki:\n",
+                "{} página(s) promovida(s) para .kira/wiki:\n",
                 promoted.len()
             );
             for page in promoted {
@@ -851,11 +851,20 @@ async fn triage_command(
                 eprintln!("aviso: contexto — {note}");
             }
             // Episodic capture (ADR-0013, PR30): fail-open, never changes the
-            // output or the exit code.
-            if let Some(note) = record_triage_episode(&report) {
+            // output or the exit code. A capture failure also prefixes the
+            // session-trail summary (W2-fix PR-F3) so `kira history` shows it.
+            let (episode_note, episode_failed) = record_triage_episode(&report);
+            if let Some(note) = episode_note {
                 eprint!("{note}");
             }
-            Outcome::success(report.output)
+            if episode_failed {
+                Outcome::success(format!(
+                    "wikipage: episódio failed (triage sem conteúdo nas 3 seções)\n{}",
+                    report.output
+                ))
+            } else {
+                Outcome::success(report.output)
+            }
         }
         Err(err) => {
             print_error(&err);
@@ -866,27 +875,58 @@ async fn triage_command(
 
 /// Episodic capture after a triage: a wiki problem is one `aviso:` line on
 /// stderr, never a failed command (same fail-open contract as the session
-/// trail).
-fn record_triage_episode(report: &triage::TriageReport) -> Option<String> {
+/// trail). Returns the stderr note (if any) plus whether the episode failed to
+/// capture for *content* reasons — an empty triage writes nothing to the wiki
+/// and only shows up on the trail (W2-fix PR-F3).
+fn record_triage_episode(report: &triage::TriageReport) -> (Option<String>, bool) {
     match record_triage_episode_inner(report) {
-        Ok(Some(path)) => Some(format!(
-            "wiki: episódio do item {} registrado em {}\n",
-            report.item_id,
-            path.display()
-        )),
-        Ok(None) => None,
-        Err(cause) => Some(format!("aviso: wiki não registrou o episódio ({cause})\n")),
+        EpisodeCapture::Recorded(path) => (
+            Some(format!(
+                "wiki: episódio do item {} registrado em {}\n",
+                report.item_id,
+                store::display_path(&path)
+            )),
+            false,
+        ),
+        EpisodeCapture::Skipped => (None, false),
+        EpisodeCapture::Empty => (
+            Some(format!(
+                "aviso: wiki não registrou o episódio do item {} (triage sem conteúdo — falha registrada na trilha)\n",
+                report.item_id
+            )),
+            true,
+        ),
+        EpisodeCapture::Failed(cause) => (
+            Some(format!("aviso: wiki não registrou o episódio ({cause})\n")),
+            false,
+        ),
     }
 }
 
+/// What the episodic capture did (W2-fix PR-F3).
+enum EpisodeCapture {
+    /// No project root detected — nothing to do, silent.
+    Skipped,
+    /// Episode written to the wiki page (path feeds the success note).
+    Recorded(PathBuf),
+    /// All three triage sections empty (or `—`): the wiki is NOT written; the
+    /// failure lives only on the session trail.
+    Empty,
+    /// Wiki failure: fail-open, one `aviso:` line on stderr.
+    Failed(String),
+}
+
 /// Builds the episode from what the command already produced and writes it to
-/// the committed wiki — a human ran `kira triage` (ADR-0013). An unattended
+/// the main wiki — a human ran `kira triage` (ADR-0013). An unattended
 /// cycle must use [`episode::EpisodeTarget::Staging`] instead (PR15).
-fn record_triage_episode_inner(report: &triage::TriageReport) -> Result<Option<PathBuf>, String> {
+fn record_triage_episode_inner(report: &triage::TriageReport) -> EpisodeCapture {
     let Some(root) = store::detect_project_root() else {
-        return Ok(None);
+        return EpisodeCapture::Skipped;
     };
-    let wiki = Wiki::open(&root).map_err(|err| err.to_string())?;
+    let wiki = match Wiki::open(&root) {
+        Ok(wiki) => wiki,
+        Err(err) => return EpisodeCapture::Failed(err.to_string()),
+    };
     let sections = triage::sections_of(&report.output);
     let findings_brief = scan::read_findings_file(&root)
         .ok()
@@ -900,14 +940,21 @@ fn record_triage_episode_inner(report: &triage::TriageReport) -> Result<Option<P
         confidence: sections[2].clone(),
         findings_brief,
     };
-    let path = episode::record(
+    // W2-fix PR-F3 (bug 529511): an episode whose three sections carry nothing
+    // is not knowledge — writing it would plant an empty page inside the
+    // client's project. The failure goes to the trail only.
+    if episode.is_empty() {
+        return EpisodeCapture::Empty;
+    }
+    match episode::record(
         &wiki,
         &episode,
-        episode::EpisodeTarget::Committed,
+        episode::EpisodeTarget::Wiki,
         &store::now_rfc3339_utc(),
-    )
-    .map_err(|err| err.to_string())?;
-    Ok(Some(path))
+    ) {
+        Ok(path) => EpisodeCapture::Recorded(path),
+        Err(err) => EpisodeCapture::Failed(err.to_string()),
+    }
 }
 
 async fn triage_live(base_url: &str, model: &str, id: i32) -> Result<triage::TriageReport, Error> {

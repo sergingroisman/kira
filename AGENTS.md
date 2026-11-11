@@ -39,7 +39,7 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Ordem de prioridade do orçamento (`KIRA_NUM_CTX`), fixa: brief do `kira scan` → achados individuais → páginas da wiki → trechos do repositório. Orçamento estourado vira nota, nunca erro.
 - DETERMINISMO: caminhada ordenada por nome, ranking = arquivo citado em `findings.json` primeiro, depois termos casados, caminho e linha. Mesmo estado ⇒ mesmo pack (gate do M1).
 - Toda linha do repositório passa por `redact`; linha de atribuição (`token = ...`, `password = ...`) sai mascarada mesmo quando é código — privacidade acima de utilidade.
-- Nunca greppar `docs/wiki/` (já vem do FTS5), dot-dirs, `target/`, `node_modules/`, build output, nem o arquivo do work item passado em `--file`.
+- Nunca greppar `.kira/wiki/` (já vem do FTS5), dot-dirs, `target/`, `node_modules/`, build output, nem o arquivo do work item passado em `--file`.
 - FAIL-OPEN por fonte: wiki, store, findings ou grep que falham só geram nota; `kira triage` continua e imprime `contexto: ...` no stderr dizendo o que foi enviado.
 ## Store
 - Trilha local por projeto em SQLite (rusqlite, feature `bundled` — binário sem instalação externa); tudo em `src/store/`; DB único central `~/.config/kira/store.db` (Windows: `%USERPROFILE%\.config\kira\store.db`), modo WAL, migração idempotente via `PRAGMA user_version` com `CREATE TABLE IF NOT EXISTS`.
@@ -61,11 +61,11 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Só `src/triage.rs`, `src/loop/` e `src/wiki/` podem importar `llm::*`. Teste de allowlist (PR33) reprova o resto — `scan`, `store`, `board`, `ado`, `guard`, `format`, `tui`, `doctor`, `scheduler` nunca falam com modelo.
 - O budget de 50 chamadas/dia mede **LLM**, não trabalho: comando determinístico não consome budget.
 ## Wiki (`src/wiki/`, ADR-0013)
-- Fonte de verdade em markdown **commitado**: `<projeto>/docs/wiki/{contexto,decisoes,padroes,glossario}.md` e `<projeto>/docs/wiki/bugs/<slug>.md`. Índice (FTS5, PR29) é derivado e descartável.
+- Fonte de verdade em markdown **local** (W2-fix PR-F3): `<projeto>/.kira/wiki/{contexto,decisoes,padroes,glossario}.md` e `<projeto>/.kira/wiki/bugs/<slug>.md`. Índice (FTS5, PR29) é derivado e descartável.
 - **Toda escrita passa por `redact` (segredos nunca vão para o disco) e por `guard::path` (confinamento na raiz).** Id de página inválido (`..`, absoluto, maiúscula, slug fora de `[a-z0-9_-]`) é recusado antes de qualquer I/O.
-- **Ciclo autônomo nunca escreve em `docs/wiki/`**: grava em `.kira/wiki-staging/` e depende de promoção humana (`kira wiki promote`, PR32).
+- **Ciclo autônomo nunca escreve em `.kira/wiki/`**: grava em `.kira/wiki-staging/` e depende de promoção humana (`kira wiki promote`, PR32).
 - Páginas não são log de conversa: guardam conhecimento reutilizável (arquitetura, decisões, padrões, glossário, causa raiz de bug). Nada de transcrição.
-- `kira triage` (comando humano) anexa um **episódio** em `docs/wiki/bugs/<item-id>.md` com causa raiz prevista, arquivos, confiança e o brief do `kira scan` — sem perguntar nada. Episódio repetido (mesmo conteúdo) não duplica; episódios com mais de 30 dias colapsam numa linha em `## Histórico colapsado`. O ciclo autônomo usa `.kira/wiki-staging/` (`EpisodeTarget::Staging`), nunca `docs/wiki/`.
+- `kira triage` (comando humano) anexa um **episódio** em `.kira/wiki/bugs/<item-id>.md` com causa raiz prevista, arquivos, confiança e o brief do `kira scan` — sem perguntar nada. Episódio vazio (as 3 seções sem conteúdo) NÃO grava: a falha fica registrada só na trilha (`kira history`). Episódio repetido (mesmo conteúdo) não duplica; episódios com mais de 30 dias colapsam numa linha em `## Histórico colapsado`. O ciclo autônomo usa `.kira/wiki-staging/` (`EpisodeTarget::Staging`), nunca `.kira/wiki/`.
 - `kira wiki forget <página>` apaga o markdown e as entradas do índice (LGPD: dado do dono); página inexistente não é erro. O índice é derivado — falha ao limpá-lo vira aviso, nunca erro do comando.
 
 ## Autonomia e aprovação
