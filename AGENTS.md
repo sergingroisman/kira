@@ -101,4 +101,5 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - **TUI é modo do binário, não substituto:** o dashboard (Ratatui) é read-only sobre o store; o modo texto do loop/agendado continua sendo a saída canônica e erros permanecem texto copiável.
 - **Dashboard é read-only PROVADO:** `kira dashboard` não escreve em disco (store aberta em `SQLITE_OPEN_READ_ONLY`), não toca rede/LLM e NÃO grava sessão na trilha; o e2e compara o hash do `store.db` antes/depois de rodar com e sem `--snapshot` — deve ser byte-idêntico (`tests/dashboard_e2e.rs`). Dado ausente aparece como `—` com a causa, nunca inventado.
 - **Proibido copiar código de projeto GPL** (ex.: ai-jail) para este repo MIT. Conceito sim, código não.
+- **Painel de achados lê, nunca reescreve:** `findings.json` entra no snapshot como `FindingRow` agregado por severidade/ferramenta (ordem critical→low, zeros visíveis); ausente/corrompido ⇒ lista vazia + causa (fail-open). A decisão do loop é a função pura `tui::app::decide` — nada de tecla nova escrevendo em disco.
 

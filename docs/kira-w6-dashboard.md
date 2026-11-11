@@ -92,9 +92,38 @@ detalhe · `Esc` volta · `/` busca na wiki · `r` recarrega (relê disco; sem r
   porta morta, causa "nunca rodou kira scan", store ausente ⇒ exit 0).
 - **Não copiado nada do statui** nesta PR — ver `third_party/statui/NOTICE.md`
   (a licença MIT passa a ser redistribuída no primeiro PR que copiar trechos).
-- Ainda não entregue desta spec: painéis Achados/Sessões/Wiki, mascote,
-  `--about`, busca `/`, teste de snapshot de buffer por painel (o `TestBackend`
-  já existe no widget do cabeçalho), smoke manual do dono no Windows.
+- Ainda não entregue desta spec: painéis Sessões/Wiki, mascote,
+  `--about`, busca `/` (o `TestBackend` por painel já existe — cabeçalho no
+  W6-PR1, achados no W6-PR2), smoke manual do dono no Windows.
+
+### Entregue no W6-PR2 (branch `w6/pr2-findings-panel`)
+
+- Painel **Achados** (`src/tui/widgets/findings.rs`): tabela com cabeçalho de
+  contagem no título do bloco (`critical N · high N · medium N · low N` — zeros
+  visíveis) e colunas SEVERIDADE / FERRAMENTA / LOCAL (`path:linha` quando o
+  path carrega `:N`; o scan não inventa linha) / RESUMO (1ª linha da mensagem).
+  Cores semânticas por severidade (critical→low na paleta; mono preserva o
+  texto). Seleção com `➤` (padrão do statui) + linha `REVERSED`. **Sem scroll
+  horizontal**: colunas têm largura da área e célula trunca com `…`.
+- `state`: `FindingRow` (severity/tool/path/line/fingerprint_short/
+  message_first_line + fingerprint e mensagem completas para o detalhe),
+  agregação por severidade e por ferramenta (`severity_counts`, `tool_counts`),
+  ordenação canônica critical→low, `findings.json` ausente/corrompido ⇒ lista
+  vazia + causa (fail-open), estado vazio honesto
+  (`achados: — (causa)` / `achados: (0 achados no último scan)`).
+- `Enter` abre o detalhe (painel lateral, 60/40) com severidade, ferramenta,
+  LOCAL, fingerprint completo e a mensagem inteira; `Esc` volta. Detalhe é
+  modal. `Tab`/`Shift+Tab` alterna **cabeçalho ↔ achados de verdade** (borda
+  em foco/idle, rodapé `painel 1/2`).
+- Decisão do loop EXTRAÍDA em função pura: `app::decide(state, key) -> Outcome`
+  (`Quit`, `Redraw` = Ctrl+L, `Reload`, `ToggleDetail`, `Move(isize)`,
+  `CyclePanel(±1)`, `Help`, `Ignore`) + `apply_move` (saturação) +
+  `next_panel` (wrap) — o loop só executa o outcome; unit-tests de todas as
+  transições (tui/app.rs sai de 0% de cobertura).
+- `--snapshot`/não-TTY imprimem a MESMA informação em texto (contagens, colunas,
+  path:linha). Nada escreve em disco — o hash do `store.db` antes/depois segue
+  byte-idêntico (`tests/dashboard_e2e.rs`, agora com fixture de 3 achados em 2
+  severidades e caso de findings.json corrompido).
 
 ## Fora de escopo (rejeitado por ora)
 

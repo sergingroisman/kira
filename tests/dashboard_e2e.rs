@@ -86,6 +86,23 @@ impl Sandbox {
         config
     }
 
+    /// Findings fixture (W6-PR2): 3 achados, 2 severidades (critical 1,
+    /// high 2), escrito direto em `.kira/findings.json` — o painel lê o MESMO
+    /// documento que o `kira scan` grava (`{"findings": [...]}`).
+    fn write_findings_fixture(&self) {
+        let dir = self.cwd.join(".kira");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar .kira fixture: {err}"));
+        std::fs::write(
+            dir.join("findings.json"),
+            r#"{"findings":[
+                {"tool":"audit","rule":"vulnerable","package":"lodash","version":"4.17.19","severity":"critical","path":"src/lib.rs:42","message":"Prototype Pollution\nCVE-2020-8203","fingerprint":"0a1b2c3d4e5f6001"},
+                {"tool":"audit","rule":"outdated","package":"minimist","version":"1.2.0","severity":"High","path":"package.json","message":"Deprecated dependency","fingerprint":"0a1b2c3d4e5f6002"},
+                {"tool":"dotnet","rule":"outdated","package":"Npgsql","version":"8.0.4","severity":"High","path":"App/Db.csproj","message":"Pacote deprecado","fingerprint":"0a1b2c3d4e5f6003"}
+            ]}"#,
+        )
+        .unwrap_or_else(|err| panic!("escrever findings.json fixture: {err}"));
+    }
+
     /// Hash of the fixture store DB (the object of the read-only proof).
     fn store_hash(&self) -> String {
         let path = self.store.join(store::DB_FILE);
@@ -236,4 +253,64 @@ fn absent_store_is_an_actionable_message_with_exit_zero() {
     assert!(out.contains("nenhuma trilha em"), "{out}");
     assert!(out.contains("rode `kira scan` ou `kira doctor`"), "{out}");
     assert!(out.contains("projeto: — ("), "{out}");
+}
+
+#[test]
+fn snapshot_with_findings_fixture_shows_counts_and_location_readonly() {
+    // W6-PR2: painel de achados no `--snapshot` — contagem por severidade no
+    // cabeçalho do painel, colunas e `path:linha` — E a prova de read-only se
+    // mantém: o hash do `store.db` tem que ser idêntico antes/depois.
+    let sandbox = Sandbox::new("findings");
+    sandbox.seed_store_with_scan(true);
+    sandbox.write_findings_fixture();
+    let before = sandbox.store_hash();
+    assert!(!before.is_empty(), "store fixture precisa existir");
+
+    let (code, out, err) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "saída: {out}{err}");
+
+    // Contagem por severidade (3 achados: critical 1, high 2) + ferramentas.
+    assert!(
+        out.contains("painel achados — critical 1 · high 2 · medium 0 · low 0"),
+        "cabeçalho de contagem esperado: {out}"
+    );
+    assert!(out.contains("ferramentas: audit 2, dotnet 1"), "{out}");
+    assert!(
+        out.contains("achados: 3"),
+        "contagem total no header: {out}"
+    );
+    // Colunas da tabela + path:linha (LOCAL) + resumo.
+    assert!(out.contains("SEVERIDADE"), "{out}");
+    assert!(out.contains("FERRAMENTA"), "{out}");
+    assert!(out.contains("LOCAL"), "{out}");
+    assert!(out.contains("RESUMO"), "{out}");
+    assert!(out.contains("src/lib.rs:42"), "path:linha esperado: {out}");
+    assert!(out.contains("Prototype Pollution"), "{out}");
+    // Ordenação canônica no texto: critical antes de high.
+    let critical = out.find("critical").unwrap_or(usize::MAX);
+    let high = out.find("high").unwrap_or(usize::MAX);
+    assert!(critical < high, "critical→low na saída: {out}");
+    // O achado cru NUNCA apaga o contrato read-only: nada de escrita.
+    let after = sandbox.store_hash();
+    assert_eq!(
+        before, after,
+        "dashboard --snapshot com painel de achados mutou o store.db — violação do contrato read-only"
+    );
+}
+
+#[test]
+fn corrupted_findings_fail_open_to_dash_with_cause_and_exit_zero() {
+    // findings.json corrompido: lista vazia + a causa real, exit 0 — o
+    // dashboard é diagnóstico, nunca pânico nem dado inventado.
+    let sandbox = Sandbox::new("corrupted");
+    sandbox.seed_store_with_scan(true);
+    let dir = sandbox.cwd.join(".kira");
+    std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar .kira: {err}"));
+    std::fs::write(dir.join("findings.json"), "{\"findings\": [quebrado")
+        .unwrap_or_else(|err| panic!("escrever findings quebrado: {err}"));
+    let (code, out, err) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "fail-open tem que ser exit 0: {out}{err}");
+    assert!(out.contains("achados: — ("), "{out}");
+    assert!(out.contains("ilegível"), "causa real da leitura: {out}");
+    assert!(!out.contains("Prototype Pollution"), "{out}");
 }
