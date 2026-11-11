@@ -18,17 +18,28 @@ pub struct HeaderWidget<'a> {
     lines: &'a [String],
     /// Nome curto do projeto para o título do bloco (quando existe).
     title: Option<&'a str>,
+    /// Painel em foco? (W6-PR2: Tab alterna cabeçalho ↔ achados — o painel
+    /// fora de foco perde a borda realçada, o foco fica sempre visível.)
+    focused: bool,
     palette: Palette,
 }
 
 impl<'a> HeaderWidget<'a> {
     /// Constrói o widget a partir do snapshot pronto (nunca consulta disco).
+    /// Em foco por padrão — no W6-PR1 ele era o único painel.
     pub fn new(lines: &'a [String], title: Option<&'a str>, palette: Palette) -> Self {
         Self {
             lines,
             title,
+            focused: true,
             palette,
         }
+    }
+
+    /// Define o estado de foco (encadeável, padrão builder do ratatui).
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
     }
 }
 
@@ -48,7 +59,11 @@ impl Widget for HeaderWidget<'_> {
                     .fg(self.palette.title)
                     .add_modifier(Modifier::BOLD),
             ))
-            .border_style(Style::default().fg(self.palette.border_focus));
+            .border_style(Style::default().fg(if self.focused {
+                self.palette.border_focus
+            } else {
+                self.palette.border_idle
+            }));
 
         block.clone().render(area, buf);
 

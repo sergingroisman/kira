@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 
 use crate::credentials;
 use crate::doctor;
-use crate::scan;
+use crate::scan::{self, Finding};
 use crate::store::{self, Store};
 
-/// O estado de tela inteiro do dashboard nesta PR (só o cabeçalho existe).
+/// O estado de tela inteiro do dashboard (W6-PR2: cabeçalho + achados).
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     /// Raiz canônica do projeto detectada do cwd; `None` = sem diretório.
@@ -39,6 +39,9 @@ pub struct Snapshot {
     pub findings: Option<usize>,
     /// Causa quando não há contagem de achados.
     pub findings_note: Option<String>,
+    /// Linhas do painel de achados (W6-PR2): já normalizadas e ordenadas
+    /// critical→low. Vazio = estado vazio honesto (`empty_findings_line`).
+    pub finding_rows: Vec<FindingRow>,
     /// Idade do último `kira scan` gravado na trilha (segundos desde então).
     pub last_scan_age_secs: Option<i64>,
     /// Data/hora local do último scan, já pronta para exibição.
@@ -160,13 +163,24 @@ fn load_pat(snapshot: &mut Snapshot) {
     }
 }
 
-/// Contagem de achados do último scan (o painel completo é o W6-PR2).
+/// Contagem + linhas de achados do último scan (painel W6-PR2). A decisão
+/// ausente/corrompido é função pura em [`apply_findings`] — testável sem disco.
 fn load_findings(snapshot: &mut Snapshot) {
     let Some(root) = snapshot.root.clone() else {
         return; // sem root, a causa já está na nota do store
     };
-    match scan::read_findings_file(&root) {
-        Ok(Some(findings)) => snapshot.findings = Some(findings.len()),
+    apply_findings(snapshot, scan::read_findings_file(&root));
+}
+
+/// Aplica o resultado da leitura de `findings.json` ao snapshot — função pura
+/// para o contrato fail-open ser unit-testável: ausente/corrompido ⇒ lista
+/// vazia + causa acionável, NUNCA pânico nem dado inventado.
+fn apply_findings(snapshot: &mut Snapshot, loaded: Result<Option<Vec<Finding>>, scan::ScanError>) {
+    match loaded {
+        Ok(Some(findings)) => {
+            snapshot.findings = Some(findings.len());
+            snapshot.finding_rows = rows_from(findings);
+        }
         Ok(None) => {
             // Honestidade depende do histórico: sem scan na trilha E sem
             // arquivo, a causa é "nunca rodou"; com scan gravado, o arquivo
@@ -178,7 +192,10 @@ fn load_findings(snapshot: &mut Snapshot) {
             });
         }
         Err(err) => {
+            // Fail-open: JSON corrompido vira lista vazia com a causa real da
+            // leitura (o próprio erro já diz "rode `kira scan` de novo").
             snapshot.findings_note = Some(format!("{err}"));
+            snapshot.finding_rows = Vec::new();
         }
     }
 }
@@ -191,6 +208,221 @@ fn age_secs_from_rfc3339(rfc3339: &str) -> Option<i64> {
     let stamp = store::rfc3339_utc_to_unix_seconds(rfc3339)?;
     let now = store::rfc3339_utc_to_unix_seconds(&store::now_rfc3339_utc())?;
     Some((now - stamp).max(0))
+}
+
+/// Uma linha da tabela de achados: o que o painel precisa de um `Finding`.
+///
+/// O `scan` não informa linha (o path do npm é a cadeia de dependência, o do
+/// dotnet é o csproj); quando o path já chega com sufixo `:N` (analisadores
+/// que apontam arquivo:linha), separamos para a coluna LOCAL exibir
+/// `path:linha` — nunca inventamos um número de linha que não veio do disco.
+/// `fingerprint`/`message` completos viajam junto porque o detalhe do `Enter`
+/// mostra o valor inteiro, não o truncado da tabela.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingRow {
+    /// Severidade em minúsculas (exibição; o dado cru fica no findings.json).
+    pub severity: String,
+    pub tool: String,
+    pub path: String,
+    /// Linha quando o path veio como `arquivo:N`; `None` = sem linha conhecida.
+    pub line: Option<u32>,
+    /// Primeiros 8 chars do fingerprint hex de 64 bits.
+    pub fingerprint_short: String,
+    /// Fingerprint completo (o detalhe do `Enter` mostra os 16 chars).
+    pub fingerprint: String,
+    /// Primeira linha da mensagem (o que cabe na coluna RESUMO).
+    pub message_first_line: String,
+    /// Mensagem inteira (o detalhe do `Enter` exibe sem corte).
+    pub message: String,
+}
+
+impl FindingRow {
+    /// LOCAL da tabela: `path:linha` quando a linha existe, senão só o path.
+    pub fn location(&self) -> String {
+        match self.line {
+            Some(line) => format!("{}:{line}", self.path),
+            None => self.path.clone(),
+        }
+    }
+}
+
+/// Ordem canônica de severidade do painel (spec W6): critical→low.
+pub const SEVERITY_ORDER: [&str; 4] = ["critical", "high", "medium", "low"];
+
+/// Rank de ordenação: as quatro severidades canônicas primeiro, qualquer
+/// severidade fora do padrão (ex.: `moderate` do npm) depois, por ordem
+/// alfabética — determinismo em vez de sumiço.
+fn severity_rank(severity: &str) -> usize {
+    SEVERITY_ORDER
+        .iter()
+        .position(|canonical| *canonical == severity)
+        .unwrap_or(SEVERITY_ORDER.len())
+}
+
+/// Separa um sufixo `:N` do path (ex.: `src/lib.rs:42`). Só aceita dígitos
+/// depois do último `:` — um `C:\proj` do Windows não vira linha falsa.
+fn split_path_line(path: &str) -> (String, Option<u32>) {
+    if let Some(colon) = path.rfind(':') {
+        let (file, line) = path.split_at(colon);
+        if !file.is_empty()
+            && let Ok(number) = line[1..].parse::<u32>()
+        {
+            return (file.to_string(), Some(number));
+        }
+    }
+    (path.to_string(), None)
+}
+
+/// Converte os `Finding` do scan em linhas do painel, já ordenadas
+/// critical→low (e dentro da mesma severidade por ferramenta/path/fingerprint,
+/// que é a ordem determinística do arquivo). Função pura: teste sem disco.
+pub fn rows_from(findings: Vec<Finding>) -> Vec<FindingRow> {
+    let mut rows: Vec<FindingRow> = findings
+        .iter()
+        .map(|finding| {
+            let severity = finding.severity.trim().to_lowercase();
+            let (path, line) = split_path_line(finding.path.trim());
+            let fingerprint = finding.fingerprint.trim().to_string();
+            let message = finding.message.trim().to_string();
+            let message_first_line = message.lines().next().unwrap_or_default().to_string();
+            FindingRow {
+                severity,
+                tool: finding.tool.trim().to_string(),
+                path,
+                line,
+                fingerprint_short: fingerprint.chars().take(8).collect(),
+                fingerprint,
+                message_first_line,
+                message,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        severity_rank(&a.severity)
+            .cmp(&severity_rank(&b.severity))
+            .then_with(|| a.tool.cmp(&b.tool))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.fingerprint.cmp(&b.fingerprint))
+    });
+    rows
+}
+
+/// Contagem por severidade, na ordem canônica do painel (critical→low com
+/// zeros visíveis) + severidades fora do padrão em ordem alfabética.
+pub fn severity_counts(rows: &[FindingRow]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for row in rows {
+        *counts.entry(row.severity.clone()).or_default() += 1;
+    }
+    let mut ordered: Vec<(String, usize)> = SEVERITY_ORDER
+        .iter()
+        .map(|severity| {
+            (
+                (*severity).to_string(),
+                *counts.get(*severity).unwrap_or(&0),
+            )
+        })
+        .collect();
+    for (severity, count) in counts {
+        if !SEVERITY_ORDER.contains(&severity.as_str()) {
+            ordered.push((severity, count));
+        }
+    }
+    ordered
+}
+
+/// Contagem por ferramenta, alfabética (determinismo; o painel mostra
+/// `ferramentas: audit 2, dotnet 1` quando há achados).
+pub fn tool_counts(rows: &[FindingRow]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for row in rows {
+        *counts.entry(row.tool.clone()).or_default() += 1;
+    }
+    counts.into_iter().collect()
+}
+
+/// Cabeçalho de contagem do painel: `critical 1 · high 2 · medium 0 · low 0`
+/// (severidades fora do padrão entram no fim, também com ` · `).
+pub fn count_header_line(rows: &[FindingRow]) -> String {
+    severity_counts(rows)
+        .iter()
+        .map(|(severity, count)| format!("{severity} {count}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Linha de ferramentas do painel: `ferramentas: audit 2, dotnet 1`; vazia
+/// quando não há achados (o chamador omite a linha inteira).
+pub fn tools_line(rows: &[FindingRow]) -> String {
+    let counts = tool_counts(rows);
+    if counts.is_empty() {
+        return String::new();
+    }
+    let parts = counts
+        .iter()
+        .map(|(tool, count)| format!("{tool} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ferramentas: {parts}")
+}
+
+/// Estado vazio honesto do painel (spec W6-PR2): arquivo presente e vazio ⇒
+/// `(0 achados no último scan)`; ausente/corrompido ⇒ `—` com a causa que o
+/// snapshot já carrega — nunca uma causa genérica inventada aqui.
+pub fn empty_findings_line(snapshot: &Snapshot) -> String {
+    if snapshot.findings == Some(0) {
+        return "achados: (0 achados no último scan)".to_string();
+    }
+    let cause = snapshot
+        .findings_note
+        .clone()
+        .unwrap_or_else(|| "findings.json ausente — rode kira scan".to_string());
+    format!("achados: — ({cause})")
+}
+
+/// Linhas de texto do painel de achados: a MESMA lista alimenta o widget TUI
+/// (modo degradado) e a saída do `--snapshot`/não-TTY. Fixas em colunas — sem
+/// scroll horizontal em nenhum dos dois mundos.
+pub fn findings_lines(snapshot: &Snapshot) -> Vec<String> {
+    let rows = &snapshot.finding_rows;
+    if rows.is_empty() {
+        return vec![empty_findings_line(snapshot)];
+    }
+    let mut lines = vec![
+        format!(
+            "painel achados — {} · {}",
+            count_header_line(rows),
+            tools_line(rows)
+        ),
+        format!(
+            "{:<10} {:<12} {:<26}{}",
+            "SEVERIDADE", "FERRAMENTA", "LOCAL", "RESUMO"
+        ),
+    ];
+    for row in rows {
+        lines.push(format!(
+            "{:<10} {:<12} {:<26}{}",
+            row.severity,
+            row.tool,
+            row.location(),
+            row.message_first_line
+        ));
+    }
+    lines
+}
+
+/// Linhas do detalhe aberto pelo `Enter`: severidade, ferramenta, LOCAL,
+/// fingerprint completo e a mensagem inteira — nada truncado aqui, o detalhe
+/// existe justamente para mostrar o valor que a tabela corta.
+pub fn detail_lines(row: &FindingRow) -> Vec<String> {
+    vec![
+        format!("severidade: {}", row.severity),
+        format!("ferramenta: {}", row.tool),
+        format!("local: {}", row.location()),
+        format!("fingerprint: {}", row.fingerprint),
+        String::from("mensagem:"),
+        row.message.clone(),
+    ]
 }
 
 /// Idade humanizada: `há 45s`, `há 3 min`, `há 2 h`, `há 5 dias`.
@@ -330,6 +562,15 @@ pub fn text_report(snapshot: &Snapshot) -> String {
         text.push_str(&line);
         text.push('\n');
     }
+    // Painel de achados (W6-PR2): mesma informação da TUI, em colunas de texto.
+    let findings = findings_lines(snapshot);
+    if !findings.is_empty() {
+        text.push('\n');
+        for line in findings {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
     text.push_str(&footer_line());
     text.push('\n');
     text
@@ -437,5 +678,189 @@ mod tests {
         assert!(report.contains("kira dashboard (read-only"), "{report}");
         assert!(report.contains("dev: Sérgio"), "{report}");
         assert!(report.contains("teclas: q sair"), "{report}");
+    }
+
+    /// Achados de referência (severidades canônicas + uma fora do padrão) que
+    /// os testes de agregação e de ordenação compartilham.
+    fn fixture_finding(tool: &str, severity: &str, path: &str, message: &str) -> Finding {
+        Finding {
+            tool: tool.to_string(),
+            rule: "outdated".to_string(),
+            package: "pkg".to_string(),
+            version: "1.0.0".to_string(),
+            severity: severity.to_string(),
+            path: path.to_string(),
+            message: message.to_string(),
+            fingerprint: "0123456789abcdef".to_string(),
+        }
+    }
+
+    #[test]
+    fn rows_are_sorted_critical_to_low_and_normalize_display() {
+        let rows = rows_from(vec![
+            fixture_finding("dotnet", "Low", "App.csproj", "pacote deprecado"),
+            fixture_finding("audit", "High", "package.json", "advisory"),
+            fixture_finding("audit", "CRITICAL", "src/lib.rs:42", "Prototype Pollution"),
+            fixture_finding("npm", "moderate", "package.json", "fora do padrão"),
+        ]);
+        let severities: Vec<&str> = rows.iter().map(|row| row.severity.as_str()).collect();
+        assert_eq!(
+            severities,
+            // As quatro canônicas em ordem canônica (low antes do fora-de-
+            // padrão, que ganha o último rank) — determinismo, nunca sumiço.
+            vec!["critical", "high", "low", "moderate"],
+            "ordem canônica com o fora-de-padrão depois das canônicas: {rows:?}"
+        );
+        // Severidade normalizada para exibição (comparação é só de tela).
+        assert_eq!(rows[0].severity, "critical");
+        assert_eq!(rows[3].severity, "moderate");
+        // E a case crua do arquivo não vaza na exibição ("CRITICAL" → "critical").
+        assert_eq!(rows[0].path, "src/lib.rs");
+        assert_eq!(rows[0].line, Some(42));
+    }
+
+    #[test]
+    fn location_shows_path_line_when_the_path_carries_one() {
+        let rows = rows_from(vec![fixture_finding(
+            "audit",
+            "high",
+            "src/lib.rs:42",
+            "Prototype Pollution",
+        )]);
+        assert_eq!(rows[0].path, "src/lib.rs");
+        assert_eq!(rows[0].line, Some(42));
+        assert_eq!(rows[0].location(), "src/lib.rs:42");
+        // Windows drive letter: o `:` da unidade NÃO vira linha falsa.
+        let windows = rows_from(vec![fixture_finding(
+            "dotnet",
+            "low",
+            "C:\\proj\\App.csproj",
+            "m",
+        )]);
+        assert_eq!(windows[0].line, None);
+        assert_eq!(windows[0].location(), "C:\\proj\\App.csproj");
+    }
+
+    #[test]
+    fn counts_aggregate_by_severity_and_tool() {
+        let rows = rows_from(vec![
+            fixture_finding("audit", "critical", "src/a.rs", "A"),
+            fixture_finding("audit", "High", "src/b.rs", "B"),
+            fixture_finding("dotnet", "high", "App.csproj", "C"),
+        ]);
+        assert_eq!(
+            severity_counts(&rows),
+            vec![
+                ("critical".to_string(), 1),
+                ("high".to_string(), 2),
+                ("medium".to_string(), 0),
+                ("low".to_string(), 0),
+            ]
+        );
+        assert_eq!(
+            tool_counts(&rows),
+            vec![("audit".to_string(), 2), ("dotnet".to_string(), 1)]
+        );
+        // O cabeçalho do painel mostra as QUATRO severidades, mesmo com zero.
+        assert_eq!(
+            count_header_line(&rows),
+            "critical 1 · high 2 · medium 0 · low 0"
+        );
+        assert_eq!(tools_line(&rows), "ferramentas: audit 2, dotnet 1");
+    }
+
+    #[test]
+    fn message_first_line_carries_only_the_first_line_but_detail_keeps_all() {
+        let rows = rows_from(vec![fixture_finding(
+            "audit",
+            "high",
+            "src/lib.rs:42",
+            "Prototype Pollution\nCVE-2020-8203 — rode `npm audit fix`",
+        )]);
+        assert_eq!(rows[0].message_first_line, "Prototype Pollution");
+        assert_eq!(rows[0].fingerprint_short, "01234567");
+        assert_eq!(rows[0].fingerprint, "0123456789abcdef");
+        let detail = detail_lines(&rows[0]).join("\n");
+        assert!(detail.contains("severidade: high"), "{detail}");
+        assert!(detail.contains("local: src/lib.rs:42"), "{detail}");
+        assert!(detail.contains("fingerprint: 0123456789abcdef"), "{detail}");
+        assert!(
+            detail.contains("CVE-2020-8203"),
+            "o detalhe mostra a mensagem INTEIRA: {detail}"
+        );
+    }
+
+    #[test]
+    fn corrupted_findings_fail_open_to_empty_list_with_the_real_cause() {
+        // JSON corrompido: lista vazia + a causa da leitura — fail-open
+        // (nada de pânico, nada de dado inventado), igual ao store ausente.
+        let mut snapshot = Snapshot::default();
+        apply_findings(
+            &mut snapshot,
+            Err(scan::ScanError::Runtime {
+                message: "findings.json ilegível (EOF) — rode `kira scan` de novo".to_string(),
+            }),
+        );
+        assert!(
+            snapshot.finding_rows.is_empty(),
+            "{:?}",
+            snapshot.finding_rows
+        );
+        assert!(snapshot.findings.is_none());
+        let note = snapshot.findings_note.clone().unwrap_or_default();
+        assert!(note.contains("ilegível"), "{note}");
+        assert!(
+            empty_findings_line(&snapshot).starts_with("achados: — ("),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn empty_state_is_honest_about_absent_file_vs_zero_findings() {
+        // Arquivo ausente: `—` com a causa (cópia da que o load Findings grava).
+        let absent = Snapshot {
+            findings_note: Some("nunca rodou kira scan".to_string()),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            empty_findings_line(&absent),
+            "achados: — (nunca rodou kira scan)"
+        );
+        // Arquivo presente e vazio: contagem zero explícita, sem `—` de mentira.
+        let zero = Snapshot {
+            findings: Some(0),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            empty_findings_line(&zero),
+            "achados: (0 achados no último scan)"
+        );
+        // E `findings_lines` devolve exatamente essa linha no estado vazio.
+        assert_eq!(
+            findings_lines(&zero),
+            vec!["achados: (0 achados no último scan)"]
+        );
+    }
+
+    #[test]
+    fn findings_lines_show_counts_columns_and_locations() {
+        let mut snapshot = Snapshot::default();
+        apply_findings(
+            &mut snapshot,
+            Ok(Some(vec![
+                fixture_finding("audit", "critical", "src/lib.rs:42", "Prototype Pollution"),
+                fixture_finding("dotnet", "High", "App.csproj", "pacote deprecado"),
+                fixture_finding("audit", "high", "package.json", "advisory"),
+            ])),
+        );
+        let lines = findings_lines(&snapshot).join("\n");
+        assert!(
+            lines.contains("painel achados — critical 1 · high 2 · medium 0 · low 0"),
+            "{lines}"
+        );
+        assert!(lines.contains("ferramentas: audit 2, dotnet 1"), "{lines}");
+        assert!(lines.contains("SEVERIDADE"), "{lines}");
+        assert!(lines.contains("src/lib.rs:42"), "{lines}");
+        assert!(lines.contains("Prototype Pollution"), "{lines}");
     }
 }

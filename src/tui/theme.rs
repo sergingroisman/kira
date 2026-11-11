@@ -24,6 +24,14 @@ pub struct Palette {
     pub footer: Color,
     /// Overlay de ajuda.
     pub help: Color,
+    /// Severidade critical (painel de achados, W6-PR2).
+    pub critical: Color,
+    /// Severidade high.
+    pub high: Color,
+    /// Severidade medium.
+    pub medium: Color,
+    /// Severidade low.
+    pub low: Color,
 }
 
 /// Paleta colorida do KIRA (verde/roxo, tom fofinho do mascote futuro).
@@ -36,6 +44,11 @@ pub const fn colorful() -> Palette {
         missing: Color::Yellow,
         footer: Color::DarkGray,
         help: Color::Magenta,
+        // Semântica de severidade (semáforo): quanto pior, mais quente.
+        critical: Color::Red,
+        high: Color::Yellow,
+        medium: Color::Cyan,
+        low: Color::DarkGray,
     }
 }
 
@@ -50,6 +63,12 @@ pub const fn mono() -> Palette {
         missing: Color::Reset,
         footer: Color::Reset,
         help: Color::Reset,
+        // Mono não perde informação: a severidade segue legível no texto da
+        // célula (a cor era só semântica visual, nunca dado).
+        critical: Color::Reset,
+        high: Color::Reset,
+        medium: Color::Reset,
+        low: Color::Reset,
     }
 }
 

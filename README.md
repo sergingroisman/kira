@@ -226,13 +226,18 @@ próximo com `Cargo.toml`/`package.json`, senão o diretório atual).
   `kira note` grava exatamente o que você digitou.
 - Apagar `store.db` limpa toda a trilha.
 
-## Dashboard — `kira dashboard` (W6-PR1, read-only)
+## Dashboard — `kira dashboard` (W6-PR2, read-only)
 
 O dashboard é a mesma TUI do binário (ratatui/crossterm, ADR-0014) mostrando o
-estado vivo do projeto atual — nesta PR, o **painel de cabeçalho**: nome do
-projeto, root, id FNV, `dev:` (chave `dev_name` do `config.toml` quando
-existir), backend LLM default (`ollama`), PAT mascarado (`Aa2x****`) e idade do
-último `kira scan` pela trilha.
+estado vivo do projeto atual — nesta PR, o **painel de cabeçalho** (nome do
+projeto, root, id FNV, `dev:` da chave `dev_name` do `config.toml`, backend LLM
+default (`ollama`), PAT mascarado (`Aa2x****`), idade do último `kira scan` pela
+trilha) e o **painel de achados** (`.kira/findings.json`): tabela ordenada
+critical→low com contagem por severidade no cabeçalho do bloco
+(`critical N · high N · medium N · low N`), colunas SEVERIDADE / FERRAMENTA /
+LOCAL (`path:linha`) / RESUMO (1ª linha da mensagem) e agregação por ferramenta.
+`Enter` abre o detalhe do achado (painel lateral com severidade, ferramenta,
+LOCAL, fingerprint completo e a mensagem inteira); `Esc` volta.
 
 - **Read-only provado**: o dashboard não escreve em nada — a store abre em modo
   `SQLITE_OPEN_READ_ONLY`, não toca rede nem LLM, e NÃO grava sessão na trilha.
@@ -245,8 +250,9 @@ existir), backend LLM default (`ollama`), PAT mascarado (`Aa2x****`) e idade do
 - **`--snapshot`**: sempre a forma de texto, para o CI e para redirecionamento —
   nunca desenha na tela.
 - **Teclas** (setas E vim; nenhuma tecla escreve): `q` sair ·
-  `Tab`/`Shift+Tab` ciclar painel · `j`/`k` ou `↑`/`↓` mover · `g`/`G` topo/fim ·
-  `r` reler o disco (sem rede, sem escrita) · `?` ajuda.
+  `Tab`/`Shift+Tab` ciclar painel (cabeçalho ↔ achados) · `j`/`k` ou `↑`/`↓`
+  mover · `g`/`G` topo/fim · `Enter` detalhe do achado · `Esc` volta · `r` reler
+  o disco (sem rede, sem escrita) · `?` ajuda.
 - **Terminal pequeno**: abaixo de 80×24 o layout degrada para lista única com
   aviso claro.
 - **Cores**: `NO_COLOR` (ou `TERM=dumb`) ⇒ paleta mono com a mesma informação.
