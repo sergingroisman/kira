@@ -114,3 +114,14 @@ problema é o packer, não a falta de vetor.
 Servidor HTTP, MCP, web UI, multi-usuário, embeddings/vetor, auto-improve com LLM
 reescrevendo a própria wiki sem revisão humana, e qualquer escrita automática em
 repositório do usuário.
+
+## Atualização (11/Nov, W2-fix PR-F3)
+
+Primeiro uso real (teishoku, bug 529511) reverte a decisão de destino: a wiki
+NÃO nasce commitada em `docs/wiki/` do projeto do cliente — agora é **local**,
+em `<projeto>/.kira/wiki/` (o `.kira/` já é local e nunca comitado; escrever em
+pasta do projeto do cliente viola o contrato read-only). O ciclo autônomo segue
+usando `.kira/wiki-staging/` + `kira wiki promote` como gate de revisão humana,
+agora dentro do mesmo diretório local. Complemento do bug real: episódio de
+triage com as 3 seções vazias não grava página — a falha vai só para a trilha
+(`kira history`), e o path exibido usa `display_path` (sem o prefixo cru `\\?\`).

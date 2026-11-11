@@ -1,17 +1,18 @@
 //! Episodic capture after `kira triage` (ADR-0013, PR30).
 //!
-//! Every triage leaves an *episode* on `docs/wiki/bugs/<item-id>.md`: predicted
-//! root cause, likely files, confidence and the last `kira scan` brief. Nothing
-//! is asked to the user — this is the "capture the work silently" of ADR-0013
-//! reduced to the minimum, and it is **deterministic** (the model already ran in
-//! `triage`; here we only format what it answered — ADR-0016).
+//! Every triage leaves an *episode* on `.kira/wiki/bugs/<item-id>.md`:
+//! predicted root cause, likely files, confidence and the last `kira scan`
+//! brief. Nothing is asked to the user — this is the "capture the work
+//! silently" of ADR-0013 reduced to the minimum, and it is **deterministic**
+//! (the model already ran in `triage`; here we only format what it answered —
+//! ADR-0016).
 //!
 //! Two rules shape this module:
 //!
-//! - **Committed vs staged**: a human-run `kira triage` writes to the committed
-//!   wiki ([`EpisodeTarget::Committed`]); an unattended cycle must use
-//!   [`EpisodeTarget::Staging`] (`.kira/wiki-staging/`), which only the future
-//!   `kira loop` does — promotion stays a human command (PR32).
+//! - **Main wiki vs staged**: a human-run `kira triage` writes to the main
+//!   wiki ([`EpisodeTarget::Wiki`], `.kira/wiki/`); an unattended cycle must
+//!   use [`EpisodeTarget::Staging`] (`.kira/wiki-staging/`), which only the
+//!   future `kira loop` does — promotion stays a human command (PR32).
 //! - **Decay**: episodes older than [`EPISODE_MAX_AGE_DAYS`] collapse into one
 //!   `- <date> triage #<id>: <cause> (colapsado)` line, so the page keeps the
 //!   knowledge diff and drops the prose.
@@ -56,8 +57,8 @@ pub struct Episode {
 /// Where the episode lands (ADR-0013).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EpisodeTarget {
-    /// `docs/wiki/` — the committed wiki of a human-invoked command.
-    Committed,
+    /// The main wiki (`.kira/wiki/`) of a human-invoked command.
+    Wiki,
     /// `.kira/wiki-staging/` — the local, uncommitted area of an unattended
     /// cycle (`kira wiki promote` moves it, PR32).
     Staging,
@@ -70,6 +71,20 @@ pub fn page_for(item_id: i32) -> String {
 }
 
 impl Episode {
+    /// Whether every triage section came out empty (or only the `—`
+    /// placeholder): such an episode carries no knowledge, so it must NEVER be
+    /// written to the wiki (W2-fix PR-F3) — the failure is recorded on the
+    /// session trail instead.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        [&self.root_cause, &self.files, &self.confidence]
+            .iter()
+            .all(|section| {
+                let trimmed = section.trim();
+                trimmed.is_empty() || trimmed == EMPTY_FIELD
+            })
+    }
+
     /// Markdown block of this episode.
     ///
     /// `at` is an RFC 3339 UTC stamp; every field is flattened to one line so
@@ -95,7 +110,7 @@ impl Episode {
     }
 }
 
-/// Appends the episode to `docs/wiki/bugs/<id>.md` (or to the staging area),
+/// Appends the episode to `.kira/wiki/bugs/<id>.md` (or to the staging area),
 /// collapsing stale episodes of that page first. Returns the written file.
 pub fn record(
     wiki: &Wiki,
@@ -110,7 +125,7 @@ pub fn record(
             // a flat staging directory) so a promotion can map them back.
             wiki.stage(&page.replace('/', "-"), &episode.render(now))
         }
-        EpisodeTarget::Committed => {
+        EpisodeTarget::Wiki => {
             let existing = wiki.read(&page)?.unwrap_or_default();
             let without_header = strip_page_header(&existing);
             let (collapsed, decayed) =
@@ -380,6 +395,24 @@ mod tests {
         );
     }
 
+    /// W2-fix PR-F3: the real defect — a triage whose three sections came out
+    /// empty (or only `—`) has no knowledge to store, so the episode must
+    /// report itself as empty and never reach the wiki.
+    #[test]
+    fn is_empty_is_true_only_when_all_three_sections_carry_nothing() {
+        let mut item = episode("");
+        item.files = "—".to_string();
+        item.confidence = String::new();
+        assert!(item.is_empty(), "só placeholders: episódio sem conteúdo");
+
+        item.root_cause = "TTL do token muito curto".to_string();
+        assert!(
+            !item.is_empty(),
+            "uma única seção com texto já é conhecimento: {:?}",
+            item.root_cause
+        );
+    }
+
     #[test]
     fn decay_collapses_only_episodes_older_than_the_window() {
         let old = episode("TTL curto").render("2026-09-01T10:00:00Z");
@@ -451,7 +484,7 @@ mod tests {
         let first = record(
             &wiki,
             &episode("token=AbC123XyZ789QqQ vazado no log"),
-            EpisodeTarget::Committed,
+            EpisodeTarget::Wiki,
             "2026-11-10T22:18:00Z",
         )
         .unwrap_or_else(|err| panic!("record 1: {err}"));
@@ -460,7 +493,7 @@ mod tests {
         let second = record(
             &wiki,
             &episode("segunda hipótese"),
-            EpisodeTarget::Committed,
+            EpisodeTarget::Wiki,
             "2026-11-10T23:00:00Z",
         )
         .unwrap_or_else(|err| panic!("record 2: {err}"));
@@ -503,7 +536,7 @@ mod tests {
         record(
             &wiki,
             &episode("segunda hipótese"),
-            EpisodeTarget::Committed,
+            EpisodeTarget::Wiki,
             "2026-11-11T00:30:00Z",
         )
         .unwrap_or_else(|err| panic!("record repetido: {err}"));
@@ -529,14 +562,14 @@ mod tests {
                 confidence: "baixa".to_string(),
                 findings_brief: None,
             },
-            EpisodeTarget::Committed,
+            EpisodeTarget::Wiki,
             "2026-09-01T10:00:00Z",
         )
         .unwrap_or_else(|err| panic!("record antigo: {err}"));
         record(
             &wiki,
             &episode("TTL curto"),
-            EpisodeTarget::Committed,
+            EpisodeTarget::Wiki,
             "2026-11-09T10:00:00Z",
         )
         .unwrap_or_else(|err| panic!("record recente: {err}"));
@@ -546,7 +579,7 @@ mod tests {
         record(
             &wiki,
             &episode("TTL curto"),
-            EpisodeTarget::Committed,
+            EpisodeTarget::Wiki,
             "2026-11-10T22:18:00Z",
         )
         .unwrap_or_else(|err| panic!("record repetido: {err}"));
@@ -579,7 +612,7 @@ mod tests {
         assert!(path.to_string_lossy().contains("wiki-staging"), "{path:?}");
         assert!(
             !dir.join(super::super::WIKI_DIR).exists(),
-            "ADR-0013: ciclo autônomo nunca escreve em docs/wiki"
+            "ADR-0013: ciclo autônomo nunca escreve em .kira/wiki"
         );
         let _ = fs::remove_dir_all(&dir);
     }

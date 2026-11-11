@@ -1,7 +1,7 @@
 //! End-to-end for `kira wiki` (W1/PR28, ADR-0013).
 //!
 //! Drives the real binary: the point is the contract at the CLI boundary —
-//! `docs/wiki/` is created where the project is, secrets never reach the disk,
+//! `.kira/wiki/` is created where the project is, secrets never reach the disk,
 //! and `list`/`show` read back what `decision` wrote.
 
 use std::fs;
@@ -45,7 +45,7 @@ impl Sandbox {
     }
 
     fn wiki_dir(&self) -> PathBuf {
-        self.cwd.join("docs").join("wiki")
+        self.cwd.join(".kira").join("wiki")
     }
 }
 
@@ -83,7 +83,7 @@ fn decision_creates_the_committed_page_and_masks_secrets() {
     let page = sandbox.wiki_dir().join("decisoes.md");
     assert!(
         page.is_file(),
-        "docs/wiki/decisoes.md deveria existir: {stdout}"
+        ".kira/wiki/decisoes.md deveria existir: {stdout}"
     );
     let content = read(&page);
     assert!(content.contains("pipeline noturno"), "{content}");
@@ -278,5 +278,5 @@ fn forget_refuses_a_traversing_page_id() {
     let (code, _, stderr) = sandbox.run(&["wiki", "forget", "../../importante.txt"]);
     assert_ne!(code, 0, "id com '..' deveria falhar");
     assert!(stderr.contains("erro:"), "{stderr}");
-    assert!(victim.is_file(), "nada fora de docs/wiki pode ser apagado");
+    assert!(victim.is_file(), "nada fora de .kira/wiki pode ser apagado");
 }

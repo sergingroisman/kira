@@ -188,7 +188,7 @@ impl Sandbox {
 
     fn page(&self) -> PathBuf {
         self.cwd
-            .join("docs")
+            .join(".kira")
             .join("wiki")
             .join("bugs")
             .join("4821.md")
@@ -203,7 +203,7 @@ impl Drop for Sandbox {
     }
 }
 
-/// PR30: the triage command leaves an episode in docs/wiki without asking
+/// PR30: the triage command leaves an episode in .kira/wiki without asking
 /// anything (ADR-0013), and the printed answer does not change.
 #[test]
 fn triage_file_captures_an_episode_in_the_project_wiki() {
@@ -237,6 +237,78 @@ fn triage_file_captures_an_episode_in_the_project_wiki() {
         "{page}"
     );
     assert!(page.contains("- Confiança: média"), "{page}");
+}
+
+/// W2-fix PR-F3 — o defeito real do bug 529511: as três seções vieram TODAS
+/// vazias (só o placeholder `—`), o triage saiu com exit 0 e a wiki registrou o
+/// episódio vazio como se fosse conhecimento. Agora o episódio vazio NÃO grava
+/// arquivo: a falha fica só na trilha (`kira history`).
+#[test]
+fn triage_empty_sections_never_write_a_wiki_page() {
+    const EMPTY_SECTIONS_BODY: &str = r#"{"model":"qwen3.5:4b","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"Causa raiz provável:\n\nArquivos prováveis:\n\nConfiança:\n"},"done":true}"#;
+    let sandbox = Sandbox::with_body("empty-sections", EMPTY_SECTIONS_BODY);
+
+    let (code, stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+    assert_eq!(code, 0, "formato ok com seções vazias: stderr: {stderr}");
+    assert!(
+        stdout.contains("Causa raiz provável:") && stdout.contains("—"),
+        "stdout segue com os placeholders do formato: {stdout}"
+    );
+    assert!(
+        stderr.contains(
+            "aviso: wiki não registrou o episódio do item 4821 (triage sem conteúdo — falha registrada na trilha)"
+        ),
+        "aviso acionável no stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("episódio do item 4821 registrado"),
+        "nenhum note de sucesso para episódio vazio: {stderr}"
+    );
+    assert!(
+        !sandbox.cwd.join(".kira").join("wiki").exists(),
+        "episódio vazio NÃO pode criar .kira/wiki"
+    );
+    assert!(
+        !sandbox.page().exists(),
+        "episódio vazio NÃO pode gravar arquivo na wiki"
+    );
+
+    // A falha fica registrada na trilha da sessão (`kira history`).
+    let (code, stdout, stderr) = sandbox.run(&["history"]);
+    assert_eq!(code, 0, "history: stderr: {stderr}");
+    assert!(
+        stdout.contains("wikipage: episódio failed (triage sem conteúdo nas 3 seções)"),
+        "a trilha deve mostrar a falha do episódio: {stdout}"
+    );
+}
+
+/// W2-fix PR-F3 — o path exibido no note de sucesso nunca sai com o prefixo
+/// cru `\\?\` do Windows (mesmo bug de display já corrigido no `kira profile`).
+#[test]
+fn triage_success_note_shows_the_path_without_the_windows_prefix() {
+    let sandbox = Sandbox::new("display-path");
+    let (code, _, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("wiki: episódio do item 4821 registrado em "),
+        "note de sucesso presente: {stderr}"
+    );
+    assert!(
+        !stderr.contains("\\\\?\\"),
+        "o path exibido não pode sair com o prefixo cru do Windows: {stderr}"
+    );
 }
 
 /// W2-fix PR-F2 — o defeito real: modelo respondendo fora do formato das três
@@ -288,9 +360,9 @@ fn triage_answer_out_of_format_fails_loudly() {
 #[test]
 fn a_broken_wiki_never_breaks_the_triage_command() {
     let sandbox = Sandbox::new("fail-open");
-    // `docs` como arquivo: criar `docs/wiki/bugs` é impossível.
-    std::fs::write(sandbox.cwd.join("docs"), "não sou um diretório")
-        .unwrap_or_else(|err| panic!("criar docs: {err}"));
+    // `.kira` como arquivo: criar `.kira/wiki/bugs` é impossível.
+    std::fs::write(sandbox.cwd.join(".kira"), "não sou um diretório")
+        .unwrap_or_else(|err| panic!("criar .kira: {err}"));
 
     let (code, stdout, stderr) = sandbox.run(&[
         "triage",

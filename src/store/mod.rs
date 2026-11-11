@@ -955,7 +955,7 @@ mod tests {
         let row = WikiPageRow {
             slug: "bugs/4821".to_string(),
             kind: "bug".to_string(),
-            path: "docs/wiki/bugs/4821.md".to_string(),
+            path: ".kira/wiki/bugs/4821.md".to_string(),
             title: "Bug 4821".to_string(),
             updated_at: "2026-11-10T22:00:00Z".to_string(),
             content_hash: "0000000000000001".to_string(),

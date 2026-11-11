@@ -1,18 +1,19 @@
 //! Project wiki — knowledge that survives between runs (ADR-0013).
 //!
-//! Markdown is the source of truth (`docs/wiki/*.md`, committed); any index is a
-//! derived, disposable artefact (PR29). This module owns only the files.
+//! Markdown is the source of truth (`.kira/wiki/*.md`, local to the project);
+//! any index is a derived, disposable artefact (PR29). This module owns only
+//! the files.
 //!
 //! Two invariants hold for every write:
 //!
 //! 1. **Privacy boundary**: the body goes through [`crate::redact`] before it
 //!    touches the disk. A wiki page is a log destination like any other.
 //! 2. **Write guard**: the destination is checked by [`crate::guard::path`], so a
-//!    page id can never escape `docs/wiki/` (no `..`, no absolute path, no
+//!    page id can never escape `.kira/wiki/` (no `..`, no absolute path, no
 //!    denied name).
 //!
 //! Autonomy rule (ADR-0013): an unattended cycle writes to
-//! `.kira/wiki-staging/`, never to `docs/wiki/`. Promotion to the committed wiki
+//! `.kira/wiki-staging/`, never to `.kira/wiki/`. Promotion to the main wiki
 //! is a human act (`kira wiki promote`, PR32).
 
 use std::fs;
@@ -24,8 +25,9 @@ use crate::guard::path::{Guard, GuardError};
 
 pub mod episode;
 
-/// Committed wiki root, relative to the project root.
-pub const WIKI_DIR: &str = "docs/wiki";
+/// Main wiki root, relative to the project root (W2-fix PR-F3: LOCAL — inside
+/// `.kira/`, never committed to the client project's git).
+pub const WIKI_DIR: &str = ".kira/wiki";
 
 /// Where an unattended cycle stages pages before a human promotes them.
 pub const STAGING_DIR: &str = ".kira/wiki-staging";
@@ -82,8 +84,8 @@ pub struct Wiki {
 }
 
 impl Wiki {
-    /// Opens the wiki of `root` (the directory must exist; `docs/wiki` itself is
-    /// created on the first write).
+    /// Opens the wiki of `root` (the directory must exist; `.kira/wiki` itself
+    /// is created on the first write).
     pub fn open(root: &Path) -> Result<Self, WikiError> {
         let guard = Guard::new(root)?;
         Ok(Self {
@@ -196,7 +198,7 @@ impl Wiki {
 
     /// Stages a page for an unattended cycle (`.kira/wiki-staging/`).
     ///
-    /// Nothing here ever reaches `docs/wiki/`: promotion is a human command.
+    /// Nothing here ever reaches `.kira/wiki/`: promotion is a human command.
     pub fn stage(&self, name: &str, body: &str) -> Result<PathBuf, WikiError> {
         let file_name = if std::path::Path::new(name)
             .extension()
@@ -228,7 +230,7 @@ impl Wiki {
         Ok(destination)
     }
 
-    /// `docs/wiki/<page>.md` or `docs/wiki/bugs/<slug>.md`, validated.
+    /// `.kira/wiki/<page>.md` or `.kira/wiki/bugs/<slug>.md`, validated.
     fn relative_page_path(&self, page: &str) -> Result<PathBuf, WikiError> {
         let trimmed = page.trim().trim_start_matches('/');
         if trimmed.is_empty() {
@@ -311,7 +313,7 @@ impl Wiki {
     ///
     /// The id is validated first (no `..`, no absolute path, known page or
     /// `bugs/<slug>`) and the destination goes through the write guard, so a
-    /// forget can never remove anything outside `docs/wiki/`. `Ok(false)` means
+    /// forget can never remove anything outside `.kira/wiki/`. `Ok(false)` means
     /// the page did not exist — nothing to do, not an error.
     pub fn forget(&self, page: &str) -> Result<bool, WikiError> {
         let path = self.page_path(page)?;
@@ -330,7 +332,7 @@ impl Wiki {
     /// Promotes staged pages into the committed wiki (ADR-0013).
     ///
     /// An unattended cycle writes to `.kira/wiki-staging/`; this is the human act
-    /// that moves knowledge into `docs/wiki/`. Staged files are named after the
+    /// that moves knowledge into `.kira/wiki/`. Staged files are named after the
     /// page with `/` replaced by `-` (`.kira` stays flat), so `bugs-4821.md` maps
     /// back to `bugs/4821`.
     ///
@@ -437,7 +439,7 @@ impl Wiki {
         Ok((destination, pages))
     }
 
-    /// Creates the page's parent directory inside `docs/wiki`.
+    /// Creates the page's parent directory inside `.kira/wiki`.
     ///
     /// Only fixed, code-owned names are created here, so a typo in a page id can
     /// never produce a new tree: unknown ids are rejected before this point.
@@ -572,7 +574,7 @@ mod tests {
             )
             .unwrap_or_else(|err| panic!("write: {err}"));
         assert!(
-            path.ends_with("docs/wiki/bugs/4821-sessao-expirada.md"),
+            path.ends_with(".kira/wiki/bugs/4821-sessao-expirada.md"),
             "{path:?}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -638,7 +640,7 @@ mod tests {
         );
         assert!(
             !dir.join(WIKI_DIR).exists(),
-            "staging não pode criar docs/wiki"
+            "staging não pode criar .kira/wiki"
         );
         let _ = fs::remove_dir_all(&dir);
     }
