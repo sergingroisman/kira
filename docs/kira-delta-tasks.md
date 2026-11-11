@@ -28,12 +28,13 @@ Atualize `README.md` e `AGENTS.md` para o estado atual e registre ADRs:
 2. **AGENTS.md**: acrescente a seção "Princípios" (edit-the-harness: edite o
    prompt, não o output; determinismo antes de inteligência; erro acionável
    nunca body cru; read-only por padrão, `--apply` explícito).
-3. **ADRs** em `docs/adr/` (formato dos que você já criou):
-   - ADR-0021: autonomia por loop/agendado no mesmo binário (pilar do dono;
+3. **ADRs** em `docs/adr/` (formato dos que você já criou; a série está em
+   ADR-0016, então os seus novos são **0017, 0018 e 0019**):
+   - ADR-0017: autonomia por loop/agendado no mesmo binário (pilar do dono;
      máquina de estados §7 do plano v2; `awaiting_approval` + `kira approve`);
-   - ADR-0022: gate do M2 = `kira triage --eval` + `tests/fixtures/triage_gold/`
+   - ADR-0018: gate do M2 = `kira triage --eval` + `tests/fixtures/triage_gold/`
      (20 bugs rotulados pelo dono) — autonomia de escrita só depois disso;
-   - ADR-0023: backend Copilot via spawn do CLI `copilot -p` como "LLM mais
+   - ADR-0019: backend Copilot via spawn do CLI `copilot -p` como "LLM mais
      cara" sob demanda (Ollama default 100% local); policy da Avanade é
      pré-requisito — registrado o caminho ollama-only caso bloqueada.
    - Cada ADR: contexto (intenção do dono, citada), decisão, consequências.
