@@ -226,18 +226,24 @@ próximo com `Cargo.toml`/`package.json`, senão o diretório atual).
   `kira note` grava exatamente o que você digitou.
 - Apagar `store.db` limpa toda a trilha.
 
-## Dashboard — `kira dashboard` (W6-PR2, read-only)
+## Dashboard — `kira dashboard` (W6-PR3, read-only)
 
 O dashboard é a mesma TUI do binário (ratatui/crossterm, ADR-0014) mostrando o
 estado vivo do projeto atual — nesta PR, o **painel de cabeçalho** (nome do
 projeto, root, id FNV, `dev:` da chave `dev_name` do `config.toml`, backend LLM
 default (`ollama`), PAT mascarado (`Aa2x****`), idade do último `kira scan` pela
-trilha) e o **painel de achados** (`.kira/findings.json`): tabela ordenada
+trilha), o **painel de achados** (`.kira/findings.json`): tabela ordenada
 critical→low com contagem por severidade no cabeçalho do bloco
 (`critical N · high N · medium N · low N`), colunas SEVERIDADE / FERRAMENTA /
-LOCAL (`path:linha`) / RESUMO (1ª linha da mensagem) e agregação por ferramenta.
-`Enter` abre o detalhe do achado (painel lateral com severidade, ferramenta,
-LOCAL, fingerprint completo e a mensagem inteira); `Esc` volta.
+LOCAL (`path:linha`) / RESUMO (1ª linha da mensagem) e agregação por ferramenta
+— e o **painel de sessões** (trilha do store): as últimas 50 sessões do
+projeto (`#id`), com quando (idade relativa — `há 3 min` — calculada por
+função pura sobre o `now` capturado uma vez no snapshot, sem relógio por
+frame), comando, modelo, duração (`412ms`, `1m5s`, `1h05m`) e a 1ª linha do
+summary; sessão que falhou fica destacada, sucesso fica neutro. Store legível
+sem sessões mostra `sessões: — (store sem sessões)`.
+`Enter` abre o detalhe — do achado ou da sessão selecionada (painel lateral
+com o summary INTEIRO, ≤2000 chars já gravados pela store); `Esc` volta.
 
 - **Read-only provado**: o dashboard não escreve em nada — a store abre em modo
   `SQLITE_OPEN_READ_ONLY`, não toca rede nem LLM, e NÃO grava sessão na trilha.
@@ -250,9 +256,9 @@ LOCAL, fingerprint completo e a mensagem inteira); `Esc` volta.
 - **`--snapshot`**: sempre a forma de texto, para o CI e para redirecionamento —
   nunca desenha na tela.
 - **Teclas** (setas E vim; nenhuma tecla escreve): `q` sair ·
-  `Tab`/`Shift+Tab` ciclar painel (cabeçalho ↔ achados) · `j`/`k` ou `↑`/`↓`
-  mover · `g`/`G` topo/fim · `Enter` detalhe do achado · `Esc` volta · `r` reler
-  o disco (sem rede, sem escrita) · `?` ajuda.
+  `Tab`/`Shift+Tab` ciclar painel (cabeçalho → achados → sessões) · `j`/`k` ou
+  `↑`/`↓` mover · `g`/`G` topo/fim · `Enter` detalhe (achado ou sessão) ·
+  `Esc` volta · `r` reler o disco (sem rede, sem escrita) · `?` ajuda.
 - **Terminal pequeno**: abaixo de 80×24 o layout degrada para lista única com
   aviso claro.
 - **Cores**: `NO_COLOR` (ou `TERM=dumb`) ⇒ paleta mono com a mesma informação.

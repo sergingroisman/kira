@@ -125,6 +125,39 @@ detalhe · `Esc` volta · `/` busca na wiki · `r` recarrega (relê disco; sem r
   byte-idêntico (`tests/dashboard_e2e.rs`, agora com fixture de 3 achados em 2
   severidades e caso de findings.json corrompido).
 
+### Entregue no W6-PR3 (branch `w6/pr3-sessions-panel`)
+
+- Painel **Sessões** (`src/tui/widgets/sessions.rs`): as últimas 50 sessões da
+  trilha (`state::SESSIONS_LIMIT = 50`; a store continua consultando 500 para
+  achar o último `scan` — uma query, dois consumidores). Colunas `#ID` /
+  QUANDO / COMANDO / MODELO / DURAÇÃO / RESUMO (1ª linha do summary);
+  seleção com `➤` + `REVERSED`; **falha destacada** (cor crítica), sucesso
+  neutro; **sem scroll horizontal** (célula trunca com `…`).
+- Tempo relativo **determinístico**: função pura `state::humanize_age(now,
+  then)` (`há 45s` / `há 3 min` / `há 2 h` / `há 5 dias`, relógio adiantado
+  satura em `há 0s`) — o `now` é capturado UMA vez por snapshot
+  (`Snapshot::now_secs`); NENHUM `SystemTime::now()` dentro do widget.
+  `format_duration_ms` idem (`412ms`, `1s`, `1m5s`, `1h05m`), testada com
+  casos fixos.
+- `state`: `SessionLine` (id/comando/modelo/duração/ok/started_unix +
+  `summary_first_line` para a tabela e `summary` INTEIRO, ≤2000 chars já
+  gravados pela store, para o detalhe), ordenação MAIS RECENTE PRIMEIRO
+  (defensiva, por id) e truncada em 50; store legível sem sessões ⇒ lista
+  vazia + causa (`sessões: — (store sem sessões)`), store ausente/ilegível ⇒
+  a causa concreta da trilha — nunca inventada.
+- `Enter` expande o summary da sessão selecionada num detalhe lateral (60/40,
+  o mesmo `DetailWidget` dos achados) com comando, modelo, quando, duração,
+  status e o summary inteiro; `Esc` volta. Detalhe segue modal.
+- `Tab`/`Shift+Tab` cicla **cabeçalho → achados → sessões** (3 painéis,
+  `PANEL_COUNT = 3`, rodapé `painel 1/3..3/3`, borda em foco/idle).
+  `decide()` continua PURA: as transições novas (Enter no painel de sessões
+  com lista vazia = `Ignore`; ciclo de 3) somam-se às existentes, todas
+  unit-testadas.
+- `--snapshot`/não-TTY imprimem a MESMA tabela em texto
+  (`painel sessões — últimas N` + colunas). Nada escreve em disco — o hash do
+  `store.db` antes/depois segue byte-idêntico (`tests/dashboard_e2e.rs`, novo
+  fixture de 3 sessões com caso de store sem sessões).
+
 ## Fora de escopo (rejeitado por ora)
 
 Mouse · edição de qualquer dado · gráfico temporal além de contagem · múltiplos
