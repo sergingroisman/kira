@@ -192,9 +192,12 @@ pub fn pack_with(
         if excerpt.is_empty() {
             continue;
         }
+        // Normalised to `/` on purpose: the model reads this path and the pack
+        // must be identical across Windows, macOS and Linux. `\` in a prompt was
+        // exactly the kind of difference that made the Windows CI fail.
         let path = wiki
             .page_path(&page)
-            .map(|path| path.display().to_string())
+            .map(|path| path.display().to_string().replace('\\', "/"))
             .unwrap_or_else(|_| page.clone());
         let age_days = age_days_of(&content);
         let cost = excerpt.chars().count() + path.chars().count() + 32;
