@@ -119,6 +119,14 @@ pub enum Error {
     )]
     LlmRequest(String),
 
+    /// The model answer carried none of the three triage section headers
+    /// (W2-fix PR-F2). Silence here used to become three `—` with exit 0; an
+    /// answer out of format is an error, not an empty result.
+    #[error(
+        "resposta do modelo fora do formato das 3 seções (Causa raiz provável / Arquivos prováveis / Confiança) — rode `kira triage` de novo, troque o modelo com --model, ou confira `ollama ps` (o modelo precisa estar carregado)"
+    )]
+    LlmFormat,
+
     /// A local work-item file could not be read (`kira triage --file`).
     #[error("não foi possível ler o arquivo '{path}' — confira o caminho e tente de novo")]
     Io {
@@ -324,6 +332,7 @@ mod tests {
                 "LlmRequest",
                 Error::LlmRequest("conexão recusada".to_string()),
             ),
+            ("LlmFormat", Error::LlmFormat),
             (
                 "Io",
                 Error::Io {

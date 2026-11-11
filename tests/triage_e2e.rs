@@ -45,6 +45,13 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
 }
 
 fn spawn_fake_ollama() -> (String, std::thread::JoinHandle<Option<String>>) {
+    spawn_fake_ollama_with(FAKE_BODY)
+}
+
+/// Serves `body` as the `/api/chat` response, so a test can make the model
+/// answer out of format (W2-fix PR-F2).
+fn spawn_fake_ollama_with(body: &str) -> (String, std::thread::JoinHandle<Option<String>>) {
+    let body = body.to_string();
     let listener = TcpListener::bind("127.0.0.1:0")
         .unwrap_or_else(|err| panic!("bind na porta efêmera: {err}"));
     let addr = listener
@@ -56,8 +63,8 @@ fn spawn_fake_ollama() -> (String, std::thread::JoinHandle<Option<String>>) {
         };
         let request = read_http_request(&mut stream);
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{FAKE_BODY}",
-            FAKE_BODY.len()
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         );
         if stream.write_all(response.as_bytes()).is_err() {
             return None;
@@ -98,9 +105,21 @@ async fn triage_file_prints_the_three_sections_with_the_model_text() {
         request.contains("Sessão expirada com token válido"),
         "prompt deve conter o título da fixture: {request}"
     );
+    // O HTML cru do work item não pode chegar ao modelo. A checagem é escopada à
+    // parte do work item: o pack de contexto pode trazer uma linha de repositório
+    // que legitimamente contém `<div>` (fixture, template) — são camadas
+    // diferentes, e a limpeza de HTML vale para o item.
+    let work_item_part = request
+        .split("Contexto do projeto")
+        .next()
+        .unwrap_or(&request);
     assert!(
-        !request.contains("<div>"),
-        "prompt não pode conter HTML cru: {request}"
+        !work_item_part.contains("<div>"),
+        "prompt não pode conter HTML cru do item: {work_item_part}"
+    );
+    assert!(
+        !work_item_part.contains("&amp;"),
+        "prompt não pode conter entidade crua do item: {work_item_part}"
     );
 }
 
@@ -113,7 +132,13 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(tag: &str) -> Self {
-        let (base_url, server) = spawn_fake_ollama();
+        Self::with_body(tag, FAKE_BODY)
+    }
+
+    /// Sandbox whose fake model answers with `body` instead of the in-format
+    /// answer — used to prove the out-of-format path fails loudly (PR-F2).
+    fn with_body(tag: &str, body: &str) -> Self {
+        let (base_url, server) = spawn_fake_ollama_with(body);
         // O handle fica solto de propósito: a thread do servidor falso acaba
         // quando o processo termina, e um `join` poderia esperar para sempre.
         drop(server);
@@ -212,6 +237,50 @@ fn triage_file_captures_an_episode_in_the_project_wiki() {
         "{page}"
     );
     assert!(page.contains("- Confiança: média"), "{page}");
+}
+
+/// W2-fix PR-F2 — o defeito real: modelo respondendo fora do formato das três
+/// seções produzia três `—` com exit 0 e a wiki gravava o episódio vazio.
+/// Agora o comando falha com erro acionável, não imprime as seções e não grava
+/// nada.
+#[test]
+fn triage_answer_out_of_format_fails_loudly() {
+    const OUT_OF_FORMAT_BODY: &str = r#"{"model":"qwen3.5:4b","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"O token expira rápido demais. Provavelmente o TTL está curto."},"done":true}"#;
+    let sandbox = Sandbox::with_body("out-of-format", OUT_OF_FORMAT_BODY);
+
+    let (code, stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+
+    assert_eq!(
+        code, 1,
+        "resposta fora do formato não pode sair com 0 — stdout: {stdout} / stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Causa raiz provável:"),
+        "não pode imprimir o template com três —: {stdout}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout deve ficar vazio: {stdout}"
+    );
+    assert!(
+        stderr.contains("fora do formato das 3 seções"),
+        "erro precisa dizer que o modelo saiu do formato: {stderr}"
+    );
+    assert!(
+        stderr.contains("--model") && stderr.contains("ollama ps"),
+        "erro precisa dizer o que fazer: {stderr}"
+    );
+    assert!(
+        !stderr.contains("episódio do item"),
+        "sem formato não há episódio: {stderr}"
+    );
+    assert!(!sandbox.page().exists(), "nada pode ser gravado na wiki");
 }
 
 /// Fail-open: a wiki que não pode ser escrita vira um `aviso:` em stderr e nada

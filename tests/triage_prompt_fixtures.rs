@@ -87,7 +87,8 @@ fn prompt_and_output_match_the_golden_fixtures() {
         let prompt = triage::build_prompt(&item);
         assert_matches_golden(&dir.join("prompt.txt"), &prompt);
 
-        let output = triage::format_triage(&read(&dir.join("model.txt")));
+        let output = triage::format_triage(&read(&dir.join("model.txt")))
+            .unwrap_or_else(|err| panic!("model.txt de {slug} fora do formato: {err}"));
         assert_matches_golden(&dir.join("expected.txt"), &output);
     }
 }
