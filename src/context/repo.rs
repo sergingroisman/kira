@@ -17,14 +17,14 @@ use walkdir::WalkDir;
 
 /// Text file bigger than this is skipped: a lockfile or a bundle is noise, and
 /// reading it would spend the token budget on nothing.
-const MAX_FILE_BYTES: u64 = 128 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 128 * 1024;
 
 /// One excerpt never exceeds this many characters (a minified line would
 /// otherwise eat the whole window).
 const MAX_LINE_CHARS: usize = 200;
 
 /// Hits per file, so one noisy file cannot fill the pack.
-const MAX_HITS_PER_FILE: usize = 3;
+pub(crate) const MAX_HITS_PER_FILE: usize = 3;
 
 /// Files read in one grep. The walk is sorted by name, so the same tree always
 /// yields the same first N files — the stop is deterministic, not racy.
@@ -64,7 +64,7 @@ const SOURCE_EXTENSIONS: [&str; 34] = [
 const SOURCE_FILENAMES: [&str; 4] = ["Dockerfile", "Makefile", "Procfile", "README"];
 
 /// One auditable excerpt: `path:line` plus the (redacted) text of that line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CodeExcerpt {
     /// Path relative to the project root, always with `/` separators.
     pub path: String,
@@ -72,6 +72,14 @@ pub struct CodeExcerpt {
     pub line: usize,
     /// Trimmed, whitespace-collapsed and redacted line content.
     pub text: String,
+    /// bm25 rank of the FTS5 hit (smaller = more relevant); `None` when the
+    /// excerpt came from the grep walk, which does not rank (ADR-0021).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<f64>,
+    /// True when the file was named by a finding (`findings.json`) — the
+    /// explain view shows it, and the ranking gives it the bonus.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub priority: bool,
 }
 
 impl CodeExcerpt {
@@ -83,7 +91,7 @@ impl CodeExcerpt {
 }
 
 /// Result of one repository grep.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RepoGrep {
     /// Ranked excerpts, best first.
     pub excerpts: Vec<CodeExcerpt>,
@@ -143,6 +151,8 @@ fn scored_text(path: &str, content: &str, terms: &[String]) -> Vec<(usize, CodeE
                 path: path.to_string(),
                 line: index + 1,
                 text: clean_line(line),
+                rank: None,
+                priority: false,
             },
         ));
         if found.len() == MAX_HITS_PER_FILE {
@@ -161,7 +171,9 @@ fn score_line(lower_line: &str, terms: &[String]) -> usize {
 }
 
 /// Trims, collapses whitespace, masks secrets and caps the length of one line.
-fn clean_line(line: &str) -> String {
+/// Shared with the indexer: the text that enters the FTS5 index is exactly the
+/// text a grep excerpt would carry — redacted on the way in (ADR-0021).
+pub(crate) fn clean_line(line: &str) -> String {
     let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let redacted = crate::redact::redact(&collapsed);
     if redacted.chars().count() <= MAX_LINE_CHARS {
@@ -283,17 +295,20 @@ pub fn grep(
 fn collect(rel: &str, content: &str, terms: &[String], priority: bool) -> Vec<Hit> {
     scored_text(rel, content, terms)
         .into_iter()
-        .map(|(score, excerpt)| Hit {
-            priority,
-            score,
-            excerpt,
+        .map(|(score, mut excerpt)| {
+            excerpt.priority = priority;
+            Hit {
+                priority,
+                score,
+                excerpt,
+            }
         })
         .collect()
 }
 
 /// Normalizes a finding path into a relative path usable with `root.join`:
 /// drops `./` and refuses absolute or parent-traversing values.
-fn normalize_rel(raw: &str) -> Option<String> {
+pub(crate) fn normalize_rel(raw: &str) -> Option<String> {
     let trimmed = raw.trim().replace('\\', "/");
     let trimmed = trimmed.trim_start_matches("./");
     if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.split('/').any(|part| part == "..")
@@ -305,14 +320,14 @@ fn normalize_rel(raw: &str) -> Option<String> {
 
 /// Path of `path` relative to `root`, with `/` separators; `None` when the
 /// file lives outside the root.
-fn relative_path(root: &Path, path: &Path) -> Option<String> {
+pub(crate) fn relative_path(root: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(root)
         .ok()
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// True for directories that never carry useful context.
-fn is_skipped_dir(path: &Path) -> bool {
+pub(crate) fn is_skipped_dir(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -324,7 +339,7 @@ fn is_skipped_dir(path: &Path) -> bool {
 }
 
 /// True when the extension (or the bare filename) is in the context allowlist.
-fn is_source_file(rel: &str) -> bool {
+pub(crate) fn is_source_file(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     if name.ends_with(".lock") || name == "package-lock.json" {
         return false;
@@ -340,7 +355,7 @@ fn is_source_file(rel: &str) -> bool {
 
 /// Reads a file as UTF-8 text, skipping oversized or binary ones. Any I/O error
 /// is a silent skip: grep is context, never a way to fail `triage`.
-fn read_text_file(path: &Path) -> Option<String> {
+pub(crate) fn read_text_file(path: &Path) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
         return None;

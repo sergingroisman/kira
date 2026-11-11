@@ -25,6 +25,7 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira note "<texto>"` / `kira note --remove N` | Fato do perfil do projeto (append-only, numerado). |
 | `kira profile` | Root, nome, primeira vez visto e todos os fatos do projeto. |
 | `kira wiki list\|show\|decision\|reindex\|search\|forget\|promote\|export` | Wiki local do projeto (seção Wiki abaixo). |
+| `kira context --file <json> [--explain] [--json]` | Mostra o **context pack** que iria ao prompt do `kira triage` — sem LLM, sem rede: fonte do repositório (`index` FTS5 ou `grep`), seções da wiki, cada trecho como `path:linha — trecho` e o resumo `contexto: N trechos — X/Y chars (~Z tokens, 3 chars/token)`. `--explain` mostra também por que cada item entrou (rank bm25, prioridade de finding); `--json` devolve a estrutura serializável. O id ao vivo (`kira context <id>`) é recusado: este comando não toca na rede. |
 
 O que **não existe ainda** vai no [Roadmap](#roadmap) — nada é prometido como
 pronto se não está no binário.
@@ -96,6 +97,7 @@ kira inspect 4821
 | `KIRA_MODEL` | Tag do modelo do triage | `qwen3.5:4b` |
 | `KIRA_NUM_CTX` | Janela de contexto do modelo | `4096` |
 | `KIRA_STORE_DIR` | Sobrescreve o diretório do store (testes/execuções portáveis) | `~/.config/kira` |
+| `KIRA_INDEX_MAX_FILES` | Teto de arquivos do índice de retrieval do repositório (ADR-0021, substitui o corte de 400 do grep). Valor inválido/zero cai no default. | `5000` |
 | `KIRA_BOARD` | Provedor de board (`azure` é o único nesta fase) | `azure` |
 | `KIRA_CONFIG` | Caminho alternativo do `config.toml` | `~/.config/kira/config.toml` |
 
@@ -139,6 +141,24 @@ e `<root>/.kira/wiki/bugs/<slug>.md` (ADR-0013).
 - `kira wiki export` imprime/salva a wiki inteira como um bundle `.md`.
 - Toda escrita passa por `redact` (segredo não vai para o disco) e pela guarda
   de caminho (confinamento na raiz).
+
+## Retrieval do repositório — índice FTS5 (ADR-0021)
+
+Além da wiki, o `kira triage`/`kira context` busca no **código do repositório**
+pelo índice FTS5 do store (`repo_file` + `repo_fts`, schema v3): uma linha de
+índice por linha de código **já redigida** (`redact` na escrita — o store nunca
+guarda segredo), ranking bm25, bônus para os arquivos citados em
+`findings.json` e teto de **5000 arquivos** (`KIRA_INDEX_MAX_FILES`) no lugar
+do corte alfabético de 400 do grep antigo.
+
+- **Incremental**: só reprocessa arquivo cujo `(mtime, size)` mudou; arquivo
+  que saiu do disco sai do índice; a cada pack (`kira triage`/`kira context`)
+  o índice é refrescado antes da busca.
+- **Fail-open**: índice ausente/vazio ⇒ o packer cai no grep determinístico de
+  sempre e marca a fonte (`index`/`grep`) no pack.
+- O índice é **derivado e descartável** — a fonte de verdade são os arquivos;
+  `kira context --explain` mostra o pack que iria ao prompt e `--json` dá a
+  estrutura para medir recall.
 
 ## Windows
 

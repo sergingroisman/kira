@@ -47,5 +47,11 @@ regex = "1.13.1"
 # so the grep layer cannot change behaviour silently on an upstream bump.
 walkdir = "2"
 
+[dev-dependencies]
+# Direct read of the store DB inside the `kira context` e2e (ADR-0021 redaction
+# proof: the index rows on disk must not carry secrets). Same exact version
+# already compiled for the runtime store — no new dependency, no new build.
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+
 [profile.release]
 strip = true

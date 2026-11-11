@@ -1,13 +1,16 @@
 //! Local SQLite store per project — the persistent trail of KIRA runs (M1.1).
 //!
 //! One single central DB (`{home}/.config/kira/store.db`, overridable with the
-//! `KIRA_STORE_DIR` env var) in WAL mode, with three tables:
+//! `KIRA_STORE_DIR` env var), with:
 //!
 //! - `projects`: one row per repository root (id = FNV-1a 64 of the canonical
 //!   root path, hand-implemented below — no extra dependency);
 //! - `sessions`: one row per `kira inspect` / `kira triage` / `kira doctor`
 //!   run (command, args, model, timing, ok/failure, summary);
-//! - `facts`: free-form profile facts of the project (`kira note`).
+//! - `facts`: free-form profile facts of the project (`kira note`);
+//! - `wiki_page` + `wiki_fts`: derived, disposable wiki index (ADR-0013);
+//! - `repo_file` + `repo_fts`: derived, disposable repository retrieval index
+//!   (FTS5, incremental, redacted on write — ADR-0021).
 //!
 //! Rules enforced by the callers: the store is fail-open (a store error never
 //! breaks the main command) and it never stores secrets (no PAT/tokens/env)
@@ -28,7 +31,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -633,8 +636,272 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
         }
     }
 
+    // v3 — repository retrieval index (ADR-0021): `repo_file` holds the on-disk
+    // identity (mtime, size) the incremental indexer compares against, and
+    // `repo_fts` one FTS5 row per redacted source line. Design note: this is a
+    // *regular* FTS5 table, NOT contentless (`content=''` was rejected because
+    // a contentless table cannot return the `text` column it did not store).
+    // The UNINDEXED columns (project_id, path, line) are stored verbatim and
+    // recoverable, so one hit yields (path, line, text) directly.
+    if current < 3 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS repo_file (
+                project_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                PRIMARY KEY (project_id, path)
+            );",
+        )
+        .map_err(schema_error)?;
+        if let Err(error) = conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS repo_fts USING fts5(
+                project_id UNINDEXED, path UNINDEXED, line UNINDEXED, text
+            );",
+        ) {
+            // Degradação, não falha: sem FTS5 o packer cai para o grep (ADR-0021).
+            eprintln!(
+                "aviso: FTS5 indisponível neste SQLite ({error}) — busca do repositório cai para grep"
+            );
+        }
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(schema_error)
+}
+
+/// One row of `repo_file`: what the indexer last saw on disk for this file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoFileRow {
+    /// Path relative to the project root, POSIX separators.
+    pub path: String,
+    /// mtime as Unix seconds (0 when the stamp was unreadable — always reindexed).
+    pub mtime: i64,
+    /// Size in bytes at index time.
+    pub size: i64,
+}
+
+/// One hit of the repository FTS5 index (ADR-0021): the stored text is already
+/// redacted — the store never keeps a secret.
+#[derive(Debug, Clone)]
+pub struct RepoFtsHit {
+    /// Path relative to the project root, POSIX separators.
+    pub path: String,
+    /// 1-based line number.
+    pub line: i64,
+    /// Redacted, whitespace-collapsed and capped line text.
+    pub text: String,
+    /// FTS5 bm25 rank (smaller = more relevant).
+    pub rank: f64,
+}
+
+impl Store {
+    /// True when the repository FTS5 virtual table exists in this database.
+    #[must_use]
+    pub fn repo_fts5_enabled(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'repo_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|count| count > 0)
+    }
+
+    /// (mtime, size) the indexer last recorded for `path`; `None` when the
+    /// file has never been indexed.
+    pub fn repo_file_get(
+        &self,
+        project_id: &str,
+        path: &str,
+    ) -> Result<Option<(i64, i64)>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT mtime, size FROM repo_file WHERE project_id = ?1 AND path = ?2",
+                rusqlite::params![project_id, path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::Sql(other)),
+            })
+    }
+
+    /// Records the on-disk identity (mtime, size) of one indexed file.
+    pub fn repo_file_upsert(
+        &self,
+        project_id: &str,
+        path: &str,
+        mtime: i64,
+        size: i64,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO repo_file (project_id, path, mtime, size) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(project_id, path) DO UPDATE SET mtime = ?3, size = ?4",
+                rusqlite::params![project_id, path, mtime, size],
+            )
+            .map_err(StoreError::Sql)?;
+        Ok(())
+    }
+
+    /// All indexed paths of the project, sorted (the deletion diff walks it).
+    pub fn repo_file_paths(&self, project_id: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path FROM repo_file WHERE project_id = ?1 ORDER BY path")
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(StoreError::Sql)?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(paths)
+    }
+
+    /// Every `repo_file` row of the project, sorted (tests and diagnostics).
+    pub fn repo_file_rows(&self, project_id: &str) -> Result<Vec<RepoFileRow>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT path, mtime, size FROM repo_file \
+                 WHERE project_id = ?1 ORDER BY path",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok(RepoFileRow {
+                    path: row.get(0)?,
+                    mtime: row.get(1)?,
+                    size: row.get(2)?,
+                })
+            })
+            .map_err(StoreError::Sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(out)
+    }
+
+    /// Number of files currently indexed for the project (0 = empty index).
+    pub fn repo_file_count(&self, project_id: &str) -> Result<i64, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM repo_file WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sql)
+    }
+
+    /// Drops the file from `repo_file` (the index rows are removed separately
+    /// by [`Store::repo_fts_remove_file`]).
+    pub fn repo_file_remove(&self, project_id: &str, path: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM repo_file WHERE project_id = ?1 AND path = ?2",
+                rusqlite::params![project_id, path],
+            )
+            .map_err(StoreError::Sql)?;
+        Ok(())
+    }
+
+    /// Drops every FTS5 line of one file (before a re-index or a deletion).
+    pub fn repo_fts_remove_file(&self, project_id: &str, path: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM repo_fts WHERE project_id = ?1 AND path = ?2",
+                rusqlite::params![project_id, path],
+            )
+            .map_err(StoreError::Sql)?;
+        Ok(())
+    }
+
+    /// Inserts one already-redacted line into the repository index.
+    pub fn repo_fts_insert_line(
+        &self,
+        project_id: &str,
+        path: &str,
+        line: usize,
+        text: &str,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO repo_fts (project_id, path, line, text) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    project_id,
+                    path,
+                    i64::try_from(line).unwrap_or(i64::MAX),
+                    text
+                ],
+            )
+            .map_err(StoreError::Sql)?;
+        Ok(())
+    }
+
+    /// bm25-ranked search over the repository index. `query` is an FTS5
+    /// `MATCH` expression — the caller quotes the terms (see `context::index`).
+    pub fn repo_fts_search(
+        &self,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RepoFtsHit>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT path, line, text, rank FROM repo_fts \
+                 WHERE repo_fts MATCH ?1 AND project_id = ?2 ORDER BY rank LIMIT ?3",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map(rusqlite::params![query, project_id, limit], |row| {
+                Ok(RepoFtsHit {
+                    path: row.get(0)?,
+                    line: row.get(1)?,
+                    text: row.get(2)?,
+                    rank: row.get(3)?,
+                })
+            })
+            .map_err(StoreError::Sql)?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(hits)
+    }
+
+    /// Every indexed line of the project, ordered by path and line — the
+    /// byte-identical state comparison used by the idempotency tests.
+    pub fn repo_fts_rows(&self, project_id: &str) -> Result<Vec<RepoFtsHit>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT path, line, text FROM repo_fts \
+                 WHERE project_id = ?1 ORDER BY path, line",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok(RepoFtsHit {
+                    path: row.get(0)?,
+                    line: row.get(1)?,
+                    text: row.get(2)?,
+                    rank: 0.0,
+                })
+            })
+            .map_err(StoreError::Sql)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(out)
+    }
 }
 
 /// Hand-rolled FNV-1a 64-bit (no extra dependency) — used to build stable
@@ -853,10 +1120,14 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap_or_else(|err| panic!("user_version: {err}"));
-        assert_eq!(version, 2, "migração deveria subir para a v2");
+        assert_eq!(version, 3, "migração deveria subir para a v3");
         assert!(
             store.wiki_fts5_enabled(),
             "wiki_fts deveria existir após a v2"
+        );
+        assert!(
+            store.repo_fts5_enabled(),
+            "repo_fts deveria existir após a v3"
         );
 
         // Dado antigo continua lá — migração aditiva, nunca destrutiva.

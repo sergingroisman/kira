@@ -10,6 +10,7 @@
 //! Every failure here is **fail-open**: a missing store, an unindexed wiki or a
 //! stale index yields an empty pack with a note, never a failed `triage`.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::scan::Finding;
@@ -17,14 +18,16 @@ use crate::store::Store;
 use crate::wiki::Wiki;
 use crate::work_item::WorkItem;
 
+pub mod index;
 mod repo;
 
+pub use index::{ContextError, IndexStats, reindex};
 pub use repo::{CodeExcerpt, RepoGrep, grep_text};
 
 /// Characters reserved per context token. Conservative on purpose: Portuguese
 /// prose runs ~3.5 chars/token, and under-filling the window is cheaper than a
 /// truncated prompt.
-const CHARS_PER_TOKEN: usize = 3;
+pub const CHARS_PER_TOKEN: usize = 3;
 
 /// Floor for the budget, so a silly `KIRA_NUM_CTX=16` still sends something.
 const MIN_BUDGET_CHARS: usize = 1_500;
@@ -44,8 +47,32 @@ const MAX_FINDING_LINES: usize = 3;
 /// Shortest keyword worth searching (drops "de", "erro", "não").
 const MIN_KEYWORD_CHARS: usize = 5;
 
+/// Where the repository excerpts of the pack came from (ADR-0021): the FTS5
+/// index or the deterministic grep walk (fail-open fallback). Serialized in
+/// lowercase so old consumers and the `--json` report stay stable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoSource {
+    /// The grep walk produced the excerpts (no index, or empty index).
+    #[default]
+    Grep,
+    /// The FTS5 retrieval index produced the excerpts.
+    Index,
+}
+
+impl RepoSource {
+    /// `"index"` or `"grep"` — the value printed by `kira context`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grep => "grep",
+            Self::Index => "index",
+        }
+    }
+}
+
 /// One wiki excerpt carried into the prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContextSection {
     /// Wiki page id (`bugs/4821`).
     pub page: String,
@@ -58,7 +85,7 @@ pub struct ContextSection {
 }
 
 /// What the prompt will carry beyond the work item.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextPack {
     /// Wiki excerpts, most relevant first.
     pub sections: Vec<ContextSection>,
@@ -74,6 +101,10 @@ pub struct ContextPack {
     pub budget_chars: usize,
     /// Why something is missing (surfaced as a warning by the caller).
     pub notes: Vec<String>,
+    /// Where the repository excerpts came from: the FTS5 index or the grep
+    /// walk. New field (ADR-0021); serde default keeps old payloads valid.
+    #[serde(default)]
+    pub repo_source: RepoSource,
 }
 
 impl ContextPack {
@@ -151,6 +182,96 @@ impl ContextPack {
 pub fn budget_chars() -> usize {
     let tokens = usize::try_from(crate::config::num_ctx_from_env()).unwrap_or(4096);
     (tokens * CHARS_PER_TOKEN).max(MIN_BUDGET_CHARS)
+}
+
+/// `kira context --json` payload (ADR-0021): the pack plus the constants the
+/// summary used, so a future recall evaluation can replay exactly what the
+/// prompt carried. No LLM, no network — pure serialization.
+#[derive(Debug, serde::Serialize)]
+pub struct ContextReport<'a> {
+    /// Work item id the pack was built for.
+    pub item_id: i32,
+    /// `used_chars / CHARS_PER_TOKEN`, floored — the same conservative
+    /// conversion the budget uses.
+    pub tokens_estimate: usize,
+    /// The chars-per-token constant used (3).
+    pub chars_per_token: usize,
+    /// The pack that would reach the prompt.
+    pub pack: &'a ContextPack,
+}
+
+/// Human report of `kira context` (ADR-0021): the source, the sections, every
+/// excerpt as `path:linha — trecho truncado` and the one-line summary. With
+/// `explain`, each item also shows why it entered (rank bm25, prioridade).
+#[must_use]
+pub fn explain_report(pack: &ContextPack, item_id: i32, explain: bool) -> String {
+    let mut out = format!(
+        "kira context — item {item_id} — fonte do repositório: {}\n",
+        pack.repo_source.as_str()
+    );
+    if let Some(brief) = &pack.findings_brief {
+        out.push_str(&format!("findings do último `kira scan`: {brief}\n"));
+    }
+    for finding in &pack.findings {
+        out.push_str(&format!("- achado: {finding}\n"));
+    }
+    for section in &pack.sections {
+        let age = section.age_days.map_or_else(
+            || "idade desconhecida".to_string(),
+            |days| format!("{days} dia(s) atrás"),
+        );
+        out.push_str(&format!(
+            "- seção {} ({age}): {}\n",
+            section.path, section.excerpt
+        ));
+    }
+    if !pack.code.is_empty() {
+        out.push_str(&format!("trechos do repositório ({}):\n", pack.code.len()));
+        for excerpt in &pack.code {
+            out.push_str(&format!("  - {} — {}\n", excerpt.anchor(), excerpt.text));
+            if explain {
+                let rank = excerpt
+                    .rank
+                    .map_or_else(|| "—".to_string(), |value| format!("{value:.4}"));
+                out.push_str(&format!(
+                    "      [fonte={}, rank={}, prioridade={}]\n",
+                    pack.repo_source.as_str(),
+                    rank,
+                    if excerpt.priority { "sim" } else { "não" }
+                ));
+            }
+        }
+    }
+    for note in &pack.notes {
+        out.push_str(&format!("nota: {note}\n"));
+    }
+    out.push_str(&context_summary(pack));
+    out
+}
+
+/// One-line summary demanded by ADR-0021:
+/// `contexto: N trechos — X/Y chars (~Z tokens, 3 chars/token)`.
+#[must_use]
+pub fn context_summary(pack: &ContextPack) -> String {
+    let tokens = pack.used_chars / CHARS_PER_TOKEN;
+    format!(
+        "contexto: {} trecho(s) — {}/{} chars (~{} tokens, {} chars/token)\n",
+        pack.code.len(),
+        pack.used_chars,
+        pack.budget_chars,
+        tokens,
+        CHARS_PER_TOKEN
+    )
+}
+
+/// `kira context --json`: the serializable report (pretty-printed).
+pub fn report_json(pack: &ContextPack, item_id: i32) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&ContextReport {
+        item_id,
+        tokens_estimate: pack.used_chars / CHARS_PER_TOKEN,
+        chars_per_token: CHARS_PER_TOKEN,
+        pack,
+    })
 }
 
 /// Distinct, meaningful terms of the work item — the retrieval query.
@@ -315,10 +436,42 @@ pub fn pack_partial(
         }
     }
 
-    // 3. Repository excerpts (PR5): the KIRA greps, the model interprets. Files
-    //    named by a finding come first, then the deterministic walk.
+    // 3. Repository excerpts (PR5): the KIRA greps, the model interprets. The
+    //    FTS5 retrieval index (ADR-0021) is tried first — it ranks with bm25
+    //    and has no 400-file alphabetical ceiling — and the grep walk is the
+    //    fail-open fallback for a missing or empty index. Files named by a
+    //    finding come first in either source.
     let priority = finding_paths(findings.as_deref().unwrap_or_default());
-    let grep = repo::grep(root, &terms, &priority, skip_paths, MAX_CODE_EXCERPTS);
+    let mut grep = RepoGrep::default();
+    let mut repo_source = RepoSource::Grep;
+    if let Some(store) = store
+        && let Ok(project_id) = crate::store::project_id_for_root(root)
+    {
+        let indexed = index::search(
+            root,
+            store,
+            &project_id,
+            &terms,
+            &priority,
+            MAX_CODE_EXCERPTS,
+        );
+        if indexed.files_scanned > 0 {
+            repo_source = RepoSource::Index;
+            let skipped: HashSet<String> = skip_paths
+                .iter()
+                .filter_map(|raw| repo::normalize_rel(raw))
+                .collect();
+            let mut filtered = indexed;
+            filtered
+                .excerpts
+                .retain(|excerpt| !skipped.contains(&excerpt.path));
+            grep = filtered;
+        }
+    }
+    if repo_source == RepoSource::Grep {
+        grep = repo::grep(root, &terms, &priority, skip_paths, MAX_CODE_EXCERPTS);
+    }
+    pack.repo_source = repo_source;
     for excerpt in grep.excerpts {
         let cost = excerpt.text.chars().count() + excerpt.path.chars().count() + 12;
         if pack.used_chars + cost > budget_chars {
@@ -349,6 +502,17 @@ pub fn pack_excluding(root: &Path, item: &WorkItem, exclude: Option<&Path>) -> C
     let mut source_notes: Vec<String> = Vec::new();
     if let Err(cause) = &store {
         source_notes.push(format!("sem store para buscar na wiki ({cause})"));
+    }
+    if let Ok(store) = &store
+        && let Ok(project_id) = crate::store::project_id_for_root(root)
+    {
+        // ADR-0021: refresh the incremental index before packing — the
+        // same walk the grep did, minus the file reads. Fail-open: a
+        // broken index degrades the pack to the grep fallback, never
+        // fails the caller.
+        if let Err(cause) = index::reindex(root, store, &project_id) {
+            source_notes.push(format!("índice do repositório não atualizado ({cause})"));
+        }
     }
     if let Err(cause) = &wiki {
         source_notes.push(format!("wiki indisponível ({cause})"));
@@ -766,6 +930,93 @@ mod tests {
             "precisa explicar o corte: {:?}",
             pack.notes
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0021: com índice o pack vem do FTS5 e registra a fonte; sem índice
+    /// (ou vazio) cai no grep com `RepoSource::Grep` — sem erro.
+    #[test]
+    fn the_pack_prefers_the_index_and_records_the_source() {
+        let dir = temp_project("index-source");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        write_file(
+            &dir,
+            "src/auth/session.rs",
+            "let token = session_token;\nlet cooldown = 30;\n",
+        );
+        let item = item_with("Sessão expirada", "token inválido no cooldown");
+
+        let without_index = pack_with(&dir, &store, &wiki, &item, 12_000);
+        assert_eq!(
+            without_index.repo_source,
+            RepoSource::Grep,
+            "índice vazio ⇒ grep"
+        );
+        assert!(!without_index.code.is_empty(), "{:?}", without_index.notes);
+
+        let project_id = crate::store::project_id_for_root(&dir)
+            .unwrap_or_else(|err| panic!("project id: {err}"));
+        index::reindex(&dir, &store, &project_id).unwrap_or_else(|err| panic!("{err}"));
+
+        let with_index = pack_with(&dir, &store, &wiki, &item, 12_000);
+        assert_eq!(with_index.repo_source, RepoSource::Index);
+        assert!(!with_index.code.is_empty(), "notas: {:?}", with_index.notes);
+        assert!(
+            with_index.code.iter().all(|excerpt| excerpt.rank.is_some()),
+            "trechos do índice carregam o rank bm25: {:?}",
+            with_index.code
+        );
+        assert!(
+            with_index
+                .code
+                .iter()
+                .any(|excerpt| excerpt.anchor() == "src/auth/session.rs:1"),
+            "{:?}",
+            with_index.code
+        );
+        let rendered = with_index.render();
+        assert!(rendered.contains("src/auth/session.rs:1 —"), "{rendered}");
+        assert_eq!(
+            context_summary(&with_index),
+            format!(
+                "contexto: {} trecho(s) — {}/12000 chars (~{} tokens, 3 chars/token)\n",
+                with_index.code.len(),
+                with_index.used_chars,
+                with_index.used_chars / CHARS_PER_TOKEN
+            )
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_json_report_round_trips_and_the_source_is_lowercase() {
+        let dir = temp_project("json-report");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        write_file(&dir, "src/a.rs", "let token = session_token;\n");
+        let project_id = crate::store::project_id_for_root(&dir)
+            .unwrap_or_else(|err| panic!("project id: {err}"));
+        index::reindex(&dir, &store, &project_id).unwrap_or_else(|err| panic!("{err}"));
+        let pack = pack_with(
+            &dir,
+            &store,
+            &wiki,
+            &item_with("Sessão expirada", "token inválido"),
+            12_000,
+        );
+        let json = report_json(&pack, 4821).unwrap_or_else(|err| panic!("{err}"));
+        assert!(json.contains("\"repo_source\": \"index\""), "{json}");
+        assert!(json.contains("\"item_id\": 4821"), "{json}");
+        assert!(json.contains("\"chars_per_token\": 3"), "{json}");
+        // O campo novo é opcional: um pack antigo sem `repo_source` parseia.
+        let legacy: ContextPack = serde_json::from_str(
+            "{\"sections\":[],\"code\":[],\"findings_brief\":null,\"findings\":[],\"used_chars\":0,\"budget_chars\":0,\"notes\":[]}",
+        )
+        .unwrap_or_else(|err| panic!("pack legado: {err}"));
+        assert_eq!(legacy.repo_source, RepoSource::Grep);
         let _ = fs::remove_dir_all(&dir);
     }
 

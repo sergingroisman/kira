@@ -111,6 +111,23 @@ enum Command {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// Print the context pack that would reach the LLM prompt — no model, no
+    /// network (ADR-0021)
+    Context {
+        /// Work item id (the live path needs the network; unsupported here —
+        /// use --file)
+        id: Option<i32>,
+        /// Read the work item from a local JSON file (offline path; no PAT)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Also show why each item entered the pack (source, bm25 rank,
+        /// finding priority)
+        #[arg(long)]
+        explain: bool,
+        /// Emit the pack as JSON (recall evaluation)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `kira wiki` actions (ADR-0013: markdown is the source of truth).
@@ -248,6 +265,12 @@ async fn run(command: Command) -> Outcome {
         Command::Profile => store_command(profile_output()),
         Command::Scan { path } => scan_command(path.as_deref()),
         Command::Wiki { action, path } => wiki_command(action, path.as_deref()),
+        Command::Context {
+            id,
+            file,
+            explain,
+            json,
+        } => context_command(id, file, explain, json),
     }
 }
 
@@ -357,6 +380,30 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 None => args,
             };
             ("wiki".to_string(), args, None)
+        }
+        Command::Context {
+            id,
+            file,
+            explain,
+            json,
+        } => {
+            let mut args = String::new();
+            if let Some(id) = id {
+                args.push_str(&id.to_string());
+            }
+            if let Some(file) = file {
+                if !args.is_empty() {
+                    args.push(' ');
+                }
+                args.push_str(&format!("--file {}", file.display()));
+            }
+            if *explain {
+                args.push_str(" --explain");
+            }
+            if *json {
+                args.push_str(" --json");
+            }
+            ("context".to_string(), args, None)
         }
     }
 }
@@ -776,6 +823,80 @@ fn forget_index(page: &str) -> String {
         Ok(false) => " (o índice não tinha essa página)".to_string(),
         Err(err) => format!("; aviso: índice não foi limpo ({err}) — rode `kira wiki reindex`"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `kira context` — the context pack without the LLM (ADR-0021)
+// ---------------------------------------------------------------------------
+
+/// `kira context <id|--file> [--explain] [--json]` — prints the pack that
+/// would reach the triage prompt: source (index/grep), sections, every excerpt
+/// as `path:linha — trecho truncado`, and the `contexto: ...` summary. 100%
+/// local: no model, no network (ADR-0021). Does not write a session row.
+fn context_command(id: Option<i32>, file: Option<PathBuf>, explain: bool, json: bool) -> Outcome {
+    let source = match context_source(id, file) {
+        Ok(source) => source,
+        Err(message) => {
+            eprintln!("erro: {message}");
+            eprintln!("uso: kira context --file <work-item.json> [--explain] [--json]");
+            return Outcome::failure(message);
+        }
+    };
+    match context_output(&source, explain, json) {
+        Ok(text) => {
+            print!("{text}");
+            Outcome {
+                code: ExitCode::SUCCESS,
+                ok: true,
+                records: false,
+                summary: first_line(&text, HISTORY_SUMMARY_LINE_CHARS),
+            }
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome {
+                code: exit_code(false),
+                ok: false,
+                records: false,
+                summary: err.to_string(),
+            }
+        }
+    }
+}
+
+/// Origin of the work item for `kira context`: only the offline file path
+/// exists — the live id would need the network and this command never touches
+/// it (ADR-0021).
+fn context_source(id: Option<i32>, file: Option<PathBuf>) -> Result<PathBuf, String> {
+    match (id, file) {
+        (None, Some(path)) => Ok(path),
+        (Some(id), None) => Err(format!(
+            "o work item #{id} ao vivo exigiria rede e `kira context` é 100% local (sem LLM, sem rede) — salve o JSON do item e rode `kira context --file <caminho.json>`"
+        )),
+        (Some(_), Some(_)) => Err(
+            "informe apenas uma origem: o id do work item OU --file <caminho.json>".to_string(),
+        ),
+        (None, None) => Err(
+            "informe a origem do work item: `kira context --file <caminho.json>` (offline; o id ao vivo exige rede e este comando não a toca)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Body of `kira context`: detect the project root, parse the work item file,
+/// refresh the index (inside `pack_excluding`, fail-open) and render the report.
+fn context_output(file: &Path, explain: bool, json: bool) -> Result<String, Error> {
+    let root = store::detect_project_root().unwrap_or_else(|| PathBuf::from("."));
+    let body = std::fs::read_to_string(file).map_err(|source| Error::Io {
+        path: file.display().to_string(),
+        source,
+    })?;
+    let item = kira::work_item::WorkItem::from_api_json(&body)?;
+    let pack = kira::context::pack_excluding(&root, &item, Some(file));
+    if json {
+        return kira::context::report_json(&pack, item.id).map_err(Error::ContextReportJson);
+    }
+    Ok(kira::context::explain_report(&pack, item.id, explain))
 }
 
 /// Resolves org/project/PAT (flags > env > keyring/config.toml) and builds the
