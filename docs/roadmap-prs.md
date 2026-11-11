@@ -133,3 +133,12 @@ Não bateu? **Pare e conserte o context packer.** Sem isso não se pinta a nave.
 Daemon Axum/SSE · DB além do SQLite `bundled` · embeddings/semantic search (pós-M2) ·
 framework de orquestração/LangChain · fan-out de agentes · MCP como dependência ·
 escrita autônoma antes do gate M2 + `--apply` explícito.
+
+## Backlog pós-W6 (pedidos do dono, 11/Nov — escopo a confirmar)
+
+| Item | O que é | Pré-condição |
+|---|---|---|
+| `kira git` / release tree | **Mini gestão de git dentro do Kira**: desenhar a árvore de release (branches, tags, merges, o que está em cada release), status/branch por projeto, agrupado por stack do `kira scan`. Só leitura + desenho (Ratatui/nome de árvore em texto) na v1 | pós-M2; precisa ADR própria (o que é `release` neste repo? tag? `CHANGELOG`?) |
+| Blog (devolvido do PR18) | `kira audit --weekly` gerando DRAFT no repo do blog | pós-W5, com aprovação humana explícita |
+| Logs multi-provedor | depois do Datadog: `setup` já pergunta a fonte; novos provedores entram como backend do mesmo trait | pós-PR12 |
+| Embeddings/busca em Rust | retrieval local (usearch/candle) para contexto do triage | pós-M2 (está na lista de rejeitados-por-agora) |
