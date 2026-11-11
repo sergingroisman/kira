@@ -74,7 +74,7 @@
       colapsa em `## Histórico colapsado`; `forget` apaga markdown + índice
       (página ausente = exit 0). Ciclo autônomo usa `EpisodeTarget::Staging`.
 - [x] **PR31** retrieval da wiki → context packer (top-k com caminho e idade).
-- [ ] **PR32** `kira wiki export` (bundle opcional) + `kira wiki promote` (staging → docs).
+- [x] **PR32** `kira wiki export` (bundle opcional) + `kira wiki promote` (staging → docs).
 - [ ] **PR5** context packer v1: item + findings do arquivo + trechos, teto de
       tokens. **Sem vetor, sem embedding** (markdown + FTS5 no SQLite existente).
       **Retrieval-first determinístico (ADR-0015):** KIRA faz o grep (`walkdir` +
