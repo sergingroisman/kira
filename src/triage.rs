@@ -201,7 +201,7 @@ fn section_header_index(line: &str) -> Option<(usize, String)> {
 /// travels too, so `kira triage` can print which evidence was sent (ADR-0015).
 ///
 /// [`ContextPack`]: crate::context::ContextPack
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TriageReport {
     /// Id of the analyzed work item.
     pub item_id: i32,
@@ -372,12 +372,15 @@ mod tests {
                 path: "src/auth/session.rs".to_string(),
                 line: 42,
                 text: "let ttl = Duration::minutes(5);".to_string(),
+                rank: None,
+                priority: false,
             }],
             findings_brief: Some("high 1".to_string()),
             findings: vec!["high · Newtonsoft.Json 12.0.1 (src/App.csproj)".to_string()],
             used_chars: 120,
             budget_chars: 12_288,
             notes: Vec::new(),
+            repo_source: crate::context::RepoSource::Grep,
         };
         let with = build_prompt_with_context(&item, &pack);
         assert!(

@@ -141,6 +141,12 @@ pub enum Error {
     /// surface it directly: refusing a write must explain how to proceed.
     #[error("{0}")]
     Guard(#[from] crate::guard::path::GuardError),
+
+    /// The `kira context --json` report could not be serialized. Theoretical
+    /// path (the payload is a plain struct); the variant exists so no call
+    /// site ever needs `unwrap`/`expect` on serialization.
+    #[error("não foi possível serializar o relatório do contexto: {0}")]
+    ContextReportJson(serde_json::Error),
 }
 
 #[cfg(test)]
