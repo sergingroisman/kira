@@ -26,7 +26,19 @@ pub use crate::llm::prompts::TRIAGE_SYSTEM_PROMPT as SYSTEM_PROMPT;
 
 /// Builds the user prompt for a work item: title, type, state, area and the
 /// description with the raw HTML cleaned by [`html_to_text`].
+///
+/// Without a [`ContextPack`] this is only the work item — the shape the model
+/// answered before PR31.
 pub fn build_prompt(item: &WorkItem) -> String {
+    build_prompt_with_context(item, &crate::context::ContextPack::default())
+}
+
+/// Builds the user prompt and appends the retrieved project context (wiki
+/// excerpts with path and age, plus the last `kira scan` brief).
+///
+/// The pack is already bounded by [`crate::context::budget_chars`]; this function
+/// only decides where it sits in the prompt.
+pub fn build_prompt_with_context(item: &WorkItem, pack: &crate::context::ContextPack) -> String {
     let mut prompt = String::new();
     prompt.push_str(
         "Analise o work item do Azure DevOps abaixo e responda no formato de três seções definido.\n\n",
@@ -47,6 +59,10 @@ pub fn build_prompt(item: &WorkItem) -> String {
     ));
     prompt.push_str("Descrição:\n");
     prompt.push_str(&description_for_prompt(item.description.as_deref()));
+    // Retrieved context goes after the item: the model reads the bug first, then
+    // the evidence. Excerpts are already redacted (they come from the wiki, which
+    // masks on write) and already bounded by the packer.
+    prompt.push_str(&pack.render());
     prompt
 }
 
@@ -202,11 +218,26 @@ async fn triage_item(base_url: &str, model: &str, item: &WorkItem) -> Result<Tri
     // nem parser responde "por que este bug acontece". Todo o resto do comando
     // (campos, HTML, fingerprint, store) é determinístico (ADR-0016).
     let backend = OllamaBackend::new(base_url, model);
-    let text = backend.complete(SYSTEM_PROMPT, &build_prompt(item)).await?;
+    let pack = context_pack(item);
+    let text = backend
+        .complete(SYSTEM_PROMPT, &build_prompt_with_context(item, &pack))
+        .await?;
     Ok(TriageReport {
         item_id: item.id,
         output: format_triage(&text),
     })
+}
+
+/// Retrieval for the prompt (PR31).
+///
+/// Fail-open by design: without a project root, store or wiki the pack is empty
+/// and `triage` behaves exactly as before — context is an improvement, never a
+/// new way to fail.
+fn context_pack(item: &WorkItem) -> crate::context::ContextPack {
+    let Some(root) = crate::store::detect_project_root() else {
+        return crate::context::ContextPack::default();
+    };
+    crate::context::pack(&root, item)
 }
 
 #[cfg(test)]
@@ -296,6 +327,42 @@ mod tests {
             prompt.contains("Maria Souza"),
             "campo não secreto preservado: {prompt}"
         );
+    }
+
+    /// PR31: the retrieved context must reach the prompt, and the no-context path
+    /// must stay byte-identical to what shipped before (no silent behaviour change).
+    #[test]
+    fn context_pack_is_appended_to_the_prompt() {
+        let item = parse(FIXTURE_FULL);
+        let without = build_prompt(&item);
+        let pack = crate::context::ContextPack {
+            sections: vec![crate::context::ContextSection {
+                page: "bugs/4821".to_string(),
+                path: "docs/wiki/bugs/4821.md".to_string(),
+                age_days: Some(3),
+                excerpt: "token renovado sem rotacionar".to_string(),
+            }],
+            findings_brief: Some("high 1".to_string()),
+            used_chars: 120,
+            budget_chars: 12_288,
+            notes: Vec::new(),
+        };
+        let with = build_prompt_with_context(&item, &pack);
+        assert!(
+            !without.contains("docs/wiki/bugs/4821.md"),
+            "sem pack não há wiki"
+        );
+        assert!(with.contains("docs/wiki/bugs/4821.md"), "{with}");
+        assert!(with.contains("3 dia(s) atrás"), "{with}");
+        assert!(with.contains("token renovado sem rotacionar"), "{with}");
+        assert!(
+            with.contains("findings do último `kira scan`: high 1"),
+            "{with}"
+        );
+        // O work item continua antes do contexto.
+        let id_at = with.find("ID: 4821").unwrap_or(0);
+        let ctx_at = with.find("Contexto do projeto").unwrap_or(usize::MAX);
+        assert!(id_at < ctx_at, "work item primeiro, contexto depois");
     }
 
     #[test]

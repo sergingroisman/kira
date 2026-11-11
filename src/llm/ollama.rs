@@ -38,15 +38,10 @@ pub fn model_from_env() -> String {
     env_or_default("KIRA_MODEL", DEFAULT_MODEL)
 }
 
-/// Reads the context window from `KIRA_NUM_CTX`, falling back to
-/// [`DEFAULT_NUM_CTX`]. An unparsable value falls back to the default too.
-pub fn num_ctx_from_env() -> u32 {
-    std::env::var("KIRA_NUM_CTX")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_NUM_CTX)
-}
+/// Reads the context window from `KIRA_NUM_CTX` — re-exported from
+/// [`crate::config`] so the knob has one owner (and the context packer can size
+/// the prompt budget without importing this backend's module).
+pub use crate::config::num_ctx_from_env;
 
 fn env_or_default(name: &str, default: &str) -> String {
     std::env::var(name)
