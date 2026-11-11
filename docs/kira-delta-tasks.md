@@ -41,3 +41,43 @@ Atualize `README.md` e `AGENTS.md` para o estado atual e registre ADRs:
 
 Referência de verdade: `docs/kira-mandato.md` (v3) e
 `docs/kira-judge-veredicto.md`. Não mude código além dos itens listados.
+
+---
+
+## ⚠️ Estado em 11/Nov (pós-janela estourada) — leia antes de retomar
+
+- **O PR-F1 já está FEITO e publicado como PR #26 (draft)**: o Orchestrator implementou
+  a mesma correção que você tinha validada em `w2-fix/pr-f1-pnpm-workspace` (members
+  dobrados na stack da raiz; e2e com shim npm que falha provando que npm não roda).
+  **Abandone seu worktree local** (`git reset --hard origin/main` no clone do Zed) e
+  parta de `origin/main`. Não refaça o F1.
+- **Seu teste local na máquina do dono achou um bug extra (PR-F4)**: em Windows pt-BR,
+  `missing_audit_tool_is_actionable` falha porque o cmd localizado emite
+  "não é reconhecido" em OEM/mojibake e a classificação texto-based não casa.
+  Confirmado em `origin/main` limpo — não é regressão de ninguém.
+- **Próxima tarefa sua: PR-F1b** (`fix(scan)`, parser pnpm real). Captura obrigatória:
+  `cd teishoku && pnpm audit --json > pnpm-audit-real.json` (a máquina do dono tem
+  pnpm real; a captura de 11/Nov mostrou `{actions, advisories, muted, metadata}` —
+  39 advisories, `findings[].paths` vazio em todas). Fixture:
+  `tests/fixtures/scan/scan_pnpm_audit_real.json` (mantenha `advisories` + `metadata`
+  verbatim; remova só o top-level `actions`, irrelevante ao parser). Parse: um
+  Finding por advisory (module_name, severity, title, findings[0].version,
+  findings[0].paths[0] com fallback `pnpm-lock.yaml`). Não suporte o formato
+  fantasma array-de-eventos (nunca existiu no pnpm real — era formato do yarn).
+
+## PR-F4 — detecção de ferramenta SEM depender de texto localizado (novo)
+
+- Sintoma (máquina do dono, Windows pt-BR): `kira scan` num projeto Node sem npm
+  instalado imprime `a ferramenta npm audit falhou (exit 1) — ... (dica: 'npm' n�o �
+  reconhecido ...)` em vez do acionável "instale o npm". O e2e
+  `missing_audit_tool_is_actionable` falha localmente por isso (CI en-US passa).
+- Causa: `is_missing_command_text` casa marcadores de texto que o cmd localizado
+  emite em OEM (mojibake) — parsing de mensagem localizada é frágil por design.
+- Correção prescrita: **resolver o binário antes de executar** — busca `which`-style
+  em Rust puro (PATH × PATHEXT no Windows: `.exe/.cmd/.bat`; Linux/mac: exec bit),
+  respeitando o override `KIRA_SCAN_*_BIN`. Ferramenta não resolvida ⇒ erro
+  "instale o X" (sem spawn, sem parsing de texto). `.cmd/.bat` resolvido ⇒ wrapper
+  `cmd /C` como hoje. Remover os marcadores CMD_MISSING_MARKERS e o caminho
+  texto-based; testes: shim faltando ⇒ mensagem de instalação; shim presente que
+  falha ⇒ ToolFailure compacto; e2e `missing_audit_tool` verde em qualquer locale.
+- Dono do PR: Delta (é ela quem roda em Windows pt-BR para validar de verdade).
