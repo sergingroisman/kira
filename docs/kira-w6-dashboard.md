@@ -1,0 +1,76 @@
+# W6 — `kira dashboard`: TUI Ratatui read-only sobre o store (especificação)
+
+- **Status**: proposta para o dono aprovar antes do primeiro PR do W6
+- **Base**: ADR-0014 (statui MIT como shell) · ADR-0013 (wiki) · AGENTS.md (contrato)
+- **Por que vem antes do W5**: dashboard é **read-only** sobre dados que já existem
+  (store, `findings.json`, wiki). Não escreve, não decide, não chama LLM. O gate M2
+  protege escrita/autonomia — nada disso está aqui. W5 (`kira loop`/agendado) continua
+  bloqueado até a medição do M2.
+
+## Objetivo
+
+`kira dashboard` = **modo interativo do mesmo binário** (nunca daemon, nunca segundo
+programa). Mostra o estado vivo do projeto atual: o que o `scan` achou, o que o
+`triage` concluiu, o que a wiki sabe, se o ambiente está saudável. Só leitura.
+
+## Painéis (v1 — 4 painéis, nada além)
+
+| Painel | Fonte | Conteúdo |
+|---|---|---|
+| **Cabeçalho** | `projects` + `kira doctor` (sem rede) | nome, root, id FNV, PAT `Aa2x****`, modelo LLM, se Ollama respondeu por último e quando |
+| **Achados** | `.kira/findings.json` | agrupado por severidade (critical→low), contagem por ferramenta, fingerprint curto; `Enter` abre o item |
+| **Sessões** | `sessions` | últimas N (default 50): `#id data comando modelo duração` + 1ª linha do summary; `Enter` expande o summary (≤2000 chars já gravados) |
+| **Wiki** | `wiki_page` + FTS | páginas por tipo (bugs/decisões/padrões/glossário), `updated_at`, busca incremental com `/` |
+
+**Regra de honestidade**: dado ausente aparece como `—` com a causa
+("nunca rodou `kira scan`", "store sem sessões"), nunca inventado ou estimado.
+
+## Interação (mínima, sem mouse)
+
+`q` sair · `Tab`/`Shift+Tab` painel · `j`/`k` linha · `g`/`G` topo/fim · `Enter`
+detalhe · `Esc` volta · `/` busca na wiki · `r` recarrega (relê disco; sem rede) ·
+`?` ajuda. **Nenhuma tecla escreve** — nem `d`, nem `x`, nem confirmação.
+
+## Estrutura técnica
+
+- `src/tui/{app,state,theme,layout,widgets}.rs`; `app` = loop de eventos
+  (`crossterm`) + `ratatui`; `state` = snapshot imutável lido do store/findings no
+  início e no `r` (sem query por frame).
+- Base: shell do **statui** (MIT) adaptado — atribuição obrigatória em
+  `third_party/statui/{LICENSE,NOTICE.md}` (ADR-0014). Não entra `backend.rs`
+  (probes HTTP) nem o modelo de config deles.
+- Tema: paleta própria (KIRA fofinho/colorido), com **fallback mono** quando
+  `NO_COLOR=1` ou terminal sem 256 cores — a mesma informação em texto.
+- Mascote: sprite pixel art em asset versionado (`assets/mascot/*.ans`), desenhado no
+  canto do cabeçalho; `kira --about` imprime a mesma arte. É arte, não PR de código.
+- Terminal menor que 80×24: layout degrada para lista única, com mensagem clara.
+
+## Contratos e testes (não negociáveis)
+
+1. **Read-only verificado**: teste e2e que roda o dashboard com um store fixture e
+   compara o hash do `store.db` antes/depois — tem que ser idêntico.
+2. **Smith determinístico**: `TestBackend` do Ratatui + snapshot de buffer ASCII para
+   cada painel com store fixture (`tests/fixtures/store/`), sem depender de terminal.
+3. **Sem rede**: teste que aponta `KIRA_OLLAMA_URL` para porta morta e
+   `AZURE_DEVOPS_PAT` inválido; o dashboard abre e mostra `—`.
+4. **Store ausente** ⇒ mensagem acionável ("nenhuma trilha em …, rode `kira scan` ou
+   `kira doctor`"), exit 0 (é diagnóstico, não erro de uso).
+5. **CI 3 SOs** roda só os testes de snapshot (sem TTY); o modo interativo é testado
+   por smoke manual do dono no Windows.
+
+## Ordem de PRs do W6
+
+| PR | Entrega |
+|---|---|
+| W6-PR1 | `src/tui` + `kira dashboard` abrindo o cabeçalho (dados do `doctor`) |
+| W6-PR2 | Painel Achados (findings.json) + detalhe |
+| W6-PR3 | Painel Sessões (store) + detalhe do summary |
+| W6-PR4 | Painel Wiki + busca `/` |
+| W6-PR5 | Mascote + tema + `NO_COLOR` + `--about` |
+| W6-PR6 | README: seção do dashboard com captura (arte ASCII no próprio markdown) |
+
+## Fora de escopo (rejeitado por ora)
+
+Mouse · edição de qualquer dado · gráfico temporal além de contagem · múltiplos
+projetos na mesma tela (v1 mostra o projeto atual; troca de projeto é `kira dashboard
+--project <id>` opcional em PR futuro) · qualquer chamada de rede ou LLM.
