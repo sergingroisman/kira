@@ -1,0 +1,10 @@
+Analise o work item do Azure DevOps abaixo e responda no formato de três seções definido.
+
+ID: 42
+Tipo: Task
+Título: Somente o essencial
+Estado: New
+Área: —
+Responsável: —
+Descrição:
+(sem descrição)

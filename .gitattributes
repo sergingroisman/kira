@@ -1,0 +1,4 @@
+# Fixtures de prompt/saída do triage: dourados comparados byte a byte (PR6).
+# CRLF de checkout Windows quebraria o contrato — fixa LF.
+tests/fixtures/triage/**/*.txt text eol=lf
+tests/fixtures/triage/**/*.json text eol=lf
