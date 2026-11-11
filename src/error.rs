@@ -119,6 +119,88 @@ pub enum Error {
     )]
     LlmRequest(String),
 
+    /// `KIRA_FOUNDRY_API_KEY` is unset or empty (PR11b, ADR-0020).
+    #[error(
+        "chave do Foundry ausente — defina a variável de ambiente KIRA_FOUNDRY_API_KEY com uma das chaves do recurso (portal do Foundry → recurso → Keys and Endpoints; ex.: export KIRA_FOUNDRY_API_KEY=...)"
+    )]
+    FoundryMissingKey,
+
+    /// `KIRA_FOUNDRY_ENDPOINT` is unset or empty.
+    #[error(
+        "defina a variável de ambiente KIRA_FOUNDRY_ENDPOINT com o endpoint do recurso Foundry — na superfície v1 ele termina em /openai/v1 (ex.: export KIRA_FOUNDRY_ENDPOINT=https://sdossantosjunior-5474-resource.openai.azure.com/openai/v1)"
+    )]
+    FoundryMissingEndpoint,
+
+    /// `KIRA_FOUNDRY_DEPLOYMENT` is unset or empty.
+    #[error(
+        "defina a variável de ambiente KIRA_FOUNDRY_DEPLOYMENT com o nome do deployment/modelo (ex.: export KIRA_FOUNDRY_DEPLOYMENT=gpt-4o-mini — confira a lista de Deployments no portal do Foundry)"
+    )]
+    FoundryMissingDeployment,
+
+    /// A project endpoint (`*/api/projects/*`) was given — it does not serve
+    /// chat completions.
+    #[error(
+        "endpoint de projeto do Foundry não aceita chat completions — defina a variável de ambiente KIRA_FOUNDRY_ENDPOINT com o endpoint do recurso OpenAI terminando em /openai/v1 (ex.: https://sdossantosjunior-5474-resource.openai.azure.com/openai/v1)"
+    )]
+    FoundryEndpoint,
+
+    /// Foundry rejected the key with HTTP 401/403. The key itself never
+    /// appears here (it lives in env; Entra ID is a later roadmap step).
+    #[error(
+        "chave recusada pelo Foundry (HTTP {status}) — gere uma nova chave em portal.azure.com (recurso → Keys and Endpoints) e rode de novo; se usar gateway, confira KIRA_FOUNDRY_AUTH=bearer (Entra ID fica para o roadmap)"
+    )]
+    FoundryAuth { status: u16 },
+
+    /// Foundry answered 404 without mentioning `api-version`.
+    #[error(
+        "HTTP 404 do Foundry — confira KIRA_FOUNDRY_ENDPOINT e KIRA_FOUNDRY_DEPLOYMENT na lista de Deployments do recurso no portal do Foundry (a chave nunca é exibida)"
+    )]
+    FoundryDeployment,
+
+    /// The server rejected the `api-version` — the default of the KIRA
+    /// (`2024-10-21`) can be overridden for endpoints on another version.
+    #[error(
+        "a versão da API foi recusada (HTTP {status}) — defina a variável de ambiente KIRA_FOUNDRY_API_VERSION com a versão aceita pelo endpoint (o default do KIRA é 2024-10-21)"
+    )]
+    FoundryApiVersion { status: u16 },
+
+    /// HTTP 429 — the quota of the license period is exhausted. The String is
+    /// the server `Retry-After` (or a default suggestion).
+    #[error(
+        "HTTP 429 do Foundry — cota do período esgotada; aguarde {0} e rode de novo (o retry-after veio do servidor)"
+    )]
+    FoundryRateLimited(String),
+
+    /// Other status, network failure or unexpected shape. `detail` is the
+    /// first line of the server `error.message`, redacted and bounded to 200
+    /// chars — never the raw body, never the key.
+    #[error(
+        "falha do Foundry: {detail} — rode de novo; se persistir, confira KIRA_FOUNDRY_ENDPOINT e o status do recurso no portal (a chave nunca é exibida)"
+    )]
+    FoundryFailed { detail: String },
+
+    /// The request exceeded `KIRA_FOUNDRY_TIMEOUT` (default 120s).
+    #[error(
+        "Foundry não respondeu em {timeout_secs}s — rode de novo ou aumente o limite com KIRA_FOUNDRY_TIMEOUT (o default é 120s)"
+    )]
+    FoundryTimeout { timeout_secs: u64 },
+
+    /// A `KIRA_FOUNDRY_*` numeric/enum variable holds an invalid value.
+    #[error("valor '{value}' inválido para {env} — {hint}")]
+    FoundryEnv {
+        env: &'static str,
+        value: String,
+        hint: &'static str,
+    },
+
+    /// The server rejected a body parameter (`unsupported_parameter` /
+    /// `temperature` / `max_tokens`) — reasoning models (GPT-5, o-series)
+    /// refuse the classic fields.
+    #[error(
+        "o endpoint recusou um parâmetro do corpo (HTTP {status}) — defina a variável de ambiente KIRA_FOUNDRY_BODY_MODE=reasoning (GPT-5/o-series: sem temperature, max_completion_tokens) ou KIRA_FOUNDRY_BODY_MODE=classic para forçar o formato antigo; mensagem do servidor: {detail}"
+    )]
+    FoundryBodyMode { status: u16, detail: String },
+
     /// The model answer carried none of the three triage section headers
     /// (W2-fix PR-F2). Silence here used to become three `—` with exit 0; an
     /// answer out of format is an error, not an empty result.
@@ -162,9 +244,9 @@ pub enum Error {
     )]
     CopilotTimeout { secs: u64 },
 
-    /// `--llm`/`KIRA_LLM` carried a value that is not a known backend.
+    /// `--llm`/`KIRA_LLM` named a backend that does not exist.
     #[error(
-        "backend LLM '{name}' desconhecido — use `ollama` (o default, local e gratuito) ou `copilot` (caro, exige o CLI autenticado)"
+        "backend LLM '{name}' desconhecido — use `ollama` (o default local), `copilot` (spawn do Copilot CLI, ADR-0019) ou `foundry` (BYOK Microsoft Foundry, ADR-0020; também KIRA_LLM=ollama|copilot|foundry)"
     )]
     UnknownLlm { name: String },
 
@@ -389,6 +471,45 @@ mod tests {
                 },
             ),
             ("CopilotTimeout", Error::CopilotTimeout { secs: 180 }),
+            ("FoundryMissingKey", Error::FoundryMissingKey),
+            ("FoundryMissingEndpoint", Error::FoundryMissingEndpoint),
+            ("FoundryMissingDeployment", Error::FoundryMissingDeployment),
+            ("FoundryEndpoint", Error::FoundryEndpoint),
+            ("FoundryAuth", Error::FoundryAuth { status: 401 }),
+            ("FoundryDeployment", Error::FoundryDeployment),
+            (
+                "FoundryApiVersion",
+                Error::FoundryApiVersion { status: 400 },
+            ),
+            (
+                "FoundryBodyMode",
+                Error::FoundryBodyMode {
+                    status: 400,
+                    detail: "unsupported_parameter: temperature".to_string(),
+                },
+            ),
+            (
+                "FoundryRateLimited",
+                Error::FoundryRateLimited("42".to_string()),
+            ),
+            (
+                "FoundryFailed",
+                Error::FoundryFailed {
+                    detail: "campo ausente: choices".to_string(),
+                },
+            ),
+            (
+                "FoundryTimeout",
+                Error::FoundryTimeout { timeout_secs: 120 },
+            ),
+            (
+                "FoundryEnv",
+                Error::FoundryEnv {
+                    env: "KIRA_FOUNDRY_MAX_TOKENS",
+                    value: "abc".to_string(),
+                    hint: "defina um inteiro >= 1 (ex.: export KIRA_FOUNDRY_MAX_TOKENS=1024)",
+                },
+            ),
             (
                 "UnknownLlm",
                 Error::UnknownLlm {

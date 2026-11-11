@@ -55,11 +55,12 @@ enum Command {
         /// Ollama model tag (overrides KIRA_MODEL)
         #[arg(long)]
         model: Option<String>,
-        /// LLM backend: `ollama` (default, local) or `copilot` (costly,
+        /// LLM backend: `ollama` (default, local) | `copilot` (costly,
         /// spawns the Copilot CLI and requires `copilot auth login`;
-        /// overrides KIRA_LLM) — the costly backend is NEVER implicit and
-        /// never falls back to Ollama
-        #[arg(long, value_parser = ["ollama", "copilot"])]
+        /// ADR-0019) | `foundry` (BYOK Microsoft Foundry over HTTP, ADR-0020)
+        /// — overrides KIRA_LLM. The costly backends are NEVER implicit and
+        /// never fall back to Ollama
+        #[arg(long, value_parser = ["ollama", "copilot", "foundry"])]
         llm: Option<String>,
     },
     /// Save the Azure DevOps configuration and the PAT in the OS keyring
@@ -353,8 +354,11 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 (None, Some(file)) => args = format!("--file {}", file.display()),
                 (None, None) => {}
             }
-            if llm.as_deref() == Some("copilot") {
-                args.push_str(" --llm copilot");
+            if let Some(llm) = llm {
+                // O valor já é validado pelo value_parser do clap
+                // (`ollama|copilot|foundry`) — a trilha registra exatamente o
+                // backend usado nesta execução.
+                args.push_str(&format!(" --llm {llm}"));
             }
             (
                 "triage".to_string(),
@@ -971,8 +975,9 @@ async fn triage_command(
             return Outcome::failure(message);
         }
     };
-    // ADR-0019: the backend choice is explicit and validated — `copilot`
-    // missing or auth-blocked fails loudly, never a silent Ollama fallback.
+    // ADR-0019/ADR-0020: the backend choice is explicit and validated — a
+    // costly backend missing (CLI absent, key unset) FAILS LOUDLY, never a
+    // silent Ollama fallback.
     let kind = match kira::llm::LlmKind::from_flag_and_env(llm_flag.as_deref()) {
         Ok(kind) => kind,
         Err(err) => {

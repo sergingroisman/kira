@@ -75,6 +75,42 @@ fn spawn_fake_ollama_with(body: &str) -> (String, std::thread::JoinHandle<Option
     (format!("http://{addr}"), handle)
 }
 
+/// Fake Foundry (OpenAI-compatible chat completions) on an ephemeral port.
+fn spawn_fake_foundry(body: &str) -> (String, std::thread::JoinHandle<Option<String>>) {
+    spawn_fake_ollama_with(body)
+}
+
+/// Fake Foundry whose accept loop gives up after a deadline: `None` proves
+/// NOTHING ever connected (the no-network-call contract of the missing key).
+fn spawn_deadline_foundry() -> (String, std::thread::JoinHandle<Option<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|err| panic!("bind na porta efêmera: {err}"));
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|err| panic!("endereço local: {err}"));
+    let handle = std::thread::spawn(move || {
+        let _ = listener.set_nonblocking(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        };
+        let _ = listener.set_nonblocking(false);
+        let _ = stream.set_nonblocking(false);
+        let request = read_http_request(&mut stream);
+        Some(request)
+    });
+    (format!("http://{addr}"), handle)
+}
+
 #[tokio::test]
 async fn triage_file_prints_the_three_sections_with_the_model_text() {
     let (base_url, server) = spawn_fake_ollama();
@@ -177,6 +213,44 @@ impl Sandbox {
             .env_remove("AZURE_DEVOPS_ORG")
             .env_remove("AZURE_DEVOPS_PROJECT")
             .env_remove("KIRA_MODEL")
+            .output()
+            .unwrap_or_else(|err| panic!("executar kira {args:?}: {err}"));
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// Runs the CLI with explicit env overrides/removes — the Foundry tests
+    /// need `KIRA_FOUNDRY_*` and a deliberately dead Ollama port.
+    fn run_with(
+        &self,
+        args: &[&str],
+        envs: &[(&str, String)],
+        removes: &[&str],
+    ) -> (i32, String, String) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
+        command
+            .args(args)
+            .current_dir(&self.cwd)
+            .env("KIRA_STORE_DIR", &self.store)
+            .env("KIRA_CONFIG", self.store.join("absent-config.toml"))
+            .env_remove("AZURE_DEVOPS_PAT")
+            .env_remove("AZURE_DEVOPS_ORG")
+            .env_remove("AZURE_DEVOPS_PROJECT")
+            .env_remove("KIRA_MODEL")
+            .env_remove("KIRA_LLM")
+            .env_remove("KIRA_FOUNDRY_URL")
+            .env_remove("KIRA_FOUNDRY_AUTH")
+            .env_remove("KIRA_FOUNDRY_BODY_MODE");
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        for name in removes {
+            command.env_remove(name);
+        }
+        let output = command
             .output()
             .unwrap_or_else(|err| panic!("executar kira {args:?}: {err}"));
         (
@@ -713,5 +787,116 @@ fn unknown_kira_llm_value_fails_with_the_valid_options() {
     assert!(
         stderr.contains("ollama") && stderr.contains("copilot"),
         "o erro lista as opções válidas: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR11b / ADR-0020 — backend foundry (`--llm foundry`, envs KIRA_FOUNDRY_*)
+// ---------------------------------------------------------------------------
+
+/// Canonical OpenAI-compatible answer of the fake Foundry (GPT-5 shape).
+const FOUNDRY_SUCCESS_BODY: &str = r#"{"id":"chatcmpl-1","object":"chat.completion","model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"Causa raiz provável:\nTTL do token muito curto.\nArquivos prováveis:\nsrc/auth/session.rs\nConfiança:\nmédia"},"finish_reason":"stop"}]}"#;
+
+/// `--llm foundry` with the v1 endpoint: exit 0 with the three sections —
+/// with KIRA_OLLAMA_URL on a dead port, proving Ollama was never used.
+#[test]
+fn triage_with_llm_foundry_prints_the_three_sections_and_never_touches_ollama() {
+    let (foundry_url, server) = spawn_fake_foundry(FOUNDRY_SUCCESS_BODY);
+    let sandbox = Sandbox::new("foundry-success");
+    let fixture = sandbox.fixture();
+
+    let (code, stdout, stderr) = sandbox.run_with(
+        &["triage", "--file", &fixture, "--llm", "foundry"],
+        &[
+            ("KIRA_FOUNDRY_ENDPOINT", format!("{foundry_url}/v1")),
+            ("KIRA_FOUNDRY_DEPLOYMENT", "gpt-5".to_string()),
+            ("KIRA_FOUNDRY_API_KEY", "kira-e2e-key".to_string()),
+            // Porta morta de propósito: se o KIRA tentasse o Ollama, o
+            // comando falharia com conexão recusada.
+            ("KIRA_OLLAMA_URL", "http://127.0.0.1:1".to_string()),
+        ],
+        &[],
+    );
+
+    assert_eq!(
+        code, 0,
+        "triage foundry deve sair com 0 — stdout: {stdout} / stderr: {stderr}"
+    );
+    assert!(
+        stdout.starts_with("Causa raiz provável:"),
+        "saída em 3 seções preservada: {stdout}"
+    );
+
+    let request = server
+        .join()
+        .unwrap_or_else(|_| panic!("thread do servidor falso entrou em pânico"))
+        .unwrap_or_else(|| panic!("servidor falso deve capturar a requisição"));
+    assert!(
+        request.starts_with("POST /v1/chat/completions HTTP/1.1"),
+        "a superfície v1 envia {{endpoint}}/chat/completions: {request}"
+    );
+    assert!(
+        !request.contains("api-version"),
+        "a superfície v1 não anexa api-version: {request}"
+    );
+    assert!(
+        request.contains("\"model\":\"gpt-5\""),
+        "o deployment vai no campo model do corpo: {request}"
+    );
+    assert!(
+        !request.contains("\"temperature\":"),
+        "gpt-5 (família reasoning) não recebe temperature: {request}"
+    );
+    assert!(
+        request.contains("\"max_completion_tokens\":"),
+        "gpt-5 exige max_completion_tokens: {request}"
+    );
+    assert!(
+        !request.contains("\"max_tokens\":"),
+        "gpt-5 não recebe max_tokens: {request}"
+    );
+    assert!(
+        request.contains("api-key: kira-e2e-key"),
+        "o header api-key deve viajar: {request}"
+    );
+}
+
+/// Missing key fails with an actionable error BEFORE any network call — the
+/// deadline server proves nothing ever connected.
+#[test]
+fn triage_foundry_without_key_fails_before_any_request() {
+    let (foundry_url, server) = spawn_deadline_foundry();
+    let sandbox = Sandbox::new("foundry-missing-key");
+    let fixture = sandbox.fixture();
+
+    let (code, stdout, stderr) = sandbox.run_with(
+        &["triage", "--file", &fixture, "--llm", "foundry"],
+        &[
+            ("KIRA_FOUNDRY_ENDPOINT", format!("{foundry_url}/v1")),
+            ("KIRA_FOUNDRY_DEPLOYMENT", "gpt-5".to_string()),
+            ("KIRA_OLLAMA_URL", "http://127.0.0.1:1".to_string()),
+        ],
+        &["KIRA_FOUNDRY_API_KEY"],
+    );
+
+    assert_eq!(
+        code, 1,
+        "chave ausente deve falhar — stdout: {stdout} / stderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "stdout deve ficar vazio: {stdout}"
+    );
+    assert!(
+        stderr.contains("KIRA_FOUNDRY_API_KEY") && stderr.contains("defina"),
+        "o erro deve dizer que env definir: {stderr}"
+    );
+
+    let captured = server
+        .join()
+        .unwrap_or_else(|_| panic!("thread do servidor falso entrou em pânico"));
+    assert!(
+        captured.is_none(),
+        "sem chave, NENHUM byte pode chegar ao servidor: {captured:?}"
     );
 }
