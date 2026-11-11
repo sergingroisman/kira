@@ -12,17 +12,13 @@ use crate::format::DESCRIPTION_MAX_CHARS;
 use crate::html::html_to_text;
 use crate::llm::LlmBackend;
 use crate::llm::ollama::OllamaBackend;
+// Single source for the prompt contract: the system text, the section headers
+// and the user preamble all live in `llm::prompts` (versioned, golden-tested).
+use crate::llm::prompts::{TRIAGE_SECTIONS as SECTION_NAMES, TRIAGE_SYSTEM_PROMPT};
 use crate::work_item::WorkItem;
-
-/// Section names of the fixed triage template.
-const SECTION_NAMES: [&str; 3] = ["Causa raiz provável", "Arquivos prováveis", "Confiança"];
 
 /// Placeholder used when the model left a section empty.
 const SECTION_EMPTY: &str = "—";
-
-/// The read-only triage system prompt lives in [`crate::llm::prompts`] so it
-/// is versioned in one place; this alias keeps the command code readable.
-pub use crate::llm::prompts::TRIAGE_SYSTEM_PROMPT as SYSTEM_PROMPT;
 
 /// Builds the user prompt for a work item: title, type, state, area and the
 /// description with the raw HTML cleaned by [`html_to_text`].
@@ -231,7 +227,10 @@ async fn triage_item(
     let backend = OllamaBackend::new(base_url, model);
     let pack = context_pack(item, exclude_from_grep);
     let text = backend
-        .complete(SYSTEM_PROMPT, &build_prompt_with_context(item, &pack))
+        .complete(
+            TRIAGE_SYSTEM_PROMPT,
+            &build_prompt_with_context(item, &pack),
+        )
         .await?;
     Ok(TriageReport {
         item_id: item.id,
@@ -260,24 +259,6 @@ mod tests {
 
     fn parse(body: &str) -> WorkItem {
         WorkItem::from_api_json(body).unwrap_or_else(|err| panic!("fixture inválida: {err}"))
-    }
-
-    #[test]
-    fn system_prompt_is_read_only_and_demands_three_sections() {
-        assert!(
-            SYSTEM_PROMPT.contains("nunca sugira escrever, editar ou corrigir código"),
-            "prompt do sistema deve proibir escrita de código: {SYSTEM_PROMPT}"
-        );
-        assert!(
-            SYSTEM_PROMPT.contains("nunca proponha ou execute alterações no Azure DevOps"),
-            "prompt do sistema deve proibir escrita no Azure: {SYSTEM_PROMPT}"
-        );
-        for name in SECTION_NAMES {
-            assert!(
-                SYSTEM_PROMPT.contains(&format!("{name}:")),
-                "prompt do sistema deve exigir a seção {name}: {SYSTEM_PROMPT}"
-            );
-        }
     }
 
     #[test]

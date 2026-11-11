@@ -1,4 +1,5 @@
-//! Fixtures de entrada/saída do prompt de triage (PR6).
+//! Fixtures de entrada/saída do prompt de triage (PR6) e dourado do prompt do
+//! sistema (PR7).
 //!
 //! Cada caso em `tests/fixtures/triage/<slug>/` é um contrato fechado:
 //!
@@ -7,9 +8,13 @@
 //! - `prompt.txt` — prompt do usuário que o KIRA deve montar, byte a byte;
 //! - `expected.txt` — saída formatada nas três seções fixas.
 //!
-//! O teste compara os dois arquivos gerados contra os dourados. Mudar o prompt
+//! E `tests/fixtures/prompts/triage-system.txt` guarda o texto exato do prompt
+//! do sistema, comparado byte a byte contra a constante compilada.
+//!
+//! O teste compara os arquivos gerados contra os dourados. Mudar o prompt
 //! ou o formatador quebra aqui de propósito: a mudança tem que vir no mesmo
-//! commit, com `TRIAGE_PROMPT_VERSION` nova e o diff das fixtures revisado.
+//! commit, com `TRIAGE_PROMPT_VERSION` nova, `TRIAGE_SYSTEM_PROMPT_FNV1A64`
+//! recalculada e o diff das fixtures revisado.
 //!
 //! Para regenerar os dourados depois de uma mudança intencional:
 //! `KIRA_UPDATE_FIXTURES=1 cargo test --test triage_prompt_fixtures`.
@@ -17,6 +22,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use kira::llm::prompts;
 use kira::triage;
 use kira::work_item::WorkItem;
 
@@ -104,4 +110,50 @@ fn every_golden_output_round_trips_through_the_three_sections() {
             );
         }
     }
+}
+
+// --- PR7: dourado do prompt do SISTEMA -------------------------------------
+
+/// `tests/fixtures/prompts/triage-system.txt` guarda o texto exato do prompt do
+/// sistema. O prompt é o contrato com o modelo: qualquer byte a mais ou a menos
+/// muda o comportamento do modelo 4B, então a comparação é byte a byte, e não
+/// um `contains`.
+fn system_prompt_golden() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("prompts")
+        .join("triage-system.txt")
+}
+
+#[test]
+fn system_prompt_matches_the_golden_text() {
+    assert_matches_golden(&system_prompt_golden(), prompts::TRIAGE_SYSTEM_PROMPT);
+}
+
+/// Duas entradas para o mesmo fato: o texto dourado e a impressão digital
+/// compilada. Se alguém editar o prompt e o dourado juntos, mas esquecer a
+/// constante, o `cargo test` reprova aqui.
+#[test]
+fn system_prompt_fingerprint_is_the_fnv1a_of_the_golden_text() {
+    let text = read(&system_prompt_golden());
+    let expected = format!("{:016x}", kira::store::fnv1a64(text.as_bytes()));
+    assert_eq!(
+        prompts::TRIAGE_SYSTEM_PROMPT_FNV1A64,
+        expected,
+        "TRIAGE_SYSTEM_PROMPT_FNV1A64 não corresponde ao dourado {}",
+        system_prompt_golden().display()
+    );
+}
+
+/// O prompt do sistema não é um lugar para dado do dono: nenhum e-mail, CPF ou
+/// token pode entrar nele (vai inteiro para o modelo local e para o repo).
+#[test]
+fn system_prompt_golden_carries_no_secret() {
+    let text = read(&system_prompt_golden());
+    assert_eq!(
+        kira::redact::redact(&text),
+        text,
+        "o prompt do sistema tem conteúdo que seria mascarado — remova antes de commitar"
+    );
 }

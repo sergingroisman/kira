@@ -2,3 +2,5 @@
 # CRLF de checkout Windows quebraria o contrato — fixa LF.
 tests/fixtures/triage/**/*.txt text eol=lf
 tests/fixtures/triage/**/*.json text eol=lf
+# Dourado do prompt do sistema (PR7): mesmo contrato byte a byte.
+tests/fixtures/prompts/**/*.txt text eol=lf
