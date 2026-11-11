@@ -87,9 +87,13 @@
       = `item.json` + `model.txt` (resposta crua de modelo 4B) + `prompt.txt` +
       `expected.txt` dourados, comparados byte a byte (`KIRA_UPDATE_FIXTURES=1`
       regenera); `.gitattributes` fixa LF nos fixtures.
-- [ ] **PR7** `prompts.rs` público, revisado, teste de regressão de texto. Resta
-      depois do PR6: dourado do **prompt do sistema** (hash/versão) e revisão da
-      superfície pública — as fixtures de entrada/saída já existem.
+- [x] **PR7** `prompts.rs` público, revisado, teste de regressão de texto.
+      `TRIAGE_SYSTEM_PROMPT_FNV1A64` (FNV-1a 64 do texto do sistema) +
+      `triage_prompt_id()` no stderr do `kira triage`; dourado
+      `tests/fixtures/prompts/triage-system.txt` comparado byte a byte (LF fixado)
+      e o hash recomputado por teste — mexer no texto sem atualizar os dois
+      reprova. Superfície pública revisada: `triage.rs` não duplica mais as seções
+      nem o alias do prompt.
 - [ ] **PR8** `LlmBackend` explícito: ollama + caminho preparado para copilot/byok.
 - [ ] **W2-bis** `kira triage --eval <dir>` + `tests/fixtures/triage_gold/`
       (schema + leitor + % de acerto). Harness testado com fixtures sintéticas;

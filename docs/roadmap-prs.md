@@ -59,7 +59,7 @@ ausência: "Arquivos prováveis" saiu descritivo).
 |---|---|---|
 | PR5 | Context packer v1: item + findings do arquivo + trechos, com teto de tokens (`KIRA_NUM_CTX=4096`) | escopo detalhado **a confirmar** |
 | PR6 | Prompt de triage v1 + fixtures de entrada/saída | **feito** — `TRIAGE_PROMPT_VERSION=v1` com regras de grounding; `tests/fixtures/triage/<slug>/` (`item.json` + `model.txt` + `prompt.txt` + `expected.txt`) comparados byte a byte em `tests/triage_prompt_fixtures.rs`; `.gitattributes` fixa LF |
-| PR7 | Prompt review: `prompts.rs` público, revisado, com teste de regressão de texto | **a confirmar** |
+| PR7 | Prompt review: `prompts.rs` público, revisado, com teste de regressão de texto | **feito** — `TRIAGE_SYSTEM_PROMPT_FNV1A64` + `triage_prompt_id()` no stderr; dourado `tests/fixtures/prompts/triage-system.txt` byte a byte com LF fixado; hash recomputado por teste (texto e `TRIAGE_SECTIONS` numa origem só) |
 | PR8 | Backend LLM por trait (`LlmBackend`): ollama + caminho explícito para copilot/byok | **a confirmar** |
 
 ## W2.5 — Wiki do KIRA (PR28–32) — inspirada no ai-memory
