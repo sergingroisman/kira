@@ -128,6 +128,16 @@ enum WikiAction {
         /// Decision text
         text: String,
     },
+    /// Rebuild the derived search index from the markdown on disk
+    Reindex,
+    /// Search the wiki (needs `kira wiki reindex` at least once)
+    Search {
+        /// What to look for
+        query: String,
+        /// Maximum hits (default 5)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 /// Result of one command run: exit code, plain success flag (kept separate
@@ -317,6 +327,11 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 WikiAction::List => "list".to_string(),
                 WikiAction::Show { page } => format!("show {page}"),
                 WikiAction::Decision { text } => format!("decision {text}"),
+                WikiAction::Reindex => "reindex".to_string(),
+                WikiAction::Search { query, limit } => match limit {
+                    Some(limit) => format!("search {query} --limit {limit}"),
+                    None => format!("search {query}"),
+                },
             };
             let args = match path {
                 Some(path) => format!("{args} --path {}", path.display()),
@@ -659,6 +674,34 @@ fn wiki_output(action: &WikiAction, root: &Path) -> Result<String, WikiError> {
         WikiAction::Decision { text } => {
             let written = wiki.append("decisoes", text)?;
             Ok(format!("decisão registrada em {}\n", written.display()))
+        }
+        WikiAction::Reindex => {
+            let store = Store::open_default()?;
+            let indexed = wiki.reindex(&store)?;
+            let engine = if store.wiki_fts5_enabled() {
+                "FTS5"
+            } else {
+                "LIKE (FTS5 indisponível)"
+            };
+            Ok(format!(
+                "índice da wiki reconstruído: {indexed} páginas, busca por {engine}\n"
+            ))
+        }
+        WikiAction::Search { query, limit } => {
+            let store = Store::open_default()?;
+            let hits = wiki.search(&store, query, limit.unwrap_or(5))?;
+            if hits.is_empty() {
+                return Ok(format!(
+                    "nenhuma página da wiki contém '{query}' — rode `kira wiki reindex` se a wiki mudou desde a última indexação\n"
+                ));
+            }
+            let mut text = format!("{} página(s) com '{query}':\n", hits.len());
+            for hit in hits {
+                text.push_str(&format!("  {} [{}] {}\n", hit.slug, hit.kind, hit.title));
+                let snippet = hit.snippet.replace('\n', " ");
+                text.push_str(&format!("      {snippet}\n"));
+            }
+            Ok(text)
         }
     }
 }

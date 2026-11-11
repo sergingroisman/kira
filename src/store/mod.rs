@@ -28,7 +28,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -341,6 +341,158 @@ impl Store {
         }
         Ok(facts)
     }
+
+    /// Replaces the whole wiki index with `pages` (derived data, ADR-0013).
+    ///
+    /// Safe to call any number of times: the markdown files are the truth, so
+    /// dropping and rebuilding the index can never lose knowledge. Returns how
+    /// many pages were indexed.
+    pub fn wiki_replace(&self, pages: &[WikiPageRow]) -> Result<usize, StoreError> {
+        let tx = self.conn.unchecked_transaction().map_err(StoreError::Sql)?;
+        tx.execute("DELETE FROM wiki_page", [])
+            .map_err(StoreError::Sql)?;
+        if self.wiki_fts5_enabled() {
+            tx.execute("DELETE FROM wiki_fts", [])
+                .map_err(StoreError::Sql)?;
+        }
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO wiki_page \
+                     (slug, kind, path, title, updated_at, content_hash, body) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(StoreError::Sql)?;
+            for page in pages {
+                insert
+                    .execute(rusqlite::params![
+                        page.slug,
+                        page.kind,
+                        page.path,
+                        page.title,
+                        page.updated_at,
+                        page.content_hash,
+                        page.body,
+                    ])
+                    .map_err(StoreError::Sql)?;
+            }
+        }
+        if self.wiki_fts5_enabled() {
+            let mut insert = tx
+                .prepare("INSERT INTO wiki_fts (slug, kind, title, body) VALUES (?1, ?2, ?3, ?4)")
+                .map_err(StoreError::Sql)?;
+            for page in pages {
+                insert
+                    .execute(rusqlite::params![
+                        page.slug, page.kind, page.title, page.body
+                    ])
+                    .map_err(StoreError::Sql)?;
+            }
+        }
+        tx.commit().map_err(StoreError::Sql)?;
+        Ok(pages.len())
+    }
+
+    /// True when the FTS5 virtual table exists in this database.
+    #[must_use]
+    pub fn wiki_fts5_enabled(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'wiki_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|count| count > 0)
+    }
+
+    /// Searches the wiki index: FTS5 `MATCH` when available, `LIKE` otherwise.
+    ///
+    /// `query` is user text; the FTS5 path quotes it as a single phrase so a
+    /// stray `"` or `*` cannot turn into a syntax error.
+    pub fn wiki_search(&self, query: &str, limit: usize) -> Result<Vec<WikiHit>, StoreError> {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut hits = Vec::new();
+
+        if self.wiki_fts5_enabled() {
+            let phrase = format!("\"{}\"", needle.replace('"', " "));
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT slug, kind, title, snippet(wiki_fts, 3, '[', ']', '…', 10) \
+                     FROM wiki_fts WHERE wiki_fts MATCH ?1 ORDER BY rank LIMIT ?2",
+                )
+                .map_err(StoreError::Sql)?;
+            let rows = statement
+                .query_map(rusqlite::params![phrase, limit], |row| {
+                    Ok(WikiHit {
+                        slug: row.get(0)?,
+                        kind: row.get(1)?,
+                        title: row.get(2)?,
+                        snippet: row.get(3)?,
+                    })
+                })
+                .map_err(StoreError::Sql)?;
+            for row in rows {
+                hits.push(row.map_err(StoreError::Sql)?);
+            }
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+        }
+
+        // Fallback (no FTS5, or FTS5 found nothing — e.g. punctuation-only query).
+        let pattern = format!("%{}%", needle.replace(['%', '_'], ""));
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT slug, kind, title, substr(body, 1, 200) \
+                 FROM wiki_page WHERE title LIKE ?1 OR body LIKE ?1 \
+                 ORDER BY slug LIMIT ?2",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map(rusqlite::params![pattern, limit], |row| {
+                Ok(WikiHit {
+                    slug: row.get(0)?,
+                    kind: row.get(1)?,
+                    title: row.get(2)?,
+                    snippet: row.get(3)?,
+                })
+            })
+            .map_err(StoreError::Sql)?;
+        for row in rows {
+            hits.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(hits)
+    }
+}
+
+/// One wiki page as stored in the derived index.
+#[derive(Debug, Clone)]
+pub struct WikiPageRow {
+    pub slug: String,
+    pub kind: String,
+    pub path: String,
+    pub title: String,
+    /// RFC 3339 UTC, taken from the page header.
+    pub updated_at: String,
+    /// FNV-1a 64 of the page content, hex — detects "page changed".
+    pub content_hash: String,
+    pub body: String,
+}
+
+/// One search hit from the wiki index.
+#[derive(Debug, Clone)]
+pub struct WikiHit {
+    pub slug: String,
+    pub kind: String,
+    pub title: String,
+    /// Context around the match (FTS5 snippet or the first 200 chars).
+    pub snippet: String,
 }
 
 /// A project row.
@@ -400,34 +552,70 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     if current >= SCHEMA_VERSION {
         return Ok(());
     }
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS projects (
-            id TEXT PRIMARY KEY,
-            root_path TEXT NOT NULL,
-            name TEXT NOT NULL,
-            first_seen_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id TEXT NOT NULL,
-            command TEXT NOT NULL,
-            args TEXT NOT NULL DEFAULT '',
-            model TEXT,
-            started_at TEXT NOT NULL,
-            duration_ms INTEGER NOT NULL,
-            ok INTEGER NOT NULL,
-            summary TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS facts (
-            project_id TEXT,
-            key TEXT,
-            value TEXT,
-            updated_at TEXT,
-            PRIMARY KEY (project_id, key)
-        );
-        PRAGMA user_version = 1;",
-    )
-    .map_err(schema_error)
+
+    // v1 — projects, sessions, facts.
+    if current < 1 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                root_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                command TEXT NOT NULL,
+                args TEXT NOT NULL DEFAULT '',
+                model TEXT,
+                started_at TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                ok INTEGER NOT NULL,
+                summary TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS facts (
+                project_id TEXT,
+                key TEXT,
+                value TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (project_id, key)
+            );",
+        )
+        .map_err(schema_error)?;
+    }
+
+    // v2 — wiki index (ADR-0013): markdown on disk is the truth, this is the
+    // derived copy. FTS5 is optional: if the linked SQLite lacks the module the
+    // virtual table is simply absent and search degrades to LIKE (documented),
+    // never an error that would block every other command.
+    if current < 2 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS wiki_page (
+                slug TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                title TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                body TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS wiki_page_kind ON wiki_page(kind);",
+        )
+        .map_err(schema_error)?;
+        if let Err(error) = conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
+                slug UNINDEXED, kind UNINDEXED, title, body
+            );",
+        ) {
+            // Degradação, não falha: sem FTS5 a busca cai para LIKE.
+            eprintln!(
+                "aviso: FTS5 indisponível neste SQLite ({error}) — busca da wiki cai para LIKE"
+            );
+        }
+    }
+
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+        .map_err(schema_error)
 }
 
 /// Hand-rolled FNV-1a 64-bit (no extra dependency) — used to build stable
@@ -574,6 +762,52 @@ mod tests {
             .map(|duration| duration.subsec_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("kira-store-{}-{name}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn migrations_upgrade_a_v1_database_without_losing_data() {
+        let dir = temp_dir("migrate-v1");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        let path = dir.join("store.db");
+
+        // Database exactly as schema v1 left it.
+        {
+            let conn =
+                rusqlite::Connection::open(&path).unwrap_or_else(|err| panic!("abrir v1: {err}"));
+            conn.execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, root_path TEXT NOT NULL, \
+                 name TEXT NOT NULL, first_seen_at TEXT NOT NULL);
+                 CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, \
+                 command TEXT NOT NULL, args TEXT NOT NULL DEFAULT '', model TEXT, started_at TEXT NOT NULL, \
+                 duration_ms INTEGER NOT NULL, ok INTEGER NOT NULL, summary TEXT NOT NULL DEFAULT '');
+                 CREATE TABLE facts (project_id TEXT, key TEXT, value TEXT, updated_at TEXT, \
+                 PRIMARY KEY (project_id, key));
+                 INSERT INTO projects VALUES ('p1', '/tmp/p1', 'p1', '2026-11-01T00:00:00Z');
+                 INSERT INTO sessions (project_id, command, args, started_at, duration_ms, ok, summary) \
+                 VALUES ('p1', 'inspect', '1', '2026-11-01T00:00:00Z', 10, 1, 'sessão antiga');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap_or_else(|err| panic!("criar v1: {err}"));
+        }
+
+        let store = Store::open_at(&path).unwrap_or_else(|err| panic!("abrir v2: {err}"));
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or_else(|err| panic!("user_version: {err}"));
+        assert_eq!(version, 2, "migração deveria subir para a v2");
+        assert!(
+            store.wiki_fts5_enabled(),
+            "wiki_fts deveria existir após a v2"
+        );
+
+        // Dado antigo continua lá — migração aditiva, nunca destrutiva.
+        let sessions = store
+            .last_sessions("p1", 10)
+            .unwrap_or_else(|err| panic!("last_sessions: {err}"));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].summary, "sessão antiga");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
