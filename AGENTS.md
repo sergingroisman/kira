@@ -32,6 +32,7 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Sem `unsafe` no código de runtime. Exceção única e test-only: testes que mexem em variáveis de ambiente (edition 2024 torna `env::set_var`/`remove_var` unsafe). Sem dependência nova sem justificar no PR.
 ## Setup
 - `kira setup` pergunta "Você já tem um PAT pronto? [S/n]" SEMPRE no modo interativo (stdin é TTY — `stdin().is_terminal()`, injetado como `SetupOptions::interactive`); stdin pipado mantém o fast path antigo (passos + abrir + colar). Enter = 's'; respostas inválidas repetem no máximo 2x e então assumem 's', com aviso.
+- O setup pergunta o nome do dev ("Como devo te chamar?") depois de org/projeto e antes de salvar — só em TTY, padrão derivado do SO (`USER`/`USERNAME` capitalizado; vazio ⇒ `dev`) — e salva `dev_name` em `config.toml` (0600); `--name <nome>` troca sem perguntar. O nome NUNCA entra em prompt de LLM: só na saída humana (`kira doctor` mostra `dev: <nome>`, `—` quando ausente).
 - 'n' na pergunta imprime os passos (URL `https://dev.azure.com/{org}/_usersSettings/tokens` + escopos Work Items Read + Project and Team Read) e confirma "Abrir no navegador agora? [S/n]" — o navegador SÓ abre com confirmação.
 - Abertura de navegador NUNCA bloqueia: `Command::spawn` (handle descartado — nunca `.status()`/`.output()`); spawn falhou ⇒ só re-imprime a URL e continua.
 - `--no-browser` pula os passos e nunca pergunta sobre navegador (vai direto ao "Cole o PAT"); `--pat` é zero-prompts de token e o valor nunca é ecoado (só máscara).

@@ -36,6 +36,10 @@ pub const CRED_KEY_PAT: &str = "azure-devops-pat";
 /// Config keys stored in `config.toml`.
 pub const CONFIG_KEY_ORG: &str = "organization";
 pub const CONFIG_KEY_PROJECT: &str = "project";
+/// Nome pelo qual o dev quer ser chamado (`kira setup` / `--name`); opcional
+/// no arquivo (ausente ⇒ `None`), como um `#[serde(default)]` do formato
+/// minimalista de pares usado aqui.
+pub const CONFIG_KEY_DEV_NAME: &str = "dev_name";
 
 /// Where a resolved value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +337,16 @@ fn restrict_permissions(_path: &Path) {
     // restricts access to the user; no extra mode bits exist.
 }
 
+/// Nome do dev salvo em `config.toml` por `kira setup` (campo `dev_name`).
+/// Ausente ou em branco ⇒ `None` — o campo é opcional para manter configs
+/// antigas (sem `dev_name`) válidas.
+pub fn dev_name_from_config() -> Option<String> {
+    let config = read_config().ok()?;
+    config_get(&config, CONFIG_KEY_DEV_NAME)
+        .map(str::to_string)
+        .filter(|name| !name.trim().is_empty())
+}
+
 /// Core of the PAT resolution: env wins over the store; a missing store or an
 /// empty store degrades to the actionable `MissingPat` error — never a panic.
 fn resolve_pat_parts(
@@ -591,6 +605,25 @@ mod tests {
                 .unwrap_or(0);
             assert_eq!(mode, 0o600, "config.toml deve ter modo 0600");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dev_name_round_trips_and_is_optional() {
+        let dir = std::env::temp_dir().join(format!("kira-test-devname-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        // Ausente ⇒ None: configs antigas (sem dev_name) continuam válidas.
+        write_config_file(&path, &[(CONFIG_KEY_ORG, "minha-org")]).expect("escrever");
+        let pairs = read_config_file(&path).expect("ler");
+        assert_eq!(config_get(&pairs, CONFIG_KEY_DEV_NAME), None);
+
+        // Presente ⇒ round-trip do valor exato, preservando as outras chaves.
+        write_config_file(&path, &[(CONFIG_KEY_DEV_NAME, "Sergin")]).expect("escrever");
+        let pairs = read_config_file(&path).expect("ler");
+        assert_eq!(config_get(&pairs, CONFIG_KEY_DEV_NAME), Some("Sergin"));
+        assert_eq!(config_get(&pairs, CONFIG_KEY_ORG), Some("minha-org"));
         let _ = fs::remove_dir_all(&dir);
     }
 

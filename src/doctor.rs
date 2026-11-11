@@ -88,6 +88,15 @@ pub fn format_unauthorized_check(organization: &str) -> String {
     )
 }
 
+/// Linha do nome do dev no `kira doctor`: `dev: Sergin` quando há nome salvo
+/// em `config.toml`, `dev: —` quando ausente (configs antigas seguem válidas).
+pub fn format_dev_check(name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("dev: {name}"),
+        None => "dev: —".to_string(),
+    }
+}
+
 /// Finds a project by name, case-insensitively, returning the exact name.
 pub fn find_project_case_insensitive<'a>(wanted: &str, available: &'a [String]) -> Option<&'a str> {
     let wanted = wanted.trim().to_lowercase();
@@ -190,6 +199,14 @@ pub async fn run() -> (bool, String) {
             missing.push(name);
         }
     }
+
+    // Nome do dev (opcional): linha informativa, nunca entra no "missing" —
+    // ausente só significa config antiga, não configuração quebrada.
+    let dev_name = credentials::dev_name_from_config();
+    emit(
+        &mut out,
+        &format!("   {}", format_dev_check(dev_name.as_deref())),
+    );
 
     if !missing.is_empty() {
         emit(&mut out, "2. Conexão com a organização");
@@ -394,5 +411,11 @@ mod tests {
             format_project_check("x", &[]),
             "✗ projeto x não encontrado (nenhum projeto visível para este PAT)"
         );
+    }
+
+    #[test]
+    fn dev_check_shows_the_saved_name_or_a_dash() {
+        assert_eq!(format_dev_check(Some("Sergin")), "dev: Sergin");
+        assert_eq!(format_dev_check(None), "dev: —");
     }
 }

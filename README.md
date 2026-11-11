@@ -21,7 +21,7 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira triage <id\|--file> --model <tag>` | Troca o modelo do Ollama para esta execução. |
 | `kira triage <id\|--file> --llm copilot` | Usa o **Copilot CLI** como LLM caro desta execução (spawn de `copilot -p`; exige `copilot auth login`) — ver [Backend LLM (ADR-0019)](#backend-llm-adr-0019). |
 | `kira triage <id\|--file> --llm foundry` | Usa o **Microsoft Foundry** (BYOK, HTTP OpenAI-compatible) no lugar do Ollama para esta execução — ver [Backend foundry](#backend-foundry-byok-microsoft-foundry) abaixo. |
-| `kira setup [--org --project --pat --no-browser --reset]` | Wizard: org, projeto e PAT validados **antes** de salvar; PAT vai para o keyring do OS (service `kira`). `--reset` remove o PAT. |
+| `kira setup [--org --project --name --pat --no-browser --reset]` | Wizard: org, projeto, nome do dev (`--name`) e PAT validados **antes** de salvar; PAT vai para o keyring do OS (service `kira`). `--reset` remove o PAT. |
 | `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
 | `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
 | `kira note "<texto>"` / `kira note --remove N` | Fato do perfil do projeto (append-only, numerado). |
@@ -70,6 +70,7 @@ Ele vive no keyring do OS (salvo por `kira setup`) ou na env
 ```bash
 kira setup          # interativo: org, projeto, pergunta "Você já tem um PAT pronto? [S/n]"
 kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas
+kira setup --name Sergin   # como o KIRA te chama (vai para config.toml, nunca para um LLM)
 kira setup --reset  # remove o PAT do keyring
 ```
 

@@ -8,7 +8,7 @@
 use std::io::{BufReader, Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kira::board::azure::AdoBoard;
@@ -109,6 +109,7 @@ async fn run_setup(
     pat_flag: Option<String>,
     no_browser: bool,
     interactive: bool,
+    name_flag: Option<String>,
 ) -> (ExitCode, String) {
     let make_board =
         move |pat: &str, org: &str, project: &str| -> Result<Box<dyn BoardProvider>, Error> {
@@ -138,6 +139,7 @@ async fn run_setup(
         pat: pat_flag,
         no_browser,
         interactive,
+        name: name_flag,
     };
     let code = setup::run(
         &options,
@@ -174,6 +176,7 @@ async fn setup_prompts_org_project_validates_and_saves_the_pat() {
         None,
         false,
         false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
     )
     .await;
 
@@ -265,6 +268,7 @@ async fn setup_with_401_shows_what_to_review_and_does_not_save() {
         None,
         false,
         false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
     )
     .await;
 
@@ -305,6 +309,7 @@ async fn setup_with_wrong_project_name_does_not_save() {
         None,
         false,
         false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
     )
     .await;
 
@@ -341,6 +346,7 @@ async fn setup_uses_flags_and_env_before_prompting() {
         None,
         false,
         false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
     )
     .await;
 
@@ -383,6 +389,7 @@ async fn setup_pat_flag_is_fully_non_interactive() {
         Some("Aa2xTOKENCOMPLETO".to_string()),
         false,
         false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
     )
     .await;
 
@@ -466,6 +473,7 @@ async fn setup_no_browser_skips_steps_and_opener_but_still_prompts() {
         None,
         true,
         false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
     )
     .await;
 
@@ -521,6 +529,7 @@ async fn setup_pat_flag_with_401_does_not_save_or_echo_the_token() {
         Some("PATRUIMSEGREDO".to_string()),
         true,
         false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
     )
     .await;
 
@@ -577,6 +586,381 @@ async fn setup_reset_removes_the_pat_from_the_store() {
 }
 
 // ---------------------------------------------------------------------------
+// Nome do dev (`--name` / pergunta em TTY / padrão do SO) salvo como
+// `dev_name` em config.toml e mostrado pelo `kira doctor`.
+// ---------------------------------------------------------------------------
+
+/// Runs the REAL binary `kira doctor` with `KIRA_CONFIG` pointing at `config`
+/// and the Azure env vars removed, so the doctor stops offline at the missing
+/// PAT — section 1 (com a linha `dev:`) é impressa antes desse corte.
+fn run_doctor(config: &std::path::Path) -> String {
+    // Sandbox próprio: o doctor grava o resumo no store de sessões, e o
+    // KIRA_CONFIG aponta para o config gravado pelo setup; as envs do Azure
+    // saem para o doctor cortar offline no PAT ausente (a seção 1, com a
+    // linha `dev:`, é impressa antes desse corte).
+    let sandbox = std::env::temp_dir().join(format!(
+        "kira-doctor-e2e-{}-{}",
+        std::process::id(),
+        config
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let _ = std::fs::create_dir_all(&sandbox);
+    let output = Command::new(env!("CARGO_BIN_EXE_kira"))
+        .arg("doctor")
+        .env("KIRA_CONFIG", config)
+        .env("KIRA_STORE_DIR", &sandbox)
+        .env_remove("AZURE_DEVOPS_PAT")
+        .env_remove("AZURE_DEVOPS_ORG")
+        .env_remove("AZURE_DEVOPS_PROJECT")
+        .output()
+        .unwrap_or_else(|err| panic!("executar kira doctor: {err}"));
+    let _ = std::fs::remove_dir_all(&sandbox);
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[tokio::test]
+async fn setup_non_interactive_uses_the_default_dev_name_and_doctor_shows_it() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("dev-name-default");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // Sem TTY, sem --name e sem dev_name salvo: o padrão vem do SO via a env
+    // injetada (USER=sergin ⇒ "Sergin") — NUNCA há prompt esperando input.
+    let (code, out) = run_setup(
+        "minha-org\nKira\nAa2xTOKENCOMPLETO\n",
+        None,
+        None,
+        &[("USER", "sergin")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        !out.contains("Como devo te chamar?"),
+        "sem TTY o setup não pode perguntar o nome: {out}"
+    );
+    assert!(
+        out.contains("dev: Sergin"),
+        "deve registrar o nome derivado do SO: {out}"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs.iter().any(|(k, v)| k == "dev_name" && v == "Sergin"),
+        "dev_name deve ir ao config.toml: {pairs:?}"
+    );
+
+    let doctor_out = run_doctor(&config);
+    assert!(
+        doctor_out.contains("dev: Sergin"),
+        "kira doctor deve mostrar o nome salvo: {doctor_out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_name_flag_wins_over_the_default_and_the_saved_name() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("dev-name-flag");
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // Parte 1: --name vence o padrão do SO (USER=joao ⇒ "Joao" não aparece).
+    // Cada setup consome UM servidor falso (um accept por spawn): um novo
+    // servidor por execução.
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
+        Some(endpoint.clone()),
+        Some(&config),
+        &store,
+        &opened,
+        Some("Aa2xTOKENCOMPLETO".to_string()),
+        false,
+        false, /* interactive: stdin pipado = fast path */
+        Some("Sergin".to_string()),
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(out.contains("dev: Sergin"), "saída: {out}");
+    assert!(
+        !out.contains("Joao"),
+        "o padrão do SO não pode vencer o --name: {out}"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs.iter().any(|(k, v)| k == "dev_name" && v == "Sergin"),
+        "config deve gravar exatamente 'Sergin': {pairs:?}"
+    );
+
+    // Parte 2: --name também troca um nome JÁ salvo (sem "Olá de novo").
+    credentials::write_config_file(&config, &[("dev_name", "Velho")]).expect("pre-gravar");
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        Some("Aa2xTOKENCOMPLETO".to_string()),
+        false,
+        false, /* interactive: stdin pipado = fast path */
+        Some("Sergin".to_string()),
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(out.contains("dev: Sergin"), "saída: {out}");
+    assert!(
+        !out.contains("Olá de novo"),
+        "com --name não deve usar o nome salvo: {out}"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs.iter().any(|(k, v)| k == "dev_name" && v == "Sergin"),
+        "o nome salvo deve ter sido trocado: {pairs:?}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_greets_when_a_name_is_already_saved() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("dev-name-saved");
+    let opened = std::sync::Mutex::new(Vec::new());
+    credentials::write_config_file(&config, &[("dev_name", "Sergin")]).expect("pre-gravar");
+
+    // Nome já existe: pergunta não aparece (nem em TTY, nem pipado) — só a
+    // saudação; troca fica para o `--name`.
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        Some("Aa2xTOKENCOMPLETO".to_string()),
+        false,
+        false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("Olá de novo, Sergin."),
+        "deve cumprimentar pelo nome salvo: {out}"
+    );
+    assert!(
+        !out.contains("Como devo te chamar?"),
+        "com nome salvo a pergunta não aparece: {out}"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs.iter().any(|(k, v)| k == "dev_name" && v == "Sergin"),
+        "o nome salvo deve permanecer: {pairs:?}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn config_without_dev_name_stays_valid_and_doctor_shows_a_dash() {
+    // Config antigo (só org/projeto, sem dev_name): continua válido e o
+    // doctor mostra `—` em vez de um nome.
+    let config = temp_config("dev-name-absent");
+    credentials::write_config_file(
+        &config,
+        &[("organization", "minha-org"), ("project", "Kira")],
+    )
+    .expect("pre-gravar");
+    let doctor_out = run_doctor(&config);
+    assert!(
+        doctor_out.contains("dev: —"),
+        "doctor deve mostrar — sem dev_name: {doctor_out}"
+    );
+
+    // `kira setup` sobre esse config antigo segue funcionando e adiciona o
+    // campo novo com o padrão derivado do SO.
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let opened = std::sync::Mutex::new(Vec::new());
+    let (code, out) = run_setup(
+        "Aa2xTOKENCOMPLETO\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        false, /* interactive: stdin pipado = fast path */
+        None,  /* name */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs.iter().any(|(k, v)| k == "dev_name" && v == "Joao"),
+        "dev_name derivado do SO deve ser gravado: {pairs:?}"
+    );
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "organization" && v == "minha-org"),
+        "as chaves antigas devem ser preservadas: {pairs:?}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_interactive_prompts_for_the_name_with_repeat_and_eof_fallbacks() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let opened = std::sync::Mutex::new(Vec::new());
+
+    // TTY: 's' no PAT, colar o PAT e responder o nome por extenso.
+    let config = temp_config("dev-name-interactive");
+    let (code, out) = run_setup(
+        "s\nAa2xTOKENCOMPLETO\nSerginho\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
+        Some(endpoint.clone()),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        true, /* interactive */
+        None, /* name */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("Como devo te chamar? (Enter = Joao): "),
+        "deve perguntar o nome em TTY com o padrão do SO: {out}"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "dev_name" && v == "Serginho"),
+        "nome digitado deve ser salvo: {pairs:?}"
+    );
+    let _ = std::fs::remove_file(&config);
+
+    // TTY com resposta inválida (41 chars > limite de 40): repete a pergunta
+    // (sem erro fatal) e o valor seguinte é aceito. Servidor novo: um accept
+    // por execução do setup.
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let config = temp_config("dev-name-interactive-invalid");
+    let (code, out) = run_setup(
+        &format!("s\nAa2xTOKENCOMPLETO\n{}\nSerginho\n", "x".repeat(41)),
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
+        Some(endpoint.clone()),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        true, /* interactive */
+        None, /* name */
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("nome inválido"),
+        "deve avisar e repetir a pergunta: {out}"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "dev_name" && v == "Serginho"),
+        "depois da repetição o nome válido entra: {pairs:?}"
+    );
+    let _ = std::fs::remove_file(&config);
+
+    // TTY com Enter na pergunta: padrão do SO; e stdin que fecha (EOF) também
+    // cai no padrão — nunca erro fatal.
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let config = temp_config("dev-name-interactive-default");
+    let (code, out) = run_setup(
+        "s\nAa2xTOKENCOMPLETO\n\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
+        Some(endpoint.clone()),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        true, /* interactive */
+        None, /* name */
+    )
+    .await;
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs.iter().any(|(k, v)| k == "dev_name" && v == "Joao"),
+        "Enter deve assumir o padrão do SO: {pairs:?}"
+    );
+    let _ = std::fs::remove_file(&config);
+
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let config = temp_config("dev-name-interactive-eof");
+    let (code, out) = run_setup(
+        "s\nAa2xTOKENCOMPLETO\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        &opened,
+        None,
+        false,
+        true, /* interactive */
+        None, /* name */
+    )
+    .await;
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs.iter().any(|(k, v)| k == "dev_name" && v == "Joao"),
+        "EOF deve assumir o padrão do SO: {pairs:?}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+// ---------------------------------------------------------------------------
 // Fluxo interativo (TTY): "Você já tem um PAT pronto?" antes de qualquer
 // navegador; o opener só é chamado com confirmação. O modo interativo é
 // injetado (`interactive: true`) — o binário real usa `stdin().is_terminal()`.
@@ -603,6 +987,7 @@ async fn setup_interactive_yes_past_the_pat_question_takes_the_paste_path() {
         None,
         false,
         true, /* interactive */
+        None, /* name */
     )
     .await;
 
@@ -665,6 +1050,7 @@ async fn setup_interactive_no_then_enter_opens_the_browser_once() {
         None,
         false,
         true, /* interactive */
+        None, /* name */
     )
     .await;
 
@@ -718,6 +1104,7 @@ async fn setup_interactive_no_and_no_never_opens_the_browser() {
         None,
         false,
         true, /* interactive */
+        None, /* name */
     )
     .await;
 
@@ -770,6 +1157,7 @@ async fn setup_interactive_invalid_answers_fall_back_to_the_default_s() {
         None,
         false,
         true, /* interactive */
+        None, /* name */
     )
     .await;
 

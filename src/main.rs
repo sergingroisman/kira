@@ -83,6 +83,10 @@ enum Command {
         /// Skip the PAT steps and the browser open; paste the PAT when asked
         #[arg(long)]
         no_browser: bool,
+        /// How the dev wants to be called (saved as `dev_name` in config.toml;
+        /// shown by `kira doctor` — never sent to any LLM prompt)
+        #[arg(long)]
+        name: Option<String>,
     },
     /// List the recent sessions recorded for the current project
     History {
@@ -266,8 +270,9 @@ async fn run(command: Command) -> Outcome {
             reset,
             pat,
             no_browser,
+            name,
         } => Outcome {
-            code: setup_command(org, project, reset, pat, no_browser).await,
+            code: setup_command(org, project, reset, pat, no_browser, name).await,
             ok: true,
             records: false,
             summary: String::new(),
@@ -1121,6 +1126,7 @@ async fn setup_command(
     reset: bool,
     pat: Option<String>,
     no_browser: bool,
+    name: Option<String>,
 ) -> ExitCode {
     // Fail fast (before the user creates a token) when there is nowhere to
     // save it; on machines without a keyring the env var remains the path.
@@ -1146,6 +1152,7 @@ async fn setup_command(
             pat,
             no_browser,
             interactive,
+            name,
         },
         store.as_ref(),
         credentials::config_path().as_deref(),
