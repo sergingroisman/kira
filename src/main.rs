@@ -839,6 +839,9 @@ async fn triage_command(
     match result {
         Ok(report) => {
             print!("{}", report.output);
+            // PR7: identifica a geração do prompt no stderr — duas saídas do
+            // modelo só são comparáveis se o texto do prompt foi o mesmo.
+            eprintln!("prompt: {}", kira::llm::prompts::triage_prompt_id());
             // ADR-0015: the user sees exactly which evidence the model got. Goes
             // to stderr so the three-section answer stays pipeable.
             if !report.context.is_empty() {

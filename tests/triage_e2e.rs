@@ -290,3 +290,26 @@ fn triage_command_reports_the_context_it_sent() {
         "os achados entraram no pack: {stderr}"
     );
 }
+
+/// PR7: a geração do prompt aparece no stderr, com versão e impressão digital —
+/// é o que permite dizer se duas saídas do modelo são comparáveis.
+#[test]
+fn triage_command_reports_the_prompt_generation() {
+    let sandbox = Sandbox::new("prompt-id");
+    let (code, stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        !stdout.contains("fnv1a"),
+        "a impressão digital não contamina a saída pipeável: {stdout}"
+    );
+    assert!(
+        stderr.contains("prompt: triage v1 (fnv1a "),
+        "o stderr identifica a geração do prompt: {stderr}"
+    );
+}
