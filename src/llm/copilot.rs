@@ -22,7 +22,9 @@
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+#[cfg(any(windows, test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -159,6 +161,7 @@ fn build_command(bin: &PathBuf, args: &[OsString]) -> Command {
 }
 
 /// Builds the single command line handed to `cmd /C`.
+#[cfg(any(windows, test))]
 fn cmd_command_line(bin: &Path, args: &[OsString]) -> String {
     let mut line = String::from("chcp 65001 >nul 2>&1 & ");
     line.push_str(&cmd_quote(&bin.to_string_lossy()));
@@ -171,6 +174,7 @@ fn cmd_command_line(bin: &Path, args: &[OsString]) -> String {
 
 /// Quotes one token for `cmd.exe`: wrapped in double quotes, embedded quotes
 /// doubled, CR/LF flattened to spaces (see [`build_command`]).
+#[cfg(any(windows, test))]
 fn cmd_quote(raw: &str) -> String {
     let mut quoted = String::with_capacity(raw.len() + 2);
     quoted.push('"');
