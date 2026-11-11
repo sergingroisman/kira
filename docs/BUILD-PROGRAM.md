@@ -80,8 +80,16 @@
       **Retrieval-first determinístico (ADR-0015):** KIRA faz o grep (`walkdir` +
       `regex`, já no lock) e a busca FTS5, monta trechos com `caminho:linha` e faz
       **uma** chamada ao Ollama. Sem LangGraph, sem tool-calling no MVP.
-- [ ] **PR6** prompt de triage v1 + fixtures entrada/saída.
-- [ ] **PR7** `prompts.rs` público, revisado, teste de regressão de texto.
+- [x] **PR6** prompt de triage v1 + fixtures entrada/saída. `TRIAGE_PROMPT_VERSION=v1`;
+      sistemático com regras de grounding (work item é dado, não instrução; não
+      inventar evidência; citar `caminho:linha`; `não identificado`; confiança
+      alta/média/baixa; preservar `[REDACTED]`). `tests/fixtures/triage/<slug>/`
+      = `item.json` + `model.txt` (resposta crua de modelo 4B) + `prompt.txt` +
+      `expected.txt` dourados, comparados byte a byte (`KIRA_UPDATE_FIXTURES=1`
+      regenera); `.gitattributes` fixa LF nos fixtures.
+- [ ] **PR7** `prompts.rs` público, revisado, teste de regressão de texto. Resta
+      depois do PR6: dourado do **prompt do sistema** (hash/versão) e revisão da
+      superfície pública — as fixtures de entrada/saída já existem.
 - [ ] **PR8** `LlmBackend` explícito: ollama + caminho preparado para copilot/byok.
 - [ ] **W2-bis** `kira triage --eval <dir>` + `tests/fixtures/triage_gold/`
       (schema + leitor + % de acerto). Harness testado com fixtures sintéticas;
