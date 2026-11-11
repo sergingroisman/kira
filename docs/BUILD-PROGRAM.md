@@ -73,7 +73,7 @@
       brief do scan, sem perguntar nada; episódio repetido não duplica; >30 dias
       colapsa em `## Histórico colapsado`; `forget` apaga markdown + índice
       (página ausente = exit 0). Ciclo autônomo usa `EpisodeTarget::Staging`.
-- [ ] **PR31** retrieval da wiki → context packer (top-k com caminho e idade).
+- [x] **PR31** retrieval da wiki → context packer (top-k com caminho e idade).
 - [ ] **PR32** `kira wiki export` (bundle opcional) + `kira wiki promote` (staging → docs).
 - [ ] **PR5** context packer v1: item + findings do arquivo + trechos, teto de
       tokens. **Sem vetor, sem embedding** (markdown + FTS5 no SQLite existente).
