@@ -19,7 +19,8 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira triage <id>` | Triage **vivo**: busca o work item no Azure e pede causa raiz ao **Ollama local** (requer PAT + Ollama). Grava um episódio em `.kira/wiki/bugs/`. |
 | `kira triage --file <json>` | Triage **offline** do mesmo JSON de work item — sem PAT, sem Azure, 100% local. |
 | `kira triage <id\|--file> --model <tag>` | Troca o modelo do Ollama para esta execução. |
-| `kira triage <id\|--file> --llm copilot` | Usa o **Copilot CLI** como LLM caro desta execução (spawn de `copilot -p`; exige `copilot auth login`). Default permanece Ollama; nunca há fallback silencioso. |
+| `kira triage <id\|--file> --llm copilot` | Usa o **Copilot CLI** como LLM caro desta execução (spawn de `copilot -p`; exige `copilot auth login`) — ver [Backend LLM (ADR-0019)](#backend-llm-adr-0019). |
+| `kira triage <id\|--file> --llm foundry` | Usa o **Microsoft Foundry** (BYOK, HTTP OpenAI-compatible) no lugar do Ollama para esta execução — ver [Backend foundry](#backend-foundry-byok-microsoft-foundry) abaixo. |
 | `kira setup [--org --project --pat --no-browser --reset]` | Wizard: org, projeto e PAT validados **antes** de salvar; PAT vai para o keyring do OS (service `kira`). `--reset` remove o PAT. |
 | `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
 | `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
@@ -96,7 +97,7 @@ kira inspect 4821
 | `KIRA_SCAN_NPM_BIN` | Caminho completo que substitui o `npm` do scan | PATH |
 | `KIRA_SCAN_PNPM_BIN` | Caminho completo que substitui o `pnpm` do scan | PATH |
 | `KIRA_OLLAMA_URL` | URL do servidor Ollama | `http://localhost:11434` |
-| `KIRA_LLM` | Backend do triage: `ollama` (default) ou `copilot` — o `--llm` vence | `ollama` |
+| `KIRA_LLM` | Backend do triage: `ollama` (default) \| `copilot` \| `foundry` — o `--llm` vence | `ollama` |
 | `KIRA_COPILOT_BIN` | Caminho completo que substitui o `copilot` do backend caro (padrão dos testes offline) | PATH |
 | `KIRA_COPILOT_TIMEOUT` | Limite por chamada do CLI do Copilot, em segundos | `180` |
 | `KIRA_MODEL` | Tag do modelo do triage | `qwen3.5:4b` |
@@ -105,11 +106,66 @@ kira inspect 4821
 | `KIRA_INDEX_MAX_FILES` | Teto de arquivos do índice de retrieval do repositório (ADR-0021, substitui o corte de 400 do grep). Valor inválido/zero cai no default. | `5000` |
 | `KIRA_BOARD` | Provedor de board (`azure` é o único nesta fase) | `azure` |
 | `KIRA_CONFIG` | Caminho alternativo do `config.toml` | `~/.config/kira/config.toml` |
+| `KIRA_FOUNDRY_ENDPOINT` | Endpoint do recurso Foundry (a superfície v1 termina em `/openai/v1`) | — |
+| `KIRA_FOUNDRY_DEPLOYMENT` | Nome do deployment/modelo (`gpt-5` etc.) | — |
+| `KIRA_FOUNDRY_API_KEY` | Chave do recurso (nunca vai para log/erro) | — |
+| `KIRA_FOUNDRY_URL` | URL verbatim da requisição (gateways OpenAI-compatible/testes) | — |
+| `KIRA_FOUNDRY_API_VERSION` | `api-version` da superfície legada (a v1 ignora) | `2024-10-21` |
+| `KIRA_FOUNDRY_AUTH` | Modo de auth: `api-key` (Azure) \| `bearer` (gateways) | `api-key` |
+| `KIRA_FOUNDRY_BODY_MODE` | Formato do corpo: `auto` \| `classic` \| `reasoning` | `auto` |
+| `KIRA_FOUNDRY_MAX_TOKENS` | `max_tokens`/`max_completion_tokens` da resposta | `1024` |
+| `KIRA_FOUNDRY_TIMEOUT` | Timeout da chamada, em segundos | `120` |
+
+## Backend foundry (BYOK Microsoft Foundry)
+
+O Ollama local é o default e nunca sai de cena; o Foundry é o caminho "caro"
+**opt-in**: `kira triage <id|--file> --llm foundry` (ou `KIRA_LLM=foundry`).
+Sem as envs, o comando falha com erro acionável — sem fallback silencioso.
+
+**Dados de cliente/Avanade NUNCA entram neste recurso de learning do
+Microsoft Foundry.** Trabalho de cliente: Ollama local ou endpoint
+aprovado pelo cliente. Este recurso é para estudo/roadmap do dono.
+
+**Duas superfícies**, escolhidas pelo formato de `KIRA_FOUNDRY_ENDPOINT`:
+
+- **v1** (endpoint termina em `/v1`): `POST {endpoint}/chat/completions`, sem
+  `/openai/deployments/...` e sem `?api-version`; o deployment vai no campo
+  `model` do corpo. Exemplo real do dono:
+  `KIRA_FOUNDRY_ENDPOINT=https://sdossantosjunior-5474-resource.openai.azure.com/openai/v1`
+  + `KIRA_FOUNDRY_DEPLOYMENT=gpt-5`. Endpoint de projeto
+  (`*.services.ai.azure.com/api/projects/...`) não serve chat completions —
+  o KIRA recusa com erro acionável apontando o `/openai/v1`.
+- **legada**: qualquer outro endpoint vira
+  `{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=
+  {KIRA_FOUNDRY_API_VERSION}` (default `2024-10-21`).
+
+**Auth**: `api-key: <chave>` por default (padrão Azure);
+`KIRA_FOUNDRY_AUTH=bearer` troca para `Authorization: Bearer` (gateways
+OpenAI-compatible). `KIRA_FOUNDRY_URL`, se definida, é usada verbatim.
+
+**Corpo por família de modelo** (`KIRA_FOUNDRY_BODY_MODE`, default `auto`):
+GPT-5 e o-series (`gpt-5*`, `o1*`, `o3*`, `o4*`) rejeitam `temperature` e
+exigem `max_completion_tokens` — o modo `auto` detecta pelo nome do
+deployment e envia só `max_completion_tokens`; o resto recebe
+`temperature: 0.2` + `max_tokens`. `classic` e `reasoning` forçam o formato.
+Se o servidor devolver 400 `unsupported_parameter`, o erro sugere
+`KIRA_FOUNDRY_BODY_MODE`.
+
+**Erros**: 401/403 ⇒ `FoundryAuth` (como gerar nova chave); 404 ⇒
+`FoundryDeployment` (onde conferir endpoint/deployment); 400/404 citando
+`api-version` ⇒ `FoundryApiVersion`; 429 ⇒ `FoundryRateLimited` com o
+`retry-after` do servidor (a guardrails v2 cobra cota por período); demais
+status/shape ⇒ `FoundryFailed` (1ª linha de `error.message`, ≤200 chars,
+mascarada — nunca body cru). Timeout por `KIRA_FOUNDRY_TIMEOUT` (default
+120s). A chave nunca aparece em log, erro ou trilha.
 
 ## Backend LLM (ADR-0019)
 
 O **Ollama local é o default** — sempre: `kira triage` roda em
 `http://localhost:11434` com `qwen3.5:4b`, 100% na sua máquina, sem custo.
+O backend HTTP BYOK (Foundry) tem a sua própria documentação em
+[Backend foundry (BYOK Microsoft Foundry)](#backend-foundry-byok-microsoft-foundry)
+(ADR-0020).
 
 O backend **caro** (Copilot) só existe sob escolha explícita — nunca é
 implícito e nunca cai em fallback silencioso para o Ollama:

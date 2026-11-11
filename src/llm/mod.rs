@@ -1,13 +1,17 @@
 //! Pluggable LLM backends.
 //!
 //! KIRA talks to models through the [`LlmBackend`] trait so the backend can be
-//! swapped later (planned: `copilot-sdk`, `byok-http`, `ollama`). In this phase
-//! two backends exist: the local [`ollama::OllamaBackend`] (the DEFAULT —
-//! localhost only) and the "costly" [`copilot::CopilotBackend`] (spawn of the
-//! Copilot CLI, explicit flag only, ADR-0019). Neither sends secrets (PAT,
-//! env) in the prompt.
+//! swapped later. Three backends exist: the local [`ollama::OllamaBackend`]
+//! (the DEFAULT — localhost only), the "costly" [`copilot::CopilotBackend`]
+//! (spawn of the Copilot CLI, explicit flag only, ADR-0019) and the
+//! [`foundry::FoundryBackend`] (HTTP BYOK Microsoft Foundry, explicit flag
+//! only, ADR-0020). The expensive backends are NEVER implicit and NEVER fall
+//! back silently to Ollama: they only run under `--llm copilot|foundry` /
+//! `KIRA_LLM=copilot|foundry`, and none of them sends secrets (PAT, env) in
+//! the prompt — the prompt is redacted upstream by `redact`.
 
 pub mod copilot;
+pub mod foundry;
 pub mod ollama;
 pub mod prompts;
 
@@ -29,22 +33,38 @@ pub trait LlmBackend {
 }
 
 /// Which backend a command runs on: [`LlmKind::Ollama`] is the DEFAULT
-/// (local, free) and [`LlmKind::Copilot`] only comes from an EXPLICIT
-/// `--llm copilot` flag or `KIRA_LLM=copilot` env (ADR-0019) — a choice
-/// never happens implicitly, and `copilot` never silently falls back to
-/// `ollama`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (local, free) and [`LlmKind::Copilot`] / [`LlmKind::Foundry`] only come
+/// from an EXPLICIT `--llm` flag or `KIRA_LLM` env (ADR-0019 for Copilot,
+/// ADR-0020 for Foundry) — a choice never happens implicitly, and a costly
+/// backend never silently falls back to `ollama`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LlmKind {
     /// Local Ollama server (default).
+    #[default]
     Ollama,
-    /// Spawn of the Copilot CLI (costly, corporate license).
+    /// Spawn of the Copilot CLI (costly, corporate license; ADR-0019).
     Copilot,
+    /// Microsoft Foundry via HTTP OpenAI-compatible (BYOK, explicit; ADR-0020).
+    Foundry,
 }
 
 /// Env var that selects the backend like the `--llm` flag does (flag wins).
 pub const LLM_ENV: &str = "KIRA_LLM";
 
 impl LlmKind {
+    /// Parses one explicit value of `--llm`/`KIRA_LLM` (pure; no env access).
+    /// An unknown value is an error (not a silent default).
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ollama" => Ok(Self::Ollama),
+            "copilot" => Ok(Self::Copilot),
+            "foundry" => Ok(Self::Foundry),
+            other => Err(Error::UnknownLlm {
+                name: other.to_string(),
+            }),
+        }
+    }
+
     /// Resolves the backend from the flag value first, then `KIRA_LLM`,
     /// defaulting to [`LlmKind::Ollama`]. An unknown value is an error (not
     /// a silent default).
@@ -62,11 +82,7 @@ impl LlmKind {
         let Some(name) = name else {
             return Ok(Self::Ollama);
         };
-        match name.to_ascii_lowercase().as_str() {
-            "ollama" => Ok(Self::Ollama),
-            "copilot" => Ok(Self::Copilot),
-            _ => Err(Error::UnknownLlm { name }),
-        }
+        Self::parse(&name)
     }
 
     /// Stable, printable name (used in messages and the session trail).
@@ -74,6 +90,7 @@ impl LlmKind {
         match self {
             Self::Ollama => "ollama",
             Self::Copilot => "copilot",
+            Self::Foundry => "foundry",
         }
     }
 }
@@ -99,6 +116,16 @@ mod tests {
             LlmKind::from_flag_and_env(Some("Copilot")),
             Ok(LlmKind::Copilot)
         ));
+        assert!(matches!(
+            LlmKind::from_flag_and_env(Some("foundry")),
+            Ok(LlmKind::Foundry)
+        ));
+        assert!(matches!(
+            LlmKind::from_flag_and_env(Some("FOUNDRY")),
+            Ok(LlmKind::Foundry)
+        ));
+        assert_eq!(LlmKind::Copilot.name(), "copilot");
+        assert_eq!(LlmKind::Foundry.name(), "foundry");
         let Err(err) = LlmKind::from_flag_and_env(Some("gpt")) else {
             panic!("backend desconhecido deve falhar, não calar");
         };
@@ -110,7 +137,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            message.contains("ollama") && message.contains("copilot"),
+            message.contains("ollama")
+                && message.contains("copilot")
+                && message.contains("foundry"),
             "o erro lista as opções válidas: {message}"
         );
     }

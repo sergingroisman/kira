@@ -13,6 +13,7 @@ use crate::html::html_to_text;
 use crate::llm::LlmBackend;
 use crate::llm::LlmKind;
 use crate::llm::copilot::CopilotBackend;
+use crate::llm::foundry::FoundryBackend;
 use crate::llm::ollama::OllamaBackend;
 // Single source for the prompt contract: the system text, the section headers
 // and the user preamble all live in `llm::prompts` (versioned, golden-tested).
@@ -225,7 +226,8 @@ pub fn sections_of(formatted: &str) -> [String; 3] {
 /// that needs no PAT and no Azure DevOps access.
 ///
 /// Kept with the Ollama default for existing callers; the backend is chosen
-/// with [`triage_file_llm`] (ADR-0019: the costly backend is never implicit).
+/// with [`triage_file_llm`] (ADR-0019/ADR-0020: the costly backend is never
+/// implicit).
 pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<TriageReport, Error> {
     triage_file_llm(LlmKind::Ollama, base_url, model, path).await
 }
@@ -273,6 +275,7 @@ pub async fn triage_live_llm(
 enum TriageBackend {
     Ollama(OllamaBackend),
     Copilot(CopilotBackend),
+    Foundry(FoundryBackend),
 }
 
 async fn triage_item(
@@ -288,15 +291,18 @@ async fn triage_item(
     // (ADR-0016).
     let backend = match kind {
         LlmKind::Ollama => TriageBackend::Ollama(OllamaBackend::new(base_url, model)),
-        // The costly path resolves its own binary/auth here and FAILS LOUDLY
-        // (CopilotMissing/CopilotAuth) — never a silent fallback to Ollama.
+        // The costly paths resolve their own binary/auth/key HERE and FAIL
+        // LOUDLY (CopilotMissing/CopilotAuth; FoundryMissingKey/...) — never a
+        // silent fallback to Ollama.
         LlmKind::Copilot => TriageBackend::Copilot(CopilotBackend::from_env()?),
+        LlmKind::Foundry => TriageBackend::Foundry(FoundryBackend::from_env()?),
     };
     let pack = context_pack(item, exclude_from_grep);
     let prompt = build_prompt_with_context(item, &pack);
     let text = match &backend {
         TriageBackend::Ollama(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await?,
         TriageBackend::Copilot(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await?,
+        TriageBackend::Foundry(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await?,
     };
     Ok(TriageReport {
         item_id: item.id,
