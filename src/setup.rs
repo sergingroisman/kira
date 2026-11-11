@@ -12,6 +12,14 @@
 //! passed via `--pat` is never echoed in the output: only the masked form
 //! (first 4 chars + `****`) is ever shown.
 //!
+//! Depois do PAT validado e ANTES de salvar, o setup resolve o nome do dev:
+//! `--name` > nome já salvo em `config.toml` (`dev_name`, com "Olá de novo,
+//! <nome>.") > pergunta "Como devo te chamar? (Enter = <padrão>)" — só em
+//! TTY — > padrão do SO (`USER`/`USERNAME` com inicial maiúscula; vazio ⇒
+//! `dev`). Sem TTY (stdin pipado, `--pat`, CI) NUNCA bloqueia: usa o padrão
+//! (ou `--name`) e registra a linha `dev: <nome>`. O nome nunca entra em
+//! prompt de LLM — só na saída humana (setup/doctor).
+//!
 //! Every input/output is injected (stdin, stdout, store, config path, board
 //! factory, browser opener), so tests drive the full flow with fake stdin, an
 //! [`crate::credentials::InMemory`] store and a fake Azure DevOps server — the
@@ -23,7 +31,8 @@ use std::process::ExitCode;
 
 use crate::board::{self, BoardProvider};
 use crate::credentials::{
-    self, CONFIG_KEY_ORG, CONFIG_KEY_PROJECT, CRED_KEY_PAT, CredStore, ORG_ENV, PROJECT_ENV,
+    self, CONFIG_KEY_DEV_NAME, CONFIG_KEY_ORG, CONFIG_KEY_PROJECT, CRED_KEY_PAT, CredStore,
+    ORG_ENV, PROJECT_ENV,
 };
 use crate::doctor;
 use crate::error::Error;
@@ -48,6 +57,10 @@ pub struct SetupOptions {
     /// "Você já tem um PAT pronto?" antes de qualquer abertura de navegador —
     /// stdin pipado mantém o fast path antigo (passos + abrir, colar no fim).
     pub interactive: bool,
+    /// `--name <nome>`: como o dev quer ser chamado (salvo como `dev_name` em
+    /// `config.toml`); vence o nome salvo e a pergunta em TTY. Nunca entra em
+    /// prompt de LLM.
+    pub name: Option<String>,
 }
 
 /// Builds the board used to validate the PAT: `(pat, org, project) -> board`.
@@ -194,6 +207,30 @@ pub async fn run(
         return ExitCode::FAILURE;
     }
 
+    // Nome do dev: `--name` > nome já salvo em `config.toml` > pergunta (só
+    // em TTY) > padrão do SO. Roda DEPOIS de org/projeto e do PAT validado,
+    // ANTES de salvar — assim uma falha de PAT/org/projeto nunca pergunta o
+    // nome. Sem TTY nunca bloqueia esperando input: cai no padrão (ou flag)
+    // e registra a linha `dev:`. O nome fica só na saída humana — nunca vai
+    // para prompt de LLM (privacidade).
+    let saved_name = config_pairs
+        .as_ref()
+        .and_then(|pairs| value_of(pairs, CONFIG_KEY_DEV_NAME))
+        .and_then(|name| validate_dev_name(&name));
+    let dev_name = if let Some(name) = options.name.as_deref().and_then(validate_dev_name) {
+        name
+    } else if let Some(name) = saved_name {
+        // Nome já existe: pergunta não aparece; troca só via `--name`.
+        let _ = writeln!(output, "Olá de novo, {name}.");
+        name
+    } else if options.interactive {
+        let default = default_dev_name_from_env(env);
+        ask_dev_name(&default, input, output)
+    } else {
+        default_dev_name_from_env(env)
+    };
+    let _ = writeln!(output, "dev: {dev_name}");
+
     if let Err(err) = store.set(CRED_KEY_PAT, &pat) {
         let _ = writeln!(output, "erro: {err}");
         return ExitCode::FAILURE;
@@ -212,6 +249,7 @@ pub async fn run(
                 &[
                     (CONFIG_KEY_ORG, &organization),
                     (CONFIG_KEY_PROJECT, &project),
+                    (CONFIG_KEY_DEV_NAME, &dev_name),
                 ],
             ) {
                 let _ = writeln!(output, "aviso: não salvei org/projeto no config: {err}");
@@ -416,6 +454,60 @@ pub fn open_url_in_browser(url: &str) -> Result<(), std::io::Error> {
     }
 }
 
+/// Valida o nome do dev: 1..=40 caracteres, sem control chars (o que cobre
+/// quebras de linha) e sem espaços nas pontas (trim). Inválido ⇒ `None` —
+/// a pergunta se repete (TTY) ou cai no padrão (não-interativo); nunca erro
+/// fatal.
+pub fn validate_dev_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.is_empty() || name.chars().count() > 40 {
+        return None;
+    }
+    if name.chars().any(char::is_control) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Padrão do nome do dev: usuário do SO (`USER`/`USERNAME`) com a inicial em
+/// maiúscula; vazio/ausente ⇒ `dev`. Lê via o lookup de env injetado para os
+/// testes nunca tocarem nas variáveis reais do processo.
+pub fn default_dev_name_from_env(env: &dyn Fn(&str) -> Option<String>) -> String {
+    let raw = env("USER").or_else(|| env("USERNAME")).unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "dev".to_string();
+    }
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => "dev".to_string(),
+    }
+}
+
+/// Pergunta "Como devo te chamar?": Enter ⇒ padrão; entrada inválida repete a
+/// pergunta; stdin fechou (EOF) ⇒ padrão. Nunca é erro fatal — só é chamada
+/// no modo interativo (TTY), nunca em stdin pipado/CI.
+fn ask_dev_name(default: &str, input: &mut dyn BufRead, output: &mut dyn Write) -> String {
+    loop {
+        let _ = write!(output, "Como devo te chamar? (Enter = {default}): ");
+        let _ = output.flush();
+        match read_line(input) {
+            None => return default.to_string(),
+            Some(line) if line.is_empty() => return default.to_string(),
+            Some(line) => match validate_dev_name(&line) {
+                Some(name) => return name,
+                None => {
+                    let _ = writeln!(
+                        output,
+                        "nome inválido ('{line}') — use de 1 a 40 caracteres, sem quebras de linha."
+                    );
+                }
+            },
+        }
+    }
+}
+
 /// Board factory used by the real binary: the Azure DevOps provider selected
 /// by `KIRA_BOARD` (default `azure`).
 pub fn default_board_factory(
@@ -431,4 +523,73 @@ pub fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn default_dev_name_capitalizes_the_os_user() {
+        let env = env_from(&[("USER", "sergin")]);
+        assert_eq!(default_dev_name_from_env(&env), "Sergin");
+
+        let env = env_from(&[("USER", "MARIA")]);
+        assert_eq!(default_dev_name_from_env(&env), "MARIA");
+
+        // USERNAME entra quando USER está ausente.
+        let env = env_from(&[("USERNAME", "joao.silva")]);
+        assert_eq!(default_dev_name_from_env(&env), "Joao.silva");
+
+        // USER vence USERNAME.
+        let env = env_from(&[("USER", "sergin"), ("USERNAME", "joao.silva")]);
+        assert_eq!(default_dev_name_from_env(&env), "Sergin");
+    }
+
+    #[test]
+    fn default_dev_name_falls_back_to_dev() {
+        let env = env_from(&[]);
+        assert_eq!(default_dev_name_from_env(&env), "dev");
+
+        let env = env_from(&[("USER", "   ")]);
+        assert_eq!(default_dev_name_from_env(&env), "dev");
+
+        let env = env_from(&[("USERNAME", "")]);
+        assert_eq!(default_dev_name_from_env(&env), "dev");
+    }
+
+    #[test]
+    fn validate_dev_name_accepts_and_trims() {
+        assert_eq!(validate_dev_name("Sergin"), Some("Sergin".into()));
+        assert_eq!(validate_dev_name("  Sergin  "), Some("Sergin".into()));
+        assert_eq!(validate_dev_name("Ana"), Some("Ana".into()));
+
+        // Exatamente 40 caracteres ainda é válido.
+        let forty = "a".repeat(40);
+        assert_eq!(validate_dev_name(&forty), Some(forty.clone()));
+        // 41 já não é.
+        let forty_one = format!("{forty}a");
+        assert_eq!(validate_dev_name(&forty_one), None);
+    }
+
+    #[test]
+    fn validate_dev_name_rejects_empty_control_and_newlines() {
+        assert_eq!(validate_dev_name(""), None);
+        assert_eq!(validate_dev_name("   "), None);
+        // Quebra de linha nas pontas é whitespace: trim, não rejeição.
+        assert_eq!(validate_dev_name("sergin\n"), Some("sergin".into()));
+        // Control chars e quebras NO MEIO são rejeitados.
+        assert_eq!(validate_dev_name("ser\ngin"), None);
+        assert_eq!(validate_dev_name("ser\r\ngin"), None);
+        assert_eq!(validate_dev_name("ser\tgin"), None);
+    }
 }
