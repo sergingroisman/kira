@@ -52,6 +52,12 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Toda chamada ao `LlmBackend` exige: pergunta de julgamento (não recuperação/extração/contagem/comparação), nenhuma camada inferior capaz de responder, e o comentário `// LLM porque: <razão>` no call site.
 - Só `src/triage.rs`, `src/loop/` e `src/wiki/` podem importar `llm::*`. Teste de allowlist (PR33) reprova o resto — `scan`, `store`, `board`, `ado`, `guard`, `format`, `tui`, `doctor`, `scheduler` nunca falam com modelo.
 - O budget de 50 chamadas/dia mede **LLM**, não trabalho: comando determinístico não consome budget.
+## Wiki (`src/wiki/`, ADR-0013)
+- Fonte de verdade em markdown **commitado**: `<projeto>/docs/wiki/{contexto,decisoes,padroes,glossario}.md` e `<projeto>/docs/wiki/bugs/<slug>.md`. Índice (FTS5, PR29) é derivado e descartável.
+- **Toda escrita passa por `redact` (segredos nunca vão para o disco) e por `guard::path` (confinamento na raiz).** Id de página inválido (`..`, absoluto, maiúscula, slug fora de `[a-z0-9_-]`) é recusado antes de qualquer I/O.
+- **Ciclo autônomo nunca escreve em `docs/wiki/`**: grava em `.kira/wiki-staging/` e depende de promoção humana (`kira wiki promote`, PR32).
+- Páginas não são log de conversa: guardam conhecimento reutilizável (arquitetura, decisões, padrões, glossário, causa raiz de bug). Nada de transcrição.
+
 ## Autonomia e aprovação
 - **Leitura é livre, escrita nunca.** Todo comando é read-only por padrão; escrita no mundo exige flag explícita `--apply`. Modo agendado e `kira loop` NUNCA ganham escrita implícita.
 - **`awaiting_approval` é estado do store, não convenção.** Antes de qualquer escrita no mundo (Azure DevOps, repo do projeto) o ciclo grava `awaiting_approval` e para. Só `kira approve <id>` (humano) transiciona para `applying`. Budget estourado ≠ aprovação; `--apply` isolado ≠ aprovação.
