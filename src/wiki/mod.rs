@@ -58,6 +58,10 @@ pub enum WikiError {
     #[error("{0}")]
     Guard(#[from] GuardError),
 
+    /// The derived index could not be read or written.
+    #[error("falha no índice da wiki: {0} — rode `kira doctor` para checar o store")]
+    Store(#[from] crate::store::StoreError),
+
     /// Filesystem failure while creating the directory, writing or reading.
     #[error("falha ao {action} a wiki em '{path}': {source} — confira permissões do diretório")]
     Io {
@@ -263,6 +267,44 @@ impl Wiki {
         })
     }
 
+    /// Rebuilds the derived index (`store.db`) from the markdown on disk.
+    ///
+    /// Idempotent by design: the index is disposable, so running this twice
+    /// yields the same rows. Returns how many pages were indexed.
+    pub fn reindex(&self, store: &crate::store::Store) -> Result<usize, WikiError> {
+        let pages = self.list()?;
+        let mut rows = Vec::with_capacity(pages.len());
+        for page in pages {
+            let Some(content) = self.read(&page)? else {
+                continue;
+            };
+            let path = self.page_path(&page)?;
+            rows.push(crate::store::WikiPageRow {
+                kind: kind_of(&page).to_string(),
+                title: title_of(&content, &page),
+                updated_at: updated_at_of(&content),
+                content_hash: format!("{:016x}", crate::store::fnv1a64(content.as_bytes())),
+                path: path.display().to_string(),
+                slug: page,
+                body: content,
+            });
+        }
+        Ok(store.wiki_replace(&rows)?)
+    }
+
+    /// Searches the derived index (FTS5, falling back to `LIKE`).
+    ///
+    /// The index must have been built first (`kira wiki reindex`); searching an
+    /// empty index returns no hits instead of an error.
+    pub fn search(
+        &self,
+        store: &crate::store::Store,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::store::WikiHit>, WikiError> {
+        Ok(store.wiki_search(query, limit)?)
+    }
+
     /// Creates the page's parent directory inside `docs/wiki`.
     ///
     /// Only fixed, code-owned names are created here, so a typo in a page id can
@@ -285,6 +327,39 @@ impl Wiki {
 /// Allowed characters in a `bugs/<slug>` id.
 fn is_slug_char(c: char) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+}
+
+/// Index kind: `bug` for `bugs/*`, `page` for the fixed pages.
+fn kind_of(page: &str) -> &'static str {
+    if page.starts_with(COLLECTION) {
+        "bug"
+    } else {
+        "page"
+    }
+}
+
+/// Title for the index: the first `# ` heading, else the page id.
+fn title_of(content: &str, page: &str) -> String {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("# ").map(str::trim))
+        .filter(|title| !title.is_empty())
+        .map_or_else(|| page.to_string(), ToString::to_string)
+}
+
+/// `updated_at` from the page header written by [`Wiki::write`], else now.
+fn updated_at_of(content: &str) -> String {
+    for line in content.lines().take(2) {
+        let Some(index) = line.find("updated_at=") else {
+            continue;
+        };
+        let rest = line[index + "updated_at=".len()..].trim();
+        let value = rest.split([' ', '>']).next().unwrap_or_default().trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    crate::store::now_rfc3339_utc()
 }
 
 #[cfg(test)]
@@ -420,6 +495,80 @@ mod tests {
             !dir.join(WIKI_DIR).exists(),
             "staging não pode criar docs/wiki"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn open_store(dir: &Path) -> crate::store::Store {
+        let store_dir = dir.join("store");
+        crate::store::Store::open_in_dir(&store_dir)
+            .unwrap_or_else(|err| panic!("abrir store: {err}"))
+    }
+
+    #[test]
+    fn reindex_indexes_every_page_and_search_finds_it() {
+        let dir = temp_project("reindex");
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        let store = open_store(&dir);
+        wiki.write("contexto", "# Contexto\nstack: Rust + Ratatui")
+            .unwrap_or_else(|err| panic!("{err}"));
+        wiki.write(
+            "bugs/4821-sessao-expirada",
+            "# Sessão expirada\ncausa raiz: token renovado sem rotacionar",
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+
+        let indexed = wiki
+            .reindex(&store)
+            .unwrap_or_else(|err| panic!("reindex: {err}"));
+        assert_eq!(indexed, 2, "duas páginas deveriam ser indexadas");
+
+        let hits = wiki
+            .search(&store, "token", 5)
+            .unwrap_or_else(|err| panic!("search: {err}"));
+        assert_eq!(hits.len(), 1, "achados: {hits:?}");
+        assert_eq!(hits[0].slug, "bugs/4821-sessao-expirada");
+        assert_eq!(hits[0].kind, "bug");
+        assert_eq!(hits[0].title, "Sessão expirada", "título vem do heading");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reindex_is_idempotent_and_tracks_changes() {
+        let dir = temp_project("idempotent");
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        let store = open_store(&dir);
+        wiki.write("glossario", "# Glossário\ntermo: pin")
+            .unwrap_or_else(|err| panic!("{err}"));
+        let first = wiki.reindex(&store).unwrap_or_else(|err| panic!("{err}"));
+        let second = wiki.reindex(&store).unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(first, second, "reindex deve ser idempotente");
+
+        wiki.write("glossario", "# Glossário\ntermo: jail")
+            .unwrap_or_else(|err| panic!("{err}"));
+        wiki.reindex(&store).unwrap_or_else(|err| panic!("{err}"));
+        let old = wiki
+            .search(&store, "pin", 5)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(
+            old.is_empty(),
+            "índice deveria refletir a versão nova: {old:?}"
+        );
+        let new = wiki
+            .search(&store, "jail", 5)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(new.len(), 1, "achados: {new:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_on_an_empty_index_is_empty_not_an_error() {
+        let dir = temp_project("emptyindex");
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        let store = open_store(&dir);
+        let hits = wiki
+            .search(&store, "qualquer", 5)
+            .unwrap_or_else(|err| panic!("search: {err}"));
+        assert!(hits.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

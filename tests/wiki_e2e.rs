@@ -127,3 +127,36 @@ fn unknown_page_id_is_refused_without_writing_anything() {
     assert!(stderr.contains("erro:"), "{stderr}");
     assert!(!sandbox.wiki_dir().exists(), "nada pode ser criado");
 }
+
+#[test]
+fn reindex_then_search_finds_the_page_through_the_real_binary() {
+    let sandbox = Sandbox::new("index");
+    let (code, _, stderr) = sandbox.run(&[
+        "wiki",
+        "decision",
+        "o fix roda dentro de um jail minimo com rlimits",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let (code, stdout, stderr) = sandbox.run(&["wiki", "reindex"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("1 páginas"), "{stdout}");
+    assert!(stdout.contains("FTS5"), "engine esperado: {stdout}");
+
+    let (code, stdout, stderr) = sandbox.run(&["wiki", "search", "rlimits"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("decisoes"), "{stdout}");
+    assert!(stdout.contains("jail"), "snippet com contexto: {stdout}");
+}
+
+#[test]
+fn search_without_reindex_is_actionable_not_silent() {
+    let sandbox = Sandbox::new("noindex");
+    let (code, _, stderr) = sandbox.run(&["wiki", "decision", "alguma decisão"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let (code, stdout, stderr) = sandbox.run(&["wiki", "search", "decisão"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("nenhuma página"), "{stdout}");
+    assert!(stdout.contains("kira wiki reindex"), "acionável: {stdout}");
+}
