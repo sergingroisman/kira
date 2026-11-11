@@ -132,9 +132,25 @@ fn timeout_from_env() -> u64 {
 /// binaries) keeps them intact.
 fn build_command(bin: &PathBuf, args: &[OsString]) -> Command {
     if binresolve::is_cmd_script(&bin.to_string_lossy()) {
-        let mut command = Command::new("cmd");
-        command.args(["/C", &cmd_command_line(bin.as_path(), args)]);
-        command
+        #[cfg(windows)]
+        {
+            // `cmd /C` needs the command line verbatim: the std would wrap the
+            // whole argument in quotes again (and escape inner quotes with a
+            // backslash `cmd` does not understand), producing
+            // `'"C:\...\copilot.cmd"' is not recognized` (real windows CI
+            // failure). `raw_arg` appends the line untouched.
+            use std::os::windows::process::CommandExt;
+            let mut command = Command::new("cmd");
+            command.arg("/C");
+            command.raw_arg(cmd_command_line(bin.as_path(), args));
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = Command::new(bin);
+            command.args(args);
+            command
+        }
     } else {
         let mut command = Command::new(bin);
         command.args(args);
@@ -160,7 +176,11 @@ fn cmd_quote(raw: &str) -> String {
     quoted.push('"');
     for ch in raw.chars() {
         match ch {
-            '"' => quoted.push_str("\"\""),
+            // `cmd.exe` has no reliable escape for a double quote inside a
+            // quoted argument (doubling breaks `raw_arg` lines, backslash is
+            // literal). Prompts are natural language: swap the quotes for
+            // apostrophes instead of corrupting the command line.
+            '"' => quoted.push('\''),
             '\r' | '\n' => quoted.push(' '),
             other => quoted.push(other),
         }
@@ -653,7 +673,7 @@ mod tests {
             line.contains("linha 1 linha "),
             "quebras viram espaço: {line}"
         );
-        assert!(line.contains("\"\"2\"\""), "aspas dobradas: {line}");
+        assert!(line.contains("\'2\'"), "aspas viram apóstrofo: {line}");
         assert!(
             line.ends_with(r#"" -s""#) || line.ends_with("\"-s\""),
             "{line}"
