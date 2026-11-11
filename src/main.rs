@@ -143,6 +143,14 @@ enum WikiAction {
         /// Page id (e.g. bugs/4821-sessao-expirada)
         page: String,
     },
+    /// Promote pages staged by an unattended cycle into docs/wiki
+    Promote,
+    /// Print the whole wiki as one markdown bundle (or save it with --out)
+    Export {
+        /// Save the bundle at this path, inside the project root
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 /// Result of one command run: exit code, plain success flag (kept separate
@@ -338,6 +346,11 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                     None => format!("search {query}"),
                 },
                 WikiAction::Forget { page } => format!("forget {page}"),
+                WikiAction::Promote => "promote".to_string(),
+                WikiAction::Export { out } => match out {
+                    Some(out) => format!("export --out {}", out.display()),
+                    None => "export".to_string(),
+                },
             };
             let args = match path {
                 Some(path) => format!("{args} --path {}", path.display()),
@@ -721,6 +734,34 @@ fn wiki_output(action: &WikiAction, root: &Path) -> Result<String, WikiError> {
                 forget_index(page)
             ))
         }
+        WikiAction::Promote => {
+            let store = Store::open_default()?;
+            let promoted = wiki.promote(&store)?;
+            if promoted.is_empty() {
+                return Ok(
+                    "nada em .kira/wiki-staging/ — nenhum episódio aguardando promoção\n"
+                        .to_string(),
+                );
+            }
+            let mut text = format!(
+                "{} página(s) promovida(s) para docs/wiki:\n",
+                promoted.len()
+            );
+            for page in promoted {
+                text.push_str(&format!("  {page}\n"));
+            }
+            Ok(text)
+        }
+        WikiAction::Export { out } => match out {
+            Some(dest) => {
+                let (path, pages) = wiki.export_to(dest)?;
+                Ok(format!(
+                    "bundle de {pages} página(s) gravado em {}\n",
+                    path.display()
+                ))
+            }
+            None => Ok(wiki.export()?.0),
+        },
     }
 }
 

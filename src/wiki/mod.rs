@@ -327,6 +327,116 @@ impl Wiki {
         Ok(true)
     }
 
+    /// Promotes staged pages into the committed wiki (ADR-0013).
+    ///
+    /// An unattended cycle writes to `.kira/wiki-staging/`; this is the human act
+    /// that moves knowledge into `docs/wiki/`. Staged files are named after the
+    /// page with `/` replaced by `-` (`.kira` stays flat), so `bugs-4821.md` maps
+    /// back to `bugs/4821`.
+    ///
+    /// Nothing is lost when the committed page already exists: the staged text is
+    /// **appended** as a new section, not written over the top. Returns the pages
+    /// promoted, in order.
+    pub fn promote(&self, store: &crate::store::Store) -> Result<Vec<String>, WikiError> {
+        let staging = self.root.join(STAGING_DIR);
+        if !staging.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut staged: Vec<PathBuf> = Vec::new();
+        let entries = fs::read_dir(&staging).map_err(|source| WikiError::Io {
+            action: "listar",
+            path: staging.display().to_string(),
+            source,
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "md") {
+                staged.push(path);
+            }
+        }
+        staged.sort();
+
+        let mut promoted = Vec::new();
+        for path in staged {
+            let Some(stem) = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+            else {
+                continue;
+            };
+            let page = page_id_from_staged(&stem);
+            // Validate the id before reading anything: a hand-planted file in
+            // staging must not be able to name a destination outside the wiki.
+            self.page_path(&page)?;
+            let content = fs::read_to_string(&path).map_err(|source| WikiError::Io {
+                action: "ler",
+                path: path.display().to_string(),
+                source,
+            })?;
+            let body = episode::strip_page_header(&content);
+            if body.trim().is_empty() {
+                continue;
+            }
+            if self.read(&page)?.is_some() {
+                self.append(&page, body)?;
+            } else {
+                self.write(&page, body)?;
+            }
+            fs::remove_file(&path).map_err(|source| WikiError::Io {
+                action: "remover",
+                path: path.display().to_string(),
+                source,
+            })?;
+            promoted.push(page);
+        }
+        if !promoted.is_empty() {
+            // The index is derived: rebuild it so `search` sees the promoted text.
+            let _ = self.reindex(store);
+        }
+        Ok(promoted)
+    }
+
+    /// Renders the whole wiki as one markdown bundle (portable, git-friendly).
+    ///
+    /// Returns `(bundle, pages)`; an empty wiki yields an empty bundle. Nothing is
+    /// written here — the CLI decides whether to print it or save it inside the
+    /// project.
+    pub fn export(&self) -> Result<(String, usize), WikiError> {
+        let pages = self.list()?;
+        let mut bundle = String::new();
+        bundle.push_str("# KIRA wiki\n\n");
+        bundle.push_str(&format!(
+            "Projeto: `{}`\nPáginas: {}\n",
+            self.root.display().to_string().replace('\\', "/"),
+            pages.len()
+        ));
+        for page in &pages {
+            let Some(content) = self.read(page)? else {
+                continue;
+            };
+            bundle.push_str(&format!("\n---\n\n## {} (`{}`)\n\n", page, page));
+            bundle.push_str(episode::strip_page_header(&content).trim());
+            bundle.push('\n');
+        }
+        Ok((bundle, pages.len()))
+    }
+
+    /// Writes the exported bundle to `dest`, confined to the project root.
+    ///
+    /// The destination goes through the write guard: `--out wiki.md` lands at the
+    /// project root, `--out ../x.md` is refused. Export is a convenience, not a
+    /// hole in the confinement.
+    pub fn export_to(&self, dest: &Path) -> Result<(PathBuf, usize), WikiError> {
+        let (bundle, pages) = self.export()?;
+        let destination = self.guard.check_write(dest)?;
+        fs::write(&destination, bundle).map_err(|source| WikiError::Io {
+            action: "gravar",
+            path: destination.display().to_string(),
+            source,
+        })?;
+        Ok((destination, pages))
+    }
+
     /// Creates the page's parent directory inside `docs/wiki`.
     ///
     /// Only fixed, code-owned names are created here, so a typo in a page id can
@@ -349,6 +459,19 @@ impl Wiki {
 /// Allowed characters in a `bugs/<slug>` id.
 fn is_slug_char(c: char) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+}
+
+/// Maps a flat staging file stem back to a wiki page id.
+///
+/// `.kira/wiki-staging/` is flat (no subdirectories), so a bug page is staged as
+/// `bugs-4821.md` and has to come back as `bugs/4821`. Fixed pages keep their
+/// name. Anything else is left as-is — [`Wiki::page_path`] then rejects it, so a
+/// hand-planted file cannot name a destination the wiki does not own.
+fn page_id_from_staged(stem: &str) -> String {
+    match stem.strip_prefix("bugs-") {
+        Some(slug) if !slug.is_empty() => format!("{COLLECTION}/{slug}"),
+        _ => stem.to_string(),
+    }
 }
 
 /// Index kind: `bug` for `bugs/*`, `page` for the fixed pages.
@@ -579,6 +702,113 @@ mod tests {
             .search(&store, "jail", 5)
             .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(new.len(), 1, "achados: {new:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_moves_a_staged_bug_page_into_the_committed_wiki() {
+        let dir = temp_project("promote");
+        let store = open_store(&dir);
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        // Unattended cycle stages; a human promotes (ADR-0013).
+        wiki.stage("bugs-4821-sessao-expirada", "causa raiz: token sem rotação")
+            .unwrap_or_else(|err| panic!("stage: {err}"));
+        assert!(!dir.join(WIKI_DIR).join("bugs").exists());
+
+        let promoted = wiki
+            .promote(&store)
+            .unwrap_or_else(|err| panic!("promote: {err}"));
+        assert_eq!(promoted, vec!["bugs/4821-sessao-expirada".to_string()]);
+
+        let page = wiki
+            .read("bugs/4821-sessao-expirada")
+            .unwrap_or_else(|err| panic!("{err}"))
+            .expect("página promovida deveria existir");
+        assert!(page.contains("token sem rotação"), "{page}");
+        assert!(
+            !dir.join(STAGING_DIR)
+                .join("bugs-4821-sessao-expirada.md")
+                .exists(),
+            "staging deveria ficar vazio depois da promoção"
+        );
+
+        // O índice é derivado: promoção reindexia, então a busca enxerga a página.
+        let hits = wiki
+            .search(&store, "rotação", 5)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_appends_when_the_page_already_exists() {
+        let dir = temp_project("promote-append");
+        let store = open_store(&dir);
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        wiki.write("bugs/1-x", "# Bug 1\nconhecimento antigo")
+            .unwrap_or_else(|err| panic!("{err}"));
+        wiki.stage("bugs-1-x", "conhecimento novo")
+            .unwrap_or_else(|err| panic!("stage: {err}"));
+
+        wiki.promote(&store)
+            .unwrap_or_else(|err| panic!("promote: {err}"));
+        let page = wiki
+            .read("bugs/1-x")
+            .unwrap_or_else(|err| panic!("{err}"))
+            .expect("página");
+        assert!(page.contains("conhecimento antigo"), "preservou: {page}");
+        assert!(page.contains("conhecimento novo"), "acrescentou: {page}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_on_empty_staging_is_a_no_op() {
+        let dir = temp_project("promote-empty");
+        let store = open_store(&dir);
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        assert!(
+            wiki.promote(&store)
+                .unwrap_or_else(|err| panic!("{err}"))
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_bundles_every_page_in_order() {
+        let dir = temp_project("export");
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        wiki.write("contexto", "# Contexto\nstack Rust")
+            .unwrap_or_else(|err| panic!("{err}"));
+        wiki.write("bugs/2-b", "# Bug 2\ntoken")
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let (bundle, pages) = wiki.export().unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(pages, 2);
+        assert!(bundle.starts_with("# KIRA wiki"), "{bundle}");
+        let ctx = bundle.find("## contexto").unwrap_or(usize::MAX);
+        let bug = bundle.find("## bugs/2-b").unwrap_or(usize::MAX);
+        assert!(ctx < bug, "ordem estável: {bundle}");
+        assert!(bundle.contains("stack Rust"), "{bundle}");
+        // O cabeçalho interno não vaza para o bundle.
+        assert!(!bundle.contains("<!-- kira-wiki"), "{bundle}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_to_refuses_a_destination_outside_the_project() {
+        let dir = temp_project("export-guard");
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        wiki.write("contexto", "# Contexto")
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(
+            wiki.export_to(Path::new("../fora.md")).is_err(),
+            "export para fora da raiz deve ser recusado"
+        );
+        let (path, _) = wiki
+            .export_to(Path::new("wiki-bundle.md"))
+            .unwrap_or_else(|err| panic!("export interno: {err}"));
+        assert!(path.is_file());
         let _ = fs::remove_dir_all(&dir);
     }
 

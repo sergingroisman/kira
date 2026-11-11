@@ -307,7 +307,7 @@ fn one_line(text: &str) -> String {
 
 /// Removes the `<!-- kira-wiki ... -->` header line a page may already carry, so
 /// a rewrite never nests two headers.
-fn strip_page_header(content: &str) -> &str {
+pub(crate) fn strip_page_header(content: &str) -> &str {
     let mut rest = content.trim_start();
     if rest.starts_with("<!-- kira-wiki")
         && let Some(end) = rest.find("-->")
