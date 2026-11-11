@@ -11,8 +11,8 @@ use std::process::Output;
 use serde_json::Value;
 
 use super::{
-    Finding, ScanError, ToolKind, exit_code_label, relative_path, spawn_error, tool_command,
-    tool_run_failure,
+    Finding, ScanError, ToolKind, exit_code_label, relative_path, spawn_error, stderr_hint,
+    tool_command,
 };
 
 /// The exact command executed on each detected .NET scope.
@@ -25,21 +25,24 @@ pub const DOTNET_ARGS: [&str; 6] = [
     "json",
 ];
 
-/// Runs the command in `dir` and parses the JSON into findings.
+/// Runs the command in `dir` and parses the JSON into findings. The binary is
+/// RESOLVED first (which-style) — absence never reaches the spawn, and the
+/// resolved full path is what runs.
 pub fn scan_dir(dir: &Path) -> Result<Vec<Finding>, ScanError> {
-    let mut command = tool_command(ToolKind::Dotnet);
+    let mut command = tool_command(ToolKind::Dotnet)?;
     command.args(DOTNET_ARGS).current_dir(dir);
     let output = command
         .output()
         .map_err(|source| spawn_error(ToolKind::Dotnet, source))?;
     if !output.status.success() {
+        // Absence was already handled by the RESOLUTION (no spawn): a
+        // non-zero exit here is a plain tool failure — no OS text parsing.
         let stderr_text = String::from_utf8_lossy(&output.stderr);
-        return Err(tool_run_failure(
-            ToolKind::Dotnet,
-            "dotnet list package",
-            exit_code_label(output.status.code()),
-            &stderr_text,
-        ));
+        return Err(ScanError::ToolFailure {
+            tool: "dotnet list package",
+            exit: exit_code_label(output.status.code()),
+            hint: stderr_hint(&stderr_text),
+        });
     }
     parse_output(&output_stdout(&output), dir)
 }
