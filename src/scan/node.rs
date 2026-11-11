@@ -12,7 +12,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    Finding, ScanError, ToolKind, exit_code_label, spawn_error, tool_command, tool_run_failure,
+    Finding, ScanError, ToolKind, exit_code_label, spawn_error, stderr_hint, tool_command,
 };
 
 /// Which package manager audit to run: choice made in the stack detection
@@ -34,9 +34,11 @@ impl NodeAuditTool {
 }
 
 /// Runs `<pnpm|npm> audit --json` in `dir` and parses the JSON into findings.
+/// The binary is RESOLVED first (which-style) — absence never reaches the
+/// spawn, and the resolved full path is what runs.
 pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanError> {
     let kind = tool.kind();
-    let mut command = tool_command(kind);
+    let mut command = tool_command(kind)?;
     command.args(["audit", "--json"]).current_dir(dir);
     let output = command
         .output()
@@ -51,19 +53,17 @@ pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanErr
         Ok(findings) => Ok(findings),
         // Audit CLIs exit non-zero exactly when vulnerabilities exist: the
         // JSON parse has already been tried — if it failed, the compact error
-        // (never the raw body) carries at most one stderr line as a hint. On
-        // Windows the `cmd /C` wrapper may also be reporting that the tool
-        // itself is missing ("is not recognized") — that becomes the
-        // actionable "instale o X" instead.
-        Err(_source) if !output.status.success() => Err(tool_run_failure(
-            kind,
-            match tool {
+        // (never the raw body) carries at most one stderr line as a hint.
+        // Absence was already handled by the RESOLUTION (no spawn), so a
+        // non-zero exit here is a plain tool failure — no OS text parsing.
+        Err(_source) if !output.status.success() => Err(ScanError::ToolFailure {
+            tool: match tool {
                 NodeAuditTool::Npm => "npm audit",
                 NodeAuditTool::Pnpm => "pnpm audit",
             },
-            exit_code_label(output.status.code()),
-            &stderr_text,
-        )),
+            exit: exit_code_label(output.status.code()),
+            hint: stderr_hint(&stderr_text),
+        }),
         Err(source) => Err(source),
     }
 }

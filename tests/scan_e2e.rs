@@ -209,9 +209,11 @@ fn scan_without_any_stack_says_where_to_scan() {
 fn missing_audit_tool_is_actionable() {
     let sandbox = Sandbox::new("missing-tool");
     sandbox.prepare_npm_project();
-    // SEM overrides (o runner limpa os KIRA_SCAN_*_BIN) e PATH vazio: o npm
-    // não existe => erro acionável "instale", sem body cru e sem confundir
-    // "ferramenta falhou" com "ferramenta ausente".
+    // SEM overrides (o runner limpa os KIRA_SCAN_*_BIN) e PATH vazio: a
+    // RESOLUÇÃO which-style não acha o npm => erro acionável "instale o npm"
+    // SEM spawn (vale em qualquer locale do OS — nada de texto localizado é
+    // parseado), sem body cru e sem confundir "ferramenta falhou" com
+    // "ferramenta ausente".
     let (code, out, err) = run_kira(&sandbox, Some(&sandbox.empty_path), &[], &["scan"]);
     assert_eq!(code, 1, "{out}{err}");
     assert!(
@@ -234,6 +236,24 @@ fn missing_audit_tool_is_actionable() {
         !err.contains("falhou"),
         "ausente não é 'a ferramenta falhou': {err}"
     );
+    assert!(
+        !err.contains("dica"),
+        "ausência por resolução não gera dica de stderr: {err}"
+    );
+}
+
+/// PR-F4: a ferramenta é achada pelo PATH (which-style) SEM override nenhum —
+/// o shim `npm` no dir do PATH resolve e roda (no Windows via `cmd /C` por ser
+/// `.cmd`, no Unix direto pelo exec bit).
+#[test]
+fn tool_is_resolved_from_the_path_without_any_override() {
+    let sandbox = Sandbox::new("path-resolve");
+    sandbox.prepare_npm_project();
+    sandbox.install_fake_tool("npm", NPM_FAKE_OUTPUT, "npm_output.json");
+    let (code, out, err) = run_kira(&sandbox, Some(&sandbox.shims), &[], &["scan"]);
+    assert_eq!(code, 0, "shim achado pelo PATH roda: {out}{err}");
+    assert!(out.contains("stacks: npm"), "{out}");
+    assert!(out.contains("achados: 2"), "{out}");
 }
 
 /// Tool present (shim via `KIRA_SCAN_NPM_BIN`) that RUNS but fails: compact,

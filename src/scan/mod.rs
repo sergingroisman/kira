@@ -176,52 +176,150 @@ impl ToolKind {
     }
 }
 
-/// Builds the command that runs the tool of `kind` (callers add their own
-/// args and `current_dir`, never touching the program).
+/// The resolved tool binary: FULL path (the spawn never uses the bare name)
+/// plus how to spawn it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Resolved {
+    pub path: PathBuf,
+    /// Spawn wrapped in `cmd /C chcp 65001 >nul 2>&1 & <path>`: Windows only
+    /// and only for `.cmd`/`.bat` (the std would try to exec them as
+    /// binaries). The `chcp` stays: it fixes the MOJIBAKE of a REAL tool's
+    /// output, not only of the wrapper's own text.
+    pub via_cmd: bool,
+}
+
+/// Resolves the tool binary BEFORE spawning (`which`-style, pure Rust — no
+/// OS-localized text is ever parsed; text-based classification of the OS is
+/// PROHIBITED because cmd output is localized and may arrive mojibaked).
 ///
-/// Windows: the std `Command` only looks for `.exe`, so `npm`/`pnpm` (which
-/// ship as `.cmd` shims on real machines) would NEVER be found by spawning
-/// them directly — these Node tools spawn wrapped in `cmd /C`, which resolves
-/// PATHEXT. `dotnet` is a real `.exe` and spawns directly. The env var
-/// `KIRA_SCAN_<TOOL>_BIN` (full executable/shim path — used by offline tests
-/// and CI without the tool) wins over the PATH; on Windows a `.cmd`/`.bat`
-/// value also spawns via `cmd /C`, anything else spawns directly. On
-/// Linux/macOS the override (and the defaults) always spawn directly.
-pub(crate) fn tool_command(kind: ToolKind) -> Command {
-    let override_bin = std::env::var(kind.bin_env())
+/// 1. `KIRA_SCAN_<TOOL>_BIN` present and non-empty: the user's contract —
+///    the pointed path spawns as-is (absence of the file is the same
+///    actionable "instale o X").
+/// 2. No override: search the PATH — Windows: each PATH dir × PATHEXT
+///    (default `.COM/.EXE/.BAT/.CMD`, case-insensitive lookup as NTFS is);
+///    Linux/macOS: a file named `<tool>` with the execute bit set.
+/// 3. Nothing found => [`ToolKind::missing_error`] with NO spawn at all.
+pub(crate) fn resolve_tool(kind: ToolKind) -> Result<Resolved, ScanError> {
+    let override_bin = override_bin(kind);
+    let path_env = std::env::var_os("PATH");
+    resolve_tool_explicit(kind, override_bin.as_deref(), path_env.as_deref())
+}
+
+/// `KIRA_SCAN_<TOOL>_BIN` value (trimmed), ignoring empty/absent.
+fn override_bin(kind: ToolKind) -> Option<String> {
+    std::env::var(kind.bin_env())
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    command_for(kind, override_bin.as_deref())
+        .filter(|value| !value.is_empty())
 }
 
-/// Pure command builder used by [`tool_command`] (unit-testable without env).
-fn command_for(kind: ToolKind, bin: Option<&str>) -> Command {
-    let program = bin.map_or_else(|| kind.program().to_string(), str::to_owned);
-    if wraps_in_cmd(kind, bin) {
+/// Pure core of [`resolve_tool`] (unit-testable without env mutation).
+fn resolve_tool_explicit(
+    kind: ToolKind,
+    override_bin: Option<&str>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<Resolved, ScanError> {
+    if let Some(bin) = override_bin {
+        let path = PathBuf::from(bin);
+        if !path.is_file() {
+            return Err(kind.missing_error());
+        }
+        return Ok(Resolved {
+            via_cmd: cfg!(windows) && is_cmd_script(bin),
+            path,
+        });
+    }
+    match find_on_path(path_env, kind.program()) {
+        Some(path) => Ok(Resolved {
+            via_cmd: cfg!(windows) && is_cmd_script(&path.to_string_lossy()),
+            path,
+        }),
+        None => Err(kind.missing_error()),
+    }
+}
+
+/// `which`-style search on the given PATH value (`None`/empty => not found).
+#[cfg(windows)]
+fn find_on_path(path_env: Option<&std::ffi::OsStr>, program: &str) -> Option<PathBuf> {
+    let path_env = path_env?;
+    let path_ext = std::env::var_os("PATHEXT")
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    for dir in std::env::split_paths(path_env) {
+        for ext in path_ext.split(';') {
+            let probe = format!("{program}{ext}");
+            if dir.join(&probe).is_file() {
+                // NTFS matches case-insensitively (`npm.COM` finds `npm.cmd`):
+                // return the REAL on-disk name, never the probe, so messages
+                // and paths show what actually exists.
+                return Some(real_entry_name(&dir, &probe).unwrap_or_else(|| dir.join(&probe)));
+            }
+        }
+    }
+    None
+}
+
+/// On-disk entry in `dir` whose name matches `probe` case-insensitively.
+#[cfg(windows)]
+fn real_entry_name(dir: &Path, probe: &str) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case(probe) {
+            Some(entry.path())
+        } else {
+            None
+        }
+    })
+}
+
+/// Unix variant: `<tool>` must exist as a file with any execute bit.
+#[cfg(unix)]
+fn find_on_path(path_env: Option<&std::ffi::OsStr>, program: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path_env = path_env?;
+    for dir in std::env::split_paths(path_env) {
+        let candidate = dir.join(program);
+        if let Ok(metadata) = std::fs::metadata(&candidate)
+            && metadata.is_file()
+            && metadata.permissions().mode() & 0o111 != 0
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Other platforms (not built here): plain existence, like the Windows one.
+#[cfg(not(any(windows, unix)))]
+fn find_on_path(path_env: Option<&std::ffi::OsStr>, program: &str) -> Option<PathBuf> {
+    let path_env = path_env?;
+    std::env::split_paths(path_env)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Builds the command that runs the tool of `kind` (callers add their own
+/// args and `current_dir`, never touching the program): resolution happens
+/// FIRST and the spawn always uses the RESOLVED full path.
+pub(crate) fn tool_command(kind: ToolKind) -> Result<Command, ScanError> {
+    let resolved = resolve_tool(kind)?;
+    Ok(command_from_resolved(&resolved))
+}
+
+/// Pure command builder over one [`Resolved`] (unit-testable without env):
+/// `.cmd`/`.bat` on Windows go via `cmd /C chcp 65001 …` (the std never
+/// resolves them and the codepage must stay UTF-8 for real tool output),
+/// everything else spawns directly.
+fn command_from_resolved(resolved: &Resolved) -> Command {
+    if resolved.via_cmd {
         let mut command = Command::new("cmd");
-        // `chcp 65001` before the tool: without it cmd.exe speaks the OEM
-        // codepage (cp850 etc.), so "is not recognized" arrives mojibaked and
-        // the missing-tool classification never matches. Forcing UTF-8 keeps
-        // the wrapper text readable AND classifiable. `&` runs the tool after
-        // chcp and the tool's own exit code is what the run reports.
-        command.args(["/C", "chcp 65001 >nul 2>&1 &", &program]);
+        command.args(["/C", "chcp 65001 >nul 2>&1 &"]);
+        command.arg(&resolved.path);
         command
     } else {
-        Command::new(program)
-    }
-}
-
-/// `cmd /C` wrapper needed? Node tools on Windows always (the std never
-/// resolves `npm.cmd` on the PATH); `dotnet` never (a real `.exe`); and a
-/// `.cmd`/`.bat` OVERRIDE only on Windows (on Linux/macOS it spawns direct).
-fn wraps_in_cmd(kind: ToolKind, bin: Option<&str>) -> bool {
-    if !cfg!(windows) {
-        return false;
-    }
-    match bin {
-        Some(script) => is_cmd_script(script),
-        None => matches!(kind, ToolKind::Npm | ToolKind::Pnpm),
+        Command::new(&resolved.path)
     }
 }
 
@@ -244,45 +342,6 @@ pub(crate) fn spawn_error(kind: ToolKind, source: std::io::Error) -> ScanError {
     } else {
         ScanError::Runtime {
             message: format!("não foi possível executar o {}: {source}", kind.program()),
-        }
-    }
-}
-
-/// Markers of the Windows `cmd /C` wrapper reporting an unknown command. When
-/// the tool itself is absent, `cmd.exe` starts fine, prints this to stderr and
-/// exits 1 — the Rust side never sees a spawn NotFound, so absence is only
-/// visible in the wrapper's own text (localized per cmd's system language).
-const CMD_MISSING_MARKERS: [&str; 4] = [
-    "is not recognized",
-    "não é reconhecido como",
-    "no se reconoce como",
-    "не является внутренней",
-];
-
-fn is_missing_command_text(stderr: &str) -> bool {
-    let lowered = stderr.to_lowercase();
-    CMD_MISSING_MARKERS
-        .iter()
-        .any(|marker| lowered.contains(marker))
-}
-
-/// Classifies a run that started but exited non-zero: on Windows, absence of
-/// the tool shows itself as the `cmd` wrapper's "is not recognized" text and
-/// MUST be reported as "instale o X" (the user did nothing wrong — the tool is
-/// simply not installed); any other failure stays the compact `ToolFailure`.
-pub(crate) fn tool_run_failure(
-    kind: ToolKind,
-    tool_label: &'static str,
-    exit: String,
-    stderr: &str,
-) -> ScanError {
-    if is_missing_command_text(stderr) {
-        kind.missing_error()
-    } else {
-        ScanError::ToolFailure {
-            tool: tool_label,
-            exit,
-            hint: stderr_hint(stderr),
         }
     }
 }
@@ -1069,123 +1128,136 @@ mod tests {
         assert_eq!(exit_code_label(None), "desconhecido");
     }
 
-    /// Windows: `cmd /C` never reports the tool absence as spawn NotFound —
-    /// it prints "is not recognized" and exits 1. That text MUST classify as
-    /// the actionable "instale o X", not as a tool failure.
+    /// RESOLUÇÃO (PR-F4): a ferramenta é resolvida ANTES do spawn — override
+    /// existente resolve como veio; no Windows `.cmd`/`.bat` vai via `cmd /C`,
+    /// em qualquer outro lugar spawn direto.
     #[test]
-    fn windows_missing_command_text_becomes_instale() {
-        let error = tool_run_failure(
+    fn existing_override_resolves_the_pointed_file() {
+        let dir = temp_dir("resolve-override");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        let shim = dir.join("npm.cmd");
+        std::fs::write(&shim, "echo ok").unwrap_or_else(|err| panic!("escrever shim: {err}"));
+        let resolved = resolve_tool_explicit(
             ToolKind::Npm,
-            "npm audit",
-            "1".to_string(),
-            "'npm' is not recognized as an internal or external command,\r\noperable program or batch file.",
+            Some(shim.to_str().unwrap_or_default()),
+            Some(std::ffi::OsStr::new("")),
+        )
+        .unwrap_or_else(|err| panic!("resolver override: {err}"));
+        assert_eq!(resolved.path, shim);
+        assert_eq!(
+            resolved.via_cmd,
+            cfg!(windows),
+            ".cmd no Windows => cmd /C; em outro OS => direto"
         );
+
+        let plain = dir.join("tool");
+        std::fs::write(&plain, "x").unwrap_or_else(|err| panic!("escrever: {err}"));
+        let resolved = resolve_tool_explicit(
+            ToolKind::Npm,
+            Some(plain.to_str().unwrap_or_default()),
+            Some(std::ffi::OsStr::new("")),
+        )
+        .unwrap_or_else(|err| panic!("resolver override simples: {err}"));
+        assert_eq!(resolved.path, plain);
+        assert!(!resolved.via_cmd, "sem .cmd/.bat o spawn é direto sempre");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Override é contrato do usuário: arquivo apontado inexistente => o
+    /// mesmo erro acionável "instale o X" (sem spawn, sem texto do OS).
+    #[test]
+    fn override_pointing_to_a_missing_file_is_instale() {
+        let error = resolve_tool_explicit(
+            ToolKind::Npm,
+            Some("/definitivamente/ausente/npm"),
+            Some(std::ffi::OsStr::new("")),
+        )
+        .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("exige o npm"), "{message}");
+        assert!(message.contains("instale"), "{message}");
         assert!(message.contains("nodejs.org"), "{message}");
 
-        // Mesma frase, em português (cmd PT-BR com codepage 65001 forçado
-        // pelo wrapper) — também tem que classificar como ausência.
-        let error_pt = tool_run_failure(
-            ToolKind::Pnpm,
-            "pnpm audit",
-            "1".to_string(),
-            "'pnpm' não é reconhecido como um comando interno ou externo, um programa operável ou um arquivo em lotes.",
-        );
-        let message_pt = error_pt.to_string();
-        assert!(message_pt.contains("exige o pnpm"), "{message_pt}");
-        assert!(message_pt.contains("corepack"), "{message_pt}");
-
-        // ANY other failure text (a real tool error) stays a compact
-        // ToolFailure with the first stderr line as hint.
-        match tool_run_failure(
-            ToolKind::Npm,
-            "npm audit",
-            "1".to_string(),
-            "EACCES permission denied on root file\nsecond line ignored\n",
-        ) {
-            ScanError::ToolFailure { tool, exit, hint } => {
-                assert_eq!(tool, "npm audit");
-                assert_eq!(exit, "1");
-                assert!(hint.contains("EACCES"), "{hint}");
-            }
-            other => panic!("esperado ToolFailure, foi {other:?}"),
-        }
+        // Espaços/valor vazio NÃO são override (o tool_command filtra), mas
+        // uma string vazia passada direto também não pode confundir.
+        assert!(resolve_tool_explicit(ToolKind::Npm, Some("   "), None).is_err());
     }
 
-    /// Command construction: no override => default program (node tools only
-    /// wrapped in `cmd /C` on Windows, where the std never finds `npm.cmd`).
+    /// PATH fake com o executável da ferramenta (exec bit no Unix, `.cmd` no
+    /// Windows) é achado; PATH vazio/ausente => "instale o X" SEM spawn.
     #[test]
-    fn default_tool_program_by_kind() {
-        let dotnet = command_for(ToolKind::Dotnet, None);
-        assert_eq!(dotnet.get_program(), "dotnet");
-        let npm = command_for(ToolKind::Npm, None);
-        let expected = if cfg!(windows) { "cmd" } else { "npm" };
-        assert_eq!(npm.get_program(), expected);
-        if cfg!(windows) {
-            let args: Vec<String> = npm
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect();
-            assert_eq!(
-                args,
-                vec!["/C", "chcp 65001 >nul 2>&1 &", "npm"],
-                "{args:?}"
-            );
+    fn fake_path_finds_the_tool_and_empty_path_is_missing() {
+        let dir = temp_dir("resolve-path");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        let name = if cfg!(windows) { "npm.cmd" } else { "npm" };
+        std::fs::write(dir.join(name), "shim").unwrap_or_else(|err| panic!("escrever shim: {err}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|err| panic!("chmod shim: {err}"));
         }
-        let pnpm = command_for(ToolKind::Pnpm, None);
-        let expected = if cfg!(windows) { "cmd" } else { "pnpm" };
-        assert_eq!(pnpm.get_program(), expected);
+        let resolved = resolve_tool_explicit(ToolKind::Npm, None, Some(dir.as_os_str()))
+            .unwrap_or_else(|err| panic!("resolver do PATH fake: {err}"));
+        assert_eq!(resolved.path, dir.join(name));
+        assert_eq!(
+            resolved.via_cmd,
+            cfg!(windows),
+            ".cmd achado no PATH (Windows) => cmd /C"
+        );
+
+        let error =
+            resolve_tool_explicit(ToolKind::Npm, None, Some(std::ffi::OsStr::new(""))).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("exige o npm"), "{message}");
+        assert!(
+            resolve_tool_explicit(ToolKind::Npm, None, None).is_err(),
+            "PATH ausente também é ausência da ferramenta"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An override WITHOUT `.cmd`/`.bat` spawns DIRECT on every OS: on
-    /// Windows only `.cmd`/`.bat` values go via `cmd /C` (a bare path might be
-    /// anything), and elsewhere `cmd` does not exist.
+    /// Unix: arquivo sem bit de execução NÃO conta como ferramenta achada.
+    #[cfg(unix)]
     #[test]
-    fn binary_override_spawns_direct_outside_windows() {
-        let shim = "/opt/shims/npm";
-        let command = command_for(ToolKind::Npm, Some(shim));
-        assert_eq!(
-            command.get_program(),
-            shim,
-            "sem .cmd/.bat o spawn é direto em qualquer OS"
+    fn file_without_exec_bit_is_not_a_tool() {
+        let dir = temp_dir("resolve-noexec");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        std::fs::write(dir.join("npm"), "não executável")
+            .unwrap_or_else(|err| panic!("escrever: {err}"));
+        assert!(
+            resolve_tool_explicit(ToolKind::Npm, None, Some(dir.as_os_str())).is_err(),
+            "sem exec bit não é executável"
         );
-        let dotnet_shim = "/opt/shims/dotnet";
-        let command = command_for(ToolKind::Dotnet, Some(dotnet_shim));
-        assert_eq!(
-            command.get_program(),
-            dotnet_shim,
-            "dotnet nunca via cmd /C"
-        );
-        let dotnet_cmd = command_for(ToolKind::Dotnet, Some("C:\\tools\\dotnet.cmd"));
-        let expected = if cfg!(windows) {
-            "cmd"
-        } else {
-            "C:\\tools\\dotnet.cmd"
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawn sobre a resolução: caminho comum spawna direto; via_cmd => o
+    /// wrapper `cmd /C chcp 65001` mantém o caminho resolvido como 3º token.
+    #[test]
+    fn resolved_path_spawns_direct_and_cmd_script_via_wrapper() {
+        let resolved = Resolved {
+            path: PathBuf::from("/tools/npm"),
+            via_cmd: false,
         };
-        assert_eq!(dotnet_cmd.get_program(), expected);
-    }
+        let command = command_from_resolved(&resolved);
+        assert_eq!(command.get_program(), "/tools/npm");
 
-    /// On Windows (and only there) a `.cmd`/`.bat` override runs via `cmd /C`
-    /// — case-insensitive; other extensions spawn direct.
-    #[test]
-    fn cmd_bat_override_wraps_only_on_windows() {
-        for script in [
-            "C:\\tools\\npm.CMD",
-            "C:\\tools\\tool.Bat",
-            "/shims/npm.cmd",
-        ] {
-            let command = command_for(ToolKind::Npm, Some(script));
-            let expected = if cfg!(windows) { "cmd" } else { script };
-            assert_eq!(command.get_program(), expected, "{script}");
-        }
-        let command = command_for(ToolKind::Npm, Some("/shims/npm.ps1"));
-        assert_eq!(command.get_program(), "/shims/npm.ps1");
-        let command = command_for(ToolKind::Npm, None);
-        // Valor vazio nunca chega aqui (tool_command filtra) — sem override é
-        // o programa padrão do PATH.
-        let expected = if cfg!(windows) { "cmd" } else { "npm" };
-        assert_eq!(command.get_program(), expected);
+        let resolved = Resolved {
+            path: PathBuf::from("C:\\tools\\npm.cmd"),
+            via_cmd: true,
+        };
+        let command = command_from_resolved(&resolved);
+        assert_eq!(command.get_program(), "cmd");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["/C", "chcp 65001 >nul 2>&1 &", "C:\\tools\\npm.cmd",],
+            "{args:?}"
+        );
     }
 
     /// Hint of `ToolFailure`: first non-empty stderr line, trimmed, control
