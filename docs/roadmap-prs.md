@@ -19,6 +19,15 @@
 4. **Orquestrador não escreve nos arquivos do PR aberto da Delta.** Código = Delta;
    docs/ledger/gates = Orchestrator. Colisão de worktree é o único risco real aqui.
 
+## Decisões de processo (dono, 11/Nov/2026)
+
+- **PR por item, agrupado por onda** — um PR por item para isolar falha no CI; a onda é o
+  agrupamento temático, não um PR único gigante.
+- **Cobertura**: mínimo de **70%**, medido **localmente** no MVP (`cargo llvm-cov`); gate no
+  CI só depois do MVP fechar.
+- **Merge é sempre humano.** Agente/automação abre PR e só mergeia PR que ele mesmo criou,
+  com CI verde, quando o dono autorizou.
+
 ## Gates (todo PR)
 
 ```
