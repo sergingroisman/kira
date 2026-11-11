@@ -5,6 +5,7 @@
 //! in [`ado`].
 
 pub mod ado;
+pub mod binresolve;
 pub mod board;
 pub mod config;
 pub mod context;

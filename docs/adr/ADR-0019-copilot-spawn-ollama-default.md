@@ -55,3 +55,37 @@ chave em arquivo. Regras:
   ganho sobre o que a licença Copilot já dá ao dono.
 - **Enviar dados a LLM de nuvem sem flag/approval** — rejeitado: viola o
   contrato read-only/seguro do repositório e a ADR-0016.
+
+## Implementação (PR11)
+
+- `src/llm/copilot.rs`: `CopilotBackend` compõe `system` + `\n\n` + `prompt`
+  num único texto e spawna `copilot -p <texto> -s` (subprocesso isolado, sem
+  HTTP/SDK). Timeout por `KIRA_COPILOT_TIMEOUT` (default 180s) com kill no
+  fim do budget; stdout/stderr drenados em threads durante a espera.
+- Resolução do binário: `KIRA_COPILOT_BIN` (arquivo existente) → senão
+  busca `copilot` no PATH (helper `which`-style extraído para
+  `src/binresolve.rs`, compartilhado com o scan sem mudar seu
+  comportamento); `.cmd`/`.bat` no Windows passam pelo wrapper `cmd /C`.
+  Não achou => `CopilotMissing`.
+- Mapa de erros (`src/error.rs`):
+  | Caso | Erro | Mensagem |
+  | --- | --- | --- |
+  | binário ausente | `CopilotMissing` | instale o Copilot CLI + `copilot auth login`, ou use o default Ollama (`--llm ollama`) |
+  | exit != 0 com stderr de auth (saml, sso, 'not authorized', 401, 403, login — case-insensitive) | `CopilotAuth` | exatamente: (1) `copilot auth login`; (2) autorizar o app do Copilot para a organização em https://github.com/settings/connections/applications (botão 'Grant'/'Authorize' na org Avanade); (3) se o admin bloquear apps OAuth, pedir aprovação à TI; (4) enquanto isso `--llm ollama` |
+  | exit != 0 outros | `CopilotFailed` | 1ª linha do stderr (≤200 chars, sem body cru) + testar `copilot -p teste` fora do KIRA |
+  | timeout | `CopilotTimeout` | limite atingido + `KIRA_COPILOT_TIMEOUT=<segundos>` para aumentar |
+  | exit 0 com saída vazia | `CopilotFailed` | "não devolveu texto" |
+- Parser de saída tolerante: remove ANSI (CSI/OSC), descarta linhas de banner
+  (heurística documentada: inicia com box-drawing/braille/check-mark, ou cita
+  "copilot"/"using model") e devolve o texto limpo (linhas internas vazias
+  preservadas — o triage tem seções). Vazio => `CopilotFailed`.
+- Wiring: `kira triage ... --llm <ollama|copilot>` (default `ollama`) e env
+  `KIRA_LLM` equivalente (a flag vence). Valor desconhecido => `UnknownLlm`.
+  `--llm copilot` sem CLI => `CopilotMissing` — **nunca fallback silencioso
+  para Ollama**.
+- Segredo: o prompt já vem redigido pelo context packer (`redact`); o spawn
+  não ecoa o prompt nem o stderr cru em log/erro.
+- Testes offline (sem rede, sem login): shims falsos via `KIRA_COPILOT_BIN`
+  (sucesso com ANSI+banner, SAML no stderr, falha comum, binário ausente,
+  timeout curto) e e2e em `tests/triage_e2e.rs` com `KIRA_OLLAMA_URL` em
+  porta morta — provando que o Ollama não é usado.

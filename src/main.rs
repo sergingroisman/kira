@@ -55,6 +55,12 @@ enum Command {
         /// Ollama model tag (overrides KIRA_MODEL)
         #[arg(long)]
         model: Option<String>,
+        /// LLM backend: `ollama` (default, local) or `copilot` (costly,
+        /// spawns the Copilot CLI and requires `copilot auth login`;
+        /// overrides KIRA_LLM) — the costly backend is NEVER implicit and
+        /// never falls back to Ollama
+        #[arg(long, value_parser = ["ollama", "copilot"])]
+        llm: Option<String>,
     },
     /// Save the Azure DevOps configuration and the PAT in the OS keyring
     #[command(
@@ -230,7 +236,12 @@ async fn run(command: Command) -> Outcome {
                 summary,
             }
         }
-        Command::Triage { id, file, model } => triage_command(id, file, model).await,
+        Command::Triage {
+            id,
+            file,
+            model,
+            llm,
+        } => triage_command(id, file, model, llm).await,
         Command::Setup {
             org,
             project,
@@ -307,12 +318,20 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             ("inspect".to_string(), args, None)
         }
         Command::Doctor => ("doctor".to_string(), String::new(), None),
-        Command::Triage { id, file, model } => {
+        Command::Triage {
+            id,
+            file,
+            model,
+            llm,
+        } => {
             let mut args = String::new();
             match (id, file) {
                 (Some(id), _) => args = id.to_string(),
                 (None, Some(file)) => args = format!("--file {}", file.display()),
                 (None, None) => {}
+            }
+            if llm.as_deref() == Some("copilot") {
+                args.push_str(" --llm copilot");
             }
             (
                 "triage".to_string(),
@@ -821,6 +840,7 @@ async fn triage_command(
     id: Option<i32>,
     file: Option<PathBuf>,
     model_flag: Option<String>,
+    llm_flag: Option<String>,
 ) -> Outcome {
     let source = match triage_source(id, file) {
         Ok(source) => source,
@@ -830,11 +850,23 @@ async fn triage_command(
             return Outcome::failure(message);
         }
     };
+    // ADR-0019: the backend choice is explicit and validated — `copilot`
+    // missing or auth-blocked fails loudly, never a silent Ollama fallback.
+    let kind = match kira::llm::LlmKind::from_flag_and_env(llm_flag.as_deref()) {
+        Ok(kind) => kind,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
     let base_url = ollama::base_url_from_env();
     let model = model_flag.unwrap_or_else(ollama::model_from_env);
     let result = match source {
-        TriageSource::Id(id) => triage_live(&base_url, &model, id).await,
-        TriageSource::File(path) => triage::triage_file(&base_url, &model, &path).await,
+        TriageSource::Id(id) => match resolve_board(None) {
+            Ok(board) => triage::triage_live_llm(kind, board.as_ref(), id, &base_url, &model).await,
+            Err(err) => Err(err),
+        },
+        TriageSource::File(path) => triage::triage_file_llm(kind, &base_url, &model, &path).await,
     };
     match result {
         Ok(report) => {
@@ -955,11 +987,6 @@ fn record_triage_episode_inner(report: &triage::TriageReport) -> EpisodeCapture 
         Ok(path) => EpisodeCapture::Recorded(path),
         Err(err) => EpisodeCapture::Failed(err.to_string()),
     }
-}
-
-async fn triage_live(base_url: &str, model: &str, id: i32) -> Result<triage::TriageReport, Error> {
-    let board = resolve_board(None)?;
-    triage::triage_live(board.as_ref(), id, base_url, model).await
 }
 
 async fn setup_command(

@@ -19,6 +19,7 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira triage <id>` | Triage **vivo**: busca o work item no Azure e pede causa raiz ao **Ollama local** (requer PAT + Ollama). Grava um episódio em `.kira/wiki/bugs/`. |
 | `kira triage --file <json>` | Triage **offline** do mesmo JSON de work item — sem PAT, sem Azure, 100% local. |
 | `kira triage <id\|--file> --model <tag>` | Troca o modelo do Ollama para esta execução. |
+| `kira triage <id\|--file> --llm copilot` | Usa o **Copilot CLI** como LLM caro desta execução (spawn de `copilot -p`; exige `copilot auth login`). Default permanece Ollama; nunca há fallback silencioso. |
 | `kira setup [--org --project --pat --no-browser --reset]` | Wizard: org, projeto e PAT validados **antes** de salvar; PAT vai para o keyring do OS (service `kira`). `--reset` remove o PAT. |
 | `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
 | `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
@@ -34,7 +35,8 @@ pronto se não está no binário.
 | Componente | Para quê | De onde |
 | --- | --- | --- |
 | Rust (via rustup) | build do binário | [rustup.rs](https://rustup.rs) |
-| Ollama | **obrigatório para `kira triage`** (LLM local) | `winget install Ollama.Ollama` ou [ollama.com/download](https://ollama.com/download) |
+| Ollama | **default do `kira triage`** (LLM local, 100% gratuito) | `winget install Ollama.Ollama` ou [ollama.com/download](https://ollama.com/download) |
+| Copilot CLI | **opcional**: backend caro do triage (`--llm copilot`) | [github.com/github/copilot-cli](https://github.com/github/copilot-cli) + `copilot auth login` |
 | .NET SDK 8+ | `kira scan` em projetos .NET | [dotnet.microsoft.com/download](https://dotnet.microsoft.com/download) |
 | npm ou pnpm | `kira scan` em projetos Node/TS | [nodejs.org/download](https://nodejs.org/download) / `npm install -g pnpm` |
 
@@ -93,11 +95,54 @@ kira inspect 4821
 | `KIRA_SCAN_NPM_BIN` | Caminho completo que substitui o `npm` do scan | PATH |
 | `KIRA_SCAN_PNPM_BIN` | Caminho completo que substitui o `pnpm` do scan | PATH |
 | `KIRA_OLLAMA_URL` | URL do servidor Ollama | `http://localhost:11434` |
+| `KIRA_LLM` | Backend do triage: `ollama` (default) ou `copilot` — o `--llm` vence | `ollama` |
+| `KIRA_COPILOT_BIN` | Caminho completo que substitui o `copilot` do backend caro (padrão dos testes offline) | PATH |
+| `KIRA_COPILOT_TIMEOUT` | Limite por chamada do CLI do Copilot, em segundos | `180` |
 | `KIRA_MODEL` | Tag do modelo do triage | `qwen3.5:4b` |
 | `KIRA_NUM_CTX` | Janela de contexto do modelo | `4096` |
 | `KIRA_STORE_DIR` | Sobrescreve o diretório do store (testes/execuções portáveis) | `~/.config/kira` |
 | `KIRA_BOARD` | Provedor de board (`azure` é o único nesta fase) | `azure` |
 | `KIRA_CONFIG` | Caminho alternativo do `config.toml` | `~/.config/kira/config.toml` |
+
+## Backend LLM (ADR-0019)
+
+O **Ollama local é o default** — sempre: `kira triage` roda em
+`http://localhost:11434` com `qwen3.5:4b`, 100% na sua máquina, sem custo.
+
+O backend **caro** (Copilot) só existe sob escolha explícita — nunca é
+implícito e nunca cai em fallback silencioso para o Ollama:
+
+```powershell
+kira triage 4821 --llm copilot        # flag vence
+KIRA_LLM=copilot kira triage 4821    # equivalente por env
+```
+
+Como funciona: o KIRA compõe `system + prompt` (o prompt já vem redigido
+pela camada de `redact` — PAT/env nunca vão ao modelo) num único texto e
+**spawn do CLI**: `copilot -p "<texto>"`. Nenhum SDK, nenhuma chave em
+arquivo. O binário é resolvido de `KIRA_COPILOT_BIN` ou do PATH; o limite
+por chamada é `KIRA_COPILOT_TIMEOUT` (default 180s).
+
+### Troubleshooting de auth (SAML/SSO) — os 3 passos
+
+Quando o CLI nega o acesso (comum com a conta GitHub corporativa), a
+mensagem de erro lista exatamente estes passos, nesta ordem:
+
+1. **Rode `copilot auth login`** e refaça o login com a conta da org
+   Avanade.
+2. **Autorize o app do Copilot para a organização** em
+   [github.com/settings/connections/applications](https://github.com/settings/connections/applications)
+   — botão **Grant**/**Authorize** na org Avanade.
+3. **Se o admin bloquear apps OAuth**, peça a aprovação à TI. Enquanto
+   isso, use `--llm ollama` (o default local continua funcionando).
+
+> **Pré-requisito de policy (Avanade):** o uso do Copilot CLI pelo KIRA é
+> decisão corporativa, não técnica. Confirme com a policy da empresa antes
+> de operar este backend em código corporativo (ADR-0019).
+
+Se o binário não existe (`--llm copilot` sem CLI instalado), o comando
+falha com `instale o Copilot CLI` — a ausência nunca se torna Ollama sem
+que você perceba.
 
 ## Store local
 
@@ -201,8 +246,6 @@ O que ainda **não** existe no binário (fonte de verdade:
 - **Autonomia: `kira loop` / modo agendado** com estado `awaiting_approval` no
   store e `kira approve <id>` (W5) — escrita só depois do gate M2 e do
   `--apply` explícito.
-- **Backend Copilot** (`copilot -p`) como LLM caro sob flag explícita (PR11);
-  Ollama segue como default 100% local.
 - **TUI Ratatui** (W6) e `kira fix --apply` (M3) — só depois do M2.
 
 ## License
