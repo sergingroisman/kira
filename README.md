@@ -196,10 +196,6 @@ ubuntu/macos/windows. O contrato do repositório está em
 O que ainda **não** existe no binário (fonte de verdade:
 [`docs/roadmap-prs.md`](docs/roadmap-prs.md)):
 
-- **Resolução which-style da ferramenta antes do spawn** (PR-F4, em
-  `w2-fix/pr-f4-tool-resolution`): PATH × PATHEXT em Rust puro, substituindo a
-  classificação por marcadores de texto do cmd localizado.
-- **Parser pnpm audit real** (PR-F1b): advisory-a-advisory com `paths`.
 - **`kira triage --eval <dir>`** + `tests/fixtures/triage_gold/` — 20 bugs
   fechados rotulados pelo dono; gate do M2 é **≥70% medido** (W2-bis).
 - **Autonomia: `kira loop` / modo agendado** com estado `awaiting_approval` no

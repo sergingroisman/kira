@@ -85,7 +85,7 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - **Leitura é livre, escrita nunca.** Todo comando é read-only por padrão; escrita no mundo exige flag explícita `--apply`. Modo agendado e `kira loop` NUNCA ganham escrita implícita.
 - **`awaiting_approval` é estado do store, não convenção.** Antes de qualquer escrita no mundo (Azure DevOps, repo do projeto) o ciclo grava `awaiting_approval` e para. Só `kira approve <id>` (humano) transiciona para `applying`. Budget estourado ≠ aprovação; `--apply` isolado ≠ aprovação.
 - **Budget tem número:** `max_llm_calls_per_day = 50` em `config.toml`, checado ANTES de cada transição de estado.
-- **Medição antes de autonomia:** `kira triage --eval <dir>` compara a causa raiz prevista com o rótulo do dono em `tests/fixtures/triage_gold/` e imprime o percentual. Sem ≥70% medido, `kira loop` e o modo agendado não são promovidos a "autônomo".
+- **Medição antes de autonomia (previsto — W2-bis, ainda não implementado):** `kira triage --eval <dir>` compara a causa raiz prevista com o rótulo do dono em `tests/fixtures/triage_gold/` e imprime o percentual. Sem ≥70% medido, `kira loop` e o modo agendado não são promovidos a "autônomo".
 - **Falha de quota não apaga dado:** provedor que responde 429 fica intocado por 5 minutos; o último resultado bom continua visível marcado como `stale` (`kira doctor` mostra a idade do último sucesso).
 - **TUI é modo do binário, não substituto:** o dashboard (Ratatui) é read-only sobre o store; o modo texto do loop/agendado continua sendo a saída canônica e erros permanecem texto copiável.
 - **Proibido copiar código de projeto GPL** (ex.: ai-jail) para este repo MIT. Conceito sim, código não.
