@@ -96,9 +96,37 @@ fn description_for_prompt(description: Option<&str>) -> String {
 /// <model text for this section>
 /// ```
 ///
-/// Sections the model did not produce show "—"; a model answer without any of
-/// the three headers falls entirely under "Causa raiz provável:".
-pub fn format_triage(model_text: &str) -> String {
+/// Sections the model did not produce show "—" — but only for an answer that
+/// **did** carry at least one of the three headers. An answer with none of them
+/// is not a filled template with holes: it is a model that ignored the format,
+/// and rendering it as three `—` was the silent failure of W2-fix PR-F2. That
+/// case returns [`Error::LlmFormat`] so the command fails loudly instead of
+/// recording an empty triage (and an empty wiki episode).
+pub fn format_triage(model_text: &str) -> Result<String, Error> {
+    if section_headers_found(model_text) == 0 {
+        return Err(Error::LlmFormat);
+    }
+    Ok(render_sections(model_text))
+}
+
+/// Number of distinct fixed headers the model answer actually carries.
+///
+/// Zero means the answer is out of format; one or two mean the template was
+/// followed partially (a section that is missing is `—`, a section that is
+/// empty is also `—` — both are data, not a format error).
+fn section_headers_found(model_text: &str) -> usize {
+    let mut found = [false; 3];
+    for line in model_text.lines() {
+        if let Some((index, _)) = section_header_index(line) {
+            found[index] = true;
+        }
+    }
+    found.iter().filter(|seen| **seen).count()
+}
+
+/// Renders the three fixed blocks from a model answer that already passed the
+/// format check.
+fn render_sections(model_text: &str) -> String {
     let sections = split_sections(model_text);
     let blocks: Vec<String> = SECTION_NAMES
         .iter()
@@ -234,7 +262,7 @@ async fn triage_item(
         .await?;
     Ok(TriageReport {
         item_id: item.id,
-        output: format_triage(&text),
+        output: format_triage(&text)?,
         context: pack,
     })
 }
@@ -259,6 +287,11 @@ mod tests {
 
     fn parse(body: &str) -> WorkItem {
         WorkItem::from_api_json(body).unwrap_or_else(|err| panic!("fixture inválida: {err}"))
+    }
+
+    /// Formats a model answer that is known to be in format (test-only sugar).
+    fn format(text: &str) -> String {
+        format_triage(text).unwrap_or_else(|err| panic!("formato válido não pode falhar: {err}"))
     }
 
     #[test]
@@ -391,7 +424,7 @@ mod tests {
     fn format_triage_renders_the_three_fixed_sections() {
         let model_text = "Causa raiz provável:\nTTL do token muito curto.\nArquivos prováveis:\nsrc/auth/session.rs\nConfiança:\nmédia";
         assert_eq!(
-            format_triage(model_text),
+            format(model_text),
             "Causa raiz provável:\nTTL do token muito curto.\n\n\
              Arquivos prováveis:\nsrc/auth/session.rs\n\n\
              Confiança:\nmédia\n"
@@ -402,27 +435,61 @@ mod tests {
     fn format_triage_tolerates_markdown_decorated_headers() {
         let model_text = "## Causa raiz provável\n_ttl_ curto\n**Arquivos prováveis:**\nsrc/x.rs\n- **Confiança:** alta";
         assert_eq!(
-            format_triage(model_text),
+            format(model_text),
             "Causa raiz provável:\n_ttl_ curto\n\n\
              Arquivos prováveis:\nsrc/x.rs\n\n\
              Confiança:\nalta\n"
         );
     }
 
+    /// W2-fix PR-F2: the real failure was a model answer with none of the three
+    /// headers being rendered as three `—` with exit 0. Out of format is an
+    /// actionable error, never an empty result.
     #[test]
-    fn format_triage_without_headers_falls_back_to_the_first_section() {
-        let out = format_triage("texto solto do modelo");
-        assert_eq!(
-            out,
-            "Causa raiz provável:\ntexto solto do modelo\n\n\
-             Arquivos prováveis:\n—\n\n\
-             Confiança:\n—\n"
+    fn format_triage_without_any_header_is_an_actionable_error() {
+        for model_text in [
+            "texto solto do modelo",
+            "",
+            "   \n\n",
+            "A causa raiz provável é o TTL curto do token.",
+        ] {
+            match format_triage(model_text) {
+                Err(Error::LlmFormat) => {
+                    let message = Error::LlmFormat.to_string();
+                    assert!(
+                        message.contains("fora do formato das 3 seções"),
+                        "{message}"
+                    );
+                    assert!(message.contains("--model"), "{message}");
+                    assert!(message.contains("ollama ps"), "{message}");
+                }
+                other => panic!("{model_text:?} deveria falhar com LlmFormat, veio {other:?}"),
+            }
+        }
+    }
+
+    /// The complement of the rule above: a partially followed template is data.
+    /// A section the model omits (or leaves empty) shows `—`; only the absence
+    /// of *all* headers is an error.
+    #[test]
+    fn format_triage_with_two_of_three_sections_placeholders_only_the_missing_one() {
+        let out = format("Causa raiz provável:\nTTL curto\nArquivos prováveis:\nsrc/a.rs");
+        assert!(out.contains("Causa raiz provável:\nTTL curto\n"), "{out}");
+        assert!(out.contains("Arquivos prováveis:\nsrc/a.rs\n"), "{out}");
+        assert!(out.contains("Confiança:\n—\n"), "{out}");
+
+        let empty_third =
+            format("Causa raiz provável:\nTTL curto\nArquivos prováveis:\nsrc/a.rs\nConfiança:\n");
+        assert!(empty_third.contains("Confiança:\n—\n"), "{empty_third}");
+        assert!(
+            !empty_third.contains("Arquivos prováveis:\n—"),
+            "{empty_third}"
         );
     }
 
     #[test]
     fn format_triage_shows_placeholder_for_empty_sections() {
-        let out = format_triage("Causa raiz provável:\n\nArquivos prováveis:\n\nConfiança:\n");
+        let out = format("Causa raiz provável:\n\nArquivos prováveis:\n\nConfiança:\n");
         assert!(out.contains("Causa raiz provável:\n—\n"), "{out}");
         assert!(out.contains("Arquivos prováveis:\n—\n"), "{out}");
         assert!(out.contains("Confiança:\n—\n"), "{out}");
@@ -432,7 +499,7 @@ mod tests {
     /// three sections, in the fixed order, trimmed.
     #[test]
     fn sections_of_returns_the_three_sections_in_order() {
-        let formatted = format_triage(
+        let formatted = format(
             "Causa raiz provável:\nTTL curto\nArquivos prováveis:\nsrc/a.rs, src/b.rs\nConfiança:\nalta",
         );
         let sections = sections_of(&formatted);
@@ -440,7 +507,7 @@ mod tests {
         assert_eq!(sections[1], "src/a.rs, src/b.rs");
         assert_eq!(sections[2], "alta");
 
-        let empty = sections_of(&format_triage(
+        let empty = sections_of(&format(
             "Causa raiz provável:\n\nArquivos prováveis:\n\nConfiança:\n",
         ));
         assert_eq!(empty, ["—", "—", "—"], "seções vazias voltam como —");
