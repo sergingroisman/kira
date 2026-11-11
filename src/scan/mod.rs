@@ -248,13 +248,30 @@ fn find_on_path(path_env: Option<&std::ffi::OsStr>, program: &str) -> Option<Pat
         .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
     for dir in std::env::split_paths(path_env) {
         for ext in path_ext.split(';') {
-            let candidate = dir.join(format!("{program}{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
+            let probe = format!("{program}{ext}");
+            if dir.join(&probe).is_file() {
+                // NTFS matches case-insensitively (`npm.COM` finds `npm.cmd`):
+                // return the REAL on-disk name, never the probe, so messages
+                // and paths show what actually exists.
+                return Some(real_entry_name(&dir, &probe).unwrap_or_else(|| dir.join(&probe)));
             }
         }
     }
     None
+}
+
+/// On-disk entry in `dir` whose name matches `probe` case-insensitively.
+#[cfg(windows)]
+fn real_entry_name(dir: &Path, probe: &str) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case(probe) {
+            Some(entry.path())
+        } else {
+            None
+        }
+    })
 }
 
 /// Unix variant: `<tool>` must exist as a file with any execute bit.
