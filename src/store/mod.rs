@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
 use crate::credentials;
@@ -108,6 +108,22 @@ impl Store {
     pub fn open_default() -> Result<Store, StoreError> {
         let dir = store_dir().ok_or(StoreError::NoStoreDir)?;
         Store::open_in_dir(&dir)
+    }
+
+    /// Opens the DB at `path` in READ-ONLY mode — used by `kira dashboard`
+    /// (W6-PR1, ADR-0014): the dashboard is read-only over the store by
+    /// contract, and the proof is the e2e hash test (`tests/dashboard_e2e.rs`).
+    /// With `SQLITE_OPEN_READ_ONLY` the connection physically cannot write —
+    /// neither the WAL pragma of [`Store::open_at`] nor the schema migration
+    /// runs, so a dashboard run leaves `store.db` byte-identical.
+    pub fn open_readonly_at(path: &Path) -> Result<Store, StoreError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+            |source| StoreError::Open {
+                path: path.display().to_string(),
+                source,
+            },
+        )?;
+        Ok(Store { conn })
     }
 
     /// Opens (or creates) `store.db` inside `dir`, creating `dir` first.

@@ -139,6 +139,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Open the read-only terminal dashboard (W6-PR1: header panel)
+    ///
+    /// Interactive ONLY with a TTY stdout; without a TTY (or with --snapshot)
+    /// the SAME content is printed as plain text and the command exits 0 —
+    /// that is how the CI tests it. Read-only proven by the store hash e2e.
+    #[command(
+        after_help = "Exemplos:\n  kira dashboard             # TUI interativa (q sair, r reler, ? ajuda)\n  kira dashboard --snapshot  # mesmo conteúdo em texto, para CI/pipes"
+    )]
+    Dashboard {
+        /// Print the text form and exit (never draws, never enters raw mode)
+        #[arg(long)]
+        snapshot: bool,
+    },
 }
 
 /// `kira wiki` actions (ADR-0013: markdown is the source of truth).
@@ -288,6 +301,7 @@ async fn run(command: Command) -> Outcome {
             explain,
             json,
         } => context_command(id, file, explain, json),
+        Command::Dashboard { snapshot } => dashboard_command(snapshot),
     }
 }
 
@@ -433,6 +447,15 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             }
             ("context".to_string(), args, None)
         }
+        Command::Dashboard { snapshot } => (
+            "dashboard".to_string(),
+            if *snapshot {
+                "--snapshot".to_string()
+            } else {
+                String::new()
+            },
+            None,
+        ),
     }
 }
 
@@ -925,6 +948,51 @@ fn context_output(file: &Path, explain: bool, json: bool) -> Result<String, Erro
         return kira::context::report_json(&pack, item.id).map_err(Error::ContextReportJson);
     }
     Ok(kira::context::explain_report(&pack, item.id, explain))
+}
+
+// ---------------------------------------------------------------------------
+// `kira dashboard` — casca TUI read-only (W6-PR1, ADR-0014)
+// ---------------------------------------------------------------------------
+
+/// `kira dashboard [--snapshot]` — o dashboard é o MESMO binário em modo
+/// interativo (nunca daemon): com stdout TTY abre a TUI (ratatui/crossterm);
+/// sem TTY ou com `--snapshot` imprime o mesmo conteúdo em texto e sai 0 — é
+/// assim que o CI testa. NUNCA grava sessão na trilha (o e2e prova isso com o
+/// hash do `store.db`) e nunca toca rede/LLM.
+fn dashboard_command(snapshot: bool) -> Outcome {
+    let model = kira::tui::state::load();
+    if snapshot || !std::io::stdout().is_terminal() {
+        // Fora de TTY o desenho é impossível (raw mode/alternate screen não
+        // existem em pipe): a forma de texto é a mesma informação, exit 0.
+        let text = kira::tui::state::text_report(&model);
+        print!("{text}");
+        Outcome {
+            code: ExitCode::SUCCESS,
+            ok: true,
+            // Read-only TOTAL: nem a trilha automática pode tocar o store
+            // aqui — é o que o teste de hash do `store.db` verifica.
+            records: false,
+            summary: text,
+        }
+    } else {
+        match kira::tui::app::run(model) {
+            Ok(()) => Outcome {
+                code: ExitCode::SUCCESS,
+                ok: true,
+                records: false,
+                summary: "dashboard fechado pelo usuário".to_string(),
+            },
+            Err(message) => {
+                eprintln!("erro: {message}");
+                Outcome {
+                    code: ExitCode::FAILURE,
+                    ok: false,
+                    records: false,
+                    summary: message,
+                }
+            }
+        }
+    }
 }
 
 /// Resolves org/project/PAT (flags > env > keyring/config.toml) and builds the
