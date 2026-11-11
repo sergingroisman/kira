@@ -1,0 +1,18 @@
+{
+  "id": 4821,
+  "rev": 7,
+  "fields": {
+    "System.Id": 4821,
+    "System.WorkItemType": "Bug",
+    "System.Title": "Sessão expirada com token válido",
+    "System.State": "Active",
+    "System.AreaPath": "Kira\\Backend",
+    "System.AssignedTo": {
+      "displayName": "Maria Souza",
+      "id": "9c1a8b0d-0000-0000-0000-000000000000",
+      "uniqueName": "maria.souza@exemplo.com"
+    },
+    "System.Description": "<div>Usuário relata <b>sessão expirada</b> após 5 minutos.<br>Login &amp; logout não resolvem.<br><a href=\"https://exemplo.com/log\">Ver log anexo</a></div>"
+  },
+  "url": "https://dev.azure.com/exemplo-org/exemplo-projeto/_apis/wit/workItems/4821"
+}

@@ -40,9 +40,9 @@ pub fn build_prompt(item: &WorkItem) -> String {
 /// only decides where it sits in the prompt.
 pub fn build_prompt_with_context(item: &WorkItem, pack: &crate::context::ContextPack) -> String {
     let mut prompt = String::new();
-    prompt.push_str(
-        "Analise o work item do Azure DevOps abaixo e responda no formato de três seções definido.\n\n",
-    );
+    // O preâmbulo e o prompt do sistema vivem juntos em `llm::prompts`
+    // (versionados); aqui só a ordem das evidências.
+    prompt.push_str(crate::llm::prompts::TRIAGE_USER_PREAMBLE);
     prompt.push_str(&format!("ID: {}\n", item.id));
     prompt.push_str(&format!("Tipo: {}\n", item.work_item_type));
     // Privacy boundary: the work item is author-controlled text and can carry a

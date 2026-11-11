@@ -1,0 +1,12 @@
+Analise o work item do Azure DevOps abaixo e responda no formato de três seções definido.
+
+ID: 4821
+Tipo: Bug
+Título: Sessão expirada com token válido
+Estado: Active
+Área: Kira\Backend
+Responsável: Maria Souza
+Descrição:
+Usuário relata sessão expirada após 5 minutos.
+Login & logout não resolvem.
+Ver log anexo

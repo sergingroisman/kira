@@ -1,0 +1,10 @@
+Causa raiz provável:
+O TTL do token de sessão está em 5 minutos (`Duration::minutes(5)`) e a renovação
+falha depois do logout, porque a sessão antiga continua em cache.
+
+Arquivos prováveis:
+- src/auth/session.rs:42
+- src/auth/login.rs
+
+Confiança:
+alta
