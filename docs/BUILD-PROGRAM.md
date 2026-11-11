@@ -94,7 +94,10 @@
       e o hash recomputado por teste — mexer no texto sem atualizar os dois
       reprova. Superfície pública revisada: `triage.rs` não duplica mais as seções
       nem o alias do prompt.
-- [ ] **PR8** `LlmBackend` explícito: ollama + caminho preparado para copilot/byok.
+- [x] **PR8** `LlmBackend` explícito: ollama + caminho preparado para copilot/byok.
+      Trait em `src/llm/mod.rs` com `from_flag_and_env` (flag > env > default);
+      `OllamaBackend` (localhost) é o default e `CopilotBackend` entrou no PR #34.
+      BYOK HTTP continua como PR11b (registrado, fora desta fila).
 - [ ] **W2-bis** `kira triage --eval <dir>` + `tests/fixtures/triage_gold/`
       (schema + leitor + % de acerto). Harness testado com fixtures sintéticas;
       **medição real espera os 20 bugs rotulados pelo dono**.
@@ -110,8 +113,10 @@
       ausente/vazia de resposta no formato. PR #27.
 - [x] **PR-F3** wiki: episódio vazio não vira página; destino em `.kira/wiki/`;
       `display_path` sem `\\?\`. PR #28.
-- [ ] **PR-F4** detecção de ferramenta sem depender de texto localizado (resolver
-      o binário antes de executar; remover marcadores de texto do cmd).
+- [x] **PR-F4** detecção de ferramenta sem depender de texto localizado (resolver
+      o binário antes de executar; remover marcadores de texto do cmd). PR #29:
+      `src/binresolve.rs` (PATH × PATHEXT, override `KIRA_SCAN_*_BIN`), spawn
+      sempre pelo caminho resolvido, zero parse de mensagem localizada.
 
 ### F2 — agente vivo (W5) — pedido explícito do dono
 - [ ] **PR15** `kira loop`: modo do binário (sem daemon), ciclos com estado no
@@ -127,8 +132,11 @@
 ### F3 — provedores e hardware
 - [ ] **PR20** tuning local: detecção de VRAM/backend, escolha de modelo por
       perfil (2060 6 GB / M1 / CPU), `kira doctor` reportando o perfil efetivo.
-- [ ] **PR11** Copilot SDK atrás de flag/env (pin preview, módulo isolado,
-      fallback spawn de CLI). Bloqueado por policy Avanade → ollama-only é válido.
+- [x] **PR11** backend "caro" atrás de flag/env: **spawn do CLI** do Copilot
+      (`--llm copilot` / `KIRA_LLM=copilot`, ADR-0019, PR #34) — módulo isolado
+      `src/llm/copilot.rs`, binário resolvido por `KIRA_COPILOT_BIN`/PATH, erro
+      acionável e **nunca** fallback silencioso para Ollama. O pin do SDK em
+      preview fica no backlog (B2: policy Avanade); ollama-only segue válido.
 - [ ] **PR27** jail mínimo do `fix --apply` (ADR-0011, decisão do dono 10/Nov):
       confinamento por canonicalização (std) + rlimits em `cfg(unix)`; Windows
       sem rlimits no MVP. **Sem bwrap/Landlock.** Deny-list do PR3 é a camada 1.
@@ -180,6 +188,10 @@ Eu executo F0→F4 sozinho, em ciclos, sem sua intervenção. **Não** consigo:
 
 ## Protocolo do ciclo autônomo (o que cada execução faz)
 
+0. **Um worktree = um executor.** Antes de tudo, `git status`: se houver arquivo
+   em conflito/merge alheio no working tree, **não** comece item — valide o que
+   existe, sincronize o ledger e reporte. Dois ciclos no mesmo worktree produzem
+   marcador de conflito commitado (já aconteceu com `src/main.rs`).
 1. `git fetch` e checar se há PR aberto de ciclo anterior; se sim, selar/mergear
    antes de começar outro.
 2. Ler este arquivo, pegar o **primeiro item aberto** de F0 e ir subindo.
