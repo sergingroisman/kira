@@ -38,8 +38,8 @@ impl NodeAuditTool {
 /// spawn, and the resolved full path is what runs.
 pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanError> {
     let kind = tool.kind();
-    let mut command = tool_command(kind)?;
-    command.args(["audit", "--json"]).current_dir(dir);
+    let mut command = tool_command(kind, &["audit", "--json"])?;
+    command.current_dir(dir);
     let output = command
         .output()
         .map_err(|source| spawn_error(kind, source))?;
