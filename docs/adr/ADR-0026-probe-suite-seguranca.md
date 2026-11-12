@@ -1,4 +1,4 @@
-# ADR-0025 — Teste de segurança do próprio KIRA: probe suite no `cargo test` (red team estático)
+# ADR-0026 — Teste de segurança do próprio KIRA: probe suite no `cargo test` (red team estático)
 
 - **Status**: proposto (12/Nov/2026) — Orchestrator (recomendação) · Sérgio
   (veto/aval).
@@ -9,7 +9,7 @@
   para Aplicações LLM** como vocabulário de referência. Relatório:
   [`docs/awesome-web-security-vale-trazer.md`](../awesome-web-security-vale-trazer.md).
 
-- **Relacionado**: [ADR-0026](ADR-0026-techleads-piso-guards-licoes-custodia.md)
+- **Relacionado**: [ADR-0027](ADR-0027-techleads-piso-guards-licoes-custodia.md)
   (piso de guardas em tiers + veredito tipado — a probe suite aqui é a
   medição executável do piso; ADR-0024 para a fronteira de prompt/redação).
 

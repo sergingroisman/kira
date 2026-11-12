@@ -8,7 +8,7 @@
   `skills/awesome-web-security/SKILL.md`. Relatório completo:
   [`docs/awesome-web-security-vale-trazer.md`](../awesome-web-security-vale-trazer.md).
 
-- **Relacionado**: [ADR-0026](ADR-0026-techleads-piso-guards-licoes-custodia.md)
+- **Relacionado**: [ADR-0027](ADR-0027-techleads-piso-guards-licoes-custodia.md)
   (custódia de prompt no CI — o scan/hash de prompt que lá se propõe é o
   complemento mecânico da regra anti-injeção do R2 aqui).
 
@@ -69,7 +69,7 @@ O contrato de versionamento (PR6/PR7) é cumprido no mesmo commit:
 ### R3 — O probe que provou o bypass vira o teste que prova a correção
 
 As 10 famílias de payload do probe (as 5 vazantes + as 5 já mascaradas) entram
-como fixtures nos testes do `redact` e na probe suite (ADR-0025). Vazamento
+como fixtures nos testes do `redact` e na probe suite (ADR-0026). Vazamento
 reprovado hoje é regressão amanhã.
 
 ### R4 — A defesa de fundo continua sendo o comando read-only

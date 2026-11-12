@@ -8,7 +8,7 @@
   (a lista também é servida como Skill para agentes de IA).
 - **ADRs**: [ADR-0024](adr/ADR-0024-guardrails-invisiveis-prompt-v2.md) —
   guardrails de prompt/redação ·
-  [ADR-0025](adr/ADR-0025-probe-suite-seguranca.md) — teste de segurança do
+  [ADR-0026](adr/ADR-0026-probe-suite-seguranca.md) — teste de segurança do
   próprio KIRA
 - **Veredito**: 3 adaptações + 1 opcional **a confirmar com o dono**; 1 achado
   empírico novo (bypass do `redact` com caracteres invisíveis — probe de
