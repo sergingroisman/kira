@@ -31,6 +31,7 @@ impl Sandbox {
             .env("KIRA_STORE_DIR", &self.store)
             .env("KIRA_CONFIG", self.store.join("absent-config.toml"))
             .env_remove("AZURE_DEVOPS_PAT")
+            .env("KIRA_SECRET_STORE", "off")
             .env_remove("AZURE_DEVOPS_ORG")
             .env_remove("AZURE_DEVOPS_PROJECT")
             .env_remove("KIRA_MODEL")

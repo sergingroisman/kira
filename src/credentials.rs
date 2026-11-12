@@ -197,11 +197,43 @@ impl CredStore for OsKeyring {
     }
 }
 
-/// Opens the default secret store: the OS keyring when available.
+/// Variável que desliga a leitura do keyring do OS.
 ///
-/// Tests must not call this — they construct [`InMemory`] instead.
+/// Existe por dois motivos concretos: (1) máquinas headless/CI, onde abrir o
+/// keyring falha ou lê estado que não é do teste; (2) testes e2e, que rodam o
+/// BINÁRIO real e por isso não podem injetar [`InMemory`] — numa máquina de
+/// dev com PAT de verdade salvo, o binário achava o segredo e o teste que
+/// espera "sem PAT" quebrava. Com `KIRA_SECRET_STORE=off` o store padrão é
+/// memória vazia: nada do usuário é lido, nada é gravado.
+pub const SECRET_STORE_ENV: &str = "KIRA_SECRET_STORE";
+
+/// Opens the default secret store: the OS keyring when available, unless
+/// [`SECRET_STORE_ENV`] desliga explicitamente.
+///
+/// Tests that call the binary must set `KIRA_SECRET_STORE=off` — sem isso o
+/// resultado depende do keyring da máquina, e teste que depende da máquina
+/// mente sobre o código.
 pub fn open_default_store() -> Result<Box<dyn CredStore>, Error> {
+    if secret_store_is_off(non_empty_env(SECRET_STORE_ENV).as_deref()) {
+        return Ok(Box::new(InMemory::new()));
+    }
     OsKeyring::open().map(|store| Box::new(store) as Box<dyn CredStore>)
+}
+
+/// Decide, sem tocar em `std::env`, se o store do OS deve ser ignorado.
+///
+/// Pura de propósito: variável de ambiente é estado global do processo, e
+/// teste que muta env deixa a suíte dependente da ordem de execução. A
+/// leitura fica em [`open_default_store`]; a regra fica aqui, testável.
+fn secret_store_is_off(value: Option<&str>) -> bool {
+    value
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "off" | "none" | "memory"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -467,6 +499,19 @@ pub fn resolve_azure_config(project_override: Option<&str>) -> Result<AzureConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_store_env_switch_is_explicit_and_case_insensitive() {
+        // Só desliga com valor explícito: vazio ou lixo mantém o keyring,
+        // porque o padrão de produto é usar o keyring — o override existe
+        // para teste e para máquina headless, não para mudar comportamento.
+        for off in ["off", "OFF", " none ", "memory", "Memory"] {
+            assert!(secret_store_is_off(Some(off)), "{off:?} deveria desligar");
+        }
+        for on in [None, Some(""), Some("os"), Some("keyring"), Some("0")] {
+            assert!(!secret_store_is_off(on), "{on:?} deveria manter o keyring");
+        }
+    }
 
     #[test]
     fn in_memory_store_round_trips_values() {

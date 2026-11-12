@@ -66,6 +66,7 @@ fn run_kira(sandbox: &Sandbox, store: &Path, args: &[&str]) -> (i32, String, Str
         .env("KIRA_STORE_DIR", store)
         .env("KIRA_CONFIG", sandbox.store.join("absent-config.toml"))
         .env_remove("AZURE_DEVOPS_PAT")
+        .env("KIRA_SECRET_STORE", "off")
         .env_remove("AZURE_DEVOPS_ORG")
         .env_remove("AZURE_DEVOPS_PROJECT")
         .env_remove("KIRA_MODEL")

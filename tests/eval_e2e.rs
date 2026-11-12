@@ -103,6 +103,7 @@ fn run_kira(store: &Path, shim: Option<&Path>, args: &[&str]) -> (i32, String, S
         .env_remove("KIRA_LLM")
         .env_remove("KIRA_MODEL")
         .env_remove("AZURE_DEVOPS_PAT")
+        .env("KIRA_SECRET_STORE", "off")
         .env_remove("AZURE_DEVOPS_ORG")
         .env_remove("AZURE_DEVOPS_PROJECT");
     match shim {

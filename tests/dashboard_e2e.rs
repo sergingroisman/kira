@@ -256,6 +256,7 @@ fn run_kira_without_pat(sandbox: &Sandbox, args: &[&str]) -> (i32, String, Strin
         .env("KIRA_STORE_DIR", &sandbox.store)
         .env("KIRA_CONFIG", sandbox.config_path())
         .env_remove("AZURE_DEVOPS_PAT")
+        .env("KIRA_SECRET_STORE", "off")
         .env("KIRA_OLLAMA_URL", "http://127.0.0.1:1")
         .env_remove("AZURE_DEVOPS_ORG")
         .env_remove("AZURE_DEVOPS_PROJECT")
