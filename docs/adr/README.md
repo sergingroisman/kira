@@ -47,6 +47,7 @@
 | **0034** | **`kira setup` com wizard de tela cheia sobre o mesmo motor de texto** | **implementado** — aguarda aceite do dono | `ADR-0034-setup-wizard.md` |
 | **0035** | **Foundry configurável pelo `kira setup` (formulário inline, chave no keyring)** | **implementado** — aguarda aceite do dono | `ADR-0035-foundry-no-setup.md` |
 | **0036** | **Camada visual do TUI: nativo do ratatui primeiro, dependência depois** | **implementado** — aguarda aceite do dono | `ADR-0036-tui-visual-nativo-sem-dependencia.md` |
+| **0037** | **Resumo em cartões: chip vem da trilha, spinner só com filho vivo** | **proposto** — aguarda aval do dono | `ADR-0037-resumo-em-cartoes.md` |
 
 ## O que **não** é ADR aqui
 

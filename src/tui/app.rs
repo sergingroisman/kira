@@ -42,9 +42,9 @@ use crate::tui::keymap::{self, Action as Key};
 use crate::tui::layout;
 use crate::tui::state::{self, Snapshot, WikiPage};
 use crate::tui::theme::{self, Palette};
+use crate::tui::widgets::cards::{self, Live};
 use crate::tui::widgets::findings::{DetailWidget, FindingsWidget};
 use crate::tui::widgets::footer;
-use crate::tui::widgets::resumo::{ResumoWidget, Visual};
 use crate::tui::widgets::sessions::SessionsWidget;
 use crate::tui::widgets::wiki::{WikiPageWidget, WikiWidget};
 
@@ -53,6 +53,10 @@ pub const SCREEN_COUNT: usize = 4;
 
 /// Passo de PgUp/PgDn no preview/lista (linhas por "página" de scroll).
 pub const SCROLL_PAGE_STEP: isize = 10;
+
+/// Quantos scans a ajuda lista antes de resumir o resto. A série inteira
+/// continua no `--snapshot`; aqui o teto é a ALTURA da tela, não o dado.
+pub const HELP_TREND_LINES: usize = 10;
 
 /// Opções de abertura do dashboard (ADR-0033).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -135,6 +139,9 @@ pub fn next_screen(screen: Screen, direction: i32) -> Screen {
 pub struct AppState {
     /// Fonte em foco.
     pub screen: Screen,
+    /// Contador do loop de eventos: o spinner avança com ele, nunca dentro do
+    /// widget (mesmo `tick` = mesmo frame, o desenho continua determinístico).
+    pub tick: u64,
     /// Inspetor 50–50 aberto na fonte atual.
     pub inspecting: bool,
     /// Seleção da tabela de achados (o ➤). UM POR TELA.
@@ -192,6 +199,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             screen: Screen::Resumo,
+            tick: 0,
             inspecting: false,
             findings_selected: 0,
             severity_filter: None,
@@ -910,6 +918,9 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
             degraded,
         ));
 
+        // Um tick por volta do loop: o spinner anda, o resto da tela não muda.
+        state_screen.tick = state_screen.tick.wrapping_add(1);
+
         // Drena a execução em andamento (nunca bloqueia: `try_recv`).
         drain_execution(&mut state_screen, &mut runner, &mut snapshot);
 
@@ -1131,7 +1142,15 @@ pub fn render_frame_with(
     if screen.exec_open
         && let Some(exec) = &screen.exec
     {
-        render_exec(frame, area, exec, snapshot.now_secs, palette, glyphs);
+        render_exec(
+            frame,
+            area,
+            exec,
+            snapshot.now_secs,
+            screen.tick,
+            palette,
+            glyphs,
+        );
     }
 
     // Leitura da wiki em tela cheia cobre tudo (modal): `Enter` abriu.
@@ -1148,10 +1167,7 @@ pub fn render_frame_with(
         // painel de trás vaza nas células que o texto não pinta (defeito que só
         // aparecia de verdade em `KIRA_GLYPHS=ascii`, onde as barras usam `#`).
         frame.render_widget(Clear, area);
-        frame.render_widget(
-            help_paragraph(&palette, &state::pending_causes(snapshot), glyphs),
-            area,
-        );
+        frame.render_widget(help_paragraph(&palette, snapshot, glyphs), area);
     }
 }
 
@@ -1169,22 +1185,21 @@ fn render_screen(
 ) {
     match screen.screen {
         Screen::Resumo => {
-            let sections = state::resumo_sections(snapshot);
-            // Faixa visual: os três números que respondem "como estamos hoje"
-            // (risco, tendência, índice) antes das tabelas de texto.
-            let severities = state::severity_bars(snapshot);
-            let index_fallback = state::index_line(snapshot);
-            let visual = Visual {
-                severities: &severities,
-                trend: &snapshot.scan_series,
-                index: state::index_usage(snapshot),
-                index_fallback: &index_fallback,
-            };
-            frame.render_widget(
-                ResumoWidget::new(&sections, true, palette)
-                    .with_visual(visual)
-                    .with_glyphs(glyphs),
+            // Cartões (PR-UX2): o grid decide quantas colunas e quantas linhas
+            // cada um leva; o conteúdo sai todo do MESMO snapshot do
+            // `--snapshot` de texto, então número de tela e número de pipe não
+            // divergem. Modo degradado (<80×24) continua na lista de texto.
+            cards::render_grid(
+                frame.buffer_mut(),
                 primary,
+                snapshot,
+                Live {
+                    exec: screen.exec.as_ref(),
+                    tick: screen.tick,
+                },
+                true,
+                palette,
+                glyphs,
             );
         }
         Screen::Achados => {
@@ -1255,7 +1270,8 @@ fn render_screen(
 }
 
 /// Overlay de ajuda: matriz de teclas + causas integrais das pendências.
-fn help_paragraph(palette: &Palette, pendings: &[String], glyphs: Glyphs) -> Paragraph<'static> {
+fn help_paragraph(palette: &Palette, snapshot: &Snapshot, glyphs: Glyphs) -> Paragraph<'static> {
+    let pendings = state::pending_causes(snapshot);
     // Setas são glifo: em modo ASCII a linha ensina o nome da tecla ("setas")
     // em vez de desenhar uma seta que o console não tem.
     let arrows = if glyphs.mode().is_ascii() {
@@ -1288,6 +1304,36 @@ fn help_paragraph(palette: &Palette, pendings: &[String], glyphs: Glyphs) -> Par
         text.push(String::new());
         text.push("pendências (causa integral; o chrome corta em uma linha):".to_string());
         text.extend(pendings.iter().cloned());
+    }
+    // A série de tendência sai do cartão em 80×24 (as linhas vão para barras e
+    // índice), mas NÃO some: aqui ela aparece inteira, uma linha por scan. Dado
+    // que some da tela é dado que o dono vai pedir depois.
+    text.push(String::new());
+    if snapshot.scan_series.len() >= 2 {
+        // A ajuda é modal de altura fixa: 50 scans = 50 linhas, e a lista
+        // empurraria o rodapé ("dado ausente aparece como —") para fora da
+        // tela. Os mais NOVOS ficam; os antigos continuam no `--snapshot`.
+        let total = snapshot.scan_series.len();
+        let shown = total.min(HELP_TREND_LINES);
+        text.push(format!(
+            "tendência de achados ({total} scans, mais antigo primeiro):"
+        ));
+        if total > shown {
+            text.push(format!(
+                "  … {rest} scans mais antigos no --snapshot",
+                rest = total - shown
+            ));
+        }
+        for (offset, count) in snapshot.scan_series.iter().skip(total - shown).enumerate() {
+            let number = total - shown + offset + 1;
+            text.push(format!("  #{number:<3} {count} achados"));
+        }
+    } else {
+        let note = snapshot
+            .scan_series_note
+            .clone()
+            .unwrap_or_else(|| "nenhum scan na trilha — rode `kira scan`".to_string());
+        text.push(format!("tendência: {note}"));
     }
     text.push(String::new());
     text.push("Dado ausente aparece como — com a causa; nada é inventado.".to_string());
@@ -1412,11 +1458,12 @@ fn render_exec(
     area: Rect,
     exec: &ExecState,
     now_secs: Option<i64>,
+    tick: u64,
     palette: Palette,
     glyphs: Glyphs,
 ) {
     frame.render_widget(Clear, area);
-    let status = exec_status_label(exec, now_secs);
+    let status = exec_status_label(exec, now_secs, tick, glyphs);
     let block = crate::tui::widgets::panel::block_with(
         &format!("{} · {status}", exec.action.title()),
         true,
@@ -1496,15 +1543,20 @@ fn exec_header(label: &str, width: u16, palette: Palette, glyphs: Glyphs) -> Lin
 }
 
 /// Rótulo do estado: `executando há 4s` / `concluído (exit 0)`.
-fn exec_status_label(exec: &ExecState, now_secs: Option<i64>) -> String {
+fn exec_status_label(exec: &ExecState, now_secs: Option<i64>, tick: u64, glyphs: Glyphs) -> String {
     match exec.status {
-        action::ExecStatus::Running => match now_secs {
-            Some(now) => format!(
-                "executando há {}",
-                state::format_duration_ms((now - exec.started_unix).max(0) * 1_000)
-            ),
-            None => "executando".to_string(),
-        },
+        action::ExecStatus::Running => {
+            // Spinner só aqui: o estado é Running porque o filho está vivo.
+            let spinner = crate::tui::spinner::frame(tick, glyphs);
+            let label = match now_secs {
+                Some(now) => format!(
+                    "executando há {}",
+                    state::format_duration_ms((now - exec.started_unix).max(0) * 1_000)
+                ),
+                None => "executando".to_string(),
+            };
+            format!("{label} {spinner}")
+        }
         action::ExecStatus::Exited { code } => match code {
             Some(0) => "concluído (exit 0)".to_string(),
             Some(code) => format!("falhou (exit {code})"),
@@ -1816,15 +1868,42 @@ mod tests {
         let text = render_text(&state, &snapshot, 80, 24);
         assert!(text.contains("pat Aa2x****"), "{text}");
         assert!(text.contains("[1 Resumo]"), "aba ativa marcada: {text}");
-        assert!(text.contains("| Resumo |"), "{text}");
-        // PR-UX1: o Resumo abre com a faixa visual de risco (as barras
-        // substituem a seção de contagem em texto, que repetia o mesmo dado).
-        assert!(text.contains("| Risco |"), "faixa visual: {text}");
+        // PR-UX2: o Resumo é um grid de cartões, não um painel de seções.
+        for card in ["| Risco", "| Sessões |", "| Projeto |", "| Pendências |"] {
+            assert!(text.contains(card), "cartão {card}: {text}");
+        }
         assert!(text.contains("critical"), "barras de severidade: {text}");
         assert!(text.contains("Sair"), "rodapé com chips: {text}");
         // Sem `--read-only`, o rodapé oferece as teclas de ação.
         assert!(text.contains(" Scan"), "{text}");
         assert!(text.contains("Triage"), "{text}");
+    }
+
+    /// A série de tendência saiu do cartão em 80×24, então a ajuda é o lugar
+    /// dela — e ela tem teto: 30 scans não podem empurrar o rodapé da ajuda
+    /// para fora da tela. Os antigos ficam no `--snapshot`.
+    #[test]
+    fn help_lists_the_trend_series_and_caps_it() {
+        let mut snapshot = snapshot_with_findings();
+        snapshot.scan_series = (1..=30).collect();
+        let state = AppState {
+            help_open: true,
+            ..AppState::default()
+        };
+        let text = render_text(&state, &snapshot, 120, 40);
+        // A ajuda quebra linha ao desenhar; a asserção é sobre as PALAVRAS.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("30 scans"), "{text}");
+        assert!(
+            flat.contains("20 scans mais antigos no --snapshot"),
+            "{text}"
+        );
+        assert!(flat.contains("#30"), "o mais novo aparece: {text}");
+        assert!(!flat.contains("#1 "), "o mais antigo sai da tela: {text}");
+        assert!(
+            flat.contains("Dado ausente"),
+            "rodapé da ajuda preservado: {text}"
+        );
     }
 
     #[test]

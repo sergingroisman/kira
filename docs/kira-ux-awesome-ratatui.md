@@ -3,6 +3,10 @@
 **Resposta ao Kombai** — 12/Nov/2026 · fonte: https://github.com/ratatui/awesome-ratatui (591 entradas lidas)
 Decisões do dono registradas em `/opt/data/planos/kira-visual-crates.md`.
 
+> **Estado em 12/Nov/2026**: **PR-UX1** e **PR-UX2** entregues, os dois **sem dependência nova**
+> — o nativo do `ratatui 0.29` mais módulos puros nossos cobriram o que a lista pedia de crate.
+> A fila UX3–UX8 está intacta (ver §6).
+
 ## 0. O achado que reorganiza tudo
 
 `ratatui 0.29` (a versão que o KIRA já usa) traz **nativos**: `BarChart`, `Sparkline`, `Gauge`,
@@ -18,7 +22,7 @@ adicionar dependência, use o nativo. Isso corta ~6 crates da lista original.
 |---|---|---|
 | `BarChart` | severidade dos achados em barras horizontais (comparação honesta) | `tui-bar-graph` |
 | `Sparkline` | tendência de achados por scan (últimos N scans) | `tui-bar-graph`/`malevich` |
-| `Gauge` | budget do dia, uso do context pack, progresso de scan | `toptop`/`amtr` (padrão) |
+| `Gauge` | **uso do índice de retrieval** (feito). Budget do dia fica bloqueado até existir contador de chamadas (PR17): sem número real, o gauge mentiria | `toptop`/`amtr` (padrão) |
 | `Scrollbar` | posição em listas longas | `tui-scrollbar` |
 | `Tabs` | indicador dos 4 painéis (se quisermos mais que o rodapé) | `tui-tabs` |
 | `Canvas` | desenho de linha/pontos (ex.: DAG de commits simples) | `malevich` |
@@ -41,13 +45,13 @@ adicionar dependência, use o nativo. Isso corta ~6 crates da lista original.
 
 | Padrão | Referência (app do awesome) | O que escrever |
 |---|---|---|
-| **Cartões de status** | `mirador`, `kdash` | `Block` + `Borders` com título e 2 linhas: ~40 linhas |
-| **Spinner "pensando"** | `throbber-widgets-tui` | ciclo de 10 glifos + `tick` no loop: ~30 linhas (mantém o throbber fora da lista de deps) |
+| **Cartões de status** [entregue] | `mirador`, `kdash` | feito no PR-UX2: `widgets/card` (moldura) + `widgets/cards` (seis cartões) + `tui/grid` (colunas e altura puras) |
+| **Spinner "pensando"** [entregue] | `throbber-widgets-tui` | feito no PR-UX2: `tui/spinner` com 10 frames braille e 4 ascii, avançando pelo `AppState.tick` — e **só** com `ExecStatus::Running`, porque spinner em tela parada finge atividade |
 | **Popup/overlay** | `tui-popup` | `Clear` + área calculada com clamp: já temos no `?`; extrair helper e testar em 80×24 |
 | **Diff entre scans** | `hwatch` | comparar `findings` por fingerprint com o scan anterior: "novo/ainda/sumiu" |
 | **Heatmap de atividade** | `sprout` | blocos `░▒▓█` em grade de 7×N (scans por dia) |
 | **Mapa do context pack** | `amtr` | barra segmentada por fonte (código, wiki, findings) + `Gauge` |
-| **Supervisão de sessões** | `iris`, `savras` | chips de estado: `rodando` · `aguardando` · `falhou` |
+| **Supervisão de sessões** [entregue] | `iris`, `savras` | feito no PR-UX2 com a verdade do dado: `[ok]`/`[falhou]` vêm de `SessionLine.ok` e `[exec]` do `ExecStatus` vivo. **`aguardando` não existe** na store para comando, então não virou chip |
 | **Busca fuzzy com preview** | `television`, `atuin` | filtro incremental + preview do match (nosso `/` evolui) |
 | **Árvore de JSON/TOML** | `otree` | work item cru ao lado do triage, colapsável (reusa `tui-tree-widget`) |
 | **Markdown melhor** | `md-tui` | tabelas e listas aninhadas no renderer próprio (hoje ~300 linhas) |
@@ -69,8 +73,8 @@ adicionar dependência, use o nativo. Isso corta ~6 crates da lista original.
 
 ## 6. Ordem de implementação (PRs separados, merge humano)
 
-1. **PR-UX1 — nativo primeiro**: `BarChart` de severidade + `Sparkline` de tendência + `Gauge` de budget + `Scrollbar`. Zero dep. Testes `TestBackend` (altura constante, sem `\n`, 80×24).
-2. **PR-UX2 — status**: cartões caseiros + spinner caseiro + chips de sessão. Zero dep.
+1. **PR-UX1 — nativo primeiro** [entregue] (ADR-0036, merge 71c20b9 via #68): `BarChart` de severidade + `Sparkline` de tendência + `Gauge` de uso do índice de retrieval + `Scrollbar` (budget fica para quando existir contador — PR17 da onda TE). Zero dep. Testes `TestBackend` (altura constante, sem `\n`, 80×24).
+2. **PR-UX2 — status** [entregue] (ADR-0037, merge pendente — branch ux/pr-ux2-cartoes-spinner-chips): cartões caseiros + spinner caseiro + chips de sessão. Zero dep.
 3. **PR-UX3 — árvore**: `tui-tree-widget` no painel de wiki (1 dep).
 4. **PR-UX4 — tema**: `opaline` + `termprofile` (2 deps) com `KIRA_GLYPHS=ascii` testado.
 5. **PR-UX5 — marca**: `tui-big-text` no cabeçalho (1 dep).

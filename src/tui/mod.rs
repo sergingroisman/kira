@@ -22,11 +22,15 @@ pub mod app;
 pub mod chrome;
 /// Glifos do dashboard: Unicode (padrão) e ASCII (`KIRA_GLYPHS=ascii`).
 pub mod glyph;
+/// Grid do Resumo (PR-UX2): colunas por largura e altura de cada cartão.
+pub mod grid;
 pub mod keymap;
 /// Geometria pura da casca (faixas do chrome, 100% × 50–50 do inspetor).
 pub mod layout;
 /// Renderizador markdown mínimo do painel de wiki (W6-PR4).
 pub mod markdown;
+/// Spinner de execução (PR-UX2): puro sobre o tick, só com filho rodando.
+pub mod spinner;
 pub mod state;
 pub mod theme;
 /// Viewport das listas: offset que mantém o cursor visível e rótulo `12/87`.
