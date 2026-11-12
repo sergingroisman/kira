@@ -413,16 +413,18 @@ pub fn tools_line(rows: &[FindingRow]) -> String {
 
 /// Estado vazio honesto do painel (spec W6-PR2): arquivo presente e vazio ⇒
 /// `(0 achados no último scan)`; ausente/corrompido ⇒ `—` com a causa que o
-/// snapshot já carrega — nunca uma causa genérica inventada aqui.
+/// snapshot já carrega — nunca uma causa genérica inventada aqui. SEM o
+/// prefixo `achados:` — o campo vive uma única vez no cabeçalho; repeti-lo na
+/// seção era duplicação (o painel só traz o conteúdo, não o rótulo de novo).
 pub fn empty_findings_line(snapshot: &Snapshot) -> String {
     if snapshot.findings == Some(0) {
-        return "achados: (0 achados no último scan)".to_string();
+        return "(0 achados no último scan)".to_string();
     }
     let cause = snapshot
         .findings_note
         .clone()
         .unwrap_or_else(|| "findings.json ausente — rode kira scan".to_string());
-    format!("achados: — ({cause})")
+    dash_line(&cause)
 }
 
 /// Linhas de texto do painel de achados: a MESMA lista alimenta o widget TUI
@@ -865,83 +867,167 @@ fn dash_line(cause: &str) -> String {
     format!("— ({cause})")
 }
 
+/// Máximo de CHARS de um VALOR do cabeçalho (100): o painel é denso e cada
+/// campo ocupa exatamente uma linha — a causa integral vai para o `?` e para
+/// o `--snapshot` (texto, que aceita várias linhas), nunca para o painel.
+pub const HEADER_VALUE_MAX_CHARS: usize = 100;
+
+/// Colapsa um valor em EXATAMENTE UMA linha (regra do dono: quebrar linha no
+/// cabeçalho é erro imperdoável — o defeito real de fumaça veio da causa de
+/// duas linhas do PAT). CR/LF viram espaço, espaços múltiplos colapsam e o
+/// resultado é truncado em `max` CHARS com `…` — conta `char`, nunca byte,
+/// então um caractere multibyte nunca é cortado ao meio. Função pura.
+pub fn one_line(value: &str, max: usize) -> String {
+    let mut line = String::new();
+    let mut pending_space = false;
+    for ch in value.chars() {
+        let is_space = matches!(ch, ' ' | '\t' | '\n' | '\r');
+        if is_space {
+            // Espaço só entra se já há conteúdo (também apara bordas) e uma
+            // única vez por sequência — `\r\n` e tabuladas viram um espaço.
+            if !line.is_empty() {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space {
+            line.push(' ');
+            pending_space = false;
+        }
+        line.push(ch);
+    }
+    if line.chars().count() > max {
+        // Total ≤ max: `max - 1` chars de conteúdo + o `…` do corte.
+        let kept: String = line.chars().take(max.saturating_sub(1)).collect();
+        return format!("{kept}…");
+    }
+    line
+}
+
+/// Causa INTEGRAL de cada dado ausente cujo cabeçalho corta para caber em uma
+/// linha (pat, dev, store, achados): alimentam a seção de pendências do `?` e
+/// do `--snapshot` — texto, que aceita várias linhas. Pura sobre o snapshot.
+pub fn pending_causes(snapshot: &Snapshot) -> Vec<String> {
+    let causes = [
+        ("pat", snapshot.pat_note.as_ref()),
+        ("dev", snapshot.dev_note.as_ref()),
+        ("store", snapshot.store_note.as_ref()),
+        ("achados", snapshot.findings_note.as_ref()),
+    ];
+    let mut lines = Vec::new();
+    for (label, note) in causes {
+        let Some(note) = note else { continue };
+        for (index, line) in note.lines().enumerate() {
+            if index == 0 {
+                // O rótulo usa ` — ` (e não `: `) para nunca colidir com o
+                // campo de uma linha do cabeçalho (`pat: —`).
+                lines.push(format!("· {label} — {line}"));
+            } else {
+                // Continuação indentada: é texto, pode ter várias linhas.
+                lines.push(format!("  {line}"));
+            }
+        }
+    }
+    lines
+}
+
 /// Linhas do cabeçalho, puras sobre o snapshot: a MESMA lista alimenta o
 /// widget TUI e a saída de texto do `--snapshot`/não-TTY (CI).
 ///
 /// A store ausente não esconde o cabeçalho: projeto/root saem como `—` com a
 /// nota acionável na última linha (contrato 4 da spec — exit 0 é diagnóstico).
 pub fn header_lines(snapshot: &Snapshot) -> Vec<String> {
+    // REGRA (dono): cada campo do cabeçalho ocupa EXATAMENTE uma linha — todo
+    // valor passa por [`one_line`] (CR/LF colapsados, corte em 100 chars com
+    // `…`); a causa integral vai para o `?`/`--snapshot` via
+    // [`pending_causes`].
+    let max = HEADER_VALUE_MAX_CHARS;
     let mut lines = Vec::new();
     match &snapshot.project {
         Some(project) => {
-            lines.push(format!("projeto: {}", project.name));
+            lines.push(format!("projeto: {}", one_line(&project.name, max)));
             lines.push(format!(
                 "root: {}",
-                store::display_path(Path::new(&project.root_path))
+                one_line(&store::display_path(Path::new(&project.root_path)), max)
             ));
-            lines.push(format!("id: {}", project.id));
+            lines.push(format!("id: {}", one_line(&project.id, max)));
         }
         None => {
             lines.push(format!(
                 "projeto: {}",
-                dash_line(
-                    snapshot
-                        .store_note
-                        .as_deref()
-                        .unwrap_or("store sem projeto")
+                one_line(
+                    &dash_line(
+                        snapshot
+                            .store_note
+                            .as_deref()
+                            .unwrap_or("store sem projeto")
+                    ),
+                    max
                 )
             ));
             lines.push(format!(
                 "root: {}",
-                snapshot
-                    .root
-                    .as_ref()
-                    .map(|root| store::display_path(root))
-                    .unwrap_or_else(|| dash_line("sem diretório atual"))
+                one_line(
+                    &snapshot
+                        .root
+                        .as_ref()
+                        .map(|root| store::display_path(root))
+                        .unwrap_or_else(|| dash_line("sem diretório atual")),
+                    max
+                )
             ));
             lines.push(format!("id: {}", dash_line("sem projeto no store")));
         }
     }
     match &snapshot.dev_name {
-        Some(name) => lines.push(format!("dev: {name}")),
+        Some(name) => lines.push(format!("dev: {}", one_line(name, max))),
         None => lines.push(format!(
             "dev: {}",
-            dash_line(
-                snapshot
-                    .dev_note
-                    .as_deref()
-                    .unwrap_or("sem dev_name no config")
+            one_line(
+                &dash_line(
+                    snapshot
+                        .dev_note
+                        .as_deref()
+                        .unwrap_or("sem dev_name no config")
+                ),
+                max
             )
         )),
     }
-    lines.push(format!("llm: {LLM_LABEL}"));
+    lines.push(format!("llm: {}", one_line(LLM_LABEL, max)));
     match &snapshot.pat_masked {
-        Some(masked) => lines.push(format!(
-            "pat: {masked} (de {})",
-            snapshot
-                .pat_source
-                .as_deref()
-                .unwrap_or("origem desconhecida")
-        )),
-        None => lines.push(format!(
-            "pat: {}",
-            dash_line(
+        Some(masked) => {
+            let value = format!(
+                "{masked} (de {})",
                 snapshot
-                    .pat_note
+                    .pat_source
                     .as_deref()
-                    .unwrap_or("defina AZURE_DEVOPS_PAT ou rode kira setup")
-            )
-        )),
+                    .unwrap_or("origem desconhecida")
+            );
+            lines.push(format!("pat: {}", one_line(&value, max)));
+        }
+        None => {
+            // A causa integral (duas linhas, com a dica do `kira doctor`)
+            // estourava o campo — defeito real de fumaça. No painel, só o
+            // ponteiro para o `?`; o texto inteiro está em [`pending_causes`].
+            lines.push(format!(
+                "pat: {}",
+                dash_line("PAT não encontrado — veja ? para o passo a passo")
+            ));
+        }
     }
     match snapshot.findings {
         Some(count) => lines.push(format!("achados: {count}")),
         None => lines.push(format!(
             "achados: {}",
-            dash_line(
-                snapshot
-                    .findings_note
-                    .as_deref()
-                    .unwrap_or("nunca rodou kira scan")
+            one_line(
+                &dash_line(
+                    snapshot
+                        .findings_note
+                        .as_deref()
+                        .unwrap_or("nunca rodou kira scan")
+                ),
+                max
             )
         )),
     }
@@ -959,9 +1045,9 @@ pub fn header_lines(snapshot: &Snapshot) -> Vec<String> {
             dash_line("nunca rodou kira scan")
         )),
     }
-    if let Some(note) = &snapshot.store_note {
-        lines.push(format!("store: {note}"));
-    }
+    // O campo `store:` saiu do cabeçalho: dizia o mesmo que `projeto: — (…)`
+    // e a causa integral já aparece nos painéis que dependem do store (e em
+    // [`pending_causes`]).
     lines
 }
 
@@ -979,6 +1065,16 @@ pub fn text_report(snapshot: &Snapshot) -> String {
     for line in header_lines(snapshot) {
         text.push_str(&line);
         text.push('\n');
+    }
+    // Pendências (causa INTEGRAL, pode ter várias linhas — é texto, não
+    // painel): o cabeçalho corta em 100 chars, o snapshot não mente.
+    let pendings = pending_causes(snapshot);
+    if !pendings.is_empty() {
+        text.push_str("\npendências:\n");
+        for line in pendings {
+            text.push_str(&line);
+            text.push('\n');
+        }
     }
     // Painel de achados (W6-PR2): mesma informação da TUI, em colunas de texto.
     let findings = findings_lines(snapshot);
@@ -1100,9 +1196,135 @@ mod tests {
             ),
             ..Snapshot::default()
         };
-        let text = header_lines(&snapshot).join("\n");
+        let lines = header_lines(&snapshot);
+        let text = lines.join("\n");
         assert!(text.contains("projeto: — (nenhuma trilha em"), "{text}");
-        assert!(text.contains("store: nenhuma trilha em"), "{text}");
+        // O campo `store:` saiu do cabeçalho: dizia o mesmo que `projeto: —`
+        // (duplicação) — a causa integral agora mora nas pendências.
+        assert!(
+            !lines.iter().any(|line| line.starts_with("store:")),
+            "campo store removido do cabeçalho: {text}"
+        );
+        let pendings = pending_causes(&snapshot).join("\n");
+        assert!(
+            pendings.contains("· store — nenhuma trilha em"),
+            "causa integral do store nas pendências: {pendings}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Disciplina de linha (regra do dono: quebrar linha é erro imperdoável)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn one_line_collapses_breaks_and_spaces_and_never_returns_two_lines() {
+        // CR/LF (isolados ou na sequência `\r\n`) viram UM espaço.
+        assert_eq!(one_line("a\nb", HEADER_VALUE_MAX_CHARS), "a b");
+        assert_eq!(one_line("a\r\nb", HEADER_VALUE_MAX_CHARS), "a b");
+        assert_eq!(one_line("a\r\rb", HEADER_VALUE_MAX_CHARS), "a b");
+        // Espaços múltiplos (e tab) colapsam; bordas aparadas.
+        assert_eq!(one_line("a   b\t c", HEADER_VALUE_MAX_CHARS), "a b c");
+        assert_eq!(one_line("   ", HEADER_VALUE_MAX_CHARS), "");
+        // Vazio e valor curto passam intactos.
+        assert_eq!(one_line("", HEADER_VALUE_MAX_CHARS), "");
+        assert_eq!(one_line("curto", HEADER_VALUE_MAX_CHARS), "curto");
+        // A garantia principal: NUNCA devolve mais de uma linha.
+        let multi = "primeira\nsegunda\r\n\r\n\tterceira";
+        let line = one_line(multi, HEADER_VALUE_MAX_CHARS);
+        assert!(!line.contains('\n'), "{line}");
+        assert!(!line.contains('\r'), "{line}");
+    }
+
+    #[test]
+    fn one_line_truncates_exactly_at_the_max_never_splitting_a_multibyte_char() {
+        // Exatamente no limite: intacto (sem `…` de sobra).
+        let at_limit = "x".repeat(HEADER_VALUE_MAX_CHARS);
+        assert_eq!(one_line(&at_limit, HEADER_VALUE_MAX_CHARS), at_limit);
+        // Um char acima do limite: total == max, terminando no `…`.
+        let cut = one_line(
+            &"x".repeat(HEADER_VALUE_MAX_CHARS + 1),
+            HEADER_VALUE_MAX_CHARS,
+        );
+        assert_eq!(cut.chars().count(), HEADER_VALUE_MAX_CHARS);
+        assert!(cut.ends_with('…'), "{cut}");
+        // Multibyte no limite: conta CHAR (não byte) — nenhum corte ao meio,
+        // nenhum pânico; todo char do resultado é válido.
+        let accents = "á".repeat(HEADER_VALUE_MAX_CHARS + 5);
+        let cut = one_line(&accents, HEADER_VALUE_MAX_CHARS);
+        assert_eq!(cut.chars().count(), HEADER_VALUE_MAX_CHARS);
+        assert!(
+            cut.chars().all(|c| c == 'á' || c == '…'),
+            "chars íntegros: {cut}"
+        );
+    }
+
+    #[test]
+    fn missing_pat_shows_the_short_pointer_and_the_full_cause_goes_to_pendings() {
+        // Defeito real de fumaça: a causa de DUAS linhas do PAT estourava o
+        // campo. No cabeçalho, ponteiro curto; no `?`/snapshot, o texto todo.
+        let snapshot = Snapshot {
+            pat_note: Some(
+                "PAT não encontrado — defina a variável de ambiente AZURE_DEVOPS_PAT com um \
+                 Personal Access Token (ex.: export AZURE_DEVOPS_PAT=...)\n\
+                 para diagnosticar a configuração desta máquina, rode `kira doctor`"
+                    .to_string(),
+            ),
+            ..Snapshot::default()
+        };
+        let header = header_lines(&snapshot).join("\n");
+        assert!(
+            header.contains("pat: — (PAT não encontrado — veja ? para o passo a passo)"),
+            "ponteiro curto no painel: {header}"
+        );
+        assert!(
+            !header.contains("defina a variável"),
+            "a causa integral NUNCA vai para o painel: {header}"
+        );
+        let pendings = pending_causes(&snapshot).join("\n");
+        assert!(
+            pendings.contains("· pat — PAT não encontrado — defina a variável"),
+            "{pendings}"
+        );
+        assert!(
+            pendings.contains("para diagnosticar a configuração desta máquina, rode `kira doctor`"),
+            "a dica do doctor inteira nas pendências: {pendings}"
+        );
+        // O `--snapshot` (texto) carrega a seção de pendências inteira.
+        let report = text_report(&snapshot);
+        assert!(report.contains("\npendências:\n"), "{report}");
+        assert!(report.contains("kira doctor"), "{report}");
+    }
+
+    #[test]
+    fn every_header_line_is_a_single_line_within_the_value_budget() {
+        // Causas longas e multilinha em TODOS os campos de uma vez: a
+        // disciplina de linha vale para o cabeçalho inteiro, não só o pat.
+        let long = "causa longa ".repeat(30) + "\nsegunda linha que NUNCA vaza";
+        let snapshot = Snapshot {
+            store_note: Some(long.clone()),
+            dev_note: Some(long.clone()),
+            pat_note: Some(long.clone()),
+            findings_note: Some(long),
+            ..Snapshot::default()
+        };
+        for line in header_lines(&snapshot) {
+            assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+            // O VALOR cabe no orçamento (o rótulo `campo: ` vem por fora).
+            let value = line
+                .split_once(": ")
+                .map(|(_, value)| value)
+                .unwrap_or(&line);
+            assert!(
+                value.chars().count() <= HEADER_VALUE_MAX_CHARS,
+                "valor acima do orçamento: {line}"
+            );
+        }
+        // E a seção de pendências carrega a segunda linha integral (texto).
+        let pendings = pending_causes(&snapshot).join("\n");
+        assert!(
+            pendings.contains("segunda linha que NUNCA vaza"),
+            "{pendings}"
+        );
     }
 
     #[test]
@@ -1252,10 +1474,9 @@ mod tests {
         assert!(snapshot.findings.is_none());
         let note = snapshot.findings_note.clone().unwrap_or_default();
         assert!(note.contains("ilegível"), "{note}");
-        assert!(
-            empty_findings_line(&snapshot).starts_with("achados: — ("),
-            "{note}"
-        );
+        // O painel traz o conteúdo SEM repetir o rótulo `achados:` (o campo
+        // vive uma única vez, no cabeçalho).
+        assert!(empty_findings_line(&snapshot).starts_with("— ("), "{note}");
     }
 
     #[test]
@@ -1265,24 +1486,15 @@ mod tests {
             findings_note: Some("nunca rodou kira scan".to_string()),
             ..Snapshot::default()
         };
-        assert_eq!(
-            empty_findings_line(&absent),
-            "achados: — (nunca rodou kira scan)"
-        );
+        assert_eq!(empty_findings_line(&absent), "— (nunca rodou kira scan)");
         // Arquivo presente e vazio: contagem zero explícita, sem `—` de mentira.
         let zero = Snapshot {
             findings: Some(0),
             ..Snapshot::default()
         };
-        assert_eq!(
-            empty_findings_line(&zero),
-            "achados: (0 achados no último scan)"
-        );
+        assert_eq!(empty_findings_line(&zero), "(0 achados no último scan)");
         // E `findings_lines` devolve exatamente essa linha no estado vazio.
-        assert_eq!(
-            findings_lines(&zero),
-            vec!["achados: (0 achados no último scan)"]
-        );
+        assert_eq!(findings_lines(&zero), vec!["(0 achados no último scan)"]);
     }
 
     #[test]

@@ -212,6 +212,19 @@ impl Drop for Sandbox {
     }
 }
 
+/// Coleta a saída de um `Command` já preparado (não-TTY por construção: o
+/// stdout do filho é um pipe).
+fn output_of(mut command: Command) -> (i32, String, String) {
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("executar kira: {err}"));
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 /// Spawns the built `kira` inside the sandbox (non-TTY by construction: the
 /// child's stdout is a pipe), returning (exit code, stdout, stderr).
 fn run_kira(sandbox: &Sandbox, extra_env: &[(&str, &str)], args: &[&str]) -> (i32, String, String) {
@@ -230,14 +243,54 @@ fn run_kira(sandbox: &Sandbox, extra_env: &[(&str, &str)], args: &[&str]) -> (i3
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let output = command
-        .output()
-        .unwrap_or_else(|err| panic!("executar kira {args:?}: {err}"));
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+    output_of(command)
+}
+
+/// Igual ao [`run_kira`], mas SEM nenhum PAT: o caso real do teste de fumaça
+/// — `AZURE_DEVOPS_PAT` ausente e keyring vazio ⇒ `pat: —` com causa.
+fn run_kira_without_pat(sandbox: &Sandbox, args: &[&str]) -> (i32, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
+    command
+        .args(args)
+        .current_dir(&sandbox.cwd)
+        .env("KIRA_STORE_DIR", &sandbox.store)
+        .env("KIRA_CONFIG", sandbox.config_path())
+        .env_remove("AZURE_DEVOPS_PAT")
+        .env("KIRA_OLLAMA_URL", "http://127.0.0.1:1")
+        .env_remove("AZURE_DEVOPS_ORG")
+        .env_remove("AZURE_DEVOPS_PROJECT")
+        .env_remove("NO_COLOR");
+    output_of(command)
+}
+
+#[test]
+fn snapshot_without_pat_and_store_shows_one_line_pat_and_the_doctor_hint() {
+    // Defeito real de fumaça: a causa de DUAS linhas do `Error::MissingPat`
+    // estourava o campo `pat:` do cabeçalho. Correção: no painel, UMA linha
+    // com o ponteiro para o `?`; a causa integral (com a dica do `kira
+    // doctor`) vai para a seção de pendências do texto/snapshot.
+    let sandbox = Sandbox::new("no-pat-no-store");
+    let (code, out, err) = run_kira_without_pat(&sandbox, &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "{out}{err}");
+    // `pat: ` aparece em EXATAMENTE uma linha (um campo, uma linha) e essa
+    // linha é o ponteiro curto — nunca a causa de duas linhas.
+    let pat_lines: Vec<&str> = out.lines().filter(|line| line.contains("pat: ")).collect();
+    assert_eq!(pat_lines.len(), 1, "um campo, uma linha: {out}");
+    assert_eq!(
+        pat_lines[0], "pat: — (PAT não encontrado — veja ? para o passo a passo)",
+        "ponteiro curto no cabeçalho: {out}"
+    );
+    // A causa INTEGRAL está no texto/snapshot, incluindo a dica do doctor.
+    assert!(
+        out.contains("defina a variável de ambiente AZURE_DEVOPS_PAT"),
+        "causa integral no snapshot: {out}"
+    );
+    assert!(
+        out.contains("para diagnosticar a configuração desta máquina, rode `kira doctor`"),
+        "dica do doctor no snapshot: {out}"
+    );
+    // E o campo `store:` não existe mais no cabeçalho (duplicava `projeto: —`).
+    assert!(!out.contains("store:"), "campo store removido: {out}");
 }
 
 #[test]

@@ -146,4 +146,70 @@ mod tests {
         let text = render_text(&lines, 20, 3);
         assert!(!text.is_empty(), "{text}");
     }
+
+    /// TestBackend provando a disciplina de linha do cabeçalho REAL
+    /// (`header_lines` sobre um snapshot com causas longas e multilinha):
+    /// altura constante (a última linha aparece nos dois casos na MESMA
+    /// altura de bloco) e nenhuma célula do buffer carrega `\n`/`\r`.
+    #[test]
+    fn header_height_is_constant_and_no_buffer_cell_holds_a_newline() {
+        use crate::tui::state::{self, Snapshot};
+        // Causa longa E multilinha — o defeito real de fumaça do PAT, agora
+        // em todos os campos de nota do snapshot de uma vez.
+        let long = "causa longa para estourar o campo ".repeat(6) + "\r\nsegunda linha";
+        let snapshot = Snapshot {
+            store_note: Some(long.clone()),
+            dev_note: Some(long.clone()),
+            pat_note: Some(long.clone()),
+            findings_note: Some(long),
+            ..Snapshot::default()
+        };
+        let long_lines = state::header_lines(&snapshot);
+        let short_lines = state::header_lines(&Snapshot::default());
+        // O bloco do cabeçalho é o conteúdo + as duas bordas — MESMA altura
+        // nos dois casos, aconteça o que acontecer com o comprimento das
+        // causas (largura 120: nenhuma linha quebra por largura).
+        let height = (short_lines.len() + 2) as u16;
+        let long_text = render_text(&long_lines, 120, height);
+        let short_text = render_text(&short_lines, 120, height);
+        // Altura constante: a borda inferior fica na MESMA linha nos dois.
+        assert_eq!(
+            long_text.lines().count(),
+            short_text.lines().count(),
+            "altura do cabeçalho não depende do comprimento da causa"
+        );
+        assert!(
+            long_text.contains("└"),
+            "borda inferior presente: {long_text}"
+        );
+        // E a ÚLTIMA linha do cabeçalho continua visível com causa longa —
+        // com `\n` cru no valor, o wrap empurraria o resto do bloco para fora.
+        assert!(
+            long_text.contains("último scan:"),
+            "última linha visível mesmo com causa longa: {long_text}"
+        );
+        // Nenhuma célula do buffer carrega quebra de linha (o CR/LF da causa
+        // foi colapsado por `one_line` antes de chegar ao widget).
+        let backend_buffer = {
+            // Re-renderiza capturando as células em vez do texto achatado.
+            use ratatui::{Terminal, backend::TestBackend};
+            let backend = TestBackend::new(120, height);
+            let mut terminal =
+                Terminal::new(backend).unwrap_or_else(|err| panic!("backend: {err}"));
+            let widget = HeaderWidget::new(&long_lines, Some("proj"), theme::mono());
+            terminal
+                .draw(|frame| frame.render_widget(widget, frame.area()))
+                .unwrap_or_else(|err| panic!("draw: {err}"));
+            terminal.backend().buffer().clone()
+        };
+        for y in 0..height {
+            for x in 0..120 {
+                let symbol = backend_buffer[(x, y)].symbol();
+                assert!(
+                    !symbol.contains('\n') && !symbol.contains('\r'),
+                    "célula ({x},{y}) com quebra de linha: {symbol:?}"
+                );
+            }
+        }
+    }
 }
