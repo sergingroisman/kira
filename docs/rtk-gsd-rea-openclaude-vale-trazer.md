@@ -7,9 +7,10 @@
   seção final, vira arquivo só com aceite do dono (ADR-0024/0025/0026 já foram
   tomados por outras sessões — a 0026 é dos tech-leads; a colisão de dois
   ADR-0025 em `docs/adr/` cabe ao Orchestrator resolver)
-- **Dumps**: `docs/dumps/snapshot-{gsd-2,openclaude,rea}.md` — **locais, não
+- **Dumps**: `docs/dumps/snapshot-{rtk,gsd-2,openclaude,rea}.md` — **locais, não
   comitados** (fornecidos pelo dono em 12/Nov; a pedido dele ficam fora do git —
-  proveniência em `docs/dumps/snapshot-README.md`) — o dump do RTK segue faltando
+  proveniência em `docs/dumps/snapshot-README.md`) — os 4 repos escolhidos
+  estão cobertos
 - **Veredito**: 1 pulo do gato + 10 melhorias (fila PR34–PR43); nenhum contrato do
   mandato quebrado; nenhuma dependência nova; nada disso depende de daemon, MCP,
   embeddings ou modelo caro.
@@ -167,11 +168,11 @@ determinísticos; spawn só sob comando explícito.
 
 | PR | Escopo | Arquivos | Aceite específico | Quando |
 |---|---|---|---|---|
-| **PR34** | Ledger de economia: pack chars vs teto, fonte, nº de chamadas LLM por sessão; estimativa `chars/CHARS_PER_TOKEN` no header do pack e no `--json` | `src/context/mod.rs`, `src/store/` | Duas execuções no mesmo estado ⇒ ledger idêntico; dashboard/history mostram o número sem inventar (ausente ⇒ `—` + causa) | **agora** |
+| **PR34** | Ledger de economia: pack chars vs teto, fonte, nº de chamadas LLM por sessão; estimativa `chars/CHARS_PER_TOKEN` no header do pack e no `--json` | `src/context/mod.rs`, `src/store/` | Duas execuções no mesmo estado ⇒ ledger idêntico; dashboard/history mostram o número sem inventar (ausente ⇒ `—` + causa); sinal de **pack ocioso** (orçamento desperdiçado ⇒ nota — suspeita de furo de coleta, padrão `rtk discover`) | **agora** |
 | **PR35** | Cache de raciocínio (o pulo): wiki-hit ≥ 0.50 ⇒ causa predita sem LLM, fonte `cache-wiki` no output e no episódio; `--no-cache` | `src/triage.rs`, `src/wiki/` | `--eval` mede as duas rotas (cache on/off); item novo fora da wiki ⇒ comportamento idêntico ao de hoje (byte a byte no modo padrão) | **agora** |
 | **PR36** | Evidência em 3 estados (observado/inferido/desconhecido) no output e no episódio | `src/llm/prompts.rs`, `src/wiki/episode.rs`, fixtures | Fixtures de prompt atualizadas byte a byte; hash do prompt recomputado por teste (padrão PR7) | **agora** |
 | **PR37** | Digest bruto com endereço no scan (`.kira/raw/`, cap + rotação) | `src/scan/node.rs`, `src/scan/dotnet.rs` | findings.json continua byte-idêntico em duas execuções; raw capado; `.kira/` segue sem comitar — mecanismo a acertar no PR: hoje o `.gitignore` só cobre `/target`, o `.git/info/exclude` só cobre `.delta/`, e a nota `.kira/README.md` prevista no AGENTS.md não existe neste clone | **agora** (junto do item P1 do relatório do gitingest — o BOM-sniff) |
-| **PR38** | Dedup + agrupamento nos trechos do pack | `src/context/repo.rs`, fixtures | Pack com linhas repetidas colapsa com contagem; âncora `caminho:linha` preservada | **agora** |
+| **PR38** | Dedup + agrupamento nos trechos do pack | `src/context/repo.rs`, fixtures | Pack com linhas repetidas colapsa com contagem; âncora `caminho:linha` preservada; cada estratégia só entra se o fixture mostrar corte ≥ 20% (barra de qualidade do RTK) | **agora** |
 | **PR39** | Repo map determinístico no brief (≤ ~200 tokens) | `src/context/` | Mesmo estado ⇒ mesmo mapa; arquivos citados em findings primeiro (regra vigente) | **agora** |
 | **PR40** | `token_profile` em `config.toml` coordenando teto e caps | `src/credentials.rs` (resolução), `src/context/mod.rs` | `budget`/`balanced`/`quality` ⇒ três packs dourados distintos; inválido ⇒ `balanced` com aviso | **agora** |
 | **PR41** | `kira rea` wrapper + pergunta no `setup` | `src/rea/` (novo), `src/binresolve.rs`, `src/setup.rs` | rea ausente ⇒ erro acionável sem spawn; saída nunca entra em prompt sem passar por `redact` + teto; teste com shim (padrão do scan) | **agora** |
@@ -191,15 +192,9 @@ por ciclo é microssegundos; o P9 é o único spawn e só sob comando explícito
 
 ## Pendências do dono
 
-1. **Dump do RTK não chegou** — os dumps de gsd-2, openclaude e rea estão em
-   `docs/dumps/snapshot-*.md` (12/Nov; **locais, não comitados** — decisão do
-   dono; análise no apêndice); falta o do RTK, o 4º repo escolhido. Sem ele, a
-   análise do RTK fica no que o site/README público mostram (e a licença mista
-   Apache-2.0/BUSL-1.1 manda "só conceito" — dump serve para confirmar as 4
-   estratégias, não para copiar).
-2. **Rotular os 20 bugs do `tests/fixtures/triage_gold/`** — pré-requisito (d) do
+1. **Rotular os 20 bugs do `tests/fixtures/triage_gold/`** — pré-requisito (d) do
    mandato; é o que valida o PR35/PR36 **com número** no `--eval`.
-3. **Aprovar o plano** — os PRs viram fila no `docs/roadmap-prs.md` (ledger do
+2. **Aprovar o plano** — os PRs viram fila no `docs/roadmap-prs.md` (ledger do
    Orchestrator) e o ADR-0027 abaixo vira arquivo.
 
 ## Permanece rejeitado (desta rodada)
@@ -268,3 +263,20 @@ linha no dump.
   do dump) existe para **economizar tokens de definição de ferramenta** — para o
   KIRA, a mesma lição vale para as seções versionadas do prompt (o gate de hash
   byte a byte do PR7 já impede inchaço silencioso).
+- **RTK** (`snapshot-rtk.md`): a análise dos docs públicos se sustenta no dump —
+  e ganha três coisas que o site não mostrava. (1) **Contrato de qualidade dos
+  filtros**: "each filter must cut at least 20%" (linha 1758) — a barra que o
+  PR38 adota para cada estratégia do packer. (2) **O estimador**: `bytes / 4` em
+  `src/core/tracking.rs`, aplicado IGUAL ao bruto e ao filtrado — "the ratios
+  are reliable but the absolute token counts are approximate" (linhas 1758 e
+  6895); o KIRA usa 3 chars/token por ser PT-BR (mais conservador — fica).
+  (3) **A família do medidor**: `rtk gain` tem summary / `--graph` (30 dias) /
+  `--history` / `--daily` / `--all --format json` para dashboards (linhas
+  1133–1142) e o `rtk discover` caça economia perdida (linha 1144) — o PR34
+  ganha um sinal análogo: **pack ocioso** (orçamento não usado) é suspeita de
+  furo de coleta, não de ferramenta. Detalhe de honestidade que o dump repete
+  (linha 1150): os % medem *bytes de saída de comando*, não a conta total.
+  Licença agora precisa: filtros/hooks são Apache-2.0 na edição `rtk-oss`
+  (linha 1327); **engine e proxy são BUSL-1.1** (linha 1367) — mantém-se o
+  "conceito sim, código não" do dono; o bypass continua rastreado no gain
+  (linha 1181), mesmo padrão do futuro `--no-cache` do KIRA.
