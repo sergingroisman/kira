@@ -7,6 +7,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 
 use kira::board::{self, BoardProvider};
+use kira::capabilities::{self, Capability};
 use kira::credentials;
 use kira::doctor;
 use kira::error::Error;
@@ -198,6 +199,19 @@ enum Command {
         #[command(subcommand)]
         action: PrAction,
     },
+    /// Conecta uma integração opcional (capacidade, ADR-0030): é AQUI que a
+    /// credencial nasce (aula do ADR-0025 movida para o momento em que o dev
+    /// entende por que precisa dela). A implementação por provider (aula,
+    /// validação 200/401/403/sem rede, gravação no keyring) chega no MVP-3 —
+    /// hoje o comando aceita o argumento e responde claramente, sem fingir
+    /// que conectou
+    #[command(
+        after_help = "Exemplos:\n  kira connect azure    # board Azure DevOps (implementação no MVP-3)\n  kira connect github   # scm.github — ainda não implementado\n  kira connect gitlab   # scm.gitlab — ainda não implementado"
+    )]
+    Connect {
+        /// Provider da integração: `azure` | `github` | `gitlab`
+        provider: String,
+    },
 }
 
 /// `kira pr` actions: for now only the local draft.
@@ -318,16 +332,23 @@ async fn main() -> ExitCode {
 
 async fn run(command: Command) -> Outcome {
     match command {
-        Command::Inspect { id, project } => match inspect(id, project).await {
-            Ok(text) => {
-                print!("{text}");
-                Outcome::success(text)
+        Command::Inspect { id, project } => {
+            // ADR-0030 #5/#6: a jornada de board só começa com a capacidade
+            // conectada — a prova vem ANTES de resolver credencial ou rede.
+            if let Err(blocked) = gate_board() {
+                return blocked;
             }
-            Err(err) => {
-                print_error(&err);
-                Outcome::failure(err.to_string())
+            match inspect(id, project).await {
+                Ok(text) => {
+                    print!("{text}");
+                    Outcome::success(text)
+                }
+                Err(err) => {
+                    print_error(&err);
+                    Outcome::failure(err.to_string())
+                }
             }
-        },
+        }
         Command::Doctor => {
             let (ok, summary) = doctor::run().await;
             Outcome {
@@ -378,6 +399,65 @@ async fn run(command: Command) -> Outcome {
             read_only,
         } => dashboard_command(snapshot, read_only),
         Command::Pr { action } => pr_command(action),
+        Command::Connect { provider } => connect_command(&provider),
+    }
+}
+
+/// ADR-0030 #5/#6: a jornada de board (`triage <id>`, `inspect`) só começa com
+/// `board.azure` conectada PARA ESTE PROJETO. A conferência roda antes de
+/// qualquer credencial ou rede; qualquer falha do store também bloqueia
+/// (fail-closed) — sem prova do estado, o comando não executa.
+fn gate_board() -> Result<(), Outcome> {
+    let Some(root) = store::detect_project_root() else {
+        let message =
+            "não foi possível determinar o projeto atual — rode dentro da raiz do repositório"
+                .to_string();
+        eprintln!("erro: {message}");
+        return Err(Outcome::failure(message));
+    };
+    let opened = Store::open_default();
+    let store = match opened {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("erro: {err}");
+            return Err(Outcome::failure(err.to_string()));
+        }
+    };
+    match capabilities::require_connected(&store, &root, Capability::BoardAzure) {
+        Ok(()) => Ok(()),
+        Err(capabilities::GateError::Missing(err)) => {
+            // Mensagem de capacidade, nunca 401/404 cru (ADR-0030 #5).
+            print_error(&err);
+            Err(Outcome::failure(err.to_string()))
+        }
+        Err(capabilities::GateError::Store(err)) => {
+            eprintln!("erro: {err}");
+            Err(Outcome::failure(err.to_string()))
+        }
+    }
+}
+
+/// `kira connect <provider>` (ADR-0030 #4): a credencial nasce aqui — mas a
+/// implementação (aula do PAT, validação, keyring, marcar a capacidade como
+/// conectada) é do MVP-3. Aceitar o argumento e responder claramente evita o
+/// "comando inexistente", que fingiria que o gating nunca vai abrir. Exit
+/// non-zero em TODOS os casos: nada foi conectado de verdade.
+fn connect_command(provider: &str) -> Outcome {
+    let message = match provider {
+        // Mensagem exata do MVP-1 (contrato de teste).
+        "azure" => "conecte com: kira connect azure (implementação no MVP-3)".to_string(),
+        // Mesmo padrão do azure: aceito, mas ainda não implementado.
+        "github" | "gitlab" => format!(
+            "conecte com: kira connect {provider} (ainda não implementado — fica para um MVP posterior)"
+        ),
+        other => format!("provider '{other}' desconhecido — use: kira connect azure|github|gitlab"),
+    };
+    println!("{message}");
+    Outcome {
+        code: ExitCode::FAILURE,
+        ok: false,
+        records: false,
+        summary: message,
     }
 }
 
@@ -477,6 +557,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             )
         }
         Command::Setup { .. } => ("setup".to_string(), String::new(), None),
+        Command::Connect { provider } => ("connect".to_string(), provider.clone(), None),
         Command::History { last } => (
             "history".to_string(),
             last.map_or_else(String::new, |n| format!("--last {n}")),
@@ -1227,6 +1308,15 @@ async fn triage_command(
             return Outcome::failure(message);
         }
     };
+    // ADR-0030 #5/#6: só o caminho VIVO (id) exige `board.azure` conectada. A
+    // prova vem ANTES de resolver credencial ou de qualquer rede — falhar aqui
+    // significa zero tentativa de rede (nada de reqwest, nada de PAT). O
+    // caminho offline (`--file`) fica intacto: não exige capacidade nenhuma.
+    if matches!(source, TriageSource::Id(_))
+        && let Err(blocked) = gate_board()
+    {
+        return blocked;
+    }
     // ADR-0019/ADR-0020: the backend choice is explicit and validated — a
     // costly backend missing (CLI absent, key unset) FAILS LOUDLY, never a
     // silent Ollama fallback.

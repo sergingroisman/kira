@@ -7,6 +7,7 @@
 pub mod ado;
 pub mod binresolve;
 pub mod board;
+pub mod capabilities;
 pub mod config;
 pub mod context;
 pub mod credentials;

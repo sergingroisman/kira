@@ -10,7 +10,9 @@
 //! - `facts`: free-form profile facts of the project (`kira note`);
 //! - `wiki_page` + `wiki_fts`: derived, disposable wiki index (ADR-0013);
 //! - `repo_file` + `repo_fts`: derived, disposable repository retrieval index
-//!   (FTS5, incremental, redacted on write — ADR-0021).
+//!   (FTS5, incremental, redacted on write — ADR-0021);
+//! - `capabilities`: state of the optional integrations (ADR-0030) per
+//!   project — nothing is connected implicitly, connecting is explicit.
 //!
 //! Rules enforced by the callers: the store is fail-open (a store error never
 //! breaks the main command) and it never stores secrets (no PAT/tokens/env)
@@ -31,7 +33,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -713,6 +715,24 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
         }
     }
 
+    // v4 — capabilities (MVP-1, ADR-0030): estado das integrações opcionais
+    // (`board.azure`, `scm.github`, `scm.gitlab`) POR PROJETO. Política do
+    // arquivo: migração aditiva — `CREATE TABLE IF NOT EXISTS` jamais recria
+    // (nem destrói) tabela existente; as strings de estado são validadas pelo
+    // caller (`crate::capabilities`), o store guarda o que foi escrito.
+    if current < 4 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS capabilities (
+                project_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (project_id, capability)
+            );",
+        )
+        .map_err(schema_error)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(schema_error)
 }
@@ -807,6 +827,47 @@ impl Store {
             paths.push(row.map_err(StoreError::Sql)?);
         }
         Ok(paths)
+    }
+
+    /// Estado gravado de uma capacidade (ADR-0030) para o projeto; `None` =
+    /// nunca registrada (desconectada por definição). O valor é string crua
+    /// porque a validação pertence ao caller (`crate::capabilities`) — o
+    /// store guarda exatamente o que foi escrito, nunca interpreta.
+    pub fn capability_state_raw(
+        &self,
+        project_id: &str,
+        capability: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT state FROM capabilities WHERE project_id = ?1 AND capability = ?2",
+                rusqlite::params![project_id, capability],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::Sql(other)),
+            })
+    }
+
+    /// Grava o estado de uma capacidade (UPSERT por projeto e capacidade):
+    /// conectar/desconectar nunca precisa apagar nem recriar a tabela.
+    pub fn capability_set_state_raw(
+        &self,
+        project_id: &str,
+        capability: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO capabilities (project_id, capability, state, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(project_id, capability) DO UPDATE SET state = ?3, updated_at = ?4",
+                rusqlite::params![project_id, capability, state, now_rfc3339_utc()],
+            )
+            .map_err(StoreError::Sql)?;
+        Ok(())
     }
 
     /// Every `repo_file` row of the project, sorted (tests and diagnostics).
@@ -1167,7 +1228,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap_or_else(|err| panic!("user_version: {err}"));
-        assert_eq!(version, 3, "migração deveria subir para a v3");
+        assert_eq!(version, 4, "migração deveria subir para a v4");
         assert!(
             store.wiki_fts5_enabled(),
             "wiki_fts deveria existir após a v2"
@@ -1183,6 +1244,89 @@ mod tests {
             .unwrap_or_else(|err| panic!("last_sessions: {err}"));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].summary, "sessão antiga");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migração v3 → v4 (MVP-1, ADR-0030): abrir um store da versão anterior
+    /// tem que preservar TODAS as tabelas antigas (e os dados nelas) e criar
+    /// só a `capabilities`. Nunca recriar tabela existente.
+    #[test]
+    fn migration_from_v3_keeps_old_tables_and_adds_capabilities() {
+        let (store, dir) = open_temp_store("migrate-v3");
+        // Dado antigo em cada tabela das versões 1–3: a migração é aditiva,
+        // nada pode ser perdido nem recriado do zero.
+        let project = store
+            .ensure_project(&dir)
+            .unwrap_or_else(|err| panic!("ensure_project: {err}"));
+        store
+            .record(
+                &project,
+                "inspect",
+                "42",
+                None,
+                "2026-11-10T21:00:00Z",
+                10,
+                true,
+                "sessão da v3",
+            )
+            .unwrap_or_else(|err| panic!("record: {err}"));
+        store
+            .add_fact(&project.id, "fato da v3")
+            .unwrap_or_else(|err| panic!("add_fact: {err}"));
+        drop(store);
+
+        // Rebaixa o store para exatamente o estado que a v3 deixava: sem a
+        // tabela `capabilities` (a primeira abertura era v4, então ela é
+        // removida junto) e com user_version = 3.
+        {
+            let path = dir.join(DB_FILE);
+            let conn = rusqlite::Connection::open(&path)
+                .unwrap_or_else(|err| panic!("abrir store para rebaixar: {err}"));
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS capabilities;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap_or_else(|err| panic!("rebaixar store: {err}"));
+        }
+
+        let reopened = Store::open_in_dir(&dir).unwrap_or_else(|err| panic!("reabrir v3: {err}"));
+        let version: i64 = reopened
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or_else(|err| panic!("user_version: {err}"));
+        assert_eq!(version, 4, "migração deveria subir para a v4");
+
+        // Tabela nova apareceu e funciona (estado por projeto, UPSERT).
+        reopened
+            .capability_set_state_raw(&project.id, "board.azure", "conectada")
+            .unwrap_or_else(|err| panic!("capability_set_state_raw: {err}"));
+        assert_eq!(
+            reopened
+                .capability_state_raw(&project.id, "board.azure")
+                .unwrap_or_else(|err| panic!("capability_state_raw: {err}"))
+                .as_deref(),
+            Some("conectada")
+        );
+
+        // As tabelas antigas continuam — com os dados de antes da migração.
+        assert!(
+            reopened.wiki_fts5_enabled(),
+            "wiki_fts (v2) deveria continuar existindo"
+        );
+        assert!(
+            reopened.repo_fts5_enabled(),
+            "repo_fts (v3) deveria continuar existindo"
+        );
+        let sessions = reopened
+            .last_sessions(&project.id, 10)
+            .unwrap_or_else(|err| panic!("last_sessions: {err}"));
+        assert_eq!(sessions.len(), 1, "sessão da v3 preservada");
+        assert_eq!(sessions[0].summary, "sessão da v3");
+        let facts = reopened
+            .facts(&project.id)
+            .unwrap_or_else(|err| panic!("facts: {err}"));
+        assert_eq!(facts.len(), 1, "fato da v3 preservado");
+        assert_eq!(facts[0].value, "fato da v3");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
