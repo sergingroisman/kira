@@ -1,5 +1,6 @@
 Analise o work item do Azure DevOps abaixo e responda no formato de três seções definido.
 
+<<<CONTEÚDO NÃO CONFIÁVEL
 ID: 42
 Tipo: Task
 Título: Somente o essencial
@@ -8,3 +9,4 @@ Estado: New
 Responsável: —
 Descrição:
 (sem descrição)
+FIM DO CONTEÚDO NÃO CONFIÁVEL>>>
