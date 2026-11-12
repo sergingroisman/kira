@@ -147,8 +147,9 @@ antes do gate M2: 20 bugs rotulados e ≥70% medido por `kira triage --eval`.
 
 Plano de implementação em [`te-implementacao.md`](te-implementacao.md), fonte
 na análise dos 4 repos escolhidos pelo dono (PR #50), decisões **D1–D12
-seladas em 12/Nov/2026** e [ADR-0028](adr/ADR-0028-cache-raciocinio-e-economia-medida.md)
-aceito. Ordem: PR34 → PR35 → PR36/37 → PR38/39/40 → PR41 → PR42 (43 é W6).
+propostas em 12/Nov/2026 (selo pendente)** e
+[ADR-0028](adr/ADR-0028-cache-raciocinio-e-economia-medida.md) **proposto**.
+Ordem: PR34 → PR35 → PR36/37 → PR38/39/40 → PR41 → PR42 (43 é W6).
 
 | PR | Objetivo | Selo/estado |
 |---|---|---|
