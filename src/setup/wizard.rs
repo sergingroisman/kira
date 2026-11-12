@@ -3,10 +3,14 @@
 //! rodapé com teclas e nenhuma pergunta "cega").
 //!
 //! Divisão de responsabilidade deliberada:
-//! - o wizard COLETA respostas (org, projeto, nome, PAT, backend) e devolve um
-//!   [`SetupOptions`] com `interactive: false`;
-//! - quem valida PAT, grava config/keyring e checa a IA continua sendo
-//!   [`super::run`] — uma única fonte de verdade para efeitos e mensagens.
+//! - o wizard COLETA respostas locais (nome, projeto/raiz, backend de IA) e
+//!   devolve um [`SetupOptions`] com `interactive: false`;
+//! - quem grava config/keyring e checa a IA continua sendo [`super::run`] —
+//!   uma única fonte de verdade para efeitos e mensagens.
+//!
+//! Local-first (ADR-0030): o wizard NÃO pede credencial — PAT só nasce em
+//! `kira connect` (MVP-3). Etapas: Ambiente → Projeto (raiz detectada) →
+//! IA (4 opções, incluindo "nenhuma por agora") → Resumo.
 //!
 //! Por que isso importa no Windows: em raw mode o terminal NÃO ecoa por
 //! construção (crossterm desliga `ENABLE_ECHO_INPUT`), então o segredo fica
@@ -65,26 +69,18 @@ pub fn mode(tty: bool, width: u16, height: u16, plain_flag: bool, explicit_flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Ambiente,
-    Azure,
-    Acesso,
+    Projeto,
     Ia,
     Resumo,
 }
 
 impl Step {
-    pub const ALL: [Step; 5] = [
-        Step::Ambiente,
-        Step::Azure,
-        Step::Acesso,
-        Step::Ia,
-        Step::Resumo,
-    ];
+    pub const ALL: [Step; 4] = [Step::Ambiente, Step::Projeto, Step::Ia, Step::Resumo];
 
     pub fn title(self) -> &'static str {
         match self {
             Step::Ambiente => "Ambiente",
-            Step::Azure => "Azure",
-            Step::Acesso => "Acesso",
+            Step::Projeto => "Projeto",
             Step::Ia => "IA",
             Step::Resumo => "Resumo",
         }
@@ -93,26 +89,6 @@ impl Step {
     pub fn from_index(index: usize) -> Step {
         Step::ALL.get(index).copied().unwrap_or(Step::Resumo)
     }
-}
-
-/// Próxima escolha do menu de acesso (Tab/↑/↓), com wrap.
-fn next_pick(current: Option<PatPick>, direction: isize) -> PatPick {
-    const ORDER: [PatPick; 3] = [PatPick::Paste, PatPick::Env, PatPick::Skip];
-    let index = current
-        .and_then(|pick| ORDER.iter().position(|item| *item == pick))
-        .unwrap_or(0) as isize;
-    ORDER[(index + direction).rem_euclid(ORDER.len() as isize) as usize]
-}
-
-/// Escolha do passo PAT.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatPick {
-    /// Colar agora (valor digitado no campo mascarado).
-    Paste,
-    /// Usar `AZURE_DEVOPS_PAT` do ambiente.
-    Env,
-    /// Pular ⇒ modo local.
-    Skip,
 }
 
 /// Formulário do Foundry está utilizável? Devolve o campo culpado e a causa
@@ -171,10 +147,6 @@ pub fn foundry_problem(
 /// Campo em edição na etapa atual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
-    Org,
-    Project,
-    Name,
-    Secret,
     /// Formulário inline do Foundry (ADR-0035): endpoint do recurso.
     FoundryEndpoint,
     /// Formulário inline do Foundry: deployment/modelo.
@@ -193,17 +165,15 @@ impl Field {
 
     /// O campo guarda segredo? (nunca é renderizado como texto)
     pub fn is_secret(self) -> bool {
-        matches!(self, Field::Secret | Field::FoundryKey)
+        matches!(self, Field::FoundryKey)
     }
 
     /// Rótulo do campo no painel.
     pub fn label(self) -> &'static str {
         match self {
-            Field::Secret => "PAT",
             Field::FoundryEndpoint => "endpoint",
             Field::FoundryDeployment => "deployment",
             Field::FoundryKey => "chave",
-            _ => "",
         }
     }
 }
@@ -287,6 +257,9 @@ pub struct EnvReport {
     pub keyring: String,
     pub config_path: String,
     pub store_path: String,
+    /// Raiz do projeto detectada (mesma regra do store) — o passo "Projeto"
+    /// mostra e confirma; nunca é inventada pela tela.
+    pub root: String,
     pub tools: Vec<(String, bool)>,
     /// O que já está gravado (config.toml + presença no keyring).
     pub saved: SavedConfig,
@@ -308,6 +281,9 @@ impl EnvReport {
                 .map(|path| crate::store::display_path(&path))
                 .unwrap_or_else(|| "— (sem diretório)".to_string())
         };
+        let root = crate::store::detect_project_root()
+            .map(|path| crate::store::display_path(&path))
+            .unwrap_or_else(|| ".".to_string());
         let tools = ["dotnet", "pnpm", "ollama", "copilot"]
             .iter()
             .map(|name| {
@@ -324,6 +300,7 @@ impl EnvReport {
             keyring,
             config_path: path_of(crate::credentials::config_path()),
             store_path: path_of(crate::store::db_path()),
+            root,
             tools,
             saved: SavedConfig::detect(),
         }
@@ -339,7 +316,13 @@ impl EnvReport {
             keyring: "Credential Manager".to_string(),
             config_path: r"C:\Users\dev\.config\kira\config.toml".to_string(),
             store_path: r"C:\Users\dev\.config\kira\store.db".to_string(),
-            tools: vec![("dotnet".to_string(), true), ("pnpm".to_string(), false)],
+            root: r"C:\repo\kira".to_string(),
+            tools: vec![
+                ("dotnet".to_string(), true),
+                ("pnpm".to_string(), false),
+                // Ollama presente: o default honesto do Enter na IA é o barato.
+                ("ollama".to_string(), true),
+            ],
             saved: SavedConfig::default(),
         }
     }
@@ -374,16 +357,9 @@ pub fn detect_shell(env: &dyn Fn(&str) -> Option<String>) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WizardState {
     pub step: usize,
-    pub org: String,
-    pub project: String,
     pub name: String,
-    /// Segredo digitado. NUNCA é renderizado; a tela usa [`Self::masked`].
-    pub secret: String,
-    pub pat_pick: Option<PatPick>,
     pub backend: Option<String>,
     pub field: Field,
-    /// Existe `AZURE_DEVOPS_PAT` no ambiente? (a opção 2 sem a env mentiria)
-    pub has_env_pat: bool,
     /// As três envs do Foundry estão presentes? Com elas o wizard não abre o
     /// formulário: o motor lê do ambiente, como sempre.
     pub foundry_ready: bool,
@@ -408,22 +384,6 @@ impl WizardState {
         env: EnvReport,
         env_lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
-        // Prioridade igual à do motor: flag > env > config.toml salvo. O que
-        // já está configurado aparece preenchido — não se pergunta de novo o
-        // que o próprio `kira setup` gravou.
-        let org = defaults
-            .org
-            .clone()
-            .or_else(|| env_lookup("AZURE_DEVOPS_ORG"))
-            .or_else(|| env.saved.org.clone())
-            .unwrap_or_default();
-        let project = defaults
-            .project
-            .clone()
-            .or_else(|| env_lookup("AZURE_DEVOPS_PROJECT"))
-            .or_else(|| env_lookup("AZURE_DEVOPS_PROJECT_NAME"))
-            .or_else(|| env.saved.project.clone())
-            .unwrap_or_default();
         // `--name` > nome salvo > padrão do SO capitalizado > "dev".
         let name = defaults
             .name
@@ -460,15 +420,9 @@ impl WizardState {
             .unwrap_or_default();
         Self {
             step: 0,
-            org,
-            project,
             name,
-            secret: String::new(),
-            pat_pick: Some(PatPick::Paste),
             backend: None,
-            field: Field::Org,
-            has_env_pat: env_lookup("AZURE_DEVOPS_PAT")
-                .is_some_and(|value| !value.trim().is_empty()),
+            field: Field::FoundryEndpoint,
             foundry_ready: foundry_source.is_some(),
             foundry_source,
             foundry_endpoint,
@@ -492,7 +446,7 @@ impl WizardState {
     /// Situação de cada etapa, para a trilha (`✓`, `›`, `·`).
     ///
     /// `✓` só em etapa já VISITADA: valor pré-preenchido não é valor
-    /// confirmado, e marcar `✓ Azure` enquanto o dono está no Ambiente
+    /// confirmado, e marcar `✓ Projeto` enquanto o dono está no Ambiente
     /// prometeria algo que ele ainda não viu.
     pub fn step_status(&self, step: Step) -> char {
         if step == self.current() {
@@ -507,14 +461,7 @@ impl WizardState {
         }
         let done = match step {
             Step::Ambiente => true,
-            Step::Azure => !self.org.trim().is_empty() && !self.project.trim().is_empty(),
-            Step::Acesso => match self.pat_pick {
-                // PAT já no keyring conta como resolvido: não é preciso colar
-                // de novo para a etapa estar concluída.
-                Some(PatPick::Paste) => !self.secret.is_empty() || self.env.saved.pat,
-                Some(PatPick::Env) | Some(PatPick::Skip) => true,
-                None => false,
-            },
+            Step::Projeto => !self.env.root.trim().is_empty() && self.env.root != ".",
             // Foundry só conta como escolhido quando dá para usar: env
             // completa, config+keyring ou o formulário validado (ADR-0035).
             Step::Ia => match self.backend.as_deref() {
@@ -540,14 +487,14 @@ impl WizardState {
                 // etapa): o dono quer voltar ao menu, não perder a etapa.
                 if self.foundry_form {
                     self.foundry_form = false;
-                    self.field = Field::Org;
+                    self.field = Field::FoundryEndpoint;
                     return false;
                 }
                 if self.step == 0 {
                     return false;
                 }
                 self.step -= 1;
-                self.field = Field::Org;
+                self.field = Field::FoundryEndpoint;
                 return false;
             }
             KeyCode::BackTab => {
@@ -564,8 +511,11 @@ impl WizardState {
                     self.step = 1;
                 }
             }
-            Step::Azure => self.handle_azure(key),
-            Step::Acesso => self.handle_access(key),
+            Step::Projeto => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
+                    self.step = 2;
+                }
+            }
             Step::Ia => self.handle_ia(key),
             Step::Resumo => {
                 if key.code == KeyCode::Enter {
@@ -576,90 +526,9 @@ impl WizardState {
         false
     }
 
-    fn handle_azure(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
-                self.field = match self.field {
-                    Field::Project => Field::Org,
-                    _ => Field::Project,
-                };
-            }
-            KeyCode::Enter => {
-                if self.field == Field::Org {
-                    self.field = Field::Project;
-                } else if self.org.trim().is_empty() || self.project.trim().is_empty() {
-                    self.notice = Some("organização e projeto são obrigatórios".to_string());
-                } else {
-                    self.step = 2;
-                    // No passo de acesso o foco já nasce no campo do PAT: quem
-                    // cola não precisa descobrir um Tab antes.
-                    self.field = Field::Secret;
-                }
-            }
-            KeyCode::Char(value) if !value.is_control() => match self.field {
-                Field::Org => self.org.push(value),
-                Field::Project => self.project.push(value),
-                _ => {}
-            },
-            KeyCode::Backspace => match self.field {
-                Field::Org => {
-                    self.org.pop();
-                }
-                Field::Project => {
-                    self.project.pop();
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-
-    /// Acesso: digitar SEMPRE vai para o segredo (PAT tem dígitos, então
-    /// `1/2/3` não podem ser menu aqui); a escolha colar/ambiente/pular anda
-    /// com Tab/↑/↓ e confirma no Enter.
-    fn handle_access(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Tab | KeyCode::Down => {
-                self.field = Field::Secret;
-                self.pat_pick = Some(next_pick(self.pat_pick, 1));
-            }
-            KeyCode::Up => {
-                self.field = Field::Secret;
-                self.pat_pick = Some(next_pick(self.pat_pick, -1));
-            }
-            KeyCode::Enter => match self.pat_pick {
-                // Nada digitado + PAT já no keyring: Enter mantém o que está
-                // salvo (o motor valida e reaproveita), em vez de exigir que o
-                // dono cole o mesmo token de novo.
-                Some(PatPick::Paste) if self.secret.trim().is_empty() && self.env.saved.pat => {
-                    self.step = 3;
-                    self.field = Field::Org;
-                }
-                Some(PatPick::Paste) if self.secret.trim().is_empty() => {
-                    self.notice =
-                        Some("cole o PAT ou escolha «ambiente»/«pular» com Tab".to_string());
-                }
-                Some(PatPick::Env) if !self.has_env_pat => {
-                    self.notice = Some(
-                        "AZURE_DEVOPS_PAT não está definida — cole o PAT ou escolha «pular»"
-                            .to_string(),
-                    );
-                }
-                _ => self.step = 3,
-            },
-            KeyCode::Char(value) if !value.is_control() => {
-                self.secret.push(value);
-                self.pat_pick = Some(PatPick::Paste);
-                self.field = Field::Secret;
-            }
-            KeyCode::Backspace => {
-                self.secret.pop();
-                self.field = Field::Secret;
-            }
-            _ => {}
-        }
-    }
-
+    /// IA: as teclas `1..4` escolhem (a 4 = "nenhuma por agora"); o Enter
+    /// assume o default HONESTO da máquina — Ollama presente ⇒ `ollama`,
+    /// ausente ⇒ `nenhuma` (o caro nunca é default).
     fn handle_ia(&mut self, key: KeyEvent) {
         if self.foundry_form {
             self.handle_foundry_form(key);
@@ -668,23 +537,27 @@ impl WizardState {
         match key.code {
             KeyCode::Char('1') => {
                 self.backend = Some("ollama".to_string());
-                self.step = 4;
+                self.step = 3;
             }
             KeyCode::Char('2') => {
                 self.backend = Some("copilot".to_string());
-                self.step = 4;
+                self.step = 3;
             }
             KeyCode::Char('3') => {
                 self.backend = Some("foundry".to_string());
                 if self.foundry_ready {
                     // Tudo já está no ambiente: nada a digitar.
-                    self.step = 4;
+                    self.step = 3;
                 } else {
                     // Formulário inline: endpoint/deployment pré-preenchidos
                     // da env; a chave nasce vazia (segredo só vem do teclado).
                     self.foundry_form = true;
                     self.field = Field::FoundryEndpoint;
                 }
+            }
+            KeyCode::Char('4') => {
+                self.backend = Some("nenhuma".to_string());
+                self.step = 3;
             }
             KeyCode::Enter => {
                 // Enter com foundry escolhido e formulário incompleto reabre o
@@ -695,9 +568,20 @@ impl WizardState {
                     return;
                 }
                 if self.backend.is_none() {
-                    self.backend = Some("ollama".to_string());
+                    // Default honesto: o que a máquina TEM, não o que seria
+                    // ideal — sem Ollama, "nenhuma" é a escolha real.
+                    let ollama_found = self
+                        .env
+                        .tools
+                        .iter()
+                        .any(|(name, found)| name == "ollama" && *found);
+                    self.backend = Some(if ollama_found {
+                        "ollama".to_string()
+                    } else {
+                        "nenhuma".to_string()
+                    });
                 }
-                self.step = 4;
+                self.step = 3;
             }
             _ => {}
         }
@@ -720,7 +604,7 @@ impl WizardState {
                     self.notice = Some(message.to_string());
                 }
                 None => {
-                    self.step = 4;
+                    self.step = 3;
                     self.foundry_form = false;
                 }
             },
@@ -777,11 +661,9 @@ impl WizardState {
         })
     }
 
-    /// Valida o mínimo e devolve as opções — o "Enter" do Resumo.
+    /// Devolve as opções — o "Enter" do Resumo. Local-first não tem campo
+    /// obrigatório: org/projeto/credencial não são pedidos (ADR-0030 #3).
     pub fn finish(&self) -> Option<SetupOptions> {
-        if self.org.trim().is_empty() || self.project.trim().is_empty() {
-            return None;
-        }
         Some(self.into_options())
     }
 
@@ -791,22 +673,15 @@ impl WizardState {
     /// motor não reabre menu nem prompt (e não roda `stty`).
     pub fn into_options(&self) -> SetupOptions {
         let mut options = SetupOptions {
-            org: Some(self.org.trim().to_string()),
-            project: Some(self.project.trim().to_string()),
             name: Some(self.name.trim().to_string()).filter(|value| !value.is_empty()),
             // O wizard já perguntou tudo: o motor de texto não reabre menu,
             // não pergunta nome e não chama `stty`.
             interactive: false,
+            // A raiz DETECTADA vai ao motor: o passo "projeto" do fluxo
+            // local-first imprime/registra o que a tela confirmou.
+            project_root: Some(self.env.root.clone()),
             ..SetupOptions::default()
         };
-        match self.pat_pick {
-            // Nada digitado ⇒ manter o que o keyring já tem: o motor resolve
-            // e valida o PAT salvo (não é "pular", e não é senha vazia).
-            Some(PatPick::Paste) if self.secret.is_empty() => {}
-            Some(PatPick::Paste) => options.pat = Some(self.secret.clone()),
-            Some(PatPick::Env) => {}
-            Some(PatPick::Skip) | None => options.skip.push("pat".to_string()),
-        }
         options.backend = self.backend.clone();
         // Só o formulário (não o ambiente) vira `FoundryChoice`: assim o motor
         // testa exatamente o que foi digitado e grava depois do teste.
@@ -856,10 +731,9 @@ pub fn run(
         if key.kind != crossterm::event::KeyEventKind::Press {
             continue;
         }
-        // `q` cancela — menos onde ele é texto: na etapa de Acesso (PAT) e no
-        // formulário do Foundry (endpoint/chave podem conter "q").
-        if key.code == KeyCode::Char('q') && state.current() != Step::Acesso && !state.foundry_form
-        {
+        // `q` cancela — menos onde ele é texto: no formulário do Foundry
+        // (endpoint/chave podem conter "q").
+        if key.code == KeyCode::Char('q') && !state.foundry_form {
             return None;
         }
         if state.handle(key) {
@@ -891,7 +765,7 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
         Paragraph::new(Line::from(Span::styled(
             if narrow {
                 format!(
-                    "etapa {}/5 · {} · Enter Avança · Esc Volta · q Cancelar",
+                    "etapa {}/4 · {} · Enter Avança · Esc Volta · q Cancelar",
                     state.step + 1,
                     state.current().title()
                 )
@@ -977,11 +851,6 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
                     " já configurado (config.toml + keyring)",
                     Style::default().fg(palette.missing),
                 )));
-                body.push(Line::from(format!(
-                    "  azure        {} / {}",
-                    saved.org.as_deref().unwrap_or("—"),
-                    saved.project.as_deref().unwrap_or("—")
-                )));
                 if let Some(name) = &saved.name {
                     body.push(Line::from(format!("  dev          {name}")));
                 }
@@ -992,95 +861,27 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
                     (None, None) => "—".to_string(),
                 };
                 body.push(Line::from(format!("  foundry      {foundry}")));
+                // O PAT não é assunto do wizard (ADR-0030 #4): a presença da
+                // credencial de board aparece no `kira doctor` e no `connect`.
                 body.push(Line::from(format!(
-                    "  chaves       PAT {} · Foundry {}",
-                    mark(saved.pat),
+                    "  chaves       Foundry {}",
                     mark(saved.foundry_key)
                 )));
             }
         }
-        Step::Azure => {
+        Step::Projeto => {
+            // Raiz DETECTADA, nunca perguntada do zero: o dono só confirma
+            // (ou vê que a detecção acertou).
             body.push(Line::from(Span::styled(
-                "de onde o KIRA lê os Work Items",
+                "a raiz do projeto foi detectada nesta máquina",
                 Style::default().fg(palette.missing),
             )));
             body.push(Line::from(""));
-            field_line(
-                &mut body,
-                "organização",
-                &state.org,
-                state.field,
-                Field::Org,
-                palette,
-            );
-            field_line(
-                &mut body,
-                "projeto",
-                &state.project,
-                state.field,
-                Field::Project,
-                palette,
-            );
-            // Origem explícita: o dono sabe se está confirmando o que salvou
-            // ou digitando algo novo.
-            if state.env.saved.org.as_deref() == Some(state.org.as_str())
-                && state.env.saved.project.as_deref() == Some(state.project.as_str())
-            {
-                body.push(Line::from(""));
-                body.push(Line::from(Span::styled(
-                    " valores salvos no config.toml — Enter confirma, digitar troca",
-                    Style::default().fg(palette.help),
-                )));
-            }
-        }
-        Step::Acesso => {
-            // Três linhas de 74 colunas no máximo: a instrução tem que caber
-            // inteira no painel de 80×24, sem corte.
-            body.push(Line::from(Span::styled(
-                "PAT é uma senha descartável de leitura de Work Items.",
-                Style::default().fg(palette.help),
-            )));
-            body.push(Line::from(Span::styled(
-                "Escopo Work Items → Read; validade de 30 ou 90 dias;",
-                Style::default().fg(palette.help),
-            )));
-            body.push(Line::from(Span::styled(
-                "o valor aparece uma única vez. Detalhes do PAT: kira doctor.",
-                Style::default().fg(palette.help),
-            )));
+            body.push(Line::from(format!(" raiz         {}", state.env.root)));
             body.push(Line::from(""));
-            body.push(menu_line(
-                state.pat_pick == Some(PatPick::Paste),
-                "Colar um PAT agora (recomendado — leitura de Work Items)",
-            ));
-            body.push(menu_line(
-                state.pat_pick == Some(PatPick::Env),
-                if state.has_env_pat {
-                    "Usar AZURE_DEVOPS_PAT do ambiente"
-                } else {
-                    "Usar AZURE_DEVOPS_PAT do ambiente — não definida nesta máquina"
-                },
-            ));
-            body.push(menu_line(
-                state.pat_pick == Some(PatPick::Skip),
-                "Pular por agora (modo local: kira triage --file)",
-            ));
-            if state.env.saved.pat {
-                body.push(Line::from(""));
-                body.push(Line::from(Span::styled(
-                    " PAT já está no keyring do OS — Enter mantém, colar substitui",
-                    Style::default().fg(palette.ok),
-                )));
-            }
-            body.push(Line::from(""));
-            let shown = if state.secret.is_empty() {
-                String::new()
-            } else {
-                state.masked()
-            };
             body.push(Line::from(Span::styled(
-                format!(" PAT  [{shown}]  (a entrada não aparece na tela)"),
-                Style::default().fg(palette.title),
+                " Enter confirma e avança — o store registra o projeto por esta raiz",
+                Style::default().fg(palette.help),
             )));
         }
         Step::Ia => {
@@ -1100,6 +901,10 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
             body.push(menu_line(
                 state.backend.as_deref() == Some("foundry"),
                 "3) Microsoft Foundry (BYOK: custo por token)",
+            ));
+            body.push(menu_line(
+                state.backend.as_deref() == Some("nenhuma"),
+                "4) nenhuma por agora (scan, wiki, context, pr draft e dashboard funcionam sem IA)",
             ));
             if state.foundry_form {
                 body.push(Line::from(""));
@@ -1169,36 +974,25 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
                 Style::default().fg(palette.missing),
             )));
             body.push(Line::from(""));
-            body.push(Line::from(format!(" organização  {}", state.org)));
-            body.push(Line::from(format!(" projeto      {}", state.project)));
+            body.push(Line::from(format!(" raiz         {}", state.env.root)));
             body.push(Line::from(format!(" dev          {}", state.name)));
-            let pat = match state.pat_pick {
-                // Vazio + PAT salvo = manter o do keyring; o resumo diz isso,
-                // em vez de "nenhum" (que seria mentira).
-                Some(PatPick::Paste) if state.secret.is_empty() && state.env.saved.pat => {
-                    "no keyring do OS (mantido — será validado agora)".to_string()
-                }
-                Some(PatPick::Paste) => {
-                    if state.secret.is_empty() {
-                        "nenhum (não informado)".to_string()
+            let ia = match state.backend.as_deref() {
+                Some(backend) => backend.to_string(),
+                None => {
+                    // O default do Enter é honesto: o que a máquina tem.
+                    let ollama_found = state
+                        .env
+                        .tools
+                        .iter()
+                        .any(|(name, found)| name == "ollama" && *found);
+                    if ollama_found {
+                        "ollama (default)".to_string()
                     } else {
-                        format!("{} (será validado agora)", state.masked())
+                        "nenhuma (default)".to_string()
                     }
                 }
-                Some(PatPick::Env) => "AZURE_DEVOPS_PAT do ambiente".to_string(),
-                Some(PatPick::Skip) | None if state.env.saved.pat => {
-                    "no keyring do OS (mantido; não validado agora)".to_string()
-                }
-                Some(PatPick::Skip) | None => "não (modo local)".to_string(),
             };
-            body.push(Line::from(format!(" PAT          {pat}")));
-            body.push(Line::from(format!(
-                " IA           {}",
-                state
-                    .backend
-                    .clone()
-                    .unwrap_or_else(|| "ollama (default)".to_string())
-            )));
+            body.push(Line::from(format!(" IA           {ia}")));
             // Foundry coletado no formulário: o resumo mostra o que será
             // gravado e ONDE — endpoint/deployment são públicos (config),
             // a chave é segredo (keyring).
@@ -1223,7 +1017,7 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                " nada é gravado antes do Enter; a validação do PAT acontece em seguida",
+                " nada é gravado antes do Enter; a credencial do board nasce em kira connect",
                 Style::default().fg(palette.help),
             )));
         }
@@ -1256,24 +1050,8 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
                 desc: "Cancelar",
             },
         ],
-        // Acesso: aqui `q` é texto do PAT, não cancelamento — o rodapé não
-        // pode prometer o que a tecla não faz.
-        Step::Acesso => vec![
-            Key {
-                key: "Tab",
-                desc: "Escolher",
-            },
-            Key {
-                key: "Enter",
-                desc: "Avançar",
-            },
-            Key {
-                key: "Esc",
-                desc: "Voltar",
-            },
-        ],
-        // Formulário do Foundry aberto: as teclas do menu não valem, e o
-        // rodapé diz apenas o que dá para fazer agora.
+        // Acesso removido (ADR-0030 #4): o PAT não é assunto do wizard —
+        // o rodapé da IA cobre as 4 opções do menu.
         Step::Ia if state.foundry_form => vec![
             Key {
                 key: "Tab",
@@ -1290,7 +1068,7 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
         ],
         Step::Ia => vec![
             Key {
-                key: "1-3",
+                key: "1-4",
                 desc: "Escolher",
             },
             Key {
@@ -1419,8 +1197,27 @@ mod tests {
         WizardState::new(
             &SetupOptions::default(),
             EnvReport::fixture(),
-            &env_of(&[("AZURE_DEVOPS_ORG", "minha-org"), ("USER", "sergin")]),
+            &env_of(&[("USER", "sergin")]),
         )
+    }
+
+    /// Ambiente com tudo já salvo (config.toml + keyring).
+    fn env_with_saved() -> EnvReport {
+        let mut env = EnvReport::fixture();
+        env.saved = SavedConfig {
+            org: Some("minha-org".to_string()),
+            project: Some("Kira".to_string()),
+            name: Some("Serginho".to_string()),
+            foundry_endpoint: Some("https://recurso.openai.azure.com/openai/v1".to_string()),
+            foundry_deployment: Some("gpt-5".to_string()),
+            foundry_key: true,
+            pat: true,
+        };
+        env
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1468,124 +1265,68 @@ mod tests {
     }
 
     #[test]
-    fn detected_environment_feeds_the_rail_and_prefills_azure() {
+    fn detected_environment_feeds_the_rail_and_walks_to_the_project_step() {
         let mut state = state();
-        assert_eq!(state.org, "minha-org", "env preenche a organização");
         assert_eq!(state.current(), Step::Ambiente);
         assert_eq!(state.step_status(Step::Ambiente), '›');
-        assert_eq!(state.step_status(Step::Azure), '·');
-        // Enter no Ambiente leva ao Azure; o campo começa pela organização.
+        assert_eq!(state.step_status(Step::Projeto), '·');
+        // Enter no Ambiente leva ao Projeto; o wizard NÃO coleta org/projeto
+        // nem credencial (ADR-0030 #3): o nome já vem do SO, a raiz é
+        // detectada.
         assert!(!state.handle(key(KeyCode::Enter)));
-        assert_eq!(state.current(), Step::Azure);
-        assert_eq!(state.field, Field::Org);
+        assert_eq!(state.current(), Step::Projeto);
     }
 
     #[test]
-    fn azure_step_requires_both_fields_and_typing_edits_the_focused_one() {
+    fn project_step_confirms_the_detected_root_and_advances() {
         let mut state = state();
-        state.handle(key(KeyCode::Enter)); // Ambiente → Azure
-        state.field = Field::Project;
-        for value in "Kira".chars() {
-            state.handle(key(KeyCode::Char(value)));
-        }
-        assert_eq!(state.project, "Kira");
-        state.handle(key(KeyCode::Backspace));
-        assert_eq!(state.project, "Kir");
+        state.handle(key(KeyCode::Enter)); // Ambiente → Projeto
+        // A raiz mostrada é a DETECTADA (injetada no EnvReport) — nunca
+        // perguntada do zero.
+        assert_eq!(state.env.root, r"C:\repo\kira");
+        assert_eq!(state.step_status(Step::Projeto), '›');
         state.handle(key(KeyCode::Enter));
+        assert_eq!(state.current(), Step::Ia, "Enter confirma a raiz e avança");
+        // Depois de visitar, a etapa aparece como concluída na trilha.
+        assert_eq!(state.step_status(Step::Projeto), '✓');
+    }
+
+    #[test]
+    fn ia_choices_are_explicit_and_the_enter_default_is_honest() {
+        let mut with_ollama = state();
+        with_ollama.step = 2; // IA
+        // Ollama PRESENTE no fixture: Enter = ollama (o barato da máquina).
+        with_ollama.handle(key(KeyCode::Enter));
         assert_eq!(
-            state.current(),
-            Step::Acesso,
-            "org+projeto preenchidos avançam"
+            with_ollama.backend.as_deref(),
+            Some("ollama"),
+            "com Ollama, Enter = barato"
         );
-    }
+        assert_eq!(with_ollama.current(), Step::Resumo);
 
-    #[test]
-    fn secret_is_masked_and_never_appears_in_state_strings() {
-        let mut state = state();
-        state.step = 2;
-        state.field = Field::Secret;
-        for value in "Aa2xSEGREDO".chars() {
-            state.handle(key(KeyCode::Char(value)));
-        }
-        assert_eq!(state.secret, "Aa2xSEGREDO");
-        assert_eq!(state.masked().chars().count(), MASK_LEN);
-        assert!(!state.masked().contains("Aa2x"));
-        // O resumo também não imprime o valor.
-        state.step = 4;
-        let options = state.into_options();
-        assert_eq!(options.pat.as_deref(), Some("Aa2xSEGREDO"));
-        assert_eq!(state.step_status(Step::Acesso), '✓');
-    }
-
-    #[test]
-    fn empty_paste_is_refused_and_skip_marks_local_mode() {
-        let mut state = state();
-        state.step = 2;
-        state.handle(key(KeyCode::Enter));
-        assert_eq!(state.current(), Step::Acesso, "sem PAT não avança");
-        assert!(
-            state
-                .notice
-                .as_deref()
-                .unwrap_or_default()
-                .contains("cole o PAT"),
-            "{:?}",
-            state.notice
+        // Escolhas explícitas: 2 = copilot, 4 = nenhuma por agora.
+        let mut none = with_ollama.clone();
+        none.step = 2;
+        none.backend = None;
+        none.handle(key(KeyCode::Char('4')));
+        assert_eq!(none.backend.as_deref(), Some("nenhuma"));
+        assert_eq!(
+            none.into_options().backend.as_deref(),
+            Some("nenhuma"),
+            "a 4ª opção chega ao motor como escolha explícita"
         );
-        // Tab anda no menu: colar → ambiente → pular.
-        state.handle(key(KeyCode::Tab));
-        state.handle(key(KeyCode::Tab));
-        assert_eq!(state.pat_pick, Some(PatPick::Skip));
-        state.handle(key(KeyCode::Enter));
-        assert_eq!(state.current(), Step::Ia);
-        let options = state.into_options();
-        assert_eq!(options.skip, vec!["pat".to_string()]);
-        assert!(options.pat.is_none());
-    }
 
-    #[test]
-    fn digits_type_into_the_pat_instead_of_picking_menu_items() {
-        let mut state = state();
-        state.step = 2;
-        for value in "123".chars() {
-            state.handle(key(KeyCode::Char(value)));
-        }
-        assert_eq!(state.secret, "123", "PAT tem dígitos: tecla 1 não é menu");
-        assert_eq!(state.pat_pick, Some(PatPick::Paste));
-    }
-
-    #[test]
-    fn choosing_env_without_the_variable_is_refused_with_the_reason() {
-        let mut state = state();
-        state.step = 2;
-        state.handle(key(KeyCode::Tab)); // ambiente
-        state.handle(key(KeyCode::Enter));
-        assert_eq!(state.current(), Step::Acesso);
-        assert!(
-            state
-                .notice
-                .as_deref()
-                .unwrap_or_default()
-                .contains("não está definida"),
-            "{:?}",
-            state.notice
+        // Sem Ollama na máquina, o Enter NÃO escolhe um pré-requisito
+        // inexistente: cai em "nenhuma" (default honesto).
+        let mut sem_ollama = state();
+        sem_ollama.env.tools = vec![("dotnet".to_string(), true), ("ollama".to_string(), false)];
+        sem_ollama.step = 2;
+        sem_ollama.handle(key(KeyCode::Enter));
+        assert_eq!(
+            sem_ollama.backend.as_deref(),
+            Some("nenhuma"),
+            "sem Ollama, o default é 'nenhuma por agora'"
         );
-        // Com a env presente, a mesma escolha avança.
-        let with_env = WizardState::new(
-            &SetupOptions::default(),
-            EnvReport::fixture(),
-            &env_of(&[
-                ("AZURE_DEVOPS_ORG", "minha-org"),
-                ("AZURE_DEVOPS_PROJECT", "Kira"),
-                ("AZURE_DEVOPS_PAT", "tok"),
-            ]),
-        );
-        let mut with_env = with_env;
-        with_env.step = 2;
-        with_env.handle(key(KeyCode::Tab));
-        with_env.handle(key(KeyCode::Enter));
-        assert_eq!(with_env.current(), Step::Ia);
-        assert!(with_env.into_options().pat.is_none());
     }
 
     #[test]
@@ -1603,29 +1344,9 @@ mod tests {
     }
 
     #[test]
-    fn backend_choice_is_explicit_and_defaults_only_on_enter() {
-        let mut state = state();
-        state.step = 3;
-        assert!(!state.handle(key(KeyCode::Enter)));
-        assert_eq!(
-            state.backend.as_deref(),
-            Some("ollama"),
-            "Enter na IA = barato"
-        );
-        assert_eq!(state.current(), Step::Resumo);
-
-        let mut copilot = state.clone();
-        copilot.step = 3;
-        copilot.backend = None;
-        copilot.handle(key(KeyCode::Char('2')));
-        assert_eq!(copilot.backend.as_deref(), Some("copilot"));
-        assert_eq!(copilot.into_options().backend.as_deref(), Some("copilot"));
-    }
-
-    #[test]
     fn foundry_opens_the_inline_form_and_keeps_the_key_masked() {
         let mut state = state();
-        state.step = 3;
+        state.step = 2;
         state.handle(key(KeyCode::Char('3')));
         assert_eq!(state.current(), Step::Ia, "não avança sem os três valores");
         assert!(state.foundry_form, "o formulário abre inline");
@@ -1641,10 +1362,10 @@ mod tests {
         }
         state.handle(key(KeyCode::Tab));
         assert_eq!(state.field, Field::FoundryKey);
-        for value in "sk-segredo-foundry".chars() {
+        for value in "«redacted:sk-…»".chars() {
             state.handle(key(KeyCode::Char(value)));
         }
-        assert_eq!(state.foundry_key, "sk-segredo-foundry");
+        assert_eq!(state.foundry_key, "«redacted:sk-…»");
         assert!(
             !mask_for(&state.foundry_key).contains("segredo"),
             "a máscara nunca contém o valor"
@@ -1657,14 +1378,14 @@ mod tests {
 
         // Enter valida os três e avança; a escolha chega ao motor.
         state.handle(key(KeyCode::Enter));
-        assert_eq!(state.step, 4, "com os três válidos o wizard avança");
+        assert_eq!(state.step, 3, "com os três válidos o wizard avança");
         assert!(!state.foundry_form, "o formulário fecha ao avançar");
         let choice = state
             .foundry_choice()
             .unwrap_or_else(|| panic!("formulário válido deve virar choice"));
         assert_eq!(choice.endpoint, "https://r.openai.azure.com/openai/v1");
         assert_eq!(choice.deployment, "gpt-5");
-        assert_eq!(choice.api_key, "sk-segredo-foundry");
+        assert_eq!(choice.api_key, "«redacted:sk-…»");
         assert_eq!(state.step_status(Step::Ia), '✓', "etapa IA concluída");
         let options = state.into_options();
         assert_eq!(
@@ -1727,7 +1448,7 @@ mod tests {
                 ("KIRA_FOUNDRY_DEPLOYMENT", "gpt-4o-mini"),
             ]),
         );
-        state.step = 3;
+        state.step = 2;
         state.handle(key(KeyCode::Char('3')));
         assert!(state.foundry_form, "sem chave, o formulário abre");
         assert_eq!(
@@ -1751,7 +1472,7 @@ mod tests {
                 ("KIRA_FOUNDRY_API_KEY", "k"),
             ]),
         );
-        ready.step = 3;
+        ready.step = 2;
         ready.handle(key(KeyCode::Char('3')));
         assert_eq!(ready.current(), Step::Resumo, "env completa avança");
         assert_eq!(ready.backend.as_deref(), Some("foundry"));
@@ -1764,7 +1485,7 @@ mod tests {
     #[test]
     fn esc_closes_only_the_foundry_form_not_the_step() {
         let mut state = state();
-        state.step = 3;
+        state.step = 2;
         state.handle(key(KeyCode::Char('3')));
         assert!(state.foundry_form);
         state.handle(key(KeyCode::Esc));
@@ -1776,48 +1497,25 @@ mod tests {
     }
 
     #[test]
-    fn finish_needs_azure_and_the_resumo_enter_returns_options() {
+    fn finish_has_no_required_field_and_the_resumo_enter_returns_options() {
         let mut state = state();
-        state.project = "Kira".to_string();
-        state.step = 4;
+        state.step = 3;
+        // Local-first não tem campo obrigatório: org/projeto/credencial não
+        // são pedidos (ADR-0030 #3), então o Resumo sempre entrega opções.
         let options = state.finish().unwrap_or_else(|| panic!("resumo válido"));
-        assert_eq!(options.org.as_deref(), Some("minha-org"));
-        assert_eq!(options.project.as_deref(), Some("Kira"));
+        assert_eq!(options.org, None, "org nunca é coletada pelo wizard");
+        assert_eq!(options.project, None, "projeto nunca é coletado");
+        assert!(options.pat.is_none(), "PAT nunca é coletado");
+        assert!(options.skip.is_empty(), "nada é pulado por coleta");
+        assert_eq!(
+            options.project_root.as_deref(),
+            Some(r"C:\repo\kira"),
+            "a raiz detectada vai ao motor"
+        );
         assert!(!options.interactive, "o wizard já perguntou tudo");
         assert_eq!(options.name.as_deref(), Some("Sergin"));
         // Enter no resumo encerra com respostas.
         assert!(state.handle(key(KeyCode::Enter)));
-    }
-
-    #[test]
-    fn render_shows_the_rail_the_panel_and_never_the_secret() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let mut state = state();
-        state.step = 2;
-        state.field = Field::Secret;
-        for value in "Aa2xSEGREDO".chars() {
-            state.handle(key(KeyCode::Char(value)));
-        }
-        let backend = TestBackend::new(110, 30);
-        let mut terminal = Terminal::new(backend).unwrap_or_else(|err| panic!("{err}"));
-        terminal
-            .draw(|frame| render(frame, &state, theme::mono()))
-            .unwrap_or_else(|err| panic!("{err}"));
-        let buffer = terminal.backend().buffer();
-        let mut text = String::new();
-        for y in 0..30 {
-            for x in 0..110 {
-                text.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
-            }
-            text.push('\n');
-        }
-        assert!(text.contains("| passo |"), "{text}");
-        assert!(text.contains("Ambiente"), "{text}");
-        assert!(text.contains("PAT"), "{text}");
-        assert!(text.contains("•"), "máscara visível: {text}");
-        assert!(!text.contains("Aa2x"), "segredo NUNCA na tela: {text}");
     }
 
     /// Desenha um frame do wizard em `TestBackend` e devolve o texto da tela.
@@ -1839,39 +1537,68 @@ mod tests {
         text
     }
 
-    /// Ambiente com tudo já salvo (config.toml + keyring).
-    fn env_with_saved() -> EnvReport {
-        let mut env = EnvReport::fixture();
-        env.saved = SavedConfig {
-            org: Some("minha-org".to_string()),
-            project: Some("Kira".to_string()),
-            name: Some("Serginho".to_string()),
-            foundry_endpoint: Some("https://recurso.openai.azure.com/openai/v1".to_string()),
-            foundry_deployment: Some("gpt-5".to_string()),
-            foundry_key: true,
-            pat: true,
-        };
-        env
-    }
-
-    fn no_env(_: &str) -> Option<String> {
-        None
+    #[test]
+    fn render_shows_the_rail_and_never_a_credential_question() {
+        let mut state = state();
+        // Passa por TODAS as etapas e confirma que nenhuma pergunta de
+        // credencial aparece (ADR-0030 #3: o setup não pede PAT).
+        let mut text = String::new();
+        for step in 0..Step::ALL.len() {
+            state.step = step;
+            text.push_str(&screen_of(&state, 120, 40));
+        }
+        assert!(text.contains("ETAPAS"), "{text}");
+        assert!(text.contains("Ambiente"), "{text}");
+        assert!(text.contains("Projeto"), "{text}");
+        assert!(text.contains("raiz"), "{text}");
+        assert!(
+            !text.contains("PAT"),
+            "a palavra PAT não pode aparecer em nenhuma etapa do wizard: {text}"
+        );
+        assert!(
+            !text.contains("Work Items"),
+            "aula do PAT não é do setup: {text}"
+        );
+        // O formulário do Foundry mostra o rótulo "chave", nunca o valor.
+        let mut foundry = state.clone();
+        foundry.step = 2;
+        foundry.handle(key(KeyCode::Char('3')));
+        for value in "https://r.openai.azure.com/openai/v1".chars() {
+            foundry.handle(key(KeyCode::Char(value)));
+        }
+        foundry.handle(key(KeyCode::Tab));
+        for value in "gpt-5".chars() {
+            foundry.handle(key(KeyCode::Char(value)));
+        }
+        foundry.handle(key(KeyCode::Tab));
+        for value in "segredo-brutal".chars() {
+            foundry.handle(key(KeyCode::Char(value)));
+        }
+        let text = screen_of(&foundry, 120, 40);
+        assert!(text.contains("chave"), "{text}");
+        assert!(
+            !text.contains("segredo-brutal"),
+            "a chave digitada NUNCA na tela: {text}"
+        );
+        assert!(text.contains("•"), "máscara visível: {text}");
     }
 
     #[test]
-    fn ambiente_lists_what_is_already_configured() {
+    fn ambiente_lists_what_is_already_configured_without_pat() {
         let state: WizardState =
             WizardState::new(&SetupOptions::default(), env_with_saved(), &no_env);
         let text = screen_of(&state, 120, 40);
         assert!(text.contains("já configurado"), "{text}");
-        assert!(text.contains("minha-org / Kira"), "{text}");
         assert!(text.contains("Serginho"), "{text}");
         assert!(
             text.contains("https://recurso.openai.azure.com/openai/v1 · gpt-5"),
             "endpoint e deployment salvos aparecem: {text}"
         );
-        assert!(text.contains("PAT ✓"), "presença do PAT: {text}");
         assert!(text.contains("Foundry ✓"), "presença da chave: {text}");
+        assert!(
+            !text.contains("PAT"),
+            "a presença do PAT não é assunto do wizard: {text}"
+        );
 
         // Máquina limpa: a mesma seção diz que não há nada, em vez de sumir.
         let fresh = WizardState::new(&SetupOptions::default(), EnvReport::fixture(), &no_env);
@@ -1880,52 +1607,24 @@ mod tests {
     }
 
     #[test]
-    fn saved_pat_means_enter_keeps_it_instead_of_asking_to_paste_again() {
-        let mut state = WizardState::new(&SetupOptions::default(), env_with_saved(), &no_env);
-        state.step = 2;
-        let text = screen_of(&state, 120, 40);
-        assert!(
-            text.contains("PAT já está no keyring do OS — Enter mantém"),
-            "a tela mostra o que já existe: {text}"
-        );
-        state.handle(key(KeyCode::Enter));
-        assert_eq!(
-            state.current(),
-            Step::Ia,
-            "PAT salvo não bloqueia a etapa de acesso"
-        );
-        let options = state.into_options();
-        assert!(options.pat.is_none(), "não regrava o token existente");
-        assert!(
-            options.skip.is_empty(),
-            "manter o salvo não é pular: o motor valida o PAT do keyring"
-        );
-        // Resumo diz a verdade sobre a origem.
-        state.step = 4;
-        let text = screen_of(&state, 120, 40);
-        assert!(text.contains("no keyring do OS (mantido"), "{text}");
-    }
-
-    #[test]
     fn rail_marks_only_visited_steps_as_done() {
         let mut state = WizardState::new(&SetupOptions::default(), env_with_saved(), &no_env);
-        // Etapa 1 com org/projeto pré-preenchidos: Azure ainda não foi vista,
-        // então não pode aparecer como concluída.
-        assert_eq!(state.step_status(Step::Azure), '·');
-        assert_eq!(state.step_status(Step::Acesso), '·');
+        // Etapas à frente ainda não foram visitadas: nunca '✓' adiantado.
+        assert_eq!(state.step_status(Step::Projeto), '·');
+        assert_eq!(state.step_status(Step::Ia), '·');
         state.step = 1;
         assert_eq!(state.step_status(Step::Ambiente), '✓');
-        assert_eq!(state.step_status(Step::Acesso), '·');
+        assert_eq!(state.step_status(Step::Ia), '·');
         // Depois de passar pela IA, as etapas anteriores mostram seu estado.
-        state.step = 4;
-        assert_eq!(state.step_status(Step::Azure), '✓');
+        state.step = 3;
+        assert_eq!(state.step_status(Step::Projeto), '✓');
     }
 
     #[test]
     fn saved_foundry_with_the_key_in_the_keyring_skips_the_form_and_says_where() {
         let mut state = WizardState::new(&SetupOptions::default(), env_with_saved(), &no_env);
         assert_eq!(state.foundry_source, Some(FoundrySource::Stored));
-        state.step = 3;
+        state.step = 2;
         let text = screen_of(&state, 120, 40);
         assert!(
             text.contains("foundry já definido em config.toml + keyring do OS"),
@@ -1943,10 +1642,8 @@ mod tests {
     }
 
     #[test]
-    fn saved_public_values_prefill_azure_and_the_foundry_form() {
+    fn saved_public_values_prefill_the_foundry_form() {
         let state = WizardState::new(&SetupOptions::default(), env_with_saved(), &no_env);
-        assert_eq!(state.org, "minha-org", "org salva vem preenchida");
-        assert_eq!(state.project, "Kira");
         assert_eq!(
             state.name, "Serginho",
             "dev_name salvo vence o usuário do SO"
@@ -1966,7 +1663,7 @@ mod tests {
         partial.saved.foundry_key = false;
         let mut state = WizardState::new(&SetupOptions::default(), partial, &no_env);
         assert_eq!(state.foundry_source, None);
-        state.step = 3;
+        state.step = 2;
         state.handle(key(KeyCode::Char('3')));
         assert!(state.foundry_form, "sem chave, o formulário abre");
         assert_eq!(
@@ -1983,12 +1680,12 @@ mod tests {
     #[test]
     fn narrow_terminal_trades_the_rail_for_the_step_counter_and_keeps_the_help() {
         let mut state = state();
-        state.step = 3;
+        state.step = 2;
         state.handle(key(KeyCode::Char('3')));
 
         let text = screen_of(&state, 80, 24);
         assert!(
-            text.contains("etapa 4/5"),
+            text.contains("etapa 3/4"),
             "a trilha vira contador em 80 colunas: {text}"
         );
         assert!(text.contains("IA"), "etapa nomeada: {text}");
@@ -1998,43 +1695,8 @@ mod tests {
         );
         // A instrução do formulário cabe inteira (nada de corte por largura).
         assert!(
-            text.contains("Tab anda entre os campos"),
-            "instrução completa: {text}"
-        );
-        assert!(text.contains("endpoint"), "{text}");
-        assert!(text.contains("chave"), "{text}");
-    }
-
-    #[test]
-    fn render_shows_the_foundry_form_and_never_the_key() {
-        let mut state = state();
-        state.step = 3;
-        state.handle(key(KeyCode::Char('3')));
-        for value in "https://r.openai.azure.com/openai/v1".chars() {
-            state.handle(key(KeyCode::Char(value)));
-        }
-        state.handle(key(KeyCode::Tab));
-        for value in "gpt-5".chars() {
-            state.handle(key(KeyCode::Char(value)));
-        }
-        state.handle(key(KeyCode::Tab));
-        for value in "sk-segredo-do-owner".chars() {
-            state.handle(key(KeyCode::Char(value)));
-        }
-
-        let text = screen_of(&state, 110, 26);
-        assert!(text.contains("| IA |"), "{text}");
-        assert!(text.contains("endpoint"), "campo visível: {text}");
-        assert!(text.contains("deployment"), "{text}");
-        assert!(text.contains("chave"), "{text}");
-        assert!(
-            text.contains("keyring"),
-            "deve dizer onde a chave fica: {text}"
-        );
-        assert!(text.contains("Validar"), "rodapé do formulário: {text}");
-        assert!(
-            !text.contains("sk-segredo"),
-            "a chave NUNCA pode ir para a tela: {text}"
+            text.contains("/openai/v1") || text.contains("endpoint"),
+            "instrução do formulário presente: {text}"
         );
     }
 }
