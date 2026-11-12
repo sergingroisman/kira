@@ -73,7 +73,7 @@ adicionar dependência, use o nativo. Isso corta ~6 crates da lista original.
 
 ## 6. Ordem de implementação (PRs separados, merge humano)
 
-1. **PR-UX1 — nativo primeiro** [entregue] (ADR-0036, merge 71c20b9 via #68): `BarChart` de severidade + `Sparkline` de tendência + `Gauge` de budget + `Scrollbar`. Zero dep. Testes `TestBackend` (altura constante, sem `\n`, 80×24).
+1. **PR-UX1 — nativo primeiro** [entregue] (ADR-0036, merge 71c20b9 via #68): `BarChart` de severidade + `Sparkline` de tendência + `Gauge` de uso do índice de retrieval + `Scrollbar` (budget fica para quando existir contador — PR17 da onda TE). Zero dep. Testes `TestBackend` (altura constante, sem `\n`, 80×24).
 2. **PR-UX2 — status** [entregue] (ADR-0037, merge pendente — branch ux/pr-ux2-cartoes-spinner-chips): cartões caseiros + spinner caseiro + chips de sessão. Zero dep.
 3. **PR-UX3 — árvore**: `tui-tree-widget` no painel de wiki (1 dep).
 4. **PR-UX4 — tema**: `opaline` + `termprofile` (2 deps) com `KIRA_GLYPHS=ascii` testado.
