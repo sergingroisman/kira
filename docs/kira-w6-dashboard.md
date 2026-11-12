@@ -211,6 +211,134 @@ detalhe · `Esc` volta · `/` busca na wiki · `r` recarrega (relê disco; sem r
   o PR1), `kira --about` e smoke manual do dono no Windows; PR6 fica com a
   captura ASCII do dashboard no README.
 
+### Entregue na casca nova (ADR-0033, branch da casca)
+
+A IA deixou de ser "quatro painéis empilhados" e passou a ser **fonte de tela cheia +
+inspetor 50–50**, com a casca do statui (MIT, `third_party/statui/{LICENSE,NOTICE.md}`).
+
+- **Chrome fixo de 2 linhas**: status (`kira · projeto · dev · pat mascarado · llm · scan há …`)
+  e abas `1 Resumo   2 Achados N   3 Sessões N   4 Wiki N` — a aba ativa fica entre `[ ]`
+  (o foco não depende de cor).
+- **Resumo** (`1`): placar de severidades + ferramentas, primeiros achados na ordem
+  canônica, últimas sessões e pendências — seções separadas por régua `═| Seção |══`.
+- **Achados/Sessões/Wiki** (`2`/`3`/`4`): tabela ocupa a área de trabalho inteira; `i`/`Enter`
+  abre o inspetor 50–50 (no Wiki, `Enter` abre a leitura integral em tela cheia).
+- **Moldura única** (`widgets::panel`): borda dupla `╔═╗` + título `| Título |`; rodapé de
+  teclas em **chip** (`widgets::footer`), com `REVERSED` no modo mono.
+- **Geometria pura** (`layout::shell`/`layout::workspace`): 80×24 é o piso; abaixo disso a
+  casca degrada para lista única com aviso.
+- **Contrato (ADR-0033)**: navegar nunca executa; `--read-only` desliga ação e mantém o hash
+  do `store.db` byte-idêntico (e2e). O `Outcome` do loop não tem variante de escrita.
+- Removidos: `widgets/header.rs` (o cabeçalho de 8 campos virou chrome de 2 linhas) e o
+  ciclo `Panel`/`PANEL_COUNT` (substituído por `Screen`/`SCREEN_COUNT`).
+
+- **Achados (PR2)**: colunas `SEVERIDADE · FERRAMENTA · PACOTE (nome+versão) · LOCAL · RESUMO`;
+  em 80 colunas a FERRAMENTA sai da tabela (fica no filtro e no inspetor) para o resumo não
+  espremer. `f` cicla severidade e `m` cicla ferramenta — **em memória**, a partir dos valores
+  presentes no snapshot; o filtro ativo aparece no título (`· filtro: critical · audit`) e `Esc`
+  limpa. O inspetor mostra severidade, ferramenta, regra, pacote, LOCAL, fingerprint e mensagem
+  inteira.
+
+- **Sessões (PR3)**: separador de dia acima de cada grupo (`2026-11-11`, vindo de
+  `local_started_at`, com fallback para a data UTC e `—` quando não há data) e a linha
+  `ritmo (últimas N): ▁▂▃   pico N/dia` — sparkline de 7 níveis (técnica do statui) sobre as
+  sessões que a tela realmente carrega; dia sem sessão é `·`, nunca barra mínima.
+- **Wiki (PR4)**: páginas ordenadas por tipo canônico (`contexto → decisoes → padroes →
+  glossario → bug`, tipos fora do padrão no fim) com cabeçalho de grupo (`contexto (1)`); a
+  seleção percorre a MESMA ordem desenhada, então `j`/`k` nunca "pula" linha.
+
+### Entregue no PR5 (ação e execução, ADR-0033)
+
+- **Modelo puro** (`src/tui/action/`): `Action` (`Scan`, `Triage{id}`, `PrDraft{id}`), `Request`
+  (a tecla sem id), `Effect` (disco/trilha/rede/LLM declarados), `Check`/`Prerequisite` com
+  `ok | aviso | falta`, e `ActionPlan { program, argv, root, effects, prerequisites }`.
+  `plan()` é puro sobre um `ActionCtx` injetado — teste fixa o argv **literal**:
+  `scan --path <root>`, `triage <id>`, `pr draft <id>`, sem shell e sem `--apply`/`--pat`/`--llm`.
+  `kira approve` fica FORA da allowlist: o subcomando não existe (W5/PR18).
+- **Teclas** (`s`/`t`/`d`/`o`): `s` vai direto ao plano; `t`/`d` abrem a folha de alvo (ids de
+  sessões da trilha + páginas `bugs/<id>.md` + digitação; id zero nunca é aceito). Enter na folha
+  só prepara o plano. `decide` barra as três com `--read-only` — agora é guarda de código, não só
+  rótulo no chrome.
+- **Confirmação**: popup centralizado (`centered_rect` + `Clear`) com alvo, efeitos e
+  pré-requisitos resolvidos (`binresolve` para dotnet/pnpm; config/env para org/projeto e PAT).
+  `Enter` é o único caminho que spawna; `Esc` em qualquer camada não executa nada.
+- **Runner** (`action/runner.rs`): thread + canal, `stdin(null)`, stdout/stderr em duas threads
+  leitoras, `try_wait` a cada 30 ms (deixa o `cancel` matar o filho sem deadlock), `Exited` enviado
+  só depois de drenar as linhas. `Drop` mata o filho: `q` não deixa `scan`/`triage` órfão.
+- **Saída**: `sanitize_line` (CSI/OSC/controle/`\r` de progresso) e `redact` ANTES de desenhar; teto
+  de 5.000 linhas / 512 KiB com contagem de descartadas; sobrevive a byte inválido.
+- **Overlay `o`**: painel de tela cheia com cabeçalho por stream (`═| stdout |══`), status
+  (`executando há 4s` / `concluído (exit 0)` / `falhou (exit N)`), `j/k` rola (desliga follow),
+  `G` religa; `Esc` fecha sem matar o processo.
+- **Reancoragem** (`state::SelectionKey`): ao terminar a execução (e no `r`) a seleção volta para o
+  MESMO achado (fingerprint), sessão (id) ou página (slug) — não para o índice que mudou de conteúdo.
+- **Testes**: 441 unit + integração/e2e verdes, incluindo `plan_uses_allowlisted_argv_and_never_a_shell`,
+  `sanitize_log_line_strips_ansi_osc_cr_and_controls`, `read_only_ignores_action_keys_and_keeps_navigation`,
+  `navigation_never_returns_an_execution_outcome` e o runner real com `--list` (stdout linha a linha
+  + exit code).
+
+### Entregue no PR-UX1 (camada visual nativa, ADR-0036)
+
+Zero dependência nova: `BarChart`, `Sparkline` e `Scrollbar` do próprio `ratatui 0.29`, mais
+quatro módulos puros nossos (`glyph`, `viewport`, `widgets/scrollbar`, `widgets/severity`,
+`widgets/trend`, `widgets/gauge`).
+
+```text
+╔| Resumo |════════════════════════════════════════════════════════════════════╗
+║| Risco |═════════════════════════════════════════════════════════════════════║
+║critical  8███████████████████████████████████████████████████████████████████║
+║high      8███████████████████████████████████████████████████████████████████║
+║medium    7███████████████████████████████████████████████████                ║
+║low       7███████████████████████████████████████████████████                ║
+║tendência (7 scans): ▆▇▅█▆▄▄                                         último 7 ║
+║índice 812/5000  [███░░░░░░░░░░░░░] 16%                                       ║
+║| Primeiros achados |═════════════════════════════════════════════════════════║
+║SEVERIDADE FERRAMENTA   LOCAL                     RESUMO                      ║
+║critical   audit        src/mod00.rs:10           advisory 00                 ║
+║… 25 mais em 2 Achados                                                        ║
+║| Pendências |════════════════════════════════════════════════════════════════║
+║— nenhuma pendência registrada                                                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
+```text
+╔| Achados — critical 8 · high 8 · medium 7 · low 7 |══════════════════════════╗
+║ferramentas: audit 30                                                   18/30 ║
+║   SEVERIDADE PACOTE                 LOCAL              RESUMO                ║
+║   critical   pkg04 1.0.0            src/mod04.rs:14    advisory 04          ▲║
+║   critical   pkg08 1.0.0            src/mod08.rs:18    advisory 08          █║
+║   high       pkg29 1.0.0            src/mod29.rs:39    advisory 29          █║
+║➤  medium     pkg06 1.0.0            src/mod06.rs:16    advisory 06          ▼║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
+- **Scrollbar + offset** (`viewport`): antes, `j` além da altura visível tirava a seleção da
+  tela (não havia offset em lugar nenhum). Agora a janela acompanha o cursor, o rótulo `18/30`
+  aparece à direita da primeira linha de dados e o scrollbar só existe quando a lista transborda.
+  Sessões e Wiki contam LINHAS de exibição (dia/tipo ocupam linha), não itens.
+- **Barras de severidade** (`BarChart`): escala pelo MAIOR grupo da tela, valor escrito ao lado
+  (o texto é o dado; a barra é a comparação). Com a faixa visual presente, a seção `Achados` sai
+  do Resumo — as barras dizem a mesma contagem e repetir número gasta linha.
+- **Tendência** (`Sparkline`): `achados` por scan, mais antigo primeiro, lida do `summary` da
+  sessão `scan` (`scan::findings_count_in_summary`). Menos de 2 pontos ⇒ a linha não aparece.
+- **Gauge**: uso do índice de retrieval (`repo_file_count` / `KIRA_INDEX_MAX_FILES`). **Budget de
+  LLM ficou de fora porque não existe contador** (ADR-0036 §6) — o schema v3 não tem tabela de
+  chamadas e `config.rs` não tem `max_llm_calls_per_day`; um `0/50` seria invenção.
+- **`KIRA_GLYPHS=ascii`**: borda `+ - |`, marcador `>`, barra `#`, gauge `#`/`-`, sparkline
+  `. : - = + * #`, scrollbar `#`/`|`. `?`, confirmação, folha de alvo e overlay `o` ainda usam
+  borda dupla — PR-UX1b.
+- **Contratos preservados**: `decide()` continua puro e nenhuma tecla mudou; tudo é read-only;
+  o `--snapshot` de texto ganhou `tendência (N scans, mais antigo primeiro): …` e
+  `índice do repositório: N/M arquivos`; o e2e de hash do `store.db` segue verde.
+- **Testes**: 522 unit verdes, incluindo `selection_scrolls_into_view_*` (três listas),
+  `the_tallest_bar_is_the_worst_group_not_a_fixed_scale`,
+  `ascii_mode_resumo_has_no_box_drawing_or_block_glyph`,
+  `findings_count_is_read_back_from_the_real_summary_format` e
+  `scan_series_reads_the_trail_oldest_first_and_skips_foreign_summaries`.
+
+Ainda pendente desta spec: mascote de estado, `kira --about` e a captura no README (PR de
+fechamento).
+
 ## Fora de escopo (rejeitado por ora)
 
 Mouse · edição de qualquer dado · gráfico temporal além de contagem · múltiplos

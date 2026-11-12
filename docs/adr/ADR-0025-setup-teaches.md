@@ -21,10 +21,12 @@ o que é PAT, tem que ensinar para ele e oferecer as opções que temos".
    imprime o pulado no resumo.
 3. **Validação na hora**, com rótulo explícito (as 4 mensagens exatas da spec:
    200 / 401 / 403 / sem rede) usando uma leitura barata. 401/403 NÃO gravam;
-   falha de rede grava e o `kira doctor` completa depois. Entrada de token sem
+    falha de rede grava e o `kira doctor` completa depois. Entrada de token sem
    eco (melhor esforço via `stty -echo` no Unix; o valor nunca é impresso —
-   nada vai para stdout/stderr/log e nunca para prompt de LLM; Windows sem
-   mecanismo std, registrado como limitação).
+   nada vai para stdout/stderr/log e nunca para prompt de LLM). No Windows não
+   há mecanismo sem dependência nova: o prompt **avisa** que o valor pode
+   ecoar, em vez de afirmar que está oculto; `SetupOptions::hidden_input`
+   controla o pedido e o `stty` só roda quando ele é `true` (nunca em teste).
 4. **Passo de backend de IA** com custo/dados em cada opção (ollama local: 0
    custo e código não sai da máquina; copilot: assinatura e política da
    empresa; foundry: BYOK, custo por token) e pré-requisito verificado
@@ -54,7 +56,8 @@ o que é PAT, tem que ensinar para ele e oferecer as opções que temos".
 - Positivas: menos desistência no primeiro contato; PAT errado é diagnosticado
   na hora (401/403/rede), não no primeiro `kira inspect`; modo local é um
   cidadão de primeira classe com resumo honesto do que ficou pendente.
-- Negativas: a saída do setup ficou mais longa (ensinar custa linhas) e o
-  passo `--deps` (fonte Nerd) fica para um PR futuro — o resumo já aponta o
-  comando de retomada. O eco oculto é best-effort no Windows (sem dependência
-  nova).
+- Negativas: a saída do setup ficou mais longa (ensinar custa linhas). O passo
+  de "fonte Nerd" saiu do fluxo: o resumo apontava `kira setup --deps --only
+  font`, um comando que o binário nunca teve — retomada inexistente é pior que
+  etapa ausente. O eco oculto segue best-effort no Windows (sem dependência
+  nova), agora declarado no próprio prompt.
