@@ -575,6 +575,33 @@ fn wiki_absent_index_shows_the_reindex_cause() {
 }
 
 #[test]
+fn empty_wiki_section_still_exists_in_the_snapshot_with_the_cause() {
+    // Bug 3 no modo texto: mesmo com a wiki VAZIA, o `--snapshot` inclui a
+    // seção da wiki com a causa honesta — a prova de que o painel existe
+    // mesmo vazio (e na ordem dos painéis: depois das sessões).
+    let sandbox = Sandbox::new("empty-wiki-section");
+    sandbox.seed_store_with_scan(false);
+    let (code, out, _) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "{out}");
+    let wiki_pos = out
+        .find("wiki: — (wiki vazia — rode kira wiki reindex)")
+        .unwrap_or(usize::MAX);
+    assert!(
+        wiki_pos < usize::MAX,
+        "a seção da wiki existe mesmo com o índice vazio: {out}"
+    );
+    let sessions_pos = out
+        .find("sessões: — (store sem sessões)")
+        .unwrap_or(usize::MAX);
+    assert!(
+        sessions_pos < wiki_pos,
+        "a wiki aparece DEPOIS das sessões (ordem dos painéis do ciclo): {out}"
+    );
+    // E o rodapé segue com `q sair` como primeiro item das teclas.
+    assert!(out.contains("teclas: q sair"), "{out}");
+}
+
+#[test]
 fn wiki_readonly_hash_holds_without_snapshot_too() {
     // A prova de read-only também vale no modo não-TTY (texto) com wiki:
     // o dashboard NUNCA escreve — nem o índice que ele acabou de ler.

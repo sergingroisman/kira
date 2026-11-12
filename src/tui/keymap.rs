@@ -35,9 +35,10 @@ pub enum Action {
 
 /// Traduz um evento de tecla em ação; `None` = tecla ignorada.
 ///
-/// Só `Char('q')` **sem** Ctrl é saída: Ctrl+C não é tratado aqui porque o
-/// crossterm em raw mode não gera interrupção, e capturar Ctrl+C como saída
-/// duplicaria o comportamento do `q` sem precisão de contrato.
+/// A SAÍDA (`q`, `Esc`, Ctrl+C) NÃO mora aqui: é a primeira checagem do
+/// `app::decide` (contrato do dono — sair em QUALQUER estado, antes de
+/// qualquer modal). Este mapa continua sem estado; o Ctrl+C cai no `_` e o
+/// decide o converte em Quit antes de chegar aqui.
 pub fn map(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
