@@ -1,0 +1,6 @@
+{
+  "causa_raiz": "Limite de tamanho do corpo da requisição no upload",
+  "arquivos": ["src/api/middleware.cs"],
+  "confianca": "baixa",
+  "nota": "fixture sintética (SEED) para testar o formato do --eval antes de rotular os 20 bugs reais do dono — substitua por rótulos verdadeiros"
+}

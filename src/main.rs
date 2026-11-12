@@ -62,6 +62,24 @@ enum Command {
         /// never fall back to Ollama
         #[arg(long, value_parser = ["ollama", "copilot", "foundry"])]
         llm: Option<String>,
+        /// Measure the M2 gate (ADR-0018) against a directory of gold labels:
+        /// each item is a folder with `item.json` + `gold.json`. Runs triage
+        /// offline (`--file` mode) on the chosen backend and compares the
+        /// answer to the gold deterministically (token similarity, threshold
+        /// 0.50, for the root cause; basename match, for the files) — no LLM
+        /// judging itself. Exit code: 0 = >=70% of the items (PASSOU),
+        /// 1 = <70% (NÃO PASSOU) or an error
+        #[arg(long)]
+        eval: Option<PathBuf>,
+        /// Print the eval report as JSON (with --eval): per-item scores plus
+        /// the predicted/gold texts, for automation
+        #[arg(long)]
+        json: bool,
+        /// Copy the 3 synthetic fixtures (seed-sintetico-*) into an EMPTY
+        /// --eval directory, then run the measurement on them — for testing
+        /// the format before labelling the 20 real bugs
+        #[arg(long)]
+        seed: bool,
     },
     /// Save the Azure DevOps configuration and the PAT in the OS keyring
     #[command(
@@ -305,7 +323,10 @@ async fn run(command: Command) -> Outcome {
             file,
             model,
             llm,
-        } => triage_command(id, file, model, llm).await,
+            eval,
+            json,
+            seed,
+        } => triage_command(id, file, model, llm, eval, json, seed).await,
         Command::Setup {
             org,
             project,
@@ -396,18 +417,33 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             file,
             model,
             llm,
+            eval,
+            json,
+            seed,
         } => {
+            // O `--eval` é outra origem (uma pasta de gold), exclusiva do id
+            // e do `--file`; a trilha registra exatamente como foi chamado.
             let mut args = String::new();
-            match (id, file) {
-                (Some(id), _) => args = id.to_string(),
-                (None, Some(file)) => args = format!("--file {}", file.display()),
-                (None, None) => {}
-            }
-            if let Some(llm) = llm {
-                // O valor já é validado pelo value_parser do clap
-                // (`ollama|copilot|foundry`) — a trilha registra exatamente o
-                // backend usado nesta execução.
-                args.push_str(&format!(" --llm {llm}"));
+            if let Some(eval) = eval {
+                args.push_str(&format!("--eval {}", eval.display()));
+                if *seed {
+                    args.push_str(" --seed");
+                }
+                if *json {
+                    args.push_str(" --json");
+                }
+            } else {
+                match (id, file) {
+                    (Some(id), _) => args = id.to_string(),
+                    (None, Some(file)) => args = format!("--file {}", file.display()),
+                    (None, None) => {}
+                }
+                if let Some(llm) = llm {
+                    // O valor já é validado pelo value_parser do clap
+                    // (`ollama|copilot|foundry`) — a trilha registra exatamente o
+                    // backend usado nesta execução.
+                    args.push_str(&format!(" --llm {llm}"));
+                }
             }
             (
                 "triage".to_string(),
@@ -1129,7 +1165,26 @@ async fn triage_command(
     file: Option<PathBuf>,
     model_flag: Option<String>,
     llm_flag: Option<String>,
+    eval: Option<PathBuf>,
+    json: bool,
+    seed: bool,
 ) -> Outcome {
+    // W2-bis (ADR-0018): o `--eval` mede o gate M2 e é exclusivo das demais
+    // origens — um erro de composição aqui é acionável, nunca implícito.
+    if eval.is_some() || seed {
+        if id.is_some() || file.is_some() {
+            let message =
+                "informe apenas uma origem: o id OU --file OU --eval <pasta-de-gold>".to_string();
+            eprintln!("erro: {message}");
+            return Outcome::failure(message);
+        }
+        return eval_command(eval, json, seed, model_flag, llm_flag).await;
+    }
+    if json {
+        let message = "--json só faz sentido com --eval (a medição do gate M2)".to_string();
+        eprintln!("erro: {message}");
+        return Outcome::failure(message);
+    }
     let source = match triage_source(id, file) {
         Ok(source) => source,
         Err(message) => {
@@ -1185,6 +1240,78 @@ async fn triage_command(
                 ))
             } else {
                 Outcome::success(report.output)
+            }
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// W2-bis (ADR-0018): mede o gate M2 com `kira triage --eval <dir>`.
+///
+/// O backend é o mesmo contrato do `triage` (explicit choice, fail loud —
+/// não se mede com dado falso). O exit code é o próprio gate: 0 quando
+/// ≥ 70% dos itens acertam, 1 quando < 70% ou quando algo falha.
+async fn eval_command(
+    eval: Option<PathBuf>,
+    json: bool,
+    seed: bool,
+    model_flag: Option<String>,
+    llm_flag: Option<String>,
+) -> Outcome {
+    let Some(dir) = eval else {
+        let message = "--seed precisa de --eval <pasta-de-gold>".to_string();
+        eprintln!("erro: {message}");
+        return Outcome::failure(message);
+    };
+    let kind = match kira::llm::LlmKind::from_flag_and_env(llm_flag.as_deref()) {
+        Ok(kind) => kind,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
+    let base_url = ollama::base_url_from_env();
+    let model = model_flag.unwrap_or_else(ollama::model_from_env);
+    // `--seed` copia as 3 fixtures sintéticas num diretório vazio e segue para
+    // a medição: o dono vê a mecânica do gate antes de rotular os 20 reais.
+    if seed {
+        if let Err(err) = kira::eval::seed_dir(&dir) {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+        eprintln!("seeds sintéticas copiadas para {}", dir.display());
+    }
+    match kira::eval::run(&dir, kind, &base_url, &model).await {
+        Ok((itens, gate)) => {
+            if json {
+                let report = kira::eval::report(&itens, &gate);
+                match serde_json::to_string_pretty(&report) {
+                    Ok(corpo) => print!("{corpo}"),
+                    Err(err) => {
+                        let failure = Error::Eval(format!(
+                            "não foi possível serializar o relatório --json: {err}"
+                        ));
+                        eprintln!("erro: {failure}");
+                        return Outcome::failure(failure.to_string());
+                    }
+                }
+            } else {
+                print!("{}", kira::eval::render_table(&itens, &gate));
+            }
+            // No modo JSON a linha do gate vai ao stderr (o veredito humano
+            // não pode se perder no JSON); na tabela ela já está no stdout.
+            let linha = kira::eval::gate_line(&gate);
+            if json {
+                eprintln!("{linha}");
+            }
+            Outcome {
+                code: exit_code(gate.passou),
+                ok: gate.passou,
+                records: true,
+                summary: format!("triage --eval: {linha}"),
             }
         }
         Err(err) => {

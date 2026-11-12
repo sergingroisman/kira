@@ -1,0 +1,6 @@
+{
+  "causa_raiz": "TTL do token de sessão muito curto",
+  "arquivos": ["src/auth/session.rs"],
+  "confianca": "alta",
+  "nota": "fixture sintética (SEED) para testar o formato do --eval antes de rotular os 20 bugs reais do dono — substitua por rótulos verdadeiros"
+}

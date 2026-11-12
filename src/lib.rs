@@ -12,6 +12,7 @@ pub mod context;
 pub mod credentials;
 pub mod doctor;
 pub mod error;
+pub mod eval;
 pub mod format;
 pub mod guard;
 pub mod html;

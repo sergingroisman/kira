@@ -47,3 +47,35 @@ com o rótulo e imprime o percentual de acerto.
 - **LLM-judge avaliando o triage** — rejeitado por ora: julgar com LLM um
   produto que usa LLM não substitui rótulo humano de causa raiz; pode voltar
   como reforço pós-M2, nunca como gate.
+
+## Implementação (W2-bis)
+
+O comando existe: **`kira triage --eval <dir>`** (`src/eval.rs`). O
+diretório de gold tem um item por **pasta**, com `item.json` (work item no
+formato da API do Azure DevOps — o mesmo do `kira triage --file`) e
+`gold.json` (`causa_raiz`, `arquivos`, `confianca`). O triage roda offline
+contra o backend escolhido (`--llm ollama` default; `copilot`/`foundry`
+explícitos e fail-loud) e a comparação é **determinística**:
+
+- **Causa raiz**: similaridade de tokens de conteúdo — normalização
+  (minúsculas, sem acento, sem stopwords PT, palavras ≥ 4 caracteres),
+  `score = |interseção(prevista, gold)| / |gold|`. **Acerto = score ≥ 0.50**
+  (metade dos tokens de conteúdo do gold). Gold vazio nunca acerta.
+- **Arquivos**: pelo menos 1 **basename** do gold presente entre os basenames
+  previstos (sem caixa; `não identificado`/`—` nunca acertam).
+- **Veredito do item**: causa E arquivos. **Gate M2: ≥ 70%** dos itens com
+  veredito pleno ⇒ PASSOU; senão NÃO PASSOU. O **exit code é o gate**
+  (0 = passou; 1 = < 70% ou qualquer erro) — pronto para CI.
+- Saída: tabela por item (`id | causa % | arquivos ok? | veredito`) + linha
+  `GATE M2: <acertos>/<total> = <pct>% (limiar 70%) — PASSOU|NÃO PASSOU`;
+  `--json` com os mesmos campos + textos previstos/gold para automação.
+- Item que falha **aborta a medição** (nunca número parcial); diretório
+  vazio sem dados ⇒ erro acionável com o schema.
+- `--seed` copia 3 fixtures **sintéticas** (`seed-sintetico-01..03`,
+  embutidas em `tests/fixtures/triage_gold_seed/`) num diretório vazio —
+  o dono testa a mecânica antes de rotular os 20 reais; seeds nunca viram
+  rótulo: o nome e o campo `nota` do gold declaram que são sintéticas.
+
+Os limiares (0.50 / 70%) são escolhas documentadas e versionadas
+(`src/eval.rs`, constantes públicas) — mudam em PR próprio, com o número
+antes/depois no ledger.

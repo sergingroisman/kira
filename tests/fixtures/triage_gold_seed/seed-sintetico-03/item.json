@@ -1,0 +1,11 @@
+{
+  "id": 900003,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900003,
+    "System.WorkItemType": "Bug",
+    "System.Title": "SEED sintética 03 — upload de anexo grande falha sem mensagem clara",
+    "System.State": "New",
+    "System.Description": "<div>Fixture sintética para testar o formato do --eval (não é um bug real). O upload de arquivos acima de alguns MB falha com erro genérico no cliente.</div>"
+  }
+}
