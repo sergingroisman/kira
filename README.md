@@ -107,9 +107,45 @@ kira triage --eval ./gold --seed                    # primeira vez, 3 fixtures s
 
 ## Instalação
 
+Ainda não há binário publicado em release — hoje o caminho é compilar do fonte:
+
 ```bash
 cargo install --path .     # ou: cargo run -- <comando> direto do repo
 ```
+
+### Instalação verificada (quando existir release)
+
+`curl | bash` executa o que chegar, sem chance de conferir. O KIRA distribui um
+`SHA256SUMS` junto com cada artefato, e os instaladores **falham fechado** se o
+hash não bater.
+
+Linux / macOS:
+
+```bash
+curl -fsSLO https://github.com/sergingroisman/kira/releases/latest/download/install.sh
+curl -fsSLO https://github.com/sergingroisman/kira/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS   # no macOS: shasum -a 256 -c …
+bash install.sh
+```
+
+Windows (PowerShell, sem admin — instala em `%LOCALAPPDATA%\kira\bin`):
+
+```powershell
+.\install.ps1
+```
+
+**O que isso prova, e o que não prova.** O `SHA256SUMS` vem do mesmo host do
+binário: isso garante *integridade de transporte* (download truncado, corrupção,
+troca parcial no caminho), não *autoria*. Quem controla o host controla os dois
+arquivos. Para exigir autoria, fixe o hash fora do canal:
+
+```bash
+curl -fsSLO https://github.com/sergingroisman/kira/releases/download/v0.1.0/install.sh
+KIRA_PINNED_SHA256=<hash que você conferiu no repo> bash install.sh
+```
+
+(`-PinnedSha256` no PowerShell). Se o hash publicado divergir do fixado, a
+instalação para antes de gravar qualquer arquivo.
 
 ## Setup (local-first — ADR-0030)
 
