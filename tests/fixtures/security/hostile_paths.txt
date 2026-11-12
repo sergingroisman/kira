@@ -1,0 +1,8 @@
+../escape.md
+..%2fescape
+../../etc/passwd
+....//....//escape
+/absoluto/fora
+.git/escape
+bugs/UPPER-CASE
+bugs/ok-slug
