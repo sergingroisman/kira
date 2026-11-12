@@ -19,9 +19,9 @@ feitos: 0024 e 0025).
 
 | Item | Objeto | Branch | Aceite | Status |
 |---|---|---|---|---|
-| **W7.1** | `redact` v2: remoção de invisíveis (zero-width/bidi) antes do masking (ADR-0024 R1) + fixtures de payload | `w7/pr-<num>-redact-invisible` | Reexecução do probe de 12/Nov: as famílias vazantes passam a sair mascaradas; `contains_secret` cobre; idempotência mantida; gates verdes | **proposto — 1º da fila (bug real)** |
-| **W7.2** | Prompt v2: bloco delimitado de conteúdo não confiável + regra anti-instrução embutida (ADR-0024 R2) | `w7/pr-<num>-prompt-v2` | `TRIAGE_PROMPT_VERSION=v2`, FNV-1a recalculado, dourado + `tests/fixtures/triage/*/prompt.txt` reescritos no mesmo commit; `--eval` intacto; gates verdes | proposto |
-| **W7.3** | Probe suite `tests/security_probe.rs` (ADR-0026) | `w7/pr-<num>-security-probes` | Suíte verde nos 3 SOs; mapeamento OWASP LLM no cabeçalho; fixtures em `tests/fixtures/security/`; sem comando novo/dep nova/rede | proposto |
+| **W7.1** | `redact` v2: remoção de invisíveis (zero-width/bidi) antes do masking (ADR-0024 R1) + fixtures de payload | `w7/pr-<num>-redact-invisible` | Reexecução do probe de 12/Nov: as famílias vazantes passam a sair mascaradas; `contains_secret` cobre; idempotência mantida; gates verdes | **implementado** (#55) |
+| **W7.2** | Prompt v2: bloco delimitado de conteúdo não confiável + regra anti-instrução embutida (ADR-0024 R2) | `w7/pr72-prompt-v2` | `TRIAGE_PROMPT_VERSION=v2`, FNV-1a recalculado, dourado + `tests/fixtures/triage/*/prompt.txt` reescritos no mesmo commit; `--eval` intacto; gates verdes | **implementado** (#56) |
+| **W7.3** | Probe suite `tests/security_probe.rs` (ADR-0026) | `w7/pr73-security-probes` | Suíte verde nos 3 SOs; mapeamento OWASP LLM no cabeçalho; fixtures em `tests/fixtures/security/`; sem comando novo/dep nova/rede | **implementado** (#58) |
 | **W7.4** (opcional) | `gitleaks` como ferramenta do `kira scan` (G4 do relatório) | `w7/pr-<num>-scan-gitleaks` | **A confirmar com o dono** — se confirmar: ADR próprio (nº definido na hora; ADR-0027 já tomado) + PR separado; KIRA orquestra (resolve no PATH, parse, fingerprint), não analisa | a confirmar |
 
 ## Ordem e dependências

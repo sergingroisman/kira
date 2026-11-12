@@ -36,10 +36,10 @@
 | 0021 | Índice de retrieval FTS5 (bm25), não embeddings | aceito | `ADR-0021-retrieval-index.md` |
 | 0022 | Organização por domínio agora, camadas depois | aceito | `ADR-0022-organizacao-por-dominio.md` |
 | 0023 | Gitingest: o que vale trazer (BOM/UTF-16, ignorados, orçamentos) | proposto | `ADR-0023-gitingest-reaproveitamento.md` |
-| **0024** | **Guardrails v2: injeção invisível (zero-width/bidi) + bloco delimitado no prompt** | **proposto** — reservado | PR #72 (`w7/pr72-prompt-v2`, R2) · `ADR-0024-guardrails-invisiveis-prompt-v2.md` |
-| **0025** | **`kira setup` ensina: aula do PAT, menu com pular, validação na hora** | **proposto** — reservado | PR #52 · `ADR-0025-setup-teaches.md` |
-| **0026** | **Probe suite de segurança no `cargo test`** | **proposto** — reservado | PR #51 · `ADR-0026-probe-suite-seguranca.md` |
-| **0027** | **Tech Leads Club: piso de guardas, lições e custódia de prompt** | **proposto** — reservado | PR #49 · `ADR-0027-techleads-piso-guards-licoes-custodia.md` |
+| **0024** | **Guardrails v2: injeção invisível (zero-width/bidi) + bloco delimitado no prompt** | **implementado** (R1 #55, R2 #56) — aguarda aceite do dono | `ADR-0024-guardrails-invisiveis-prompt-v2.md` |
+| **0025** | **`kira setup` ensina: aula do PAT, menu com pular, validação na hora** | **implementado** (#52) — aguarda aceite do dono | `ADR-0025-setup-teaches.md` |
+| **0026** | **Probe suite de segurança no `cargo test`** | **implementado** (#58) — aguarda aceite do dono | `ADR-0026-probe-suite-seguranca.md` |
+| **0027** | **Tech Leads Club: piso de guardas, lições e custódia de prompt** | **proposto** — aguarda aval do dono | `ADR-0027-techleads-piso-guards-licoes-custodia.md` |
 | **0028** | **Reservado** — ferramentas de scan (ex.: `gitleaks`) / economia de token | **reservado** | a confirmar com o dono |
 
 ## O que **não** é ADR aqui
