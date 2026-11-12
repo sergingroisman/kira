@@ -1,8 +1,9 @@
 # Plano de implementação — Onda TE (PR34–PR43)
 
 **Data**: 12/Nov/2026 · **Fonte**: [`docs/rtk-gsd-rea-openclaude-vale-trazer.md`](rtk-gsd-rea-openclaude-vale-trazer.md)
-(plano de análise, mergeado na PR #50) · **Estado ancorado**: `main` em `2441701`
-(prompt v2 na PR #56, redact W7.1 na #55, keyring hermético na #57).
+(plano de análise, mergeado na PR #50) · **Estado ancorado**: `main` em
+`1f9ed80` (prompt v2 na PR #56, redact W7.1 na #55, keyring hermético na #57,
+probe suite na #58, índice de ADR na #59).
 
 Este documento transforma a tabela PR34–PR43 do plano de análise em **planos de
 implementação executáveis**: escopo fechado, arquivos com âncoras de código
@@ -478,14 +479,19 @@ internos resolvidos. Decisão aberta **D12**: os percentuais 50/75/90
 
 ## 13. PR43 — Painel de economia no dashboard (W6)
 
-**Objetivo**: o dashboard (Ratatui, read-only provado) mostra a economia medida
-pelo PR34 — pack vs teto, chamadas, hits de cache — sem poder escrever **nada**
-em disco.
+**Objetivo**: o dashboard (Ratatui) mostra a economia medida pelo PR34 — pack
+vs teto, chamadas, hits de cache — sob o contrato vigente do AGENTS.md
+(**read-only provado**: nada de disco/rede/LLM, store
+`SQLITE_OPEN_READ_ONLY`). O painel é widget de exibição e **não adiciona
+tecla de ação** — escrever segue proibido nele. Nota: se o contrato de ações
+confirmadas (ADR-0026, em discussão na main) prevalecer, a prova read-only
+desse painel roda via `kira dashboard --read-only` — o panel em si não muda.
 
 **Escopo fechado**: **1 campo por PR** (regra do plano): esta PR entrega o
 painel com o primeiro campo (`tokens_est vs budget_chars` da sessão mais
 recente); campos seguintes (`llm_calls`, `hits cache-wiki`) viram PRs pequenos
-posteriores. Timeline: **W6** (pós-gate M2) — não entra na fila agora.
+posteriores. Nenhuma ação nova no painel. Timeline: **W6** (pós-gate M2) —
+não entra na fila agora.
 
 **Arquivos**:
 
@@ -497,8 +503,9 @@ posteriores. Timeline: **W6** (pós-gate M2) — não entra na fila agora.
 
 **Testes de aceite** (padrão `dashboard_e2e`):
 
-- Hash do `store.db` byte-idêntico antes/depois de rodar `kira dashboard`
-  (com e sem `--snapshot`) — read-only provado.
+- Hash do `store.db` **byte-idêntico** antes/depois de rodar `kira dashboard`
+  (com e sem `--snapshot`); se o contrato ADR-0026 prevalecer, a prova roda em
+  `--read-only` (e2e deve cobrir os dois modos).
 - Sem ledger na sessão ⇒ campo `—` com a causa (fail-open do store).
 
 ---
