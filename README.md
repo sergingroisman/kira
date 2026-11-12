@@ -292,6 +292,66 @@ página — a fonte de verdade é o disco, o índice é derivado).
 Atribuição: a casca é inspirada no statui (MIT, Mohamed Badry) — nenhum trecho
 foi copiado nesta PR; ver `third_party/statui/NOTICE.md`.
 
+## PR draft — `kira pr draft` (W4, local)
+
+Gera o **rascunho de PR em markdown** a partir do que o KIRA já sabe — SEM
+rede, SEM LLM, SEM push e SEM abrir PR. Fontes: último `kira triage ITEM_ID`
+na trilha do store (causa raiz, arquivos, confiança), achados do
+`.kira/findings.json` cujo path aparece entre os arquivos citados pelo triage,
+até 3 páginas de wiki relacionadas por termo comum e, opcionalmente, o item do
+board via `--file caminho.json` (JSON salvo localmente).
+
+```text
+kira pr draft 4821                       # rascunho no stdout
+kira pr draft 4821 --file item.json      # usa o item do board do JSON local (título/contexto)
+kira pr draft 4821 --out draft.md        # escreve o arquivo (caminho explícito; nunca escolhe sozinho)
+kira pr draft 4821 --json                # estrutura parseável (item_id, seções, markdown)
+```
+
+Exemplo de saída (com uma seção sem dado — o placeholder `—` sempre vem com a
+causa, nunca dado inventado):
+
+```markdown
+# Sessão expirada com token válido
+
+## Contexto
+Item #4821 do tipo Bug no estado Active.
+
+## Causa raiz provável
+TTL do token muito curto.
+
+Confiança: média
+
+## Mudança proposta
+A partir dos arquivos citados pelo último triage (nenhum arquivo novo é sugerido):
+- revisar `src/auth/session.rs` (citado pelo triage)
+
+## Evidências
+src/auth/session.rs — achado audit/high: TTL fixo sem configurar
+.kira/wiki/bugs/4821-sessao-expirada.md — trecho: "TTL do token muito curto causa relogin frequente..."
+
+## Riscos
+— (não há achado de scan relacionado aos arquivos citados; rode kira scan antes)
+
+## Checklist
+- [ ] `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test` e `cargo build` verdes
+- [ ] revisão humana antes do merge — o merge é sempre humano
+- [ ] diff sem segredos (nenhum PAT/token/e-mail no diff)
+```
+
+Regras do comando (testadas em `src/prdraft.rs` e `tests/prdraft_e2e.rs`):
+
+- **Anti-invenção**: evidência só entra se veio de dado real (sessão, finding
+  ou wiki). Seção sem dado sai como `— (não há dado; rode kira triage <id>
+  antes)` — sem arquivo, linha, causa ou métrica inventados. `path:linha` só
+  quando o achado traz linha.
+- **Redação obrigatória**: o texto inteiro passa por `crate::redact` antes de
+  sair — o rascunho pode ir para PR público.
+- **Determinismo**: template fixo, sem `now()` — a data vem do dado gravado;
+  mesma entrada = mesma saída byte a byte.
+- Item sem triage sai com `—` + causa e **exit 0** (falta de dado não é erro).
+- O comando é read-only: não grava sessão na trilha, não toca rede nem LLM.
+
 ## Wiki — `.kira/wiki/`
 
 O KIRA mantém conhecimento reutilizável (não log de conversa) em markdown
