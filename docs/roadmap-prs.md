@@ -124,6 +124,12 @@ Não bateu? **Pare e conserte o context packer.** Sem isso não se pinta a nave.
 | PR17 | Flywheel de autonomia (budget `max_llm_calls_per_day = 50`) | budget checado **antes** de cada transição |
 | PR18 | `kira audit --weekly` | **blog saiu**; vira ROADMAP "a confirmar com o dono" |
 
+## W5 — spec pronta, execução bloqueada pelo gate M2
+
+O desenho do `kira loop` (estados, cadências, budget, watchdogs, kill switch e o modo
+sugestão sem PR) está em [`kira-w5-loop.md`](kira-w5-loop.md). Nada disso vira código
+antes do gate M2: 20 bugs rotulados e ≥70% medido por `kira triage --eval`.
+
 ## W6 — TUI + mascote (só pós-M2)
 
 - **Base: shell do `statui` (MIT) adaptado** — `src/tui/{app,keymap,theme,fx,state}.rs`
