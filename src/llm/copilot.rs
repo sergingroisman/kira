@@ -22,8 +22,6 @@
 
 use std::ffi::OsString;
 use std::io::Read;
-#[cfg(any(windows, test))]
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,6 +29,13 @@ use std::time::{Duration, Instant};
 use crate::binresolve;
 use crate::error::Error;
 use crate::llm::LlmBackend;
+// `cmd_command_line` é usado na montagem da linha (Windows) e nos testes;
+// `cmd_quote` só nos testes. O `cfg` precisa ser por nome: com o mesmo `cfg`
+// para os dois, o build de lib no Windows acusa `cmd_quote` como import não usado.
+#[cfg(any(windows, test))]
+use crate::shellline::cmd_command_line;
+#[cfg(test)]
+use crate::shellline::cmd_quote;
 
 /// Name searched on the PATH when `KIRA_COPILOT_BIN` is not set.
 const CLI_PROGRAM: &str = "copilot";
@@ -158,39 +163,6 @@ fn build_command(bin: &PathBuf, args: &[OsString]) -> Command {
         command.args(args);
         command
     }
-}
-
-/// Builds the single command line handed to `cmd /C`.
-#[cfg(any(windows, test))]
-fn cmd_command_line(bin: &Path, args: &[OsString]) -> String {
-    let mut line = String::from("chcp 65001 >nul 2>&1 & ");
-    line.push_str(&cmd_quote(&bin.to_string_lossy()));
-    for arg in args {
-        line.push(' ');
-        line.push_str(&cmd_quote(&arg.to_string_lossy()));
-    }
-    line
-}
-
-/// Quotes one token for `cmd.exe`: wrapped in double quotes, embedded quotes
-/// doubled, CR/LF flattened to spaces (see [`build_command`]).
-#[cfg(any(windows, test))]
-fn cmd_quote(raw: &str) -> String {
-    let mut quoted = String::with_capacity(raw.len() + 2);
-    quoted.push('"');
-    for ch in raw.chars() {
-        match ch {
-            // `cmd.exe` has no reliable escape for a double quote inside a
-            // quoted argument (doubling breaks `raw_arg` lines, backslash is
-            // literal). Prompts are natural language: swap the quotes for
-            // apostrophes instead of corrupting the command line.
-            '"' => quoted.push('\''),
-            '\r' | '\n' => quoted.push(' '),
-            other => quoted.push(other),
-        }
-    }
-    quoted.push('"');
-    quoted
 }
 
 /// Reads a child stream fully as bytes (never fails the caller on invalid

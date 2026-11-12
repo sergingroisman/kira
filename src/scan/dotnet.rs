@@ -29,8 +29,8 @@ pub const DOTNET_ARGS: [&str; 6] = [
 /// RESOLVED first (which-style) — absence never reaches the spawn, and the
 /// resolved full path is what runs.
 pub fn scan_dir(dir: &Path) -> Result<Vec<Finding>, ScanError> {
-    let mut command = tool_command(ToolKind::Dotnet)?;
-    command.args(DOTNET_ARGS).current_dir(dir);
+    let mut command = tool_command(ToolKind::Dotnet, &DOTNET_ARGS)?;
+    command.current_dir(dir);
     let output = command
         .output()
         .map_err(|source| spawn_error(ToolKind::Dotnet, source))?;

@@ -242,23 +242,46 @@ fn resolve_tool_explicit(
 /// Builds the command that runs the tool of `kind` (callers add their own
 /// args and `current_dir`, never touching the program): resolution happens
 /// FIRST and the spawn always uses the RESOLVED full path.
-pub(crate) fn tool_command(kind: ToolKind) -> Result<Command, ScanError> {
+pub(crate) fn tool_command(kind: ToolKind, args: &[&str]) -> Result<Command, ScanError> {
     let resolved = resolve_tool(kind)?;
-    Ok(command_from_resolved(&resolved))
+    Ok(command_from_resolved(&resolved, args))
 }
 
 /// Pure command builder over one [`Resolved`] (unit-testable without env):
 /// `.cmd`/`.bat` on Windows go via `cmd /C chcp 65001 …` (the std never
 /// resolves them and the codepage must stay UTF-8 for real tool output),
 /// everything else spawns directly.
-fn command_from_resolved(resolved: &Resolved) -> Command {
+fn command_from_resolved(resolved: &Resolved, args: &[&str]) -> Command {
     if resolved.via_cmd {
+        // `cmd /C` recebe UMA linha, com os argumentos dentro dela. Antes, o
+        // `chcp ... &` ia como argumento separado e o std o citava inteiro: o
+        // `cmd` lia tudo como nome de programa e o scan morria com
+        // "The filename, directory name, or volume label syntax is incorrect."
+        // (bug real, reproduzido no CI do windows-latest). Os argumentos
+        // também precisam entrar na linha: `Command::arg` depois do `raw_arg`
+        // não tem efeito.
+        let owned: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+        let line = crate::shellline::cmd_command_line(&resolved.path, &owned);
         let mut command = Command::new("cmd");
-        command.args(["/C", "chcp 65001 >nul 2>&1 &"]);
-        command.arg(&resolved.path);
+        command.arg("/C");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.raw_arg(line);
+        }
+        #[cfg(not(windows))]
+        {
+            // Inalcançável (via_cmd só é true no Windows), mas mantém o build
+            // honesto em outros alvos e nos testes.
+            let _ = line;
+            command.arg(&resolved.path);
+            command.args(args);
+        }
         command
     } else {
-        Command::new(&resolved.path)
+        let mut command = Command::new(&resolved.path);
+        command.args(args);
+        command
     }
 }
 
@@ -1183,23 +1206,26 @@ mod tests {
             path: PathBuf::from("/tools/npm"),
             via_cmd: false,
         };
-        let command = command_from_resolved(&resolved);
+        let command = command_from_resolved(&resolved, &[]);
         assert_eq!(command.get_program(), "/tools/npm");
 
         let resolved = Resolved {
             path: PathBuf::from("C:\\tools\\npm.cmd"),
             via_cmd: true,
         };
-        let command = command_from_resolved(&resolved);
+        let command = command_from_resolved(&resolved, &["audit", "--json"]);
         assert_eq!(command.get_program(), "cmd");
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            args,
-            vec!["/C", "chcp 65001 >nul 2>&1 &", "C:\\tools\\npm.cmd",],
-            "{args:?}"
+        // Em Windows o segundo argumento é a LINHA inteira (raw_arg); nos
+        // outros alvos é o caminho + args. O contrato que importa: nunca existe
+        // um argumento isolado "chcp ... &".
+        assert_eq!(args.first().map(String::as_str), Some("/C"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.trim() == "chcp 65001 >nul 2>&1 &"),
+            "chcp não pode ir como argumento separado: {args:?}"
         );
     }
 
