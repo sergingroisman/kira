@@ -1054,7 +1054,7 @@ pub fn header_lines(snapshot: &Snapshot) -> Vec<String> {
 /// Rodapé de 1 linha com as teclas — mesmo texto no TUI e no snapshot.
 /// `q sair` é SEMPRE o primeiro item (contrato do dono) e `? ajuda` o último.
 pub fn footer_line() -> String {
-    "teclas: q sair · Esc/Ctrl+C saem · Tab/Shift+Tab painel · j/k ou ↑/↓ mover · g/G topo/fim · / busca wiki · r reler disco · ? ajuda".to_string()
+    "teclas: q sair · Esc voltar · Ctrl+C sair · Tab/Shift+Tab painel · j/k ou ↑/↓ mover · g/G topo/fim · / busca wiki · r reler disco · ? ajuda".to_string()
 }
 
 /// Dica do painel vazio para o rodapé (uma linha): quando o painel EM FOCO
@@ -1399,11 +1399,12 @@ mod tests {
 
     #[test]
     fn footer_keeps_q_sair_first_and_ajuda_last() {
-        // Contrato do dono: `q sair` é SEMPRE o primeiro item do rodapé —
-        // mesmo depois de Esc/Ctrl+C entrarem como saída também.
+        // Contrato do dono: `q sair` é SEMPRE o primeiro item do rodapé, e
+        // Esc aparece como "voltar" (padrão de mercado), com Ctrl+C como saída.
         let footer = footer_line();
         assert!(footer.starts_with("teclas: q sair · "), "{footer}");
-        assert!(footer.contains("Esc/Ctrl+C saem"), "{footer}");
+        assert!(footer.contains("Esc voltar"), "{footer}");
+        assert!(footer.contains("Ctrl+C sair"), "{footer}");
         assert!(footer.ends_with("? ajuda"), "{footer}");
     }
 
