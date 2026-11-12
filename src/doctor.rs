@@ -6,6 +6,7 @@
 //! setting is present, so an incomplete setup never touches the network.
 
 use crate::board;
+use crate::capabilities::{Capability, CapabilityState};
 use crate::credentials::{self, Source};
 use crate::error::Error;
 
@@ -76,8 +77,15 @@ pub fn set_env_command(name: &str, value: &str) -> String {
 
 /// Concrete fix for a missing setting.
 pub fn missing_setting_fix(name: &str) -> String {
+    // O PAT agora nasce em `connect` (ADR-0030 #4): a dica aponta para o
+    // comando que valida e grava, não para o setup (que não pede mais PAT).
+    if name == "AZURE_DEVOPS_PAT" {
+        return format!(
+            "rode `kira connect azure` (ou {})",
+            set_env_command(name, "<pat>")
+        );
+    }
     let value = match name {
-        "AZURE_DEVOPS_PAT" => "<pat>",
         "AZURE_DEVOPS_ORG" => "nome-da-org",
         "AZURE_DEVOPS_PROJECT" => "nome-do-projeto",
         other => return format!("defina {other}"),
@@ -105,20 +113,46 @@ pub fn format_unauthorized_check(organization: &str) -> String {
     )
 }
 
-/// Explicação CURTA do PAT (a aula completa vive no `kira setup`; o doctor
-/// repete o resumo quando o PAT está ausente ou inválido — ADR-0025). Quando
-/// a org não é conhecida, usa `<sua-org>` no link.
-pub fn format_pat_lesson_short(organization: Option<&str>) -> String {
-    let url = match organization {
-        Some(org) => format!("https://dev.azure.com/{org}/_usersSettings/tokens"),
-        None => "https://dev.azure.com/<sua-org>/_usersSettings/tokens".to_string(),
+/// Linha de capacidades do `kira doctor` (ADR-0030): o que está conectado
+/// para o projeto atual, ou o aviso de modo local quando nada está.
+pub fn format_capabilities_line(connected: &[&str]) -> String {
+    if connected.is_empty() {
+        "capacidades: nenhuma conectada (modo local)".to_string()
+    } else {
+        format!("capacidades: {}", connected.join(", "))
+    }
+}
+
+/// Lê o estado REAL das capacidades do projeto atual no store (mesma fonte
+/// do gating). Qualquer falha de leitura (sem HOME, store indisponível,
+/// fora de um projeto) degrada para "nenhuma conectada" — o doctor é
+/// diagnóstico, não gate: nunca falha nem bloqueia por isso.
+pub fn connected_capabilities() -> Vec<&'static str> {
+    const ALL: [Capability; 3] = [
+        Capability::BoardAzure,
+        Capability::ScmGithub,
+        Capability::ScmGitlab,
+    ];
+    let Ok(store) = crate::store::Store::open_default() else {
+        return Vec::new();
     };
-    format!(
-        "PAT = senha descartável de leitura de Work Items: expira na data escolhida \
-         (30/90 dias) e aparece uma única vez.\n   \
-         Crie em {url} com o escopo Work Items → Read; depois rode `kira setup` para colar\n   \
-         (ou pule: o KIRA funciona em modo local com `kira triage --file`)."
-    )
+    let Some(root) = crate::store::detect_project_root() else {
+        return Vec::new();
+    };
+    let Ok(project) = store.ensure_project(&root) else {
+        return Vec::new();
+    };
+    ALL.iter()
+        .filter(|capability| {
+            store
+                .capability_state_raw(&project.id, capability.name())
+                .ok()
+                .flatten()
+                .and_then(|value| CapabilityState::from_stored(&value))
+                .is_some_and(|state| state == CapabilityState::Conectada)
+        })
+        .map(|capability| capability.name())
+        .collect()
 }
 
 /// Linha do nome do dev no `kira doctor`: `dev: Sergin` quando há nome salvo
@@ -229,13 +263,9 @@ pub async fn run() -> (bool, String) {
         let (line, ok) = format_resolved_check(name, resolved);
         emit(&mut out, &format!("   {line}"));
         if !ok {
-            // PAT ausente: repete a explicação curta (ADR-0025) — o usuário
-            // que desistiu do token entende o que está faltando sem rodar o
-            // wizard de novo.
-            if *name == *"AZURE_DEVOPS_PAT" {
-                let org = organization.as_ref().ok().map(|found| found.value.as_str());
-                emit(&mut out, &format!("   {}", format_pat_lesson_short(org)));
-            }
+            // PAT ausente NÃO ensina mais como criar token (ADR-0030 #4): o
+            // PAT agora só é assunto de `kira connect` — a linha ✗ já aponta
+            // para o comando certo, e o modo local segue válido.
             missing.push(name);
         }
     }
@@ -246,6 +276,14 @@ pub async fn run() -> (bool, String) {
     emit(
         &mut out,
         &format!("   {}", format_dev_check(dev_name.as_deref())),
+    );
+
+    // Capacidades (ADR-0030): o que está conectado PARA ESTE PROJETO, lido
+    // na mesma fonte do gating — ou o aviso de modo local, que é o estado
+    // normal de uma instalação local-first.
+    emit(
+        &mut out,
+        &format_capabilities_line(&connected_capabilities()).to_string(),
     );
 
     if !missing.is_empty() {
@@ -282,15 +320,12 @@ pub async fn run() -> (bool, String) {
         }
         Err(Error::AdoUnauthorized { organization: org }) => {
             emit(&mut out, &format!("   {}", format_unauthorized_check(&org)));
-            // PAT inválido: repete a explicação curta (ADR-0025).
-            emit(
-                &mut out,
-                &format!("   {}", format_pat_lesson_short(Some(&org))),
-            );
+            // PAT inválido não ensina mais a aula (ADR-0030 #4): o comando
+            // que valida e grava o token é o `kira connect`.
             emit(&mut out, "");
             emit(
                 &mut out,
-                "PAT inválido — gere um novo token e rode `kira doctor` de novo.",
+                "PAT inválido — rode `kira connect azure` para reconectar e rode `kira doctor` de novo.",
             );
             return (false, out);
         }
@@ -372,10 +407,11 @@ mod tests {
         } else {
             assert_eq!(fix, "export AZURE_DEVOPS_ORG=nome-da-org");
         }
-        // A linha de "defina a variável" reusa a mesma dica.
-        let hint = missing_setting_fix("AZURE_DEVOPS_PAT");
+        // A linha de "defina a variável" reusa a mesma dica — e o PAT NÃO
+        // aponta mais para o setup (a credencial nasce em `kira connect`).
+        let hint = missing_setting_fix("AZURE_DEVOPS_ORG");
         assert!(hint.contains("kira setup"), "{hint}");
-        assert!(hint.contains("AZURE_DEVOPS_PAT"), "{hint}");
+        assert!(hint.contains("AZURE_DEVOPS_ORG"), "{hint}");
     }
 
     #[test]
@@ -384,6 +420,32 @@ mod tests {
             format_missing_env_summary(&["AZURE_DEVOPS_PAT", "AZURE_DEVOPS_ORG"]),
             "Variáveis ausentes: AZURE_DEVOPS_PAT, AZURE_DEVOPS_ORG — \
              defina-as e rode `kira doctor` de novo."
+        );
+    }
+
+    #[test]
+    fn missing_pat_fix_points_to_connect_not_to_setup() {
+        // ADR-0030 #4: o PAT só é assunto de `kira connect` — o setup deixou
+        // de pedir, então a dica não pode mandar de volta para o wizard.
+        let hint = missing_setting_fix("AZURE_DEVOPS_PAT");
+        assert!(hint.contains("kira connect azure"), "{hint}");
+        assert!(hint.contains("AZURE_DEVOPS_PAT"), "{hint}");
+        assert!(!hint.contains("kira setup"), "{hint}");
+    }
+
+    #[test]
+    fn capabilities_line_shows_local_mode_or_the_connected_list() {
+        assert_eq!(
+            format_capabilities_line(&[]),
+            "capacidades: nenhuma conectada (modo local)"
+        );
+        assert_eq!(
+            format_capabilities_line(&["board.azure"]),
+            "capacidades: board.azure"
+        );
+        assert_eq!(
+            format_capabilities_line(&["board.azure", "scm.github"]),
+            "capacidades: board.azure, scm.github"
         );
     }
 
@@ -473,22 +535,13 @@ mod tests {
     }
 
     #[test]
-    fn pat_lesson_short_teaches_and_points_to_setup_or_local_mode() {
-        let lesson = format_pat_lesson_short(Some("minha-org"));
-        assert!(lesson.contains("senha descartável"), "{lesson}");
+    fn connected_capabilities_reads_the_store_or_degrades_to_empty() {
+        // Fora de um projeto de verdade / com store indisponível: vazio —
+        // nunca pânico e nunca lista inventada.
+        let connected = connected_capabilities();
         assert!(
-            lesson.contains("https://dev.azure.com/minha-org/_usersSettings/tokens"),
-            "{lesson}"
-        );
-        assert!(lesson.contains("Work Items → Read"), "{lesson}");
-        assert!(lesson.contains("kira setup"), "{lesson}");
-        assert!(lesson.contains("modo local"), "{lesson}");
-
-        // Sem org conhecida: o link usa o placeholder (nunca link quebrado).
-        let lesson = format_pat_lesson_short(None);
-        assert!(
-            lesson.contains("https://dev.azure.com/<sua-org>/_usersSettings/tokens"),
-            "{lesson}"
+            connected.iter().all(|name| !name.is_empty()),
+            "só nomes de contrato: {connected:?}"
         );
     }
 }
