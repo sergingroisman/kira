@@ -418,13 +418,23 @@ mod tests {
             (String::from("copilot"), unix_script)
         };
         let path = dir.join(&name);
-        fs::write(&path, script).unwrap_or_else(|err| panic!("escrever shim {path:?}: {err}"));
+        // Escreve num arquivo temporário e RENOMEIA por cima do definitivo.
+        //
+        // Por que não `fs::write` direto: o teste roda em paralelo com outros que
+        // fazem `fork`/`exec`. Se outro processo herda o descritor aberto do shim,
+        // o `exec` falha com ETXTBSY ("Text file busy") e o teste falha de forma
+        // intermitente — foi exatamente o que aconteceu no CI. O rename troca o
+        // inode, então o arquivo executado nunca é o que ainda está sendo escrito.
+        let staging = dir.join(format!("{name}.staging-{}", std::process::id()));
+        fs::write(&staging, script)
+            .unwrap_or_else(|err| panic!("escrever shim {staging:?}: {err}"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-                .unwrap_or_else(|err| panic!("chmod shim {path:?}: {err}"));
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|err| panic!("chmod shim {staging:?}: {err}"));
         }
+        fs::rename(&staging, &path).unwrap_or_else(|err| panic!("publicar shim {path:?}: {err}"));
         path
     }
 
