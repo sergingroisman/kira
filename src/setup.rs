@@ -1,27 +1,27 @@
-//! `kira setup` — o wizard que ENSINA (ADR-0025).
+//! `kira setup` — o wizard LOCAL-FIRST (ADR-0030).
 //!
-//! Princípio da spec: cada pergunta vem com **o que é**, **por que pedimos**,
-//! **como fazer** e **o que acontece se pular** — e nunca bloqueia: tudo tem
-//! caminho "depois".
+//! O KIRA funciona completo sem nenhuma integração externa: scan, wiki,
+//! context, pr draft e dashboard rodam com zero credencial. Por isso o setup
+//! pergunta primeiro o que é LOCAL e nunca pede credencial:
 //!
-//! Fluxo: org/project (flags > env > config.toml > prompt) → passo PAT: a aula
-//! ("O que é um PAT", analogia da senha descartável + passo a passo com a URL
-//! `https://dev.azure.com/<org>/_usersSettings/tokens`, escopo Work Items →
-//! Read, validade 30/90 dias, aviso de valor único) impressa ANTES de qualquer
-//! pedido → menu obrigatório de 3 opções (1 colar PAT [default em TTY],
-//! 2 usar `AZURE_DEVOPS_PAT` do ambiente, 3 pular ⇒ modo local) → validação
-//! IMEDIATA com leitura barata (lista de projetos) e as 4 mensagens exatas da
-//! spec (200 / 401 / 403 / sem rede). Entrada de token SEM ECO (melhor esforço
-//! via `stty -echo` no Unix; o valor digitado nunca é impresso — nada vai para
-//! stdout/stderr/log e nunca para prompt de LLM). Um 401/403 NÃO grava; falha
-//! de rede grava e segue (o `kira doctor` completa o diagnóstico depois).
-//! → passo de backend de IA com custo/dados em cada opção e pré-requisito
-//! verificado (ollama list contém `qwen3.5:4b`; `copilot` no PATH; Foundry
-//! pede endpoint + deployment + chave mascarada e faz UMA chamada de teste
-//! barata reportando 401/403/404). Regra: backend caro NUNCA é default nem
-//! fallback silencioso. → resumo final no formato `pronto: / pulado (dá para
-//! fazer depois): / próximo passo:  kira scan` — nunca "configuração
+//! nome do dev → projeto (raiz detectada + confirmar) → backend de IA (4
+//! opções, com **4) nenhuma por agora** como default quando o Ollama não está
+//! instalado) → resumo no formato `pronto: / funciona agora: / desativado: /
+//! ativar depois: / próximo passo:  kira scan` — nunca "configuração
 //! concluída".
+//!
+//! PAT não é assunto do setup (ADR-0030 #3/#4): credencial nasce em
+//! `kira connect <provider>` (MVP-3), onde a aula (`pat_lesson_lines`) será
+//! reutilizada. O setup ainda aceita `--pat` como atalho EXPLÍCITO para quem
+//! já tem o token: nesse caso ele é validado na hora (as 4 mensagens exatas
+//! da spec — 200 / 401 / 403 / sem rede) e salvo no keyring. Nada é conectado
+//! implicitamente: env/keyring com PAT NÃO são usados por aqui.
+//!
+//! Entrada de token SEM ECO (melhor esforço via `stty -echo` no Unix; o valor
+//! digitado nunca é impresso — nada vai para stdout/stderr/log e nunca para
+//! prompt de LLM). Regra do backend de IA: o caro NUNCA é default nem
+//! fallback silencioso, e `--yes` nunca bloqueia (sem Ollama ⇒ "nenhuma",
+//! com o pulado impresso).
 //!
 //! Todo input/output é injetado (stdin, stdout, store, config path, board
 //! factory, hooks de IA), então os testes dirigem o fluxo completo com stdin
@@ -41,7 +41,7 @@ pub mod wizard;
 use crate::board::{self, BoardProvider};
 use crate::credentials::{
     self, CONFIG_KEY_DEV_NAME, CONFIG_KEY_ORG, CONFIG_KEY_PROJECT, CRED_KEY_PAT, CredStore,
-    ORG_ENV, PAT_ENV, PROJECT_ENV,
+    ORG_ENV, PROJECT_ENV,
 };
 use crate::doctor;
 use crate::error::Error;
@@ -58,31 +58,41 @@ const FOUNDRY_TEST_MAX_TOKENS: u32 = 16;
 /// Flags accepted by `kira setup`.
 #[derive(Debug, Default, Clone)]
 pub struct SetupOptions {
-    /// `--org <nome>`
+    /// `--org <nome>`: atalho para quem já tem a organização — NUNCA é
+    /// perguntado (ADR-0030 #3); vai para o config.toml quando resolvível.
     pub org: Option<String>,
-    /// `--project <nome>`
+    /// `--project <nome>`: atalho para quem já tem o projeto — NUNCA é
+    /// perguntado (ADR-0030 #3); vai para o config.toml quando resolvível.
     pub project: Option<String>,
     /// `--reset`: remove o que o setup guardou como credencial (PAT e chave do
     /// Foundry no keyring, endpoint/deployment no `config.toml`) e sai.
     pub reset: bool,
-    /// `--pat <token>`: PAT passed straight on the command line (skips the
-    /// aula, o menu e o prompt; o valor nunca é ecoado — só a máscara).
+    /// `--pat <token>`: atalho EXPLÍCITO (ADR-0030 #4 — credencial só nasce
+    /// por consentimento). Sem a flag o setup NÃO usa PAT de env/keyring: o
+    /// token informado é validado e salvo; o valor nunca é ecoado — só a
+    /// máscara.
     pub pat: Option<String>,
     /// stdin é interativo (TTY), injetado pelo binário real via
-    /// `stdin().is_terminal()`; só no modo interativo o menu do PAT aparece.
+    /// `stdin().is_terminal()`; só no modo interativo o nome é perguntado e o
+    /// menu de IA aparece.
     pub interactive: bool,
     /// `--name <nome>`: como o dev quer ser chamado (salvo como `dev_name` em
     /// `config.toml`); vence o nome salvo e a pergunta em TTY. Nunca entra em
     /// prompt de LLM.
     pub name: Option<String>,
-    /// `--yes`: modo não-interativo mesmo em TTY — usa a env do PAT se
-    /// existir, senão pula, e imprime o pulado. Nunca bloqueia.
+    /// `--yes`: modo não-interativo mesmo em TTY — nunca bloqueia; sem
+    /// Ollama escolhe "nenhuma por agora" e imprime o pulado.
     pub yes: bool,
-    /// `--backend <ollama|copilot|foundry>`: escolha EXPLÍCITA do backend de
-    /// IA (o caro nunca é default nem fallback silencioso).
+    /// `--backend <ollama|copilot|foundry|nenhuma>`: escolha EXPLÍCITA do
+    /// backend de IA (o caro nunca é default nem fallback silencioso).
     pub backend: Option<String>,
-    /// `--skip <passo>` (repetível): pula um passo — `pat` ou `ia`.
+    /// `--skip <passo>` (repetível): pula um passo — `pat` (no-op, o passo
+    /// deixou de existir) ou `ia`.
     pub skip: Vec<String>,
+    /// Raiz do projeto detectada, injetada pelo binário real
+    /// (`store::detect_project_root`); testes fixam o valor. `None` faz o
+    /// motor detectar pelo cwd.
+    pub project_root: Option<String>,
     /// Dados do Foundry já coletados (pelo wizard de tela cheia, ADR-0035).
     /// Quando presentes, o motor NÃO pergunta nada: testa estes valores e, se
     /// o teste passar, grava endpoint/deployment no config e a chave no
@@ -98,26 +108,13 @@ pub struct SetupOptions {
 /// Builds the board used to validate the PAT: `(pat, org, project) -> board`.
 pub type BoardFactory<'a> = dyn Fn(&str, &str, &str) -> Result<Box<dyn BoardProvider>, Error> + 'a;
 
-/// Resultado do passo PAT antes da validação.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PatResult {
-    /// Token colado (opção 1 ou `--pat`).
-    Pasted(String),
-    /// Token já presente em `AZURE_DEVOPS_PAT` (opção 2).
-    FromEnv(String),
-    /// Token do keyring do OS (setup anterior, ou o wizard mantendo o que já
-    /// existia): é VALIDADO, mas não é regravado.
-    FromStore(String),
-    /// Pular por agora ⇒ modo local (opção 3).
-    Skipped,
-}
-
-/// Escolha do backend de IA no setup.
+/// Escolha do backend de IA no setup (`4` = nenhuma por agora).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IaChoice {
     Ollama,
     Copilot,
     Foundry,
+    Nenhuma,
 }
 
 /// Dados que o usuário passou para o teste do Foundry (a chave vive só aqui,
@@ -211,6 +208,9 @@ fn foundry_call_real(
 }
 
 /// Runs `kira setup` and returns the process exit code.
+///
+/// Fluxo local-first (ADR-0030 #3): nome do dev → projeto (raiz detectada) →
+/// backend de IA (4 opções) → resumo. PAT só entra pelo atalho `--pat`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     options: &SetupOptions,
@@ -227,36 +227,11 @@ pub async fn run(
     }
 
     let config_pairs = read_config(config_path, output);
-    let organization = match resolve_input(
-        options.org.as_deref(),
-        env(ORG_ENV),
-        config_pairs
-            .as_ref()
-            .and_then(|pairs| value_of(pairs, CONFIG_KEY_ORG)),
-        "Organização do Azure DevOps (ex.: minha-org): ",
-        input,
-        output,
-    ) {
-        Some(value) => value,
-        None => return ExitCode::FAILURE,
-    };
-    let project = match resolve_input(
-        options.project.as_deref(),
-        env(PROJECT_ENV),
-        config_pairs
-            .as_ref()
-            .and_then(|pairs| value_of(pairs, CONFIG_KEY_PROJECT)),
-        "Projeto do Azure DevOps (ex.: MeuProjeto): ",
-        input,
-        output,
-    ) {
-        Some(value) => value,
-        None => return ExitCode::FAILURE,
-    };
 
     // Valores explícitos inválidos falham de cara, sem adivinhar: --skip só
-    // aceita 'pat'/'ia' e --backend só ollama/copilot/foundry (nada de
-    // fallback silencioso).
+    // aceita 'pat'/'ia' ('pat' segue aceito por compatibilidade — virou no-op
+    // porque o passo deixou de existir) e --backend só os nomes conhecidos
+    // (nada de fallback silencioso).
     for skipped_step in &options.skip {
         let step = skipped_step.trim().to_ascii_lowercase();
         if step != "pat" && step != "ia" {
@@ -269,178 +244,19 @@ pub async fn run(
     }
     if let Some(name) = &options.backend {
         let parsed = name.trim().to_ascii_lowercase();
-        if parsed != "ollama" && parsed != "copilot" && parsed != "foundry" {
+        if parsed != "ollama" && parsed != "copilot" && parsed != "foundry" && parsed != "nenhuma" {
             let _ = writeln!(
                 output,
-                "erro: backend desconhecido '{name}' — use ollama, copilot ou foundry."
+                "erro: backend desconhecido '{name}' — use ollama, copilot, foundry ou nenhuma."
             );
             return ExitCode::FAILURE;
         }
     }
 
     // ------------------------------------------------------------------
-    // Passo PAT: a aula vem sempre antes de qualquer pedido (ADR-0025).
-    // Com `--pat` o token já existe — zero aula, zero menu, zero prompt.
-    // ------------------------------------------------------------------
-    let pat_result = if let Some(pat) = options.pat.as_deref() {
-        PatResult::Pasted(pat.to_string())
-    } else {
-        let url = pat_url(&organization);
-        print_pat_lesson(&url, output);
-        if options
-            .skip
-            .iter()
-            .any(|item| item.trim().eq_ignore_ascii_case("pat"))
-        {
-            let _ = writeln!(
-                output,
-                "PAT pulado (--skip) — o KIRA funciona em modo local (kira triage --file)."
-            );
-            PatResult::Skipped
-        } else if options.interactive && !options.yes {
-            match pat_menu_interactive(env, options.hidden_input, input, output) {
-                Some(result) => result,
-                // Entrada vazia no prompt de colar: erro acionável e fim.
-                None => return ExitCode::FAILURE,
-            }
-        } else {
-            // Não-interativo (--yes/sem TTY): env > keyring > pular. O PAT do
-            // keyring entra aqui porque o wizard pode ter mantido o que já
-            // existia — reusar é o que o dono espera, e nada é bloqueante.
-            let non_interactive = pat_from_env_store_or_skip(env(PAT_ENV), stored_pat(store));
-            match &non_interactive {
-                PatResult::FromEnv(_) => {
-                    let _ = writeln!(
-                        output,
-                        "usando AZURE_DEVOPS_PAT do ambiente (o PAT já está nesta máquina)"
-                    );
-                }
-                PatResult::FromStore(_) => {
-                    let _ = writeln!(
-                        output,
-                        "usando o PAT do keyring do OS (salvo por um `kira setup` anterior)"
-                    );
-                }
-                PatResult::Skipped => {
-                    let _ = writeln!(
-                        output,
-                        "PAT pulado — o KIRA funciona em modo local (kira triage --file)."
-                    );
-                }
-                // Colar por stdin não existe fora de TTY: a resolução acima
-                // nunca devolve esse caso.
-                PatResult::Pasted(_) => {}
-            }
-            non_interactive
-        }
-    };
-
-    // ------------------------------------------------------------------
-    // Validação na hora, com rótulo explícito do que aconteceu (as 4
-    // mensagens exatas da spec). Um 401/403 NÃO grava; falha de rede grava
-    // e o fluxo segue (o doctor completa depois).
-    // ------------------------------------------------------------------
-    let mut pat_summary: Option<String> = None;
-    let mut skipped_steps: Vec<&'static str> = Vec::new();
-    match &pat_result {
-        PatResult::Skipped => {
-            skipped_steps.push("pat");
-        }
-        PatResult::Pasted(token) | PatResult::FromEnv(token) | PatResult::FromStore(token) => {
-            let is_pasted = matches!(pat_result, PatResult::Pasted(_));
-            // Origem do token, para o resumo não dizer "da env" quando veio
-            // do keyring (nem o contrário).
-            let origin = match &pat_result {
-                PatResult::FromStore(_) => "do keyring do OS",
-                _ => "da env AZURE_DEVOPS_PAT",
-            };
-            let _ = writeln!(output, "Validando o PAT na organização {organization}...");
-            let board = match make_board(token, &organization, &project) {
-                Ok(board) => board,
-                Err(err) => {
-                    let _ = writeln!(output, "erro: {err}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match board.project_names().await {
-                Ok(project_names) => {
-                    if doctor::find_project_case_insensitive(&project, &project_names).is_none() {
-                        let _ = writeln!(output);
-                        let _ = writeln!(
-                            output,
-                            "{}",
-                            doctor::format_project_check(&project, &project_names)
-                        );
-                        let _ = writeln!(
-                            output,
-                            "projeto incorreto — o token NÃO foi salvo; rode `kira setup` de novo com o nome exato."
-                        );
-                        return ExitCode::FAILURE;
-                    }
-                    let _ = writeln!(output, "{}", msg_pat_ok(&organization, &project));
-                    if is_pasted {
-                        if let Err(err) = store.set(CRED_KEY_PAT, token) {
-                            let _ = writeln!(output, "erro: {err}");
-                            return ExitCode::FAILURE;
-                        }
-                        let _ = writeln!(
-                            output,
-                            "✓ PAT salvo no keyring do OS ({} chars: {}).",
-                            token.chars().count(),
-                            doctor::mask_pat(token)
-                        );
-                        pat_summary = Some(format!(
-                            "{} (lê Work Items de {organization}/{project})",
-                            doctor::mask_pat(token)
-                        ));
-                    } else {
-                        // Token da env/keyring fica onde está (env vence o
-                        // keyring na resolução); gravar seria cópia inútil.
-                        pat_summary = Some(format!(
-                            "{} ({origin} — lê Work Items de {organization}/{project})",
-                            doctor::mask_pat(token)
-                        ));
-                    }
-                }
-                Err(Error::AdoUnauthorized { .. }) => {
-                    let _ = writeln!(output, "{}", msg_pat_401(&organization));
-                    let _ = writeln!(output, "o token NÃO foi salvo; rode `kira setup` de novo.");
-                    return ExitCode::FAILURE;
-                }
-                Err(Error::AdoStatus { status: 403, .. }) => {
-                    let _ = writeln!(output, "{}", msg_pat_403());
-                    let _ = writeln!(output, "o token NÃO foi salvo; rode `kira setup` de novo.");
-                    return ExitCode::FAILURE;
-                }
-                Err(_) => {
-                    // rede/timeout: o token É salvo (spec) e o fluxo segue —
-                    // o `kira doctor` completa o diagnóstico depois.
-                    if is_pasted {
-                        if let Err(err) = store.set(CRED_KEY_PAT, token) {
-                            let _ = writeln!(output, "erro: {err}");
-                            return ExitCode::FAILURE;
-                        }
-                        pat_summary = Some(format!(
-                            "{} (salvo; validação pendente — rode kira doctor)",
-                            doctor::mask_pat(token)
-                        ));
-                    } else {
-                        pat_summary = Some(format!(
-                            "{} ({origin}; validação pendente — rode kira doctor)",
-                            doctor::mask_pat(token)
-                        ));
-                    }
-                    let from_store = matches!(pat_result, PatResult::FromStore(_));
-                    let _ = writeln!(output, "{}", msg_pat_rede(is_pasted, from_store));
-                }
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Nome do dev: `--name` > nome já salvo em `config.toml` > pergunta (só
-    // em TTY) > padrão do SO. Sem TTY nunca bloqueia. Nunca entra em prompt
-    // de LLM — só na saída humana (setup/doctor).
+    // Passo 1 — nome do dev: `--name` > nome já salvo em `config.toml` >
+    // pergunta (só em TTY) > padrão do SO. Sem TTY nunca bloqueia. Nunca
+    // entra em prompt de LLM — só na saída humana (setup/doctor).
     // ------------------------------------------------------------------
     let saved_name = config_pairs
         .as_ref()
@@ -460,32 +276,156 @@ pub async fn run(
     };
     let _ = writeln!(output, "dev: {dev_name}");
 
-    // org/projeto/nome vão para o config.toml mesmo com PAT pulado — assim o
-    // `kira doctor` e a retomada (`kira setup --pat`) já têm o contexto.
+    // ------------------------------------------------------------------
+    // org/projeto NÃO são perguntados (ADR-0030 #3): entram só quando o dono
+    // já tem (flag > env > config) e vão ao config.toml para o `kira connect`
+    // achar depois. resolve_saved nunca pergunta.
+    // ------------------------------------------------------------------
+    let organization = resolve_saved(
+        options.org.as_deref(),
+        env(ORG_ENV),
+        config_pairs
+            .as_ref()
+            .and_then(|pairs| value_of(pairs, CONFIG_KEY_ORG)),
+    );
+    let project = resolve_saved(
+        options.project.as_deref(),
+        env(PROJECT_ENV),
+        config_pairs
+            .as_ref()
+            .and_then(|pairs| value_of(pairs, CONFIG_KEY_PROJECT)),
+    );
+
+    // ------------------------------------------------------------------
+    // Passo PAT — existe SÓ quando o dono o traz por `--pat` (atalho
+    // explícito; ADR-0030 #4: nada é conectado implicitamente, então
+    // env/keyring com PAT NÃO são usados aqui). Validação na hora, com as 4
+    // mensagens exatas da spec. Um 401/403 NÃO grava; falha de rede grava e
+    // o fluxo segue (o `kira doctor` completa o diagnóstico depois).
+    // ------------------------------------------------------------------
+    if let Some(token) = options.pat.as_deref() {
+        let Some(organization) = organization.as_deref() else {
+            let _ = writeln!(
+                output,
+                "erro: --pat precisa da organização — rode de novo com --org <nome> (ou defina AZURE_DEVOPS_ORG)."
+            );
+            return ExitCode::FAILURE;
+        };
+        let Some(project) = project.as_deref() else {
+            let _ = writeln!(
+                output,
+                "erro: --pat precisa do projeto — rode de novo com --project <nome> (ou defina AZURE_DEVOPS_PROJECT)."
+            );
+            return ExitCode::FAILURE;
+        };
+        let _ = writeln!(output, "Validando o PAT na organização {organization}...");
+        let board = match make_board(token, organization, project) {
+            Ok(board) => board,
+            Err(err) => {
+                let _ = writeln!(output, "erro: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match board.project_names().await {
+            Ok(project_names) => {
+                if doctor::find_project_case_insensitive(project, &project_names).is_none() {
+                    let _ = writeln!(output);
+                    let _ = writeln!(
+                        output,
+                        "{}",
+                        doctor::format_project_check(project, &project_names)
+                    );
+                    let _ = writeln!(
+                        output,
+                        "projeto incorreto — o token NÃO foi salvo; rode `kira setup` de novo com o nome exato."
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let _ = writeln!(output, "{}", msg_pat_ok(organization, project));
+                if let Err(err) = store.set(CRED_KEY_PAT, token) {
+                    let _ = writeln!(output, "erro: {err}");
+                    return ExitCode::FAILURE;
+                }
+                let _ = writeln!(
+                    output,
+                    "✓ PAT salvo no keyring do OS ({} chars: {}).",
+                    token.chars().count(),
+                    doctor::mask_pat(token)
+                );
+            }
+            Err(Error::AdoUnauthorized { .. }) => {
+                let _ = writeln!(output, "{}", msg_pat_401(organization));
+                let _ = writeln!(output, "o token NÃO foi salvo; rode `kira setup` de novo.");
+                return ExitCode::FAILURE;
+            }
+            Err(Error::AdoStatus { status: 403, .. }) => {
+                let _ = writeln!(output, "{}", msg_pat_403());
+                let _ = writeln!(output, "o token NÃO foi salvo; rode `kira setup` de novo.");
+                return ExitCode::FAILURE;
+            }
+            Err(_) => {
+                // rede/timeout: o token É salvo (spec) e o fluxo segue —
+                // o `kira doctor` completa o diagnóstico depois.
+                if let Err(err) = store.set(CRED_KEY_PAT, token) {
+                    let _ = writeln!(output, "erro: {err}");
+                    return ExitCode::FAILURE;
+                }
+                let _ = writeln!(
+                    output,
+                    "✓ {} — salvo no keyring do OS; validação pendente (rode kira doctor)",
+                    doctor::mask_pat(token)
+                );
+                let _ = writeln!(output, "{}", msg_pat_rede(true, false));
+            }
+        }
+    }
+
+    // org/projeto/nome vão para o config.toml mesmo sem credencial — assim o
+    // `kira doctor` e o `kira connect` (MVP-3) já têm o contexto.
+    let mut config_updates: Vec<(&str, &str)> = Vec::new();
+    config_updates.push((CONFIG_KEY_DEV_NAME, dev_name.as_str()));
+    if let Some(organization) = organization.as_deref() {
+        config_updates.push((CONFIG_KEY_ORG, organization));
+    }
+    if let Some(project) = project.as_deref() {
+        config_updates.push((CONFIG_KEY_PROJECT, project));
+    }
     match config_path {
         Some(path) => {
-            if let Err(err) = credentials::write_config_file(
-                path,
-                &[
-                    (CONFIG_KEY_ORG, &organization),
-                    (CONFIG_KEY_PROJECT, &project),
-                    (CONFIG_KEY_DEV_NAME, &dev_name),
-                ],
-            ) {
+            if let Err(err) = credentials::write_config_file(path, &config_updates) {
                 let _ = writeln!(output, "aviso: não salvei org/projeto no config: {err}");
             }
         }
         None => {
             let _ = writeln!(
                 output,
-                "aviso: sem diretório home, org/projeto não foram salvos em config.toml"
+                "aviso: sem diretório home, as respostas não foram salvas em config.toml"
             );
         }
     }
 
     // ------------------------------------------------------------------
-    // Passo backend de IA: custo e dados explicados em cada opção e
-    // pré-requisito verificado. Backend caro NUNCA é default nem fallback.
+    // Passo 2 — projeto: a raiz é DETECTADA (mesma regra do store) e o dono
+    // só confirma em TTY; fora de TTY nunca bloqueia.
+    // ------------------------------------------------------------------
+    let detected_root = options
+        .project_root
+        .clone()
+        .or_else(detect_project_root_display)
+        .unwrap_or_else(|| ".".to_string());
+    let project_root = if options.interactive && !options.yes {
+        ask_project_root(&detected_root, input, output)
+    } else {
+        let _ = writeln!(output, "projeto: {detected_root} (raiz detectada)");
+        detected_root
+    };
+    let _ = writeln!(output, "projeto: {project_root}");
+
+    // ------------------------------------------------------------------
+    // Passo 3 — backend de IA: 4 opções, com "nenhuma por agora" como default
+    // quando o Ollama não está instalado. Custo e dados explicados em cada
+    // opção e pré-requisito verificado. Backend caro NUNCA é default nem
+    // fallback; `--yes` nunca bloqueia.
     // ------------------------------------------------------------------
     let mut ia_summary: Option<String> = None;
     if options
@@ -494,28 +434,39 @@ pub async fn run(
         .any(|item| item.trim().eq_ignore_ascii_case("ia"))
     {
         let _ = writeln!(output, "IA pulada (--skip) — dê para escolher depois.");
-        skipped_steps.push("ia");
     } else {
+        // Pré-requisito verificado UMA vez: o default do menu e a decisão
+        // não-interativa dependem dele (nunca outro processo além deste).
+        let ollama_models = (ia_hooks.ollama_models)();
         let choice = if let Some(name) = options.backend.as_deref() {
             // Escolha explícita vence (mesmo em TTY): o caro só por flag.
             match name.trim().to_ascii_lowercase().as_str() {
                 "ollama" => IaChoice::Ollama,
                 "copilot" => IaChoice::Copilot,
-                _ => IaChoice::Foundry,
+                "foundry" => IaChoice::Foundry,
+                _ => IaChoice::Nenhuma,
             }
         } else if options.interactive && !options.yes {
-            match ask_menu_choice(IA_MENU, &["1", "2", "3"], "1", input, output).as_str() {
+            // Default HONESTO: com Ollama ausente, "nenhuma" é o default —
+            // nunca um pré-requisito que a máquina não tem.
+            let default = if ollama_models.is_some() { "1" } else { "4" };
+            match ask_menu_choice(IA_MENU, &["1", "2", "3", "4"], default, input, output).as_str() {
                 "2" => IaChoice::Copilot,
                 "3" => IaChoice::Foundry,
+                "4" => IaChoice::Nenhuma,
                 _ => IaChoice::Ollama,
             }
-        } else {
-            // Sem TTY e sem flag: o default é o barato (Ollama local) —
-            // nunca um backend caro por omissão.
+        } else if ollama_models.is_some() {
+            // Não-interativo: o barato local é tentado (e a ausência do
+            // modelo vira dica, não erro). Nunca um backend caro por omissão.
             IaChoice::Ollama
+        } else {
+            // Sem Ollama nesta máquina: "nenhuma" — e o pulado é impresso
+            // abaixo, com a causa. Nunca bloqueia.
+            IaChoice::Nenhuma
         };
         match choice {
-            IaChoice::Ollama => match (ia_hooks.ollama_models)() {
+            IaChoice::Ollama => match &ollama_models {
                 Some(models) if models.contains(DEFAULT_MODEL) => {
                     let _ = writeln!(
                         output,
@@ -526,16 +477,14 @@ pub async fn run(
                 Some(_) => {
                     let _ = writeln!(
                         output,
-                        "{DEFAULT_MODEL} não está no ollama — rode: ollama pull {DEFAULT_MODEL} (3,3 GB)"
+                        "{DEFAULT_MODEL} não está no ollama — rode: ollama pull {DEFAULT_MODEL} (3,3 GB). Por agora, ia: nenhuma."
                     );
-                    skipped_steps.push("ia");
                 }
                 None => {
                     let _ = writeln!(
                         output,
-                        "ollama não encontrado nesta máquina — instale (https://ollama.com) e rode: ollama pull {DEFAULT_MODEL} (3,3 GB)"
+                        "ollama não encontrado nesta máquina — instale (https://ollama.com) e rode: ollama pull {DEFAULT_MODEL} (3,3 GB). Por agora, ia: nenhuma."
                     );
-                    skipped_steps.push("ia");
                 }
             },
             IaChoice::Copilot => match (ia_hooks.copilot_bin)() {
@@ -549,9 +498,8 @@ pub async fn run(
                 None => {
                     let _ = writeln!(
                         output,
-                        "copilot não está no PATH — instale/autentique o Copilot CLI (pré-requisito: a política da sua empresa permitir)"
+                        "copilot não está no PATH — instale/autentique o Copilot CLI (pré-requisito: a política da sua empresa permitir). Por agora, ia: nenhuma."
                     );
-                    skipped_steps.push("ia");
                 }
             },
             IaChoice::Foundry => {
@@ -598,23 +546,20 @@ pub async fn run(
                             Err(Error::FoundryAuth { status }) => {
                                 let _ = writeln!(
                                     output,
-                                    "erro: chave recusada pelo Foundry (HTTP {status}) — a IA fica pulada; rode kira setup de novo para tentar outra chave."
+                                    "erro: chave recusada pelo Foundry (HTTP {status}) — a IA fica pulada; rode kira setup de novo para tentar outra chave. Por agora, ia: nenhuma."
                                 );
-                                skipped_steps.push("ia");
                             }
                             Err(Error::FoundryDeployment) => {
                                 let _ = writeln!(
                                     output,
-                                    "erro: HTTP 404 do Foundry — confira KIRA_FOUNDRY_ENDPOINT e KIRA_FOUNDRY_DEPLOYMENT; a IA fica pulada."
+                                    "erro: HTTP 404 do Foundry — confira KIRA_FOUNDRY_ENDPOINT e KIRA_FOUNDRY_DEPLOYMENT; a IA fica pulada. Por agora, ia: nenhuma."
                                 );
-                                skipped_steps.push("ia");
                             }
                             Err(err) => {
                                 let _ = writeln!(
                                     output,
-                                    "erro: {err} — a IA fica pulada; rode kira setup de novo."
+                                    "erro: {err} — a IA fica pulada; rode kira setup de novo. Por agora, ia: nenhuma."
                                 );
-                                skipped_steps.push("ia");
                             }
                         }
                     }
@@ -623,16 +568,28 @@ pub async fn run(
                     None => return ExitCode::FAILURE,
                 }
             }
+            IaChoice::Nenhuma => {
+                // De onde veio "nenhuma": com Ollama ausente e sem escolha
+                // explícita, a causa vem junto (o pulado é impresso, não
+                // escondido); escolha explícita só confirma.
+                if options.backend.is_none() && ollama_models.is_none() {
+                    let _ = writeln!(
+                        output,
+                        "ollama não encontrado nesta máquina — instale (https://ollama.com) e rode: ollama pull {DEFAULT_MODEL} (3,3 GB)"
+                    );
+                }
+                let _ = writeln!(
+                    output,
+                    "ia: nenhuma por agora — scan, wiki, context, pr draft e dashboard funcionam sem IA."
+                );
+            }
         }
     }
 
-    // O passo "fonte Nerd" saiu: o resumo mandava rodar `kira setup --deps
-    // --only font`, comando que o binário nunca teve. Prometer retomada
-    // inexistente é pior que não oferecer a etapa.
-
     // ------------------------------------------------------------------
-    // Resumo final: o que ficou pronto, o que ficou pulado (com o comando
-    // de retomada) e o PRÓXIMO comando — nunca "configuração concluída".
+    // Resumo final: o que ficou pronto, o que funciona AGORA (sem credencial
+    // nenhuma), o que fica desativado até uma capacidade conectar e o
+    // PRÓXIMO comando — nunca "configuração concluída".
     // ------------------------------------------------------------------
     let store_line = store::db_path()
         .map(|path| path.display().to_string())
@@ -641,15 +598,51 @@ pub async fn run(
     let _ = writeln!(
         output,
         "{}",
-        format_summary(
-            &dev_name,
-            pat_summary.as_deref(),
-            ia_summary.as_deref(),
-            &store_line,
-            &skipped_steps,
-        )
+        format_summary(&dev_name, ia_summary.as_deref(), &store_line)
     );
     ExitCode::SUCCESS
+}
+
+/// Primeiro valor não vazio entre as fontes (flag > env > config), SEM
+/// pergunta: org/projeto não são mais pedidos no setup (ADR-0030 #3).
+fn resolve_saved(
+    flag: Option<&str>,
+    env_value: Option<String>,
+    config_value: Option<String>,
+) -> Option<String> {
+    [flag.map(str::to_string), env_value, config_value]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
+}
+
+/// Raiz do projeto (mesma detecção do store) como texto, para o passo
+/// "projeto" do setup. `None` = sem cwd (o chamador usa um fallback).
+fn detect_project_root_display() -> Option<String> {
+    store::detect_project_root().map(|root| root.display().to_string())
+}
+
+/// Passo "projeto": mostra a raiz detectada e confirma (Enter = sim). Um
+/// caminho digitado substitui o detectado SÓ se existir (nunca inventa raiz);
+/// EOF ⇒ confirma o detectado. Só é chamada em modo interativo (TTY).
+fn ask_project_root(detected: &str, input: &mut dyn BufRead, output: &mut dyn Write) -> String {
+    let _ = write!(output, "Projeto: {detected}\nÉ este? (Enter = sim): ");
+    let _ = output.flush();
+    match read_line(input) {
+        None => detected.to_string(),
+        Some(line) if line.is_empty() => detected.to_string(),
+        Some(line) => {
+            if Path::new(line.as_str()).is_dir() {
+                line
+            } else {
+                let _ = writeln!(
+                    output,
+                    "caminho '{line}' não existe — mantendo a raiz detectada."
+                );
+                detected.to_string()
+            }
+        }
+    }
 }
 
 /// `--reset`: remove TUDO o que o `kira setup` gravou como credencial ou
@@ -741,35 +734,6 @@ fn value_of(pairs: &[(String, String)], key: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
-/// First non-empty source: flag > env > config; otherwise prompts stdin.
-/// Returns `None` (after an actionable message) when nothing was provided.
-fn resolve_input(
-    flag: Option<&str>,
-    env_value: Option<String>,
-    config_value: Option<String>,
-    prompt: &str,
-    input: &mut dyn BufRead,
-    output: &mut dyn Write,
-) -> Option<String> {
-    for value in [flag.map(str::to_string), env_value, config_value] {
-        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-            return Some(value);
-        }
-    }
-    let _ = write!(output, "{prompt}");
-    let _ = output.flush();
-    match read_line(input) {
-        Some(value) if !value.is_empty() => Some(value),
-        _ => {
-            let _ = writeln!(
-                output,
-                "erro: valor não informado — rode `kira setup` e digite o valor pedido."
-            );
-            None
-        }
-    }
-}
-
 fn read_line(input: &mut dyn BufRead) -> Option<String> {
     let mut line = String::new();
     match input.read_line(&mut line) {
@@ -787,102 +751,40 @@ fn pat_url(organization: &str) -> String {
 /// lida do config/env quando existir): o que é (analogia da senha
 /// descartável), por que pedimos, como fazer e o que acontece.
 pub fn pat_lesson(url: &str) -> String {
-    format!(
-        "O que é um PAT\n\
-         PAT é uma senha descartável, feita para uma coisa só. Em vez de entregar a\n\
-         senha da sua conta para o KIRA, você cria um Personal Access Token: um código\n\
-         que permite apenas ler Work Items do projeto que você escolher, e que expira\n\
-         na data que você definir. Se ele vazar, você apaga aquele código — sua conta e\n\
-         o resto do Azure DevOps continuam intactos. É por isso que ele é mais seguro\n\
-         que a senha.\n\
-         \n\
-         Como criar (2 minutos)\n\
-         1. Abra {url}\n\
-         2. New Token → nome: kira-local → validade: 30 dias (ou 90, se preferir)\n\
-         3. Em Scopes, marque Work Items → Read. Só isso. Nada mais é necessário.\n\
-         4. Clique Create e copie o valor agora — ele aparece uma única vez.\n"
-    )
+    pat_lesson_lines(url).join("\n")
 }
 
-/// Imprime a aula do PAT antes de qualquer pedido de token.
-fn print_pat_lesson(url: &str, output: &mut dyn Write) {
-    let _ = writeln!(output, "{}", pat_lesson(url));
+/// A aula do PAT em LINHAS — a fonte ÚNICA do texto (ADR-0030 #4): o setup
+/// deixou de imprimi-la e o `kira connect <provider>` (MVP-3) a reaproveita
+/// sem duplicar string. Cada elemento é uma linha pronta para imprimir.
+pub fn pat_lesson_lines(url: &str) -> Vec<String> {
+    let url = url.to_string();
+    vec![
+        "O que é um PAT".to_string(),
+        "PAT é uma senha descartável, feita para uma coisa só. Em vez de entregar a".to_string(),
+        "senha da sua conta para o KIRA, você cria um Personal Access Token: um código".to_string(),
+        "que permite apenas ler Work Items do projeto que você escolher, e que expira".to_string(),
+        "na data que você definir. Se ele vazar, você apaga aquele código — sua conta e"
+            .to_string(),
+        "o resto do Azure DevOps continuam intactos. É por isso que ele é mais seguro".to_string(),
+        "que a senha.".to_string(),
+        String::new(),
+        "Como criar (2 minutos)".to_string(),
+        format!("1. Abra {url}"),
+        "2. New Token → nome: kira-local → validade: 30 dias (ou 90, se preferir)".to_string(),
+        "3. Em Scopes, marque Work Items → Read. Só isso. Nada mais é necessário.".to_string(),
+        "4. Clique Create e copie o valor agora — ele aparece uma única vez.".to_string(),
+    ]
 }
 
-/// Menu obrigatório do PAT (texto exato da spec; `1` é o default em TTY).
-pub const PAT_MENU: &str = "Como o KIRA vai falar com o Azure DevOps?\n\
-     1) Colar um PAT agora            (recomendado — leitura de Work Items)\n\
-     2) Usar AZURE_DEVOPS_PAT do ambiente (o token já está configurado nesta máquina)\n\
-     3) Pular por agora              (o KIRA funciona em modo local: kira triage --file)\n";
-
-/// Menu do backend de IA (texto exato da spec; `1` é o default — o caro
-/// nunca é escolhido por omissão).
+/// Menu do backend de IA (texto exato da spec; o default depende da máquina:
+/// com Ollama ausente, `4` — "nenhuma" — é o default; o caro nunca é
+/// escolhido por omissão).
 pub const IA_MENU: &str = "Como o KIRA deve pensar?\n\
      1) Ollama local            (recomendado: 0 custo, o código não sai da sua máquina)\n\
      2) Copilot CLI             (usa sua assinatura; mesma política da sua empresa)\n\
-     3) Microsoft Foundry       (BYOK: custo por token; precisa endpoint + deployment + chave)\n";
-
-/// Menu do PAT em TTY: opção 1 colar (entrada oculta), 2 usar a env, 3 pular.
-/// Enter/EOF ⇒ 1 (default). Resposta inválida repete no máximo 2x e assume o
-/// default com aviso. A opção 2 sem a env avisa e volta ao menu (nunca sai
-/// silenciosamente para outra opção).
-fn pat_menu_interactive(
-    env: &dyn Fn(&str) -> Option<String>,
-    hidden: bool,
-    input: &mut dyn BufRead,
-    output: &mut dyn Write,
-) -> Option<PatResult> {
-    loop {
-        match ask_menu_choice(PAT_MENU, &["1", "2", "3"], "1", input, output).as_str() {
-            "2" => match env(PAT_ENV).filter(|pat| !pat.trim().is_empty()) {
-                Some(pat) => {
-                    let _ = writeln!(
-                        output,
-                        "usando AZURE_DEVOPS_PAT do ambiente (o token já está nesta máquina)"
-                    );
-                    return Some(PatResult::FromEnv(pat));
-                }
-                None => {
-                    let _ = writeln!(
-                        output,
-                        "AZURE_DEVOPS_PAT não está definida nesta máquina — defina-a ({}) ou escolha 1.",
-                        doctor::set_env_command(PAT_ENV, "...")
-                    );
-                }
-            },
-            "3" => {
-                let _ = writeln!(
-                    output,
-                    "PAT pulado — o KIRA funciona em modo local (kira triage --file)."
-                );
-                return Some(PatResult::Skipped);
-            }
-            _ => {
-                return prompt_for_pat(input, output, hidden).map(PatResult::Pasted);
-            }
-        }
-    }
-}
-
-/// Seleção do PAT fora de TTY (pura, testável): env > keyring > pular.
-///
-/// O keyring entra na conta porque o wizard pode ter MANTIDO o PAT que já
-/// existia — pedir para colar de novo o token que está salvo seria trabalho
-/// inventado. Nunca bloqueia e nunca inventa default caro.
-fn pat_from_env_store_or_skip(env_pat: Option<String>, stored: Option<String>) -> PatResult {
-    match env_pat.filter(|pat| !pat.trim().is_empty()) {
-        Some(pat) => PatResult::FromEnv(pat),
-        None => match stored.filter(|pat| !pat.trim().is_empty()) {
-            Some(pat) => PatResult::FromStore(pat),
-            None => PatResult::Skipped,
-        },
-    }
-}
-
-/// PAT guardado no keyring, quando existir (reuso; o valor nunca é impresso).
-fn stored_pat(store: &dyn CredStore) -> Option<String> {
-    store.get(CRED_KEY_PAT).ok().flatten()
-}
+     3) Microsoft Foundry       (BYOK: custo por token; precisa endpoint + deployment + chave)\n\
+     4) nenhuma por agora       (scan, wiki, context, pr draft e dashboard funcionam sem IA)\n";
 
 /// Pergunta de menu genérica: imprime o menu + `Escolha [<default>]: ` e
 /// valida contra `valid`; Enter/EOF ⇒ default; resposta inválida repete no
@@ -895,6 +797,7 @@ fn ask_menu_choice(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> String {
+    let options = valid.join(", ");
     let mut invalid = 0;
     loop {
         let _ = write!(output, "{menu}Escolha [{default}]: ");
@@ -911,7 +814,7 @@ fn ask_menu_choice(
                     return answer;
                 }
                 invalid += 1;
-                let _ = writeln!(output, "resposta inválida ('{line}') — use 1, 2 ou 3.");
+                let _ = writeln!(output, "resposta inválida ('{line}') — use {options}.");
                 if invalid >= 2 {
                     let _ = writeln!(
                         output,
@@ -944,11 +847,6 @@ fn terminal_echo(enable: bool) {
     {
         let _ = enable;
     }
-}
-
-/// Prompt "Cole o PAT": uma linha de stdin; vazia ⇒ erro acionável.
-fn prompt_for_pat(input: &mut dyn BufRead, output: &mut dyn Write, hidden: bool) -> Option<String> {
-    prompt_secret("Cole o PAT e pressione Enter", hidden, input, output)
 }
 
 /// Linha do prompt de segredo, HONESTA sobre o eco: prometer "não aparece"
@@ -1228,42 +1126,37 @@ fn persist_foundry(
     }
 }
 
-/// Comando de retomada de cada passo pulado (o resumo imprime os dois juntos).
+/// Comando de ativação de cada passo que ficou desativado (o resumo imprime
+/// na seção "ativar depois").
 pub fn resume_command(step: &str) -> &'static str {
     match step {
-        "pat" => "kira setup --pat",
+        // A credencial agora nasce em `connect` (ADR-0030 #4), não em setup.
+        "pat" => "kira connect azure",
         "ia" => "kira setup --backend ollama",
         _ => "kira setup",
     }
 }
 
-/// Resumo final (formato exato da spec): `pronto:` com dev/pat mascarado/ia/
-/// store, `pulado (dá para fazer depois):` com os comandos de retomada e o
-/// próximo comando — nunca termina com "configuração concluída".
-pub fn format_summary(
-    dev: &str,
-    pat_line: Option<&str>,
-    ia_line: Option<&str>,
-    store_path: &str,
-    skipped: &[&str],
-) -> String {
+/// Resumo final (formato exato do MVP-2, ADR-0030): `pronto:` com dev/ia/
+/// store, os blocos "funciona agora" (toda a jornada local, zero credencial),
+/// "desativado" (o que espera uma capacidade) e "ativar depois" (com a linha
+/// do backend de IA só quando ficou sem IA), e o próximo comando — nunca
+/// termina com "configuração concluída".
+pub fn format_summary(dev: &str, ia: Option<&str>, store_path: &str) -> String {
     let mut text = String::new();
     text.push_str("pronto:\n");
     text.push_str(&format!("  dev: {dev}\n"));
-    let pat = pat_line.unwrap_or("não configurado (modo local)");
-    text.push_str(&format!("  pat: {pat}\n"));
-    let ia = ia_line.unwrap_or("não configurada (rode kira setup --backend)");
-    text.push_str(&format!("  ia:  {ia}\n"));
+    let ia_line = ia.unwrap_or("nenhuma");
+    text.push_str(&format!("  ia:  {ia_line}\n"));
     text.push_str(&format!("  store: {store_path}\n"));
-    if !skipped.is_empty() {
-        text.push('\n');
-        text.push_str("pulado (dá para fazer depois):\n");
-        for step in skipped {
-            text.push_str(&format!("  {step} — {}\n", resume_command(step)));
-        }
-    }
     text.push('\n');
-    text.push_str("próximo passo:  kira scan");
+    text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard\n");
+    text.push_str("desativado:      judge de item do board · read (board) · publicar PR\n");
+    text.push_str("ativar depois:   kira connect azure   (leitura de work items)\n");
+    if ia.is_none() {
+        text.push_str(&format!("                 {}\n", resume_command("ia")));
+    }
+    text.push_str("próximo passo:   kira scan");
     text
 }
 
@@ -1387,12 +1280,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // A aula do PAT: o que é, por que, como fazer (URL + escopo + validade
-    // + valor único) — antes de qualquer pedido.
+    // A aula do PAT (em linhas, fonte única para o `connect` do MVP-3): o
+    // que é, por que, como fazer (URL + escopo + validade + valor único).
     // ------------------------------------------------------------------
     #[test]
-    fn pat_lesson_teaches_what_how_and_single_use() {
-        let lesson = pat_lesson("https://dev.azure.com/minha-org/_usersSettings/tokens");
+    fn pat_lesson_lines_teach_what_how_and_single_use() {
+        let lines = pat_lesson_lines("https://dev.azure.com/minha-org/_usersSettings/tokens");
+        let lesson = lines.join("\n");
         assert!(lesson.contains("senha descartável"), "aula: {lesson}");
         assert!(lesson.contains("Personal Access Token"), "aula: {lesson}");
         assert!(lesson.contains("https://dev.azure.com/minha-org/_usersSettings/tokens"));
@@ -1400,22 +1294,30 @@ mod tests {
         assert!(lesson.contains("30 dias"), "aula: {lesson}");
         assert!(lesson.contains("90"), "aula: {lesson}");
         assert!(lesson.contains("uma única vez"), "aula: {lesson}");
+        // Cada elemento é uma linha pronta (sem quebra interna): o `connect`
+        // pode numerar/indentar sem re-parsear.
+        for line in &lines {
+            assert!(!line.contains('\n'), "linha com quebra interna: {line:?}");
+        }
+        // pat_lesson é a mesma fonte, só junta — nunca uma segunda cópia.
+        assert_eq!(
+            pat_lesson("https://x/y"),
+            pat_lesson_lines("https://x/y").join("\n")
+        );
     }
 
     // ------------------------------------------------------------------
-    // Menus: 3 opções com o default certo (1 = barato/recomendado; o caro
-    // nunca é default).
+    // Menu de IA: 4 opções, com a 4ª = "nenhuma por agora" (o default quando
+    // o Ollama não está instalado; o caro nunca é default).
     // ------------------------------------------------------------------
     #[test]
-    fn menus_have_three_options_and_the_cheap_default() {
-        assert!(PAT_MENU.contains("1) Colar um PAT agora"));
-        assert!(PAT_MENU.contains("2) Usar AZURE_DEVOPS_PAT do ambiente"));
-        assert!(PAT_MENU.contains("3) Pular por agora"));
-        assert!(PAT_MENU.contains("kira triage --file"));
+    fn ia_menu_has_four_options_with_the_none_choice() {
         assert!(IA_MENU.contains("1) Ollama local"));
         assert!(IA_MENU.contains("2) Copilot CLI"));
         assert!(IA_MENU.contains("3) Microsoft Foundry"));
+        assert!(IA_MENU.contains("4) nenhuma por agora"));
         assert!(IA_MENU.contains("custo por token"));
+        assert!(IA_MENU.contains("funcionam sem IA"));
     }
 
     #[test]
@@ -1442,17 +1344,33 @@ mod tests {
         let mut input = BufReader::new(std::io::Cursor::new("\n"));
         let mut output: Vec<u8> = Vec::new();
         assert_eq!(
-            ask_menu_choice("menu\n", &["1", "2", "3"], "1", &mut input, &mut output),
-            "1"
+            ask_menu_choice(
+                "menu\n",
+                &["1", "2", "3", "4"],
+                "4",
+                &mut input,
+                &mut output
+            ),
+            "4"
         );
 
         let mut input = BufReader::new(std::io::Cursor::new("x\nx\n"));
         let mut output: Vec<u8> = Vec::new();
         assert_eq!(
-            ask_menu_choice("menu\n", &["1", "2", "3"], "2", &mut input, &mut output),
+            ask_menu_choice(
+                "menu\n",
+                &["1", "2", "3", "4"],
+                "2",
+                &mut input,
+                &mut output
+            ),
             "2"
         );
         let text = String::from_utf8_lossy(&output).to_string();
+        assert!(
+            text.contains("resposta inválida ('x') — use 1, 2, 3, 4"),
+            "deve listar as opções válidas: {text}"
+        );
         assert!(
             text.contains("assumindo '2' (padrão)"),
             "deve avisar o default assumido: {text}"
@@ -1461,82 +1379,64 @@ mod tests {
         let mut input = BufReader::new(std::io::Cursor::new(""));
         let mut output: Vec<u8> = Vec::new();
         assert_eq!(
-            ask_menu_choice("menu\n", &["1", "2", "3"], "3", &mut input, &mut output),
+            ask_menu_choice(
+                "menu\n",
+                &["1", "2", "3", "4"],
+                "3",
+                &mut input,
+                &mut output
+            ),
             "3"
         );
     }
 
     // ------------------------------------------------------------------
-    // Não-interativo: usa a env quando existe; senão pula (nunca bloqueia,
-    // nunca inventa token).
+    // Resumo final: formato exato do MVP-2 (pronto / funciona agora /
+    // desativado / ativar depois / próximo passo) — e nada de PAT: o setup
+    // não fala de credencial.
     // ------------------------------------------------------------------
     #[test]
-    fn non_interactive_pat_prefers_env_then_the_keyring_then_skips() {
-        assert_eq!(
-            pat_from_env_store_or_skip(Some("tok".into()), Some("keyring".into())),
-            PatResult::FromEnv("tok".into()),
-            "env vence o keyring"
-        );
-        assert_eq!(
-            pat_from_env_store_or_skip(None, Some("keyring".into())),
-            PatResult::FromStore("keyring".into()),
-            "o PAT salvo é reusado e validado"
-        );
-        assert_eq!(pat_from_env_store_or_skip(None, None), PatResult::Skipped);
-        assert_eq!(
-            pat_from_env_store_or_skip(Some("   ".into()), Some("  ".into())),
-            PatResult::Skipped
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Resumo final: formato exato da spec (pronto / pulado / próximo passo)
-    // e pat mascarado — nunca o token completo.
-    // ------------------------------------------------------------------
-    #[test]
-    fn summary_has_ready_skipped_and_next_command_sections() {
+    fn summary_has_ready_works_disabled_and_next_command_sections() {
         let text = format_summary(
             "Sergin",
-            Some("Aa2x**** (lê Work Items de avanade/pague-menos)"),
             Some("ollama (qwen3.5:4b)"),
             "/home/x/.config/kira/store.db",
-            &["pat"],
         );
         assert!(text.starts_with("pronto:\n  dev: Sergin\n"), "{text}");
-        assert!(text.contains("  pat: Aa2x**** (lê Work Items de avanade/pague-menos)"));
         assert!(text.contains("  ia:  ollama (qwen3.5:4b)"));
         assert!(text.contains("  store: /home/x/.config/kira/store.db"));
-        assert!(text.contains("pulado (dá para fazer depois):"));
-        assert!(text.contains("  pat — kira setup --pat"));
-        // Nenhuma etapa inventada no "pulado": sem fonte, sem comando fantasma.
-        assert!(!text.contains("--deps"), "{text}");
-        assert!(text.contains("próximo passo:  kira scan"));
+        assert!(text.contains("funciona agora:  scan · wiki · context · pr draft · dashboard"));
+        assert!(
+            text.contains("desativado:      judge de item do board · read (board) · publicar PR"),
+            "{text}"
+        );
+        assert!(text.contains("ativar depois:   kira connect azure   (leitura de work items)"));
+        // Com IA escolhida, a linha do backend não aparece em "ativar depois".
+        assert!(!text.contains("kira setup --backend ollama"), "{text}");
+        assert!(text.contains("próximo passo:   kira scan"));
         assert!(
             !text.contains("configuração concluída"),
             "nunca termina com 'configuração concluída': {text}"
         );
+        // A palavra PAT nunca entra no resumo do setup.
+        assert!(!text.contains("PAT"), "{text}");
     }
 
     #[test]
-    fn summary_without_pat_and_ia_marks_local_mode() {
-        let text = format_summary("dev", None, None, "store.db", &["pat", "ia"]);
+    fn summary_without_ia_marks_none_and_the_activation_command() {
+        let text = format_summary("dev", None, "store.db");
+        assert!(text.contains("  ia:  nenhuma"), "{text}");
         assert!(
-            text.contains("  pat: não configurado (modo local)"),
-            "{text}"
+            text.contains("                 kira setup --backend ollama"),
+            "sem IA, o ativar depois traz o comando: {text}"
         );
-        assert!(
-            text.contains("  ia:  não configurada (rode kira setup --backend)"),
-            "{text}"
-        );
-        assert!(
-            text.contains("  ia — kira setup --backend ollama"),
-            "{text}"
-        );
+        assert!(!text.contains("PAT"), "{text}");
     }
 
     #[test]
     fn resume_commands_point_to_the_right_flags() {
-        assert_eq!(resume_command("pat"), "kira setup --pat");
+        // A credencial agora nasce em `connect` (MVP-3), não no setup.
+        assert_eq!(resume_command("pat"), "kira connect azure");
         assert_eq!(resume_command("ia"), "kira setup --backend ollama");
         // Passo desconhecido cai no comando neutro (nada de fantasma).
         assert_eq!(resume_command("fonte"), "kira setup");
