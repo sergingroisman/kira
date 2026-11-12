@@ -325,6 +325,12 @@ página — a fonte de verdade é o disco, o índice é derivado).
   wiki lendo `.kira/wiki/`.
 - **Honestidade**: dado ausente aparece como `—` com a causa
   (`achados: — (nunca rodou kira scan)`), nunca inventado ou estimado.
+- **Disciplina de linha**: cada campo do cabeçalho ocupa exatamente UMA linha
+  (o valor passa por um filtro que colapsa CR/LF e corta em 100 chars com
+  `…`); causa longa vai para `?` — a seção **pendências** (no overlay e no
+  `--snapshot`) traz o texto integral, inclusive a dica do `kira doctor`. O
+  campo `store:` saiu do cabeçalho (duplicava `projeto: —`); o rótulo
+  `achados:` aparece uma única vez (no cabeçalho — a seção não o repete).
 - **Interativo só em TTY**: `kira dashboard` com stdout de terminal abre a TUI;
   sem TTY (pipe/CI) imprime o mesmo conteúdo em texto e sai 0.
 - **`--snapshot`**: sempre a forma de texto, para o CI e para redirecionamento —

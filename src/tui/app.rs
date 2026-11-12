@@ -625,7 +625,12 @@ pub fn render_frame(frame: &mut Frame, snapshot: &Snapshot, screen: &AppState, p
         );
     }
     if screen.help_open {
-        frame.render_widget(help_paragraph(&palette), area);
+        // As pendências (causas integrais) vêm do snapshot — mesma função
+        // pura que alimenta a seção do `--snapshot`.
+        frame.render_widget(
+            help_paragraph(&palette, &state::pending_causes(snapshot)),
+            area,
+        );
     }
 }
 
@@ -638,9 +643,12 @@ fn split_detail(area: Rect) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
-/// Overlay de ajuda: os mesmos atalhos do rodapé, com o que cada um faz.
-fn help_paragraph(palette: &Palette) -> Paragraph<'static> {
-    let text = [
+/// Overlay de ajuda: os mesmos atalhos do rodapé, com o que cada um faz —
+/// mais a seção de pendências com a causa INTEGRAL de cada dado ausente (o
+/// cabeçalho corta o valor em 100 chars; o `?` mostra o passo a passo todo,
+/// inclusive a dica do `kira doctor`, em várias linhas — é texto, não painel).
+fn help_paragraph(palette: &Palette, pendings: &[String]) -> Paragraph<'static> {
+    let mut text = vec![
         "ajuda do kira dashboard (read-only — nenhuma tecla escreve)".to_string(),
         String::new(),
         "q                sair".to_string(),
@@ -653,9 +661,16 @@ fn help_paragraph(palette: &Palette) -> Paragraph<'static> {
         "j/k, PgUp/PgDn   rolar a página da wiki aberta em tela cheia".to_string(),
         "r                reler o disco (sem rede, sem escrita)".to_string(),
         "?                abrir/fechar esta ajuda".to_string(),
-        String::new(),
-        "Dado ausente aparece como — com a causa; nada é inventado.".to_string(),
     ];
+    if !pendings.is_empty() {
+        text.push(String::new());
+        text.push(
+            "pendências (cabeçalho corta em uma linha; aqui vai a causa inteira):".to_string(),
+        );
+        text.extend(pendings.iter().cloned());
+    }
+    text.push(String::new());
+    text.push("Dado ausente aparece como — com a causa; nada é inventado.".to_string());
     Paragraph::new(
         text.into_iter()
             .map(|line| {
@@ -1008,6 +1023,41 @@ mod tests {
         assert!(
             text.contains("Esc              voltar"),
             "o Esc documentado na ajuda: {text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_lists_the_full_pat_cause_with_the_doctor_hint() {
+        // A causa de DUAS linhas do PAT mora agora no `?` (texto) — o
+        // cabeçalho mostra só o ponteiro curto, nunca a causa estourada.
+        let snapshot = Snapshot {
+            pat_note: Some(
+                "PAT não encontrado — defina AZURE_DEVOPS_PAT (ex.: export AZURE_DEVOPS_PAT=...)\n\
+                 para diagnosticar a configuração desta máquina, rode `kira doctor`"
+                    .to_string(),
+            ),
+            ..Snapshot::default()
+        };
+        let screen = AppState {
+            panel: Panel::Header,
+            help_open: true,
+            ..AppState::default()
+        };
+        let text = render_full(&snapshot, &screen, 120, 40);
+        assert!(text.contains("pendências"), "seção na ajuda: {text}");
+        assert!(
+            text.contains("kira doctor"),
+            "a dica do doctor INTEIRA no overlay: {text}"
+        );
+        assert!(
+            text.contains("defina AZURE_DEVOPS_PAT"),
+            "o passo a passo completo no overlay: {text}"
+        );
+        // Sem pendências, a seção não existe (ajuda limpa).
+        let clean = render_full(&Snapshot::default(), &screen, 120, 40);
+        assert!(
+            !clean.contains("pendências"),
+            "nada de seção vazia: {clean}"
         );
     }
 
