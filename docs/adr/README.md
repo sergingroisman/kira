@@ -40,7 +40,11 @@
 | **0025** | **`kira setup` ensina: aula do PAT, menu com pular, validação na hora** | **implementado** (#52) — aguarda aceite do dono | `ADR-0025-setup-teaches.md` |
 | **0026** | **Probe suite de segurança no `cargo test`** | **implementado** (#58) — aguarda aceite do dono | `ADR-0026-probe-suite-seguranca.md` |
 | **0027** | **Tech Leads Club: piso de guardas, lições e custódia de prompt** | **proposto** — aguarda aval do dono | `ADR-0027-techleads-piso-guards-licoes-custodia.md` |
-| **0028** | **Reservado** — ferramentas de scan (ex.: `gitleaks`) / economia de token | **reservado** | a confirmar com o dono |
+| **0028** | **Cache de raciocínio e economia medida (ledger, cache-wiki, barra de qualidade)** | **proposto** — aguarda selo do dono (D1–D12 não seladas) | `ADR-0028-cache-raciocinio-e-economia-medida.md` |
+| **0033** | **Dashboard: leitura por padrão, execução só com confirmação explícita** | **implementado** — aguarda aceite do dono | `ADR-0033-dashboard-execucao-confirmada.md` |
+| **0034** | **`kira setup` com wizard de tela cheia sobre o mesmo motor de texto** | **implementado** — aguarda aceite do dono | `ADR-0034-setup-wizard.md` |
+| **0035** | **Foundry configurável pelo `kira setup` (formulário inline, chave no keyring)** | **implementado** — aguarda aceite do dono | `ADR-0035-foundry-no-setup.md` |
+| **0036** | **Camada visual do TUI: nativo do ratatui primeiro, dependência depois** | **implementado** — aguarda aceite do dono | `ADR-0036-tui-visual-nativo-sem-dependencia.md` |
 
 ## O que **não** é ADR aqui
 

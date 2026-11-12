@@ -1,6 +1,6 @@
 # ADR-0028 — Cache de raciocínio e economia medida
 
-**Data**: 12/Nov/2026 · **Estado**: aceite (selo do dono) · **Onda**: TE
+**Data**: 12/Nov/2026 · **Estado**: proposto (aguardando selo do dono) · **Onda**: TE
 (PR34–PR43, [`docs/te-implementacao.md`](../te-implementacao.md))
 
 ## Contexto
@@ -32,9 +32,9 @@ código em `src/context/mod.rs`).
    similaridade de tokens (interseção sobre `content_tokens`, mesma família de
    `eval::content_tokens`) e, com hit ≥ 0,50, **responde sem LLM** com a
    conclusão do episódio anterior, fonte `cache-wiki`, `llm_calls=0` no ledger.
-   `--no-cache` desliga. **Hit não grava episódio novo** (selo do dono,
-   12/Nov/2026): página de bug não é log de re-execução — o hit fica no output
-   e no ledger.
+   `--no-cache` desliga. **Hit não grava episódio novo** (proposta D1,
+   12/Nov/2026, sem selo): página de bug não é log de re-execução — o hit fica
+   no output e no ledger.
 3. **Barra de qualidade (PR38)** — toda estratégia nova de corte do packer só
    entra se o fixture mostrar corte ≥ 20% (padrão de filtro do RTK).
 4. **Medição antes de autonomia** — o cache é rota *padrão* de triage, mas a
@@ -52,8 +52,9 @@ código em `src/context/mod.rs`).
 - **Estimador `bytes / 4`** (RTK) — PT-BR é mais denso que inglês médio;
   3 chars/token fica (conservador: subestima a economia, nunca a infla).
 - **Gravar episódio a cada hit** — transformaria a página do bug em log de
-  re-execução (recusado pelo dono); dedup já evita duplicata, mas o valor
-  informativo de "acertei de novo" pertence ao ledger, não à wiki.
+  re-execução (proposta D1: não gravar, ainda sem selo); dedup já evita
+  duplicata, mas o valor informativo de "acertei de novo" pertence ao ledger,
+  não à wiki.
 - **Ajustar `KIRA_NUM_CTX` por perfil** (PR40) — o perfil coordena caps de
   pack; o teto de janela continua sendo do ambiente (fonte única de verdade).
 
