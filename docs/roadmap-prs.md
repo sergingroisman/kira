@@ -143,6 +143,26 @@ antes do gate M2: 20 bugs rotulados e ≥70% medido por `kira triage --eval`.
 - Mascote pixel art = **arte**, não PR de código: sprites gerados/desenhados e
   versionados como asset; o binário só consome (`kira --about`).
 
+## Onda TE — economia de token (PR34–43, plano de 12/Nov)
+
+Plano de implementação em [`te-implementacao.md`](te-implementacao.md), fonte
+na análise dos 4 repos escolhidos pelo dono (PR #50), decisões **D1–D12
+seladas em 12/Nov/2026** e [ADR-0028](adr/ADR-0028-cache-raciocinio-e-economia-medida.md)
+aceito. Ordem: PR34 → PR35 → PR36/37 → PR38/39/40 → PR41 → PR42 (43 é W6).
+
+| PR | Objetivo | Selo/estado |
+|---|---|---|
+| PR34 | Ledger de economia (pack vs teto, chamadas, pack ocioso; schema v4) | fila |
+| PR35 | Cache de raciocínio — wiki-hit ≥0.50 = causa sem LLM, `cache-wiki`, `--no-cache`; hit **não grava episódio** (D1) | fila; mede só com os 20 rótulos |
+| PR36 | Evidência em 3 estados (tag por arquivo, prompt v3) | fila |
+| PR37 | Digest bruto `.kira/raw/` (512 KiB, redigido) + `.kira/` fora do git + BOM-sniff | fila |
+| PR38 | Dedup contíguo nos trechos (barra ≥20% por estratégia) | fila |
+| PR39 | Repo map determinístico no brief (≤20 arquivos/≤600 chars) | fila |
+| PR40 | `token_profile` em `config.toml` (budget/balanced/quality, 3 packs dourados) | fila |
+| PR41 | `kira rea` wrapper + pergunta teaching-only no setup | fila |
+| PR42 | Watchdogs de budget 50/75/90% na spec W5 (doc-only) | fila |
+| PR43 | Painel de economia no dashboard (1 campo por PR; lê, nunca escreve — prova `dashboard_e2e`) | **W6** (pós-M2) |
+
 ## Permanece REJEITADO
 
 Daemon Axum/SSE · DB além do SQLite `bundled` · embeddings/semantic search (pós-M2) ·
