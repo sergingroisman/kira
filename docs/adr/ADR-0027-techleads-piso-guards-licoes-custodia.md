@@ -1,4 +1,4 @@
-# ADR-0026 — Emprestado do Tech Leads Club: piso de guardas com veredito, lições que provam que valem e custódia de prompt
+# ADR-0027 — Emprestado do Tech Leads Club: piso de guardas com veredito, lições que provam que valem e custódia de prompt
 
 - **Status**: proposto (12/Nov/2026) — Orchestrator (recomendação) · Sérgio (veto/aval).
   Um veto vira ADR que supersede este, não edição silenciosa.

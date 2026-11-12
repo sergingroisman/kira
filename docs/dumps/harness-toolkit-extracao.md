@@ -11,7 +11,7 @@
   Quem quiser o dump: rode `git clone --depth 1` e gere com o gitingest de
   sempre — o repo é público.
 - **Companheiro**: `docs/agent-skills-harness-vale-trazer.md` (análise e plano) e
-  [ADR-0025](../adr/ADR-0025-techleads-piso-guards-licoes-custodia.md).
+  [ADR-0027](../adr/ADR-0027-techleads-piso-guards-licoes-custodia.md).
 
 ## O que é
 

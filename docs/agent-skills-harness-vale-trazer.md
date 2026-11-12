@@ -10,7 +10,7 @@
   (**conceito sim, código não** — extração em
   [`docs/dumps/harness-toolkit-extracao.md`](dumps/harness-toolkit-extracao.md);
   o dump cru deles fica local, fora do repo MIT).
-- **ADR**: [ADR-0026](adr/ADR-0026-techleads-piso-guards-licoes-custodia.md)
+- **ADR**: [ADR-0027](adr/ADR-0027-techleads-piso-guards-licoes-custodia.md)
 - **Benchmark**: [docs/benchmark-kira-vs-techleads.md](benchmark-kira-vs-techleads.md)
 - **Veredito**: 1 tese comprovada + 8 melhorias (fila PR44–PR51) + 2 bônus a
   confirmar; nenhum contrato do mandato quebrado; nenhuma dependência nova;
@@ -207,7 +207,7 @@ fez o harness-toolkit: **139 ADRs antes de confiar no runtime**.
 
 ## Pendências do dono
 
-1. **Aprovar o ADR-0026** — os PRs acima viram fila no `docs/roadmap-prs.md`
+1. **Aprovar o ADR-0027** — os PRs acima viram fila no `docs/roadmap-prs.md`
    (ledger do Orchestrator) só depois do aval.
 2. **O dump cru do harness-toolkit fica FORA do repo (ELv2)** — se o dono
    quiser comitar mesmo assim, precisa de pasta própria com a licença ELv2
