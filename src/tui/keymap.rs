@@ -27,6 +27,8 @@ pub enum Action {
     Bottom,
     /// Reler o disco e recompor o snapshot (r) — sem rede, sem escrita.
     Reload,
+    /// Abrir a busca incremental da wiki (/) — o filtro é função pura.
+    SearchWiki,
     /// Alternar a ajuda de atalhos (?).
     Help,
 }
@@ -52,6 +54,10 @@ pub fn map(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('G') if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::Bottom),
         KeyCode::Char('G') => Some(Action::Bottom),
         KeyCode::Char('r') => Some(Action::Reload),
+        // `/` abre a busca incremental do painel de wiki (W6-PR4): o
+        // keymap só traduz a tecla; a aplicação decide se faz sentido no
+        // painel em foco (só na wiki — nos outros é Ignore).
+        KeyCode::Char('/') => Some(Action::SearchWiki),
         KeyCode::Char('?') => Some(Action::Help),
         _ => None,
     }
@@ -99,6 +105,8 @@ mod tests {
     #[test]
     fn reload_and_help_are_read_only_actions() {
         assert_eq!(map(plain(KeyCode::Char('r'))), Some(Action::Reload));
+        // W6-PR4: `/` abre a busca da wiki.
+        assert_eq!(map(plain(KeyCode::Char('/'))), Some(Action::SearchWiki));
         assert_eq!(map(plain(KeyCode::Char('?'))), Some(Action::Help));
     }
 

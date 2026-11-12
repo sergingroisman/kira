@@ -131,6 +131,27 @@ impl Sandbox {
         record("doctor", "", None, &now, 400, false, "ollama não respondeu");
     }
 
+    /// Wiki fixture (W6-PR4): 2 páginas reais em `.kira/wiki/` (contexto +
+    /// bugs/4821) indexadas pelo MESMO caminho de produção (`Wiki::reindex`
+    /// grava as linhas em `wiki_page`/`wiki_fts`). Fecha a store antes de
+    /// voltar, para o hash ficar estável (WAL checkpointed).
+    fn seed_wiki_fixture(&self) {
+        let markdown_contexto = "# Contexto do projeto\n\nDecisão **com fofura** e `kira scan`.\n\n- item um\n- item dois\n\n> uma citação\n\n---\n\nveja [o guia](https://exemplo.com/guia)\n";
+        let markdown_bug = "# Sessão 4821\n\ntoken expirado em **produção**\n";
+        let wiki = kira::wiki::Wiki::open(&self.cwd)
+            .unwrap_or_else(|err| panic!("abrir wiki fixture: {err}"));
+        wiki.write("contexto", markdown_contexto)
+            .unwrap_or_else(|err| panic!("escrever contexto fixture: {err}"));
+        wiki.write("bugs/4821", markdown_bug)
+            .unwrap_or_else(|err| panic!("escrever bug fixture: {err}"));
+        let store_db = Store::open_in_dir(&self.store)
+            .unwrap_or_else(|err| panic!("abrir store fixture: {err}"));
+        let indexed = wiki
+            .reindex(&store_db)
+            .unwrap_or_else(|err| panic!("reindexar wiki fixture: {err}"));
+        assert_eq!(indexed, 2, "as duas páginas foram indexadas");
+    }
+
     /// Config fixture with `dev_name` — the header shows it as `dev: <nome>`.
     fn config_path(&self) -> PathBuf {
         let config = self.base.join("config.toml");
@@ -432,4 +453,88 @@ fn sessions_absent_store_shows_the_honest_cause() {
     let (code, out, _) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("sessões: — (store sem sessões)"), "{out}");
+}
+
+#[test]
+fn snapshot_with_wiki_fixture_shows_rendered_pages_and_keeps_the_store_readonly() {
+    // W6-PR4: painel de wiki no `--snapshot` com fixture de 2 páginas — a
+    // lista (tipo · título · idade) + o markdown RENDIDO pelo renderizador
+    // próprio (títulos com marcador por nível, listas com `•`, ênfase
+    // desligada, link expandido, citação com `│`, régua — NUNCA `#` nem
+    // `**` nem HTML executado) — e a prova de read-only se mantém: o hash
+    // do `store.db` tem que ser idêntico antes/depois.
+    let sandbox = Sandbox::new("wiki");
+    sandbox.seed_store_with_scan(true);
+    sandbox.seed_wiki_fixture();
+    let before = sandbox.store_hash();
+    assert!(!before.is_empty(), "store fixture precisa existir");
+
+    let (code, out, err) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "saída: {out}{err}");
+
+    // Cabeçalho do painel com a contagem real do fixture.
+    assert!(out.contains("painel wiki — 2 páginas"), "{out}");
+    assert!(out.contains("TIPO"), "{out}");
+    assert!(out.contains("TÍTULO"), "{out}");
+    assert!(out.contains("ATUALIZAÇÃO"), "{out}");
+    // Os títulos das duas páginas na lista.
+    assert!(out.contains("Contexto do projeto"), "{out}");
+    assert!(out.contains("Sessão 4821"), "{out}");
+    // O markdown RENDIDO (sem `#`, sem `**`, sem code span cru).
+    assert!(out.contains("▌ Contexto do projeto"), "{out}");
+    // As duas páginas começam com `#` (h1): marcador de nível 1 nas duas.
+    assert!(out.contains("▌ Sessão 4821"), "{out}");
+    assert!(out.contains("• item um"), "{out}");
+    assert!(out.contains("• item dois"), "{out}");
+    assert!(out.contains("Decisão com fofura"), "{out}");
+    // O code span da página foi desligado dentro do conteúdo rendido (o
+    // texto é "Decisão com fofura e kira scan." — sem backtick no trecho).
+    assert!(out.contains("e kira scan."), "{out}");
+    assert!(out.contains("o guia (https://exemplo.com/guia)"), "{out}");
+    assert!(out.contains("│ uma citação"), "{out}");
+    assert!(out.contains("────"), "{out}");
+    // Nenhum marcador cru sobrevive ao renderizador: a ênfase `**com
+    // fofura**` virou texto sem marcador e `#` em início de linha NUNCA
+    // aparece como markdown (o `Aa2x****` do PAT é máscara, não markdown).
+    assert!(!out.contains("**com fofura"), "ênfase desligada: {out}");
+    assert!(!out.contains("\n# "), "nenhum título cru: {out}");
+    // E a prova de read-only: nada escreve, byte a byte.
+    let after = sandbox.store_hash();
+    assert_eq!(
+        before, after,
+        "dashboard --snapshot com painel de wiki mutou o store.db — violação do contrato read-only"
+    );
+}
+
+#[test]
+fn wiki_absent_index_shows_the_reindex_cause() {
+    // Store legível, índice `wiki_page` vazio: `—` com a causa que conserta
+    // (rode kira wiki reindex) — nunca lista inventada.
+    let sandbox = Sandbox::new("no-wiki");
+    sandbox.seed_store_with_scan(true);
+    let (code, out, _) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("wiki: — (wiki vazia — rode kira wiki reindex)"),
+        "{out}"
+    );
+    assert!(!out.contains("painel wiki — "), "{out}");
+}
+
+#[test]
+fn wiki_readonly_hash_holds_without_snapshot_too() {
+    // A prova de read-only também vale no modo não-TTY (texto) com wiki:
+    // o dashboard NUNCA escreve — nem o índice que ele acabou de ler.
+    let sandbox = Sandbox::new("wiki-plain");
+    sandbox.seed_store_with_scan(true);
+    sandbox.seed_wiki_fixture();
+    let before = sandbox.store_hash();
+    let (code, out, err) = run_kira(&sandbox, &[], &["dashboard"]);
+    assert_eq!(code, 0, "saída: {out}{err}");
+    assert!(out.contains("painel wiki — 2 páginas"), "{out}");
+    let after = sandbox.store_hash();
+    assert_eq!(
+        before, after,
+        "dashboard (não-TTY) mutou o store.db — violação do contrato read-only"
+    );
 }

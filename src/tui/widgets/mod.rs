@@ -1,5 +1,6 @@
-//! Painéis do dashboard. W6-PR3: cabeçalho + achados + sessões (Wiki entra
-//! no PR seguinte da spec W6).
+//! Painéis do dashboard. W6-PR4: cabeçalho + achados + sessões + wiki (os
+//! quatro da spec; o PR5 fica com mascote/tema).
 pub mod findings;
 pub mod header;
 pub mod sessions;
+pub mod wiki;

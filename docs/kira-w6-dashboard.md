@@ -158,6 +158,59 @@ detalhe · `Esc` volta · `/` busca na wiki · `r` recarrega (relê disco; sem r
   `store.db` antes/depois segue byte-idêntico (`tests/dashboard_e2e.rs`, novo
   fixture de 3 sessões com caso de store sem sessões).
 
+### Entregue no W6-PR4 (branch `w6/pr4-wiki-panel`)
+
+- Painel **Wiki** (`src/tui/widgets/wiki.rs`): lista de páginas lidas do
+  índice derivado `wiki_page` da store pela MESMA conexão
+  `Store::open_readonly_at` do resto do dashboard (read-only real), com o
+  markdown REAL de cada arquivo re-lido de `.kira/wiki/` (caminho do índice,
+  fallback canônico `<root>/.kira/wiki/<slug>.md`) e **limite de 256 KiB por
+  página** (`WIKI_PAGE_MAX_BYTES`; leitura com `from_utf8_lossy` — byte
+  quebrado nunca derruba o painel). Colunas TIPO / TÍTULO / ATUALIZAÇÃO
+  (idade relativa via `humanize_age` sobre o `now` do snapshot), seleção com
+  `➤` + REVERSED, **sem scroll horizontal** (célula trunca com `…`).
+- **Renderizador markdown próprio e mínimo** (`src/tui/markdown.rs`), SEM
+  dependência nova: título `#`→`▌`, `##`→`■`, `###`+→`·` (o `#` cru NUNCA sai
+  na tela); lista `-`/`*`→`•`; bloco de código (``` → `│` sem cor de
+  sintaxe); code span cru desligado; negrito/itálico desligando marcadores
+  (`**x**`→`x`); link `[txt](url)`→`txt (url)`; citação `>`→`│`; régua
+  `---`→`────`. HTML **nunca executado** (tags viram texto), wrap finito na
+  largura dada, determinístico, e **markdown inválido não panica** (fence
+  aberto, marcador solto, par vazio degradam para texto). Unit-tests de cada
+  elemento + caso de lixo.
+- **Busca incremental `/`** com filtro PURA `state::filter_pages(pages,
+  needle)`: título E conteúdo, case-insensitive e **sem acento-sensível**
+  (`fold_text`/`deaccent` — `sessao` acha `Sessão`), unit-testada. O rodapé
+  vira caixa de texto (`busca wiki: <agulha>▌`) enquanto a busca está aberta;
+  `Esc` cancela; `Backspace` apaga. A lista do painel é a FILTRADA (a
+  seleção/clamp usam o tamanho da lista filtrada).
+- **`Enter`** abre a página selecionada em tela cheia (`OpenPage` — modal, o
+  painel de fundo é limpo, nada vaza) com scroll vertical `j`/`k`, `g`/`G` e
+  `PgUp`/`PgDn` (passo de 10 linhas); o scroll é **clamped pelo tamanho REAL
+  do conteúdo rendido dentro do widget** (nunca além do fim). `Esc` volta à
+  lista. `q`/`r` continuam saindo/re-ler dentro do preview (mesmo contrato do
+  modal de detalhe).
+- Índice vazio com store legível ⇒ `wiki: — (wiki vazia — rode kira wiki
+  reindex)`; store ausente/ilegível ⇒ a causa concreta da store (nunca
+  inventada). Página ilegível no disco ⇒ preview com a nota `(conteúdo
+  ausente em .kira/wiki/ — rode kira wiki reindex)`.
+- `Tab`/`Shift+Tab` agora cicla **cabeçalho → achados → sessões → wiki** (4
+  painéis, `PANEL_COUNT = 4`, rodapé `painel 1/4..4/4`, borda em foco/idle).
+  `decide()` continua PURA: as transições novas (`OpenPage`/`ClosePage`,
+  `SearchWiki`/`SearchChar`/`SearchBackspace`/`CloseSearch`,
+  `ScrollPage(±n)`; `/` fora do painel de wiki = Ignore) somam-se às
+  existentes (keymap ganhou `Action::SearchWiki`), todas unit-testadas.
+- `--snapshot`/não-TTY imprimem a MESMA informação em texto: lista do painel
+  (`painel wiki — N páginas`) + o markdown rendido de cada página (a mesma
+  saída do renderizador que o `Enter` mostra na TUI). Nada escreve em disco —
+  o hash do `store.db` antes/depois segue byte-idêntico
+  (`tests/dashboard_e2e.rs`, fixture de 2 páginas em `.kira/wiki/` +
+  `Wiki::reindex`, casos de índice vazio e hash no modo não-TTY).
+- **Ainda não entregue desta spec (PR5)**: mascote + tema com `NO_COLOR`
+  formalizado no sprite/`--about` (o fallback mono de paleta já existe desde
+  o PR1), `kira --about` e smoke manual do dono no Windows; PR6 fica com a
+  captura ASCII do dashboard no README.
+
 ## Fora de escopo (rejeitado por ora)
 
 Mouse · edição de qualquer dado · gráfico temporal além de contagem · múltiplos
