@@ -14,10 +14,12 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 
+use crate::tui::glyph::Glyphs;
 use crate::tui::state::{self, WikiPage};
 use crate::tui::theme::Palette;
+use crate::tui::viewport;
 use crate::tui::widgets::findings::cell;
 
 /// O widget da LISTA de páginas da wiki.
@@ -32,6 +34,8 @@ pub struct WikiWidget<'a> {
     palette: Palette,
     /// Texto do estado vazio (já calculado em `state::empty_wiki_line`).
     empty_line: String,
+    /// Conjunto de glifos (`KIRA_GLYPHS=ascii`).
+    glyphs: Glyphs,
 }
 
 impl<'a> WikiWidget<'a> {
@@ -51,8 +55,37 @@ impl<'a> WikiWidget<'a> {
             focused,
             palette,
             empty_line,
+            glyphs: Glyphs::default(),
         }
     }
+
+    /// Glifos da sessão (o `app` passa o modo lido do ambiente uma vez).
+    pub fn with_glyphs(mut self, glyphs: Glyphs) -> Self {
+        self.glyphs = glyphs;
+        self
+    }
+}
+
+/// Uma linha da lista da wiki: cabeçalho de tipo ou página.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Row {
+    /// Cabeçalho do grupo (`contexto (3)`).
+    Group { kind: String, count: usize },
+    /// Índice da página na lista recebida.
+    Item(usize),
+}
+
+/// Modelo de exibição: grupos e páginas na ordem em que a tela desenha.
+fn display_rows(pages: &[&WikiPage]) -> Vec<Row> {
+    let mut display = Vec::with_capacity(pages.len() + 4);
+    for (kind, indices) in state::wiki_groups(pages) {
+        display.push(Row::Group {
+            kind,
+            count: indices.len(),
+        });
+        display.extend(indices.into_iter().map(Row::Item));
+    }
+    display
 }
 
 /// Larguras das colunas da lista a partir da área interna, SEM scroll
@@ -69,23 +102,12 @@ pub fn column_widths(inner_width: u16) -> (usize, usize, usize) {
 impl Widget for WikiWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let title = match self.pages.len() {
-            0 => " wiki ".to_string(),
-            1 => " wiki — 1 página ".to_string(),
-            n => format!(" wiki — {n} páginas "),
+            0 => "Wiki".to_string(),
+            1 => "Wiki — 1 página".to_string(),
+            n => format!("Wiki — {n} páginas"),
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(self.palette.title)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .border_style(Style::default().fg(if self.focused {
-                self.palette.border_focus
-            } else {
-                self.palette.border_idle
-            }));
+        let block =
+            crate::tui::widgets::panel::block_with(&title, self.focused, self.palette, self.glyphs);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -101,11 +123,28 @@ impl Widget for WikiWidget<'_> {
             return;
         }
 
-        let (kind_w, title_w, age_w) = column_widths(inner.width);
-        let marker_w = 2usize;
+        let display = display_rows(self.pages);
         let selected = self.selected.min(self.pages.len().saturating_sub(1));
+        let list_height = inner.height.saturating_sub(1);
+        let visible = usize::from(list_height);
+        let cursor_row = display
+            .iter()
+            .position(|row| matches!(row, Row::Item(index) if *index == selected))
+            .unwrap_or(0);
+        let offset = viewport::keep_visible(cursor_row, visible, display.len());
+        let label = viewport::position_label(selected, visible, self.pages.len());
+        let with_scrollbar = label.is_some() && inner.width >= 24;
+        let body_width = if with_scrollbar {
+            inner.width.saturating_sub(1)
+        } else {
+            inner.width
+        };
 
-        // Cabeçalho das colunas: uma linha fixa no topo da lista.
+        let (kind_w, title_w, age_w) = column_widths(body_width);
+        let marker_w = 2usize;
+
+        // Cabeçalho das colunas: uma linha fixa no topo, com o rótulo de
+        // posição à direita quando a lista não cabe inteira.
         let header_line = format!(
             "{}{} {} {}",
             cell("", marker_w),
@@ -113,45 +152,92 @@ impl Widget for WikiWidget<'_> {
             cell("TÍTULO", title_w),
             cell("ATUALIZAÇÃO", age_w),
         );
+        let header_line = match &label {
+            Some(label) => viewport::overlay_right(&header_line, label, usize::from(body_width)),
+            None => header_line,
+        };
         Paragraph::new(Line::from(Span::styled(
             header_line,
             Style::default().fg(self.palette.missing),
         )))
-        .render(inner, buf);
+        .render(
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: body_width,
+                height: 1,
+            },
+            buf,
+        );
 
-        // Linhas da lista: y fixo por índice — tabela de verdade, não fluxo.
-        let row_area = Rect {
+        // Lista agrupada por tipo, na fatia que o viewport escolheu. Os
+        // índices continuam sendo os da lista recebida (seleção coerente).
+        let list_area = Rect {
             x: inner.x,
             y: inner.y + 1,
-            width: inner.width,
-            height: inner.height.saturating_sub(1),
+            width: body_width,
+            height: list_height,
         };
-        for (index, page) in self.pages.iter().enumerate() {
-            if index as u16 >= row_area.height {
-                break; // o que não couber espera o terminal maior (denso).
-            }
-            let is_selected = index == selected;
-            let marker = if is_selected { "➤ " } else { "  " };
-            let body = format!(
-                "{}{} {} {}",
-                cell(marker, marker_w),
-                cell(&page.kind, kind_w),
-                cell(&page.title, title_w),
-                cell(&state::wiki_age_line(page, self.now_secs), age_w),
-            );
-            let mut line = Line::from(Span::styled(body, Style::default().fg(self.palette.value)));
-            if is_selected {
-                // Destaque de seleção que sobrevive a `NO_COLOR`: REVERSED.
-                for span in &mut line.spans {
-                    span.style = span.style.add_modifier(Modifier::REVERSED);
+        let (start, end) = viewport::slice(offset, visible, display.len());
+        for (line_index, row) in display[start..end].iter().enumerate() {
+            let rect = Rect {
+                x: list_area.x,
+                y: list_area.y + line_index as u16,
+                width: body_width,
+                height: 1,
+            };
+            match row {
+                Row::Group { kind, count } => {
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" {kind} ({count})"),
+                        Style::default().fg(self.palette.missing),
+                    )))
+                    .render(rect, buf);
+                }
+                Row::Item(index) => {
+                    let Some(page) = self.pages.get(*index) else {
+                        continue;
+                    };
+                    let is_selected = *index == selected;
+                    let marker = if is_selected {
+                        self.glyphs.selection()
+                    } else {
+                        "  "
+                    };
+                    let body = format!(
+                        "{}{} {} {}",
+                        cell(marker, marker_w),
+                        cell(&page.kind, kind_w),
+                        cell(&page.title, title_w),
+                        cell(&state::wiki_age_line(page, self.now_secs), age_w),
+                    );
+                    let mut line =
+                        Line::from(Span::styled(body, Style::default().fg(self.palette.value)));
+                    if is_selected {
+                        // Destaque que sobrevive a `NO_COLOR`: REVERSED.
+                        for span in &mut line.spans {
+                            span.style = span.style.add_modifier(Modifier::REVERSED);
+                        }
+                    }
+                    Paragraph::new(line).render(rect, buf);
                 }
             }
-            let row_rect = Rect {
-                y: row_area.y + index as u16,
-                height: 1,
-                ..row_area
-            };
-            Paragraph::new(line).render(row_rect, buf);
+        }
+
+        if with_scrollbar {
+            crate::tui::widgets::scrollbar::render(
+                buf,
+                Rect {
+                    x: inner.x + body_width,
+                    y: list_area.y,
+                    width: 1,
+                    height: list_height,
+                },
+                offset,
+                display.len(),
+                self.palette,
+                self.glyphs,
+            );
         }
     }
 }
@@ -166,6 +252,7 @@ pub struct WikiPageWidget<'a> {
     page: &'a WikiPage,
     scroll: usize,
     palette: Palette,
+    glyphs: Glyphs,
 }
 
 impl<'a> WikiPageWidget<'a> {
@@ -174,27 +261,35 @@ impl<'a> WikiPageWidget<'a> {
             page,
             scroll,
             palette,
+            glyphs: Glyphs::default(),
         }
+    }
+
+    /// Glifos da sessão: o markdown rendido também respeita o modo ASCII.
+    pub fn with_glyphs(mut self, glyphs: Glyphs) -> Self {
+        self.glyphs = glyphs;
+        self
     }
 }
 
 impl Widget for WikiPageWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                format!(" wiki: {} — Esc volta ", self.page.title),
-                Style::default()
-                    .fg(self.palette.title)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .border_style(Style::default().fg(self.palette.border_focus));
+        let block = crate::tui::widgets::panel::block_with(
+            &format!("Wiki: {} — Esc volta", self.page.title),
+            true,
+            self.palette,
+            self.glyphs,
+        );
         let inner = block.inner(area);
         // Tela cheia de verdade: limpa a área ANTES de pintar — as linhas
         // vazias do markdown não podem deixar o painel de fundo vazar.
         Clear.render(inner, buf);
         block.render(area, buf);
-        let rendered = crate::tui::markdown::render(&self.page.content, inner.width as usize);
+        let rendered = crate::tui::markdown::render_with(
+            &self.page.content,
+            inner.width as usize,
+            self.glyphs,
+        );
         if rendered.is_empty() {
             // Página ilegível/ausente no disco: causa honesta, nunca texto
             // inventado (o índice pode estar velho — `kira wiki reindex`).
@@ -311,7 +406,7 @@ mod tests {
         // now = stamp + 180s ⇒ "há 3 min" determinístico.
         let pages = vec![&p1, &p2];
         let text = render_text(&pages, Some(1_762_861_200 + 180), 0, true, "", 100, 10);
-        assert!(text.contains("wiki — 2 páginas"), "{text}");
+        assert!(text.contains("Wiki — 2 páginas"), "{text}");
         assert!(text.contains("TIPO"), "{text}");
         assert!(text.contains("TÍTULO"), "{text}");
         assert!(text.contains("ATUALIZAÇÃO"), "{text}");
@@ -348,6 +443,20 @@ mod tests {
     }
 
     #[test]
+    fn pages_are_grouped_by_kind_with_one_header_per_group() {
+        let contexto = page("contexto", "contexto", "Contexto", None, "c");
+        let bug_one = page("bugs/1", "bug", "Bug 1", None, "b");
+        let bug_two = page("bugs/2", "bug", "Bug 2", None, "b");
+        let pages = vec![&contexto, &bug_one, &bug_two];
+        let text = render_text(&pages, None, 0, true, "", 100, 14);
+        assert!(text.contains("contexto (1)"), "{text}");
+        assert!(text.contains("bug (2)"), "{text}");
+        assert_eq!(text.matches("contexto (").count(), 1, "{text}");
+        assert_eq!(text.matches("bug (").count(), 1, "{text}");
+        assert!(text.contains("➤"), "seleção visível: {text}");
+    }
+
+    #[test]
     fn column_widths_never_exceed_the_area() {
         let (kind, title, age) = column_widths(100);
         assert_eq!(kind, 8);
@@ -357,6 +466,29 @@ mod tests {
         assert!(kind + title + age <= 12, "{kind} {title} {age}");
         let (kind, title, age) = column_widths(0);
         assert_eq!(kind + title + age, 0);
+    }
+
+    /// O cabeçalho de tipo também é linha: o viewport conta ele para manter a
+    /// página selecionada visível quando a lista transborda.
+    #[test]
+    fn selection_scrolls_into_view_with_the_group_headers() {
+        let pages_owned: Vec<WikiPage> = (1..=10)
+            .map(|n| {
+                page(
+                    &format!("bugs/{n}"),
+                    "bug",
+                    &format!("Bug {n:02}"),
+                    None,
+                    "c",
+                )
+            })
+            .collect();
+        let pages: Vec<&WikiPage> = pages_owned.iter().collect();
+        let text = render_text(&pages, None, 9, true, "", 100, 10);
+        assert!(text.contains("Bug 10"), "última página visível: {text}");
+        assert!(!text.contains("Bug 01"), "o topo rolou para fora: {text}");
+        assert!(text.contains("10/10"), "posição do cursor: {text}");
+        assert!(text.contains("➤"), "marcador visível: {text}");
     }
 
     #[test]
@@ -386,7 +518,7 @@ mod tests {
         };
         // Topo: título do bloco + primeiras linhas rendidas.
         let top = render_page(0, 80, 12);
-        assert!(top.contains("wiki: Contexto — Esc volta"), "{top}");
+        assert!(top.contains("Wiki: Contexto — Esc volta"), "{top}");
         assert!(top.contains("linha 1"), "{top}");
         // Fim (scroll gigante de `G`): as ÚLTIMAS linhas, nunca além.
         let bottom = render_page(usize::MAX, 80, 12);
@@ -411,7 +543,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("draw: {err}"));
         let text = buffer_text(&terminal, 60, 6);
         assert!(text.contains("conteúdo ausente"), "{text}");
-        assert!(text.contains("wiki: Fantasma — Esc volta"), "{text}");
+        assert!(text.contains("Wiki: Fantasma — Esc volta"), "{text}");
     }
 
     #[test]

@@ -32,6 +32,11 @@ pub const PROJECT_ENV: &str = "AZURE_DEVOPS_PROJECT";
 pub const KEYRING_SERVICE: &str = "kira";
 /// Key stored in the credential store for the PAT.
 pub const CRED_KEY_PAT: &str = "azure-devops-pat";
+/// Chave de API do Foundry guardada pelo `kira setup` no keyring do OS
+/// (ADR-0035). `KIRA_FOUNDRY_API_KEY` continua vencendo — a env é o caminho
+/// portátil; o keyring existe para quem configurou pelo wizard não precisar
+/// exportar nada.
+pub const CRED_KEY_FOUNDRY_API_KEY: &str = "foundry-api-key";
 
 /// Config keys stored in `config.toml`.
 pub const CONFIG_KEY_ORG: &str = "organization";
@@ -40,6 +45,10 @@ pub const CONFIG_KEY_PROJECT: &str = "project";
 /// no arquivo (ausente ⇒ `None`), como um `#[serde(default)]` do formato
 /// minimalista de pares usado aqui.
 pub const CONFIG_KEY_DEV_NAME: &str = "dev_name";
+/// Endpoint do recurso Foundry (público, não é segredo) em `config.toml`.
+pub const CONFIG_KEY_FOUNDRY_ENDPOINT: &str = "foundry_endpoint";
+/// Deployment/modelo do Foundry (público) em `config.toml`.
+pub const CONFIG_KEY_FOUNDRY_DEPLOYMENT: &str = "foundry_deployment";
 
 /// Where a resolved value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +348,31 @@ pub fn write_config_file(path: &Path, updates: &[(&str, &str)]) -> Result<(), Er
             None => pairs.push((key.to_string(), value.to_string())),
         }
     }
+    write_pairs(path, &pairs)
+}
+
+/// Remove chaves do `config.toml` preservando o resto (usado por
+/// `kira setup --reset` para apagar exatamente o que o wizard gravou).
+///
+/// Ausência de qualquer chave não é erro e não reescreve o arquivo: reset é
+/// idempotente. Segredo NUNCA mora aqui — este arquivo só tem valores públicos
+/// (org, projeto, dev, endpoint/deployment do Foundry).
+pub fn remove_config_keys(path: &Path, keys: &[&str]) -> Result<bool, Error> {
+    let pairs = read_config_file(path)?;
+    let kept: Vec<(String, String)> = pairs
+        .iter()
+        .filter(|(name, _)| !keys.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    if kept.len() == pairs.len() {
+        return Ok(false);
+    }
+    write_pairs(path, &kept)?;
+    Ok(true)
+}
+
+/// Grava os pares no formato mínimo do KIRA (0600, cabeçalho fixo).
+fn write_pairs(path: &Path, pairs: &[(String, String)]) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| Error::ConfigRead {
             path: parent.display().to_string(),
@@ -346,7 +380,7 @@ pub fn write_config_file(path: &Path, updates: &[(&str, &str)]) -> Result<(), Er
         })?;
     }
     let mut body = String::from("# kira — configuração local (escrita por `kira setup`)\n");
-    for (key, value) in &pairs {
+    for (key, value) in pairs {
         body.push_str(&format!("{key} = \"{value}\"\n"));
     }
     fs::write(path, body).map_err(|source| Error::ConfigRead {
@@ -499,6 +533,17 @@ pub fn resolve_azure_config(project_override: Option<&str>) -> Result<AzureConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foundry_public_keys_and_the_key_never_share_a_slot() {
+        // O endpoint/deployment são públicos (config.toml); a chave é segredo
+        // (keyring). Nomes distintos por construção: nenhum caminho grava a
+        // chave no arquivo de configuração.
+        assert_ne!(CONFIG_KEY_FOUNDRY_ENDPOINT, CONFIG_KEY_FOUNDRY_DEPLOYMENT);
+        assert_ne!(CRED_KEY_FOUNDRY_API_KEY, CRED_KEY_PAT);
+        assert!(!CONFIG_KEY_FOUNDRY_ENDPOINT.contains("key"));
+        assert!(!CONFIG_KEY_FOUNDRY_DEPLOYMENT.contains("key"));
+    }
 
     #[test]
     fn secret_store_env_switch_is_explicit_and_case_insensitive() {
@@ -669,6 +714,49 @@ mod tests {
         let pairs = read_config_file(&path).expect("ler");
         assert_eq!(config_get(&pairs, CONFIG_KEY_DEV_NAME), Some("Sergin"));
         assert_eq!(config_get(&pairs, CONFIG_KEY_ORG), Some("minha-org"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_config_keys_keeps_the_rest_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("kira-test-rm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        write_config_file(
+            &path,
+            &[
+                (CONFIG_KEY_ORG, "minha-org"),
+                (CONFIG_KEY_FOUNDRY_ENDPOINT, "https://x/openai/v1"),
+                (CONFIG_KEY_FOUNDRY_DEPLOYMENT, "gpt-5"),
+            ],
+        )
+        .expect("gravar");
+
+        let removed = remove_config_keys(
+            &path,
+            &[CONFIG_KEY_FOUNDRY_ENDPOINT, CONFIG_KEY_FOUNDRY_DEPLOYMENT],
+        )
+        .expect("remover");
+        assert!(removed, "as duas chaves existiam");
+        let pairs = read_config_file(&path).expect("ler");
+        assert_eq!(config_get(&pairs, CONFIG_KEY_ORG), Some("minha-org"));
+        assert_eq!(config_get(&pairs, CONFIG_KEY_FOUNDRY_ENDPOINT), None);
+        assert_eq!(config_get(&pairs, CONFIG_KEY_FOUNDRY_DEPLOYMENT), None);
+
+        // Segunda passada: ausente não é erro nem reescreve à toa.
+        assert!(
+            !remove_config_keys(
+                &path,
+                &[CONFIG_KEY_FOUNDRY_ENDPOINT, CONFIG_KEY_FOUNDRY_DEPLOYMENT],
+            )
+            .expect("remover de novo"),
+            "nada a remover na segunda passada"
+        );
+
+        // Arquivo inexistente também não é erro (reset idempotente).
+        assert!(
+            !remove_config_keys(&dir.join("nao-existe.toml"), &[CONFIG_KEY_ORG]).expect("ausente")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -5,13 +5,13 @@ use thiserror::Error;
 pub enum Error {
     /// `AZURE_DEVOPS_PAT` is unset or empty (and not found in the OS keyring).
     #[error(
-        "PAT não encontrado — defina a variável de ambiente AZURE_DEVOPS_PAT com um Personal Access Token que tenha permissão de leitura de Work Items (ex.: export AZURE_DEVOPS_PAT=...), ou rode `kira setup` para salvar o PAT no keyring do sistema\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
+        "PAT não encontrado — defina AZURE_DEVOPS_PAT com um Personal Access Token de leitura de Work Items (Unix: export AZURE_DEVOPS_PAT=...; PowerShell: $env:AZURE_DEVOPS_PAT='...'; cmd: setx AZURE_DEVOPS_PAT \"...\"), ou rode `kira setup` para salvar o PAT no keyring do sistema\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
     )]
     MissingPat,
 
     /// `AZURE_DEVOPS_ORG` is unset or empty (and absent from config.toml).
     #[error(
-        "defina a variável de ambiente AZURE_DEVOPS_ORG com o nome da organização (ex.: export AZURE_DEVOPS_ORG=minha-org), ou rode `kira setup` para salvar a configuração\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
+        "defina AZURE_DEVOPS_ORG com o nome da organização (Unix: export AZURE_DEVOPS_ORG=minha-org; PowerShell: $env:AZURE_DEVOPS_ORG='minha-org'; cmd: setx AZURE_DEVOPS_ORG \"minha-org\"), ou rode `kira setup` para salvar a configuração\npara diagnosticar a configuração desta máquina, rode `kira doctor`"
     )]
     MissingOrg,
 

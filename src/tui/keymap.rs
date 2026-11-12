@@ -3,8 +3,10 @@
 //! unit-testável sem terminal real.
 //!
 //! Persona (docs/kira-persona.md §7): setas E vim (`j/k`, `g/G`) — as duas
-//! famílias são cidadãs de primeira classe. Nenhuma tecla escreve: não existe
-//! `Action` de mutação, e o `Reload` apenas relê o disco.
+//! famílias são cidadãs de primeira classe. Navegação não executa (ADR-0033):
+//! `s`/`t`/`d` viram um PEDIDO (`Action::Request`), que só vira processo
+//! depois da folha de alvo + popup de confirmação; `o` só abre o overlay do
+//! que já está rodando. `Reload` apenas relê o disco.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -27,10 +29,21 @@ pub enum Action {
     Bottom,
     /// Reler o disco e recompor o snapshot (r) — sem rede, sem escrita.
     Reload,
+    /// Abrir/fechar o inspetor 50–50 da tela atual (i) — tecla do statui.
+    Inspect,
+    /// Ciclar o filtro de severidade dos achados (f) — só em memória.
+    FilterSeverity,
+    /// Ciclar o filtro de ferramenta dos achados (m) — só em memória.
+    FilterTool,
     /// Abrir a busca incremental da wiki (/) — o filtro é função pura.
     SearchWiki,
     /// Alternar a ajuda de atalhos (?).
     Help,
+    /// Pedir uma AÇÃO (`s`/`t`/`d`) — pedido, não execução: quem monta o
+    /// plano e confirma é o `app` (ADR-0033).
+    Request(crate::tui::action::Request),
+    /// Abrir/fechar o overlay da execução em andamento (`o`).
+    Execution,
 }
 
 /// Traduz um evento de tecla em ação; `None` = tecla ignorada.
@@ -55,11 +68,22 @@ pub fn map(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('G') if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Action::Bottom),
         KeyCode::Char('G') => Some(Action::Bottom),
         KeyCode::Char('r') => Some(Action::Reload),
+        // `i` é o inspetor do statui: abre/fecha o painel lateral 50–50.
+        KeyCode::Char('i') => Some(Action::Inspect),
+        // `f`/`m` filtram a tabela de achados em memória (nada é reescrito).
+        KeyCode::Char('f') => Some(Action::FilterSeverity),
+        KeyCode::Char('m') => Some(Action::FilterTool),
         // `/` abre a busca incremental do painel de wiki (W6-PR4): o
         // keymap só traduz a tecla; a aplicação decide se faz sentido no
         // painel em foco (só na wiki — nos outros é Ignore).
         KeyCode::Char('/') => Some(Action::SearchWiki),
         KeyCode::Char('?') => Some(Action::Help),
+        // Teclas de AÇÃO: o keymap só diz o pedido; `decide` guarda
+        // `read_only` e o loop monta/confirma o plano. Nenhuma delas spawna.
+        KeyCode::Char('s') => Some(Action::Request(crate::tui::action::Request::Scan)),
+        KeyCode::Char('t') => Some(Action::Request(crate::tui::action::Request::Triage)),
+        KeyCode::Char('d') => Some(Action::Request(crate::tui::action::Request::PrDraft)),
+        KeyCode::Char('o') => Some(Action::Execution),
         _ => None,
     }
 }
@@ -109,6 +133,24 @@ mod tests {
         // W6-PR4: `/` abre a busca da wiki.
         assert_eq!(map(plain(KeyCode::Char('/'))), Some(Action::SearchWiki));
         assert_eq!(map(plain(KeyCode::Char('?'))), Some(Action::Help));
+    }
+
+    #[test]
+    fn action_keys_map_to_requests_never_to_execution() {
+        use crate::tui::action::Request;
+        assert_eq!(
+            map(plain(KeyCode::Char('s'))),
+            Some(Action::Request(Request::Scan))
+        );
+        assert_eq!(
+            map(plain(KeyCode::Char('t'))),
+            Some(Action::Request(Request::Triage))
+        );
+        assert_eq!(
+            map(plain(KeyCode::Char('d'))),
+            Some(Action::Request(Request::PrDraft))
+        );
+        assert_eq!(map(plain(KeyCode::Char('o'))), Some(Action::Execution));
     }
 
     #[test]

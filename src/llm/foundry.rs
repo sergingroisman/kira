@@ -137,29 +137,39 @@ pub struct FoundryConfig {
 impl FoundryConfig {
     /// Reads the configuration from the `KIRA_FOUNDRY_*` environment.
     pub fn from_env() -> Result<Self, Error> {
-        let url_override = env_trim(ENV_URL);
-        let endpoint = env_trim(ENV_ENDPOINT);
+        Self::from_lookup(&env_trim)
+    }
+
+    /// Builds the config from an injected lookup (não vazia, já trimada).
+    ///
+    /// Existe porque o `kira setup` guarda endpoint e deployment em
+    /// `config.toml` (ADR-0035): a resolução precisa da MESMA regra de
+    /// superfícies e defaults lendo a env ou o arquivo, sem duplicar a
+    /// validação em dois lugares.
+    pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Self, Error> {
+        let url_override = lookup(ENV_URL);
+        let endpoint = lookup(ENV_ENDPOINT);
         let endpoint = match (endpoint, url_override.is_some()) {
             (Some(endpoint), _) => Some(endpoint),
             (None, true) => None, // gateway verbatim: endpoint not needed
             (None, false) => return Err(Error::FoundryMissingEndpoint),
         };
-        let deployment = env_trim(ENV_DEPLOYMENT).ok_or(Error::FoundryMissingDeployment)?;
+        let deployment = lookup(ENV_DEPLOYMENT).ok_or(Error::FoundryMissingDeployment)?;
         let api_version =
-            env_trim(ENV_API_VERSION).unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
-        let auth = match env_trim(ENV_AUTH) {
+            lookup(ENV_API_VERSION).unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
+        let auth = match lookup(ENV_AUTH) {
             Some(value) => parse_auth(&value)?,
             None => FoundryAuthMode::default(),
         };
-        let max_tokens = match env_trim(ENV_MAX_TOKENS) {
+        let max_tokens = match lookup(ENV_MAX_TOKENS) {
             Some(value) => parse_max_tokens(&value)?,
             None => DEFAULT_MAX_TOKENS,
         };
-        let timeout_secs = match env_trim(ENV_TIMEOUT) {
+        let timeout_secs = match lookup(ENV_TIMEOUT) {
             Some(value) => parse_timeout_secs(&value)?,
             None => DEFAULT_TIMEOUT_SECS,
         };
-        let body_mode = match env_trim(ENV_BODY_MODE) {
+        let body_mode = match lookup(ENV_BODY_MODE) {
             Some(value) => parse_body_mode(&value)?,
             None => BodyMode::default(),
         };
@@ -237,6 +247,25 @@ impl FoundryBackend {
             .ok()
             .filter(|key| !key.trim().is_empty())
             .ok_or(Error::FoundryMissingKey)?;
+        Self::new(config, api_key)
+    }
+
+    /// env > `config.toml` (endpoint/deployment) > keyring (chave).
+    ///
+    /// É o caminho do runtime depois do `kira setup` (ADR-0035): o wizard
+    /// grava endpoint e deployment no config e a chave no keyring, então não
+    /// é preciso exportar nada. A env continua vencendo — quem exporta
+    /// `KIRA_FOUNDRY_*` não é surpreendido pelo que ficou salvo.
+    pub fn from_sources() -> Result<Self, Error> {
+        let config_pairs = crate::credentials::read_config().unwrap_or_default();
+        let lookup = merge_lookup(&env_trim, &config_pairs);
+        let config = FoundryConfig::from_lookup(&lookup)?;
+        let api_key = match env_trim(ENV_API_KEY) {
+            Some(key) => key,
+            // Keyring indisponível/ausente degrada para a mensagem que pede a
+            // env — nunca um erro de keyring no lugar do erro acionável.
+            None => stored_api_key().ok_or(Error::FoundryMissingKey)?,
+        };
         Self::new(config, api_key)
     }
 
@@ -502,6 +531,57 @@ fn env_trim(name: &str) -> Option<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string())
+}
+
+/// Fonte de configuração do Foundry: nome da env → valor já trimado e não
+/// vazio (env, `config.toml` ou a mescla dos dois).
+pub type Lookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+/// Mescla env > `config.toml` num lookup único (PURO).
+///
+/// Só endpoint e deployment aceitam vir do arquivo: `KIRA_FOUNDRY_URL`,
+/// `_API_KEY`, `_AUTH`, `_BODY_MODE` e os limites são ambiente/execução e
+/// ficam de fora de propósito — config persistente é para o que identifica o
+/// recurso, não para segredo nem para ajuste de uma execução.
+pub fn merge_lookup<'a>(
+    env: &'a dyn Fn(&str) -> Option<String>,
+    config: &'a [(String, String)],
+) -> Box<Lookup<'a>> {
+    Box::new(move |name: &str| {
+        if let Some(value) = env(name) {
+            return Some(value);
+        }
+        let config_key = match name {
+            ENV_ENDPOINT => crate::credentials::CONFIG_KEY_FOUNDRY_ENDPOINT,
+            ENV_DEPLOYMENT => crate::credentials::CONFIG_KEY_FOUNDRY_DEPLOYMENT,
+            _ => return None,
+        };
+        config
+            .iter()
+            .find(|(key, _)| key == config_key)
+            .map(|(_, value)| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// Existe chave do Foundry guardada pelo `kira setup` no keyring?
+///
+/// Só a PRESENÇA: o valor nunca sai daqui para uma tela (`kira setup` mostra
+/// "chave no keyring ✓", não a chave).
+pub fn has_stored_key() -> bool {
+    stored_api_key().is_some()
+}
+
+/// A chave guardada pelo `kira setup` no keyring, quando existir. Qualquer
+/// problema (sem daemon, entrada ausente) vira `None`: quem chama decide a
+/// mensagem, e a env continua sendo a saída.
+fn stored_api_key() -> Option<String> {
+    let store = crate::credentials::open_default_store().ok()?;
+    store
+        .get(crate::credentials::CRED_KEY_FOUNDRY_API_KEY)
+        .ok()
+        .flatten()
+        .filter(|key| !key.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -1046,6 +1126,71 @@ mod tests {
             message.contains("KIRA_FOUNDRY_BODY_MODE") && message.contains("reasoning"),
             "o erro deve sugerir KIRA_FOUNDRY_BODY_MODE: {message}"
         );
+    }
+
+    #[test]
+    fn lookup_prefers_the_env_and_falls_back_to_the_saved_config() {
+        let config = vec![
+            (
+                crate::credentials::CONFIG_KEY_FOUNDRY_ENDPOINT.to_string(),
+                "https://salvo.openai.azure.com/openai/v1".to_string(),
+            ),
+            (
+                crate::credentials::CONFIG_KEY_FOUNDRY_DEPLOYMENT.to_string(),
+                "gpt-5-salvo".to_string(),
+            ),
+        ];
+        let env = |name: &str| -> Option<String> {
+            match name {
+                ENV_DEPLOYMENT => Some("gpt-5-da-env".to_string()),
+                _ => None,
+            }
+        };
+        let lookup = merge_lookup(&env, &config);
+        assert_eq!(lookup(ENV_DEPLOYMENT).as_deref(), Some("gpt-5-da-env"));
+        assert_eq!(
+            lookup(ENV_ENDPOINT).as_deref(),
+            Some("https://salvo.openai.azure.com/openai/v1")
+        );
+        // Segredo e ajuste de execução NUNCA vêm do arquivo: só env.
+        assert_eq!(lookup(ENV_API_KEY), None);
+        assert_eq!(lookup(ENV_AUTH), None);
+        assert_eq!(lookup(ENV_MAX_TOKENS), None);
+        // O `KIRA_FOUNDRY_URL` verbatim também é ambiente: não mora em config.
+        assert_eq!(lookup(ENV_URL), None);
+    }
+
+    #[test]
+    fn lookup_builds_the_v1_surface_from_saved_values_without_any_env() {
+        let config = vec![
+            (
+                crate::credentials::CONFIG_KEY_FOUNDRY_ENDPOINT.to_string(),
+                "https://salvo.openai.azure.com/openai/v1".to_string(),
+            ),
+            (
+                crate::credentials::CONFIG_KEY_FOUNDRY_DEPLOYMENT.to_string(),
+                "gpt-5".to_string(),
+            ),
+        ];
+        let lookup = merge_lookup(&|_: &str| None, &config);
+        let config = FoundryConfig::from_lookup(&lookup)
+            .unwrap_or_else(|err| panic!("config salvo deve resolver: {err}"));
+        let (url, model_in_body) = config
+            .resolve_request()
+            .unwrap_or_else(|err| panic!("URL deve resolver: {err}"));
+        assert_eq!(
+            url, "https://salvo.openai.azure.com/openai/v1/chat/completions",
+            "superfície v1 vem do endpoint salvo"
+        );
+        assert!(model_in_body, "v1 leva o deployment no corpo");
+        assert_eq!(config.deployment, "gpt-5");
+    }
+
+    #[test]
+    fn lookup_without_any_source_still_asks_for_the_endpoint() {
+        let lookup = merge_lookup(&|_: &str| None, &[]);
+        let err = FoundryConfig::from_lookup(&lookup).expect_err("sem origem deve falhar");
+        assert!(matches!(err, Error::FoundryMissingEndpoint), "{err:?}");
     }
 
     #[test]

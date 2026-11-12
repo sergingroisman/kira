@@ -57,15 +57,32 @@ pub fn format_missing_env_check(name: &str, fix: &str) -> String {
     format!("✗ {name} não definida — {fix}")
 }
 
+/// Como definir uma variável de ambiente no shell DESTA máquina.
+///
+/// A sintaxe POSIX não serve no PowerShell/cmd, e a mensagem que manda rodar
+/// algo impossível é pior que não dizer nada: no Windows o texto traz as duas
+/// formas (PowerShell é o default moderno; `setx` cobre o cmd), no Unix o
+/// `export` de sempre.
+pub fn set_env_command(name: &str, value: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("$env:{name}='{value}' (PowerShell) ou setx {name} \"{value}\" (cmd)")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("export {name}={value}")
+    }
+}
+
 /// Concrete fix for a missing setting.
 pub fn missing_setting_fix(name: &str) -> String {
-    let export = match name {
-        "AZURE_DEVOPS_PAT" => "export AZURE_DEVOPS_PAT=<pat>",
-        "AZURE_DEVOPS_ORG" => "export AZURE_DEVOPS_ORG=nome-da-org",
-        "AZURE_DEVOPS_PROJECT" => "export AZURE_DEVOPS_PROJECT=nome-do-projeto",
+    let value = match name {
+        "AZURE_DEVOPS_PAT" => "<pat>",
+        "AZURE_DEVOPS_ORG" => "nome-da-org",
+        "AZURE_DEVOPS_PROJECT" => "nome-do-projeto",
         other => return format!("defina {other}"),
     };
-    format!("rode `kira setup` (ou {export})")
+    format!("rode `kira setup` (ou {})", set_env_command(name, value))
 }
 
 /// Final summary for an incomplete setup.
@@ -345,12 +362,20 @@ mod tests {
 
     #[test]
     fn missing_env_line_uses_cross_and_concrete_fix() {
-        let line =
-            format_missing_env_check("AZURE_DEVOPS_ORG", "export AZURE_DEVOPS_ORG=nome-da-org");
-        assert_eq!(
-            line,
-            "✗ AZURE_DEVOPS_ORG não definida — export AZURE_DEVOPS_ORG=nome-da-org"
-        );
+        // A dica acompanha o SO: `export` no Unix, `$env:`/`setx` no Windows.
+        let fix = set_env_command("AZURE_DEVOPS_ORG", "nome-da-org");
+        let line = format_missing_env_check("AZURE_DEVOPS_ORG", &fix);
+        assert_eq!(line, format!("✗ AZURE_DEVOPS_ORG não definida — {fix}"));
+        if cfg!(windows) {
+            assert!(fix.contains("$env:AZURE_DEVOPS_ORG"), "{fix}");
+            assert!(fix.contains("setx"), "{fix}");
+        } else {
+            assert_eq!(fix, "export AZURE_DEVOPS_ORG=nome-da-org");
+        }
+        // A linha de "defina a variável" reusa a mesma dica.
+        let hint = missing_setting_fix("AZURE_DEVOPS_PAT");
+        assert!(hint.contains("kira setup"), "{hint}");
+        assert!(hint.contains("AZURE_DEVOPS_PAT"), "{hint}");
     }
 
     #[test]

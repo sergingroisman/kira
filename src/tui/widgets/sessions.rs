@@ -14,10 +14,12 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Paragraph, Widget, Wrap};
 
+use crate::tui::glyph::Glyphs;
 use crate::tui::state::{self, SessionLine};
 use crate::tui::theme::Palette;
+use crate::tui::viewport;
 use crate::tui::widgets::findings::cell;
 
 /// O widget da tabela de sessões.
@@ -32,6 +34,8 @@ pub struct SessionsWidget<'a> {
     palette: Palette,
     /// Texto do estado vazio (já calculado em `state::empty_sessions_line`).
     empty_line: String,
+    /// Conjunto de glifos (`KIRA_GLYPHS=ascii`).
+    glyphs: Glyphs,
 }
 
 impl<'a> SessionsWidget<'a> {
@@ -51,7 +55,14 @@ impl<'a> SessionsWidget<'a> {
             focused,
             palette,
             empty_line,
+            glyphs: Glyphs::default(),
         }
+    }
+
+    /// Glifos da sessão (o `app` passa o modo lido do ambiente uma vez).
+    pub fn with_glyphs(mut self, glyphs: Glyphs) -> Self {
+        self.glyphs = glyphs;
+        self
     }
 
     /// Cor da linha: falha destacada, sucesso neutro — a informação é a MESMA
@@ -83,28 +94,40 @@ pub fn column_widths(inner_width: u16) -> (usize, usize, usize, usize, usize, us
     (id, quando, comando, modelo, duracao, resumo)
 }
 
+/// Uma linha da lista de sessões: separador de dia ou sessão.
+///
+/// A rolagem é medida em LINHAS desenhadas, e um separador de dia ocupa uma
+/// linha igual a uma sessão. Sem este modelo, `j` até o fim da lista deixava o
+/// cursor fora da área visível (o defeito que o viewport corrige).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Row {
+    /// Cabeçalho do dia (`2026-11-11`).
+    Day(String),
+    /// Índice da sessão no slice recebido.
+    Item(usize),
+}
+
+/// Modelo de exibição: dias e sessões na ordem em que a tela desenha.
+fn display_rows(rows: &[SessionLine]) -> Vec<Row> {
+    let mut display = Vec::with_capacity(rows.len() + 4);
+    for (day, indices) in state::session_days(rows) {
+        display.push(Row::Day(day));
+        display.extend(indices.into_iter().map(Row::Item));
+    }
+    display
+}
+
 impl Widget for SessionsWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Título do bloco: quantas sessões a store tem para mostrar (o limite
         // de 50 da spec já foi aplicado em `state::session_rows_from`).
         let title = if self.rows.is_empty() {
-            " sessões ".to_string()
+            "Sessões".to_string()
         } else {
-            format!(" sessões — últimas {} ", self.rows.len())
+            format!("Sessões — últimas {}", self.rows.len())
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(self.palette.title)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .border_style(Style::default().fg(if self.focused {
-                self.palette.border_focus
-            } else {
-                self.palette.border_idle
-            }));
+        let block =
+            crate::tui::widgets::panel::block_with(&title, self.focused, self.palette, self.glyphs);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -120,11 +143,42 @@ impl Widget for SessionsWidget<'_> {
             return;
         }
 
-        let (id_w, quando_w, comando_w, modelo_w, duracao_w, resumo_w) = column_widths(inner.width);
-        let marker_w = 2usize;
+        let display = display_rows(self.rows);
         let selected = self.selected.min(self.rows.len().saturating_sub(1));
 
-        // Cabeçalho das colunas: uma linha fixa no topo da tabela.
+        // Ritmo das últimas 50 (a janela que a tela realmente carrega).
+        let activity = state::activity_per_day(self.rows, self.now_secs);
+        let rhythm = if activity.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "ritmo (últimas {}): {}   pico {}/dia",
+                self.rows.len(),
+                crate::tui::widgets::sparkline::bars_with(&activity, self.glyphs),
+                crate::tui::widgets::sparkline::peak(&activity),
+            ))
+        };
+        let header_height = if rhythm.is_some() { 2u16 } else { 1u16 };
+        let list_height = inner.height.saturating_sub(header_height);
+        let visible = usize::from(list_height);
+
+        // Cursor em LINHAS de exibição (o separador conta como linha).
+        let cursor_row = display
+            .iter()
+            .position(|row| matches!(row, Row::Item(index) if *index == selected))
+            .unwrap_or(0);
+        let offset = viewport::keep_visible(cursor_row, visible, display.len());
+        let label = viewport::position_label(selected, visible, self.rows.len());
+        let with_scrollbar = label.is_some() && inner.width >= 24;
+        let body_width = if with_scrollbar {
+            inner.width.saturating_sub(1)
+        } else {
+            inner.width
+        };
+
+        let (id_w, quando_w, comando_w, modelo_w, duracao_w, resumo_w) = column_widths(body_width);
+        let marker_w = 2usize;
+
         let header_line = format!(
             "{}{} {} {} {} {} {}",
             cell("", marker_w),
@@ -135,50 +189,97 @@ impl Widget for SessionsWidget<'_> {
             cell("DURAÇÃO", duracao_w),
             cell("RESUMO", resumo_w),
         );
-        Paragraph::new(Line::from(Span::styled(
-            header_line,
-            Style::default().fg(self.palette.missing),
-        )))
-        .render(inner, buf);
-
-        // Linhas da tabela: y fixo por índice — tabela de verdade, não fluxo.
-        let row_area = Rect {
-            x: inner.x,
-            y: inner.y + 1,
-            width: inner.width,
-            height: inner.height.saturating_sub(1),
-        };
-        for (index, row) in self.rows.iter().enumerate() {
-            if index as u16 >= row_area.height {
-                break; // sem scroll horizontal e sem página: o que não couber
-                // espera o terminal maior (denso, não escondido).
-            }
-            let is_selected = index == selected;
-            let marker = if is_selected { "➤ " } else { "  " };
-            let body = format!(
-                "{}{} {} {} {} {} {}",
-                cell(marker, marker_w),
-                cell(&format!("#{}", row.id), id_w),
-                cell(&state::session_age_line(row, self.now_secs), quando_w),
-                cell(&row.command, comando_w),
-                cell(row.model.as_deref().unwrap_or("—"), modelo_w),
-                cell(&state::format_duration_ms(row.duration_ms), duracao_w),
-                cell(&row.summary_first_line, resumo_w),
+        // O rótulo de posição entra à direita da PRIMEIRA linha de cabeçalho
+        // (o ritmo, quando existe) — nunca por cima de dado.
+        let mut header_lines: Vec<(String, Style)> = Vec::with_capacity(2);
+        if let Some(rhythm) = rhythm {
+            header_lines.push((rhythm, Style::default().fg(self.palette.footer)));
+        }
+        header_lines.push((header_line, Style::default().fg(self.palette.missing)));
+        if let (Some(label), Some(first)) = (&label, header_lines.first_mut()) {
+            first.0 = viewport::overlay_right(&first.0, label, usize::from(body_width));
+        }
+        for (index, (line, style)) in header_lines.iter().enumerate() {
+            Paragraph::new(Line::from(Span::styled(line.clone(), *style))).render(
+                Rect {
+                    x: inner.x,
+                    y: inner.y + index as u16,
+                    width: body_width,
+                    height: 1,
+                },
+                buf,
             );
-            let mut line = Line::from(Span::styled(body, self.row_style(row.ok)));
-            if is_selected {
-                // Destaque de seleção que sobrevive a `NO_COLOR`: REVERSED é
-                // suportado por qualquer terminal, mono incluso.
-                for span in &mut line.spans {
-                    span.style = span.style.add_modifier(Modifier::REVERSED);
+        }
+
+        // Lista: dias e sessões, na fatia que o viewport escolheu.
+        let list_area = Rect {
+            x: inner.x,
+            y: inner.y + header_height,
+            width: body_width,
+            height: list_height,
+        };
+        let (start, end) = viewport::slice(offset, visible, display.len());
+        for (line_index, row) in display[start..end].iter().enumerate() {
+            let rect = Rect {
+                x: list_area.x,
+                y: list_area.y + line_index as u16,
+                width: body_width,
+                height: 1,
+            };
+            match row {
+                Row::Day(day) => {
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" {day}"),
+                        Style::default().fg(self.palette.missing),
+                    )))
+                    .render(rect, buf);
+                }
+                Row::Item(index) => {
+                    let Some(session) = self.rows.get(*index) else {
+                        continue;
+                    };
+                    let is_selected = *index == selected;
+                    let marker = if is_selected {
+                        self.glyphs.selection()
+                    } else {
+                        "  "
+                    };
+                    let body = format!(
+                        "{}{} {} {} {} {} {}",
+                        cell(marker, marker_w),
+                        cell(&format!("#{}", session.id), id_w),
+                        cell(&state::session_age_line(session, self.now_secs), quando_w),
+                        cell(&session.command, comando_w),
+                        cell(session.model.as_deref().unwrap_or("—"), modelo_w),
+                        cell(&state::format_duration_ms(session.duration_ms), duracao_w),
+                        cell(&session.summary_first_line, resumo_w),
+                    );
+                    let mut line = Line::from(Span::styled(body, self.row_style(session.ok)));
+                    if is_selected {
+                        // Destaque que sobrevive a `NO_COLOR`: REVERSE.
+                        for span in &mut line.spans {
+                            span.style = span.style.add_modifier(Modifier::REVERSED);
+                        }
+                    }
+                    Paragraph::new(line).render(rect, buf);
                 }
             }
-            let row_rect = Rect {
-                y: row_area.y + index as u16,
-                height: 1,
-                ..row_area
-            };
-            Paragraph::new(line).render(row_rect, buf);
+        }
+
+        if with_scrollbar {
+            crate::tui::widgets::scrollbar::render(
+                buf,
+                Rect {
+                    x: inner.x + body_width,
+                    y: list_area.y,
+                    width: 1,
+                    height: list_height,
+                },
+                offset,
+                display.len(),
+                self.palette,
+                self.glyphs,
+            );
         }
     }
 }
@@ -201,6 +302,7 @@ mod tests {
         SessionLine {
             id,
             command: command.to_string(),
+            args: String::new(),
             model: model.map(|model| model.to_string()),
             started_unix: Some(1_762_861_200),
             started_at: "2026-11-11T09:00:00Z".to_string(),
@@ -261,7 +363,7 @@ mod tests {
         // now = started + 180s ⇒ "há 3 min" determinístico (o caso da spec).
         let now = 1_762_861_200 + 180;
         let text = render_text(&rows, Some(now), 0, true, 100, 12);
-        assert!(text.contains("sessões — últimas 3"), "{text}");
+        assert!(text.contains("Sessões — últimas 3"), "{text}");
         assert!(text.contains("#ID"), "{text}");
         assert!(text.contains("QUANDO"), "{text}");
         assert!(text.contains("COMANDO"), "{text}");
@@ -347,7 +449,10 @@ mod tests {
         // Nada cruza a borda direita nas linhas internas.
         for line in text.lines().skip(2).take(1) {
             let border = line.chars().last().unwrap_or(' ');
-            assert_eq!(border, '│', "borda preservada em toda linha: {line:?}");
+            assert_eq!(
+                border, '║',
+                "borda dupla preservada em toda linha: {line:?}"
+            );
         }
         assert!(text.contains('…'), "corte com reticência: {text}");
     }
@@ -359,10 +464,7 @@ mod tests {
             text.contains("sessões: — (store sem sessões)"),
             "estado vazio honesto: {text}"
         );
-        assert!(
-            text.contains("sessões "),
-            "título do bloco presente: {text}"
-        );
+        assert!(text.contains("Sessões"), "título do bloco presente: {text}");
     }
 
     #[test]
@@ -383,6 +485,66 @@ mod tests {
         assert!(id + quando + comando + modelo + duracao + resumo <= 5);
         let (id, quando, comando, modelo, duracao, resumo) = column_widths(0);
         assert_eq!((id + quando + comando + modelo + duracao + resumo), 0);
+    }
+
+    #[test]
+    fn sessions_are_grouped_by_day_and_the_rhythm_line_uses_real_counts() {
+        let day_one = SessionLine {
+            id: 3,
+            command: "scan".to_string(),
+            args: String::new(),
+            model: None,
+            started_unix: Some(1_762_861_200),
+            started_at: "2026-11-11T09:00:00Z".to_string(),
+            local_started_at: Some("2026-11-11 09:00:00".to_string()),
+            duration_ms: 1_200,
+            ok: true,
+            summary_first_line: "hoje".to_string(),
+            summary: "hoje".to_string(),
+        };
+        let day_two = SessionLine {
+            id: 2,
+            command: "triage".to_string(),
+            args: "4821".to_string(),
+            model: Some("qwen3.5".to_string()),
+            started_unix: Some(1_762_861_200 - 86_400),
+            started_at: "2026-11-10T09:00:00Z".to_string(),
+            local_started_at: Some("2026-11-10 09:00:00".to_string()),
+            duration_ms: 38_000,
+            ok: true,
+            summary_first_line: "ontem".to_string(),
+            summary: "ontem".to_string(),
+        };
+        let rows = vec![day_one, day_two];
+        let now = 1_762_861_380;
+        let text = render_text(&rows, Some(now), 0, true, 100, 14);
+        assert!(text.contains("ritmo (últimas 2):"), "{text}");
+        assert!(text.contains("2026-11-11"), "separador do dia: {text}");
+        assert!(text.contains("2026-11-10"), "separador do dia: {text}");
+        // Cada dia aparece UMA vez (o separador não repete por linha).
+        assert_eq!(text.matches("2026-11-11").count(), 1, "{text}");
+        assert_eq!(text.matches("2026-11-10").count(), 1, "{text}");
+        // Ordem: dia mais recente primeiro.
+        let recent = text.find("2026-11-11").unwrap_or(usize::MAX);
+        let older = text.find("2026-11-10").unwrap_or(usize::MAX);
+        assert!(recent < older, "{text}");
+    }
+
+    /// O cursor conta LINHAS de exibição (dia + sessões), não itens: sem isso
+    /// `j` no fim da lista saía da área visível mesmo com poucas sessões.
+    #[test]
+    fn selection_scrolls_into_view_in_the_grouped_list() {
+        let rows: Vec<SessionLine> = (1..=12)
+            .map(|id| session_line(id, "scan", None, true, &format!("sessao {id:02}")))
+            .collect();
+        let text = render_text(&rows, Some(1_762_861_380), 11, true, 100, 10);
+        assert!(text.contains("sessao 12"), "última sessão visível: {text}");
+        assert!(
+            !text.contains("sessao 01"),
+            "o topo rolou para fora: {text}"
+        );
+        assert!(text.contains("12/12"), "posição do cursor: {text}");
+        assert!(text.contains("➤"), "marcador visível: {text}");
     }
 
     #[test]
