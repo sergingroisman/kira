@@ -326,6 +326,26 @@ pub fn run(path_flag: Option<&Path>) -> Result<String, ScanError> {
     ))
 }
 
+/// Contagem de achados LIDA de volta do summary que o próprio `kira scan`
+/// gravou na trilha (`… | achados: 7 (critical 1, high 2) | arquivo: …`).
+///
+/// O parser mora ao lado de quem ESCREVE o formato, de propósito: `findings.json`
+/// é sobrescrito a cada execução, então a trilha (`sessions.summary`) é a única
+/// memória histórica do scan — e esse texto é contrato NOSSO, não saída de
+/// ferramenta de terceiro (que exigiria fixture de versão).
+///
+/// Qualquer linha fora do formato devolve `None`: o dashboard omite o ponto da
+/// série em vez de desenhar `0`, que seria inventar uma queda que não houve.
+pub fn findings_count_in_summary(summary: &str) -> Option<usize> {
+    let first_line = summary.lines().next()?;
+    let after = first_line.split_once("| achados: ")?.1;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<usize>().ok()
+}
+
 /// Scan root: `--path` wins (canonicalized); the default detects the project
 /// root like the store (`.git` > manifests > cwd) from the current directory.
 fn resolve_root(path_flag: Option<&Path>) -> Result<PathBuf, ScanError> {
@@ -1202,5 +1222,38 @@ mod tests {
             "{hint}"
         );
         assert!(hint.chars().all(|ch| ch != '\n' && ch != '\r'));
+    }
+
+    /// O summary que o `run` grava é a fonte da série histórica do dashboard.
+    /// O caso feliz usa a linha REAL do formato (mudar o texto do `run` quebra
+    /// este teste — que é exatamente o alarme que se quer).
+    #[test]
+    fn findings_count_is_read_back_from_the_real_summary_format() {
+        let summary = "kira scan em 'C:\\proj' — stacks: dotnet, npm | achados: 7 (critical 1, high 6) | arquivo: C:\\proj\\.kira\\findings.json\nstacks…\nachados por severidade…";
+        assert_eq!(findings_count_in_summary(summary), Some(7));
+        // Rodapé de linha única também serve (a trilha corta o summary).
+        assert_eq!(
+            findings_count_in_summary(
+                "kira scan em '/' — stacks: npm | achados: 0 (nenhum) | arquivo: /f.json"
+            ),
+            Some(0)
+        );
+    }
+
+    /// Fora do formato: `None`, nunca `Some(0)` — inventar zero desenharia uma
+    /// queda que não houve na sparkline.
+    #[test]
+    fn a_foreign_or_truncated_summary_yields_none() {
+        assert_eq!(findings_count_in_summary(""), None);
+        assert_eq!(findings_count_in_summary("scan fixture: 3 achados"), None);
+        assert_eq!(
+            findings_count_in_summary("kira scan em '/' — stacks: npm | achados: muitos"),
+            None
+        );
+        assert_eq!(
+            findings_count_in_summary("kira scan em '/' | achados: 12"),
+            Some(12),
+            "o resto da linha não importa"
+        );
     }
 }

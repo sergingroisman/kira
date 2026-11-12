@@ -282,8 +282,9 @@ fn snapshot_without_pat_and_store_shows_one_line_pat_and_the_doctor_hint() {
         "ponteiro curto no cabeçalho: {out}"
     );
     // A causa INTEGRAL está no texto/snapshot, incluindo a dica do doctor.
+    // A mensagem nomeia a variável e mostra a sintaxe do SO (Unix/PowerShell/cmd).
     assert!(
-        out.contains("defina a variável de ambiente AZURE_DEVOPS_PAT"),
+        out.contains("defina AZURE_DEVOPS_PAT"),
         "causa integral no snapshot: {out}"
     );
     assert!(
@@ -292,6 +293,49 @@ fn snapshot_without_pat_and_store_shows_one_line_pat_and_the_doctor_hint() {
     );
     // E o campo `store:` não existe mais no cabeçalho (duplicava `projeto: —`).
     assert!(!out.contains("store:"), "campo store removido: {out}");
+}
+
+#[test]
+fn read_only_flag_keeps_the_store_byte_identical_and_prints_the_text_form() {
+    // ADR-0033: `--read-only` desliga toda ação e restaura a prova antiga.
+    // Fora de TTY o caminho é o de texto (o MESMO do `--snapshot`), e o hash
+    // do `store.db` tem que ficar byte-idêntico antes/depois.
+    let sandbox = Sandbox::new("read-only");
+    sandbox.seed_store_with_scan(true);
+    sandbox.write_findings_fixture();
+
+    let before = sandbox.store_hash();
+    let (snapshot_code, snapshot_out, snapshot_err) =
+        run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(snapshot_code, 0, "{snapshot_out}{snapshot_err}");
+    let after_snapshot = sandbox.store_hash();
+
+    let (code, out, err) = run_kira(&sandbox, &[], &["dashboard", "--read-only"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let after = sandbox.store_hash();
+
+    // O texto NÃO é comparado byte a byte de propósito: a idade do último
+    // scan (`há Ns`) muda entre as duas execuções. Os marcadores estáveis da
+    // mesma forma de texto são o contrato.
+    for marker in ["achados: 3", "dev: Sérgio", "teclas: q sair"] {
+        assert!(
+            snapshot_out.contains(marker) && out.contains(marker),
+            "marcador ausente em uma das formas de texto: {marker}\n{snapshot_out}\n{out}"
+        );
+    }
+    assert_eq!(before, after_snapshot, "nem o --snapshot escreve no store");
+    assert_eq!(
+        before, after,
+        "com --read-only o hash do store.db continua byte-idêntico"
+    );
+    assert!(
+        !out.contains(FAKE_PAT),
+        "o PAT inteiro nunca aparece: {out}"
+    );
+    assert!(
+        out.contains("achados: 3"),
+        "o conteúdo real continua visível: {out}"
+    );
 }
 
 #[test]

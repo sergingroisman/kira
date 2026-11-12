@@ -274,6 +274,7 @@ async fn run_setup(
         yes,
         backend,
         skip: skip.iter().map(|item| (*item).to_string()).collect(),
+        foundry: None,
         hidden_input: false,
     };
     let code = setup::run(
@@ -476,6 +477,60 @@ async fn setup_interactive_menu_option_2_uses_the_env_pat() {
         store.get(CRED_KEY_PAT).ok().flatten(),
         None,
         "token da env não deve ser copiado para o keyring"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_validates_the_pat_already_in_the_keyring_instead_of_skipping() {
+    // Wizard manteve o PAT de um setup anterior: o motor tem que VALIDAR o
+    // token do keyring, não anunciar "PAT pulado".
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    store
+        .set(CRED_KEY_PAT, "Aa2xTOKENCOMPLETO")
+        .unwrap_or_else(|err| panic!("set: {err}"));
+    let config = temp_config("pat-keyring");
+    let ia = IaStub::new();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        false,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("usando o PAT do keyring do OS"),
+        "deve dizer a origem: {out}"
+    );
+    assert!(
+        out.contains("PAT ok — lê Work Items de minha-org/Kira"),
+        "o token salvo é validado: {out}"
+    );
+    assert!(
+        out.contains("do keyring do OS — lê Work Items"),
+        "resumo com a origem certa: {out}"
+    );
+    assert!(
+        !out.contains("PAT pulado"),
+        "não é pulado: existe token salvo: {out}"
+    );
+    assert!(
+        !out.contains("Aa2xTOKENCOMPLETO"),
+        "o token nunca aparece: {out}"
     );
     let _ = std::fs::remove_file(&config);
 }
@@ -1106,6 +1161,290 @@ async fn setup_foundry_ok_reports_the_deployment_and_reminds_the_env() {
         "lembrete das envs: {out}"
     );
     assert!(out.contains("  ia:  foundry (gpt-5)"), "resumo: {out}");
+    let _ = std::fs::remove_file(&config);
+}
+
+/// `kira setup` com os três valores do Foundry já coletados pelo wizard (sem
+/// TTY, sem env e sem rede: o passo do PAT é pulado).
+fn foundry_form_options(choice: FoundryChoice) -> SetupOptions {
+    SetupOptions {
+        org: Some("minha-org".to_string()),
+        project: Some("Kira".to_string()),
+        interactive: false,
+        backend: Some("foundry".to_string()),
+        foundry: Some(choice),
+        ..SetupOptions::default()
+    }
+}
+
+/// Roda o motor com `SetupOptions` prontos (sem PAT, sem rede).
+async fn run_options(
+    options: &SetupOptions,
+    config_path: &Path,
+    store: &dyn CredStore,
+    ia: &IaStub,
+) -> (ExitCode, String) {
+    let make_board = |_: &str, _: &str, _: &str| -> Result<Box<dyn BoardProvider>, Error> {
+        panic!("sem PAT nenhum board é consultado")
+    };
+    let mut input = BufReader::new(Cursor::new(String::new()));
+    let mut output: Vec<u8> = Vec::new();
+    let code = setup::run(
+        options,
+        store,
+        Some(config_path),
+        &|_| None,
+        &mut input,
+        &mut output,
+        &make_board,
+        &ia.hooks(),
+    )
+    .await;
+    (code, String::from_utf8_lossy(&output).to_string())
+}
+
+fn form_choice() -> FoundryChoice {
+    FoundryChoice {
+        endpoint: "https://recurso.openai.azure.com/openai/v1".to_string(),
+        deployment: "gpt-5".to_string(),
+        api_key: "chave-secreta-foundry".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn setup_foundry_form_is_tested_then_saved_to_config_and_keyring() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("foundry-form-ok");
+    let ia = IaStub::new();
+    let options = foundry_form_options(form_choice());
+
+    let (code, out) = run_options(&options, &config, &store, &ia).await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert_eq!(ia.calls(), 1, "exatamente UMA chamada de teste barata");
+    assert!(
+        out.contains("✓ ia: foundry (gpt-5)"),
+        "confirma o backend: {out}"
+    );
+    assert!(
+        out.contains("foundry gravado"),
+        "diz o que foi gravado: {out}"
+    );
+    assert!(
+        !out.contains("chave-secreta-foundry"),
+        "a chave nunca aparece: {out}"
+    );
+
+    // Endpoint/deployment são públicos e vão ao config; a chave vai ao keyring.
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "foundry_endpoint"
+                && v == "https://recurso.openai.azure.com/openai/v1"),
+        "{pairs:?}"
+    );
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "foundry_deployment" && v == "gpt-5"),
+        "{pairs:?}"
+    );
+    assert_eq!(
+        store
+            .get(credentials::CRED_KEY_FOUNDRY_API_KEY)
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("chave-secreta-foundry"),
+        "a chave fica no keyring"
+    );
+    let raw = std::fs::read_to_string(&config).unwrap_or_default();
+    assert!(
+        !raw.contains("chave-secreta-foundry"),
+        "a chave NUNCA vai para o config.toml: {raw}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_foundry_form_with_401_saves_nothing() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("foundry-form-401");
+    let ia = IaStub::new();
+    ia.set_foundry(FoundryStub::Auth401);
+    let options = foundry_form_options(form_choice());
+
+    let (code, out) = run_options(&options, &config, &store, &ia).await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("chave recusada pelo Foundry (HTTP 401)"),
+        "deve reportar o 401: {out}"
+    );
+    assert_eq!(
+        store
+            .get(credentials::CRED_KEY_FOUNDRY_API_KEY)
+            .ok()
+            .flatten(),
+        None,
+        "chave recusada NÃO pode ser gravada"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        !pairs.iter().any(|(k, _)| k == "foundry_endpoint"),
+        "endpoint sem teste aprovado não é gravado: {pairs:?}"
+    );
+    assert!(
+        !out.contains("chave-secreta-foundry"),
+        "a chave nunca aparece: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_foundry_backend_uses_config_and_keyring_without_any_env() {
+    // Depois do wizard: endpoint/deployment no config, chave no keyring. Um
+    // `kira setup --backend foundry` no modo texto tem que achar os três —
+    // senão o que o wizard gravou não serve para nada.
+    let store = credentials::InMemory::new();
+    store
+        .set(credentials::CRED_KEY_FOUNDRY_API_KEY, "chave-do-keyring")
+        .unwrap_or_else(|err| panic!("set: {err}"));
+    let config = temp_config("foundry-saved");
+    credentials::write_config_file(
+        &config,
+        &[
+            ("organization", "minha-org"),
+            ("project", "Kira"),
+            (
+                "foundry_endpoint",
+                "https://recurso.openai.azure.com/openai/v1",
+            ),
+            ("foundry_deployment", "gpt-5"),
+        ],
+    )
+    .expect("pré-gravar config");
+    let ia = IaStub::new();
+    let options = SetupOptions {
+        backend: Some("foundry".to_string()),
+        interactive: false,
+        ..SetupOptions::default()
+    };
+
+    let (code, out) = run_options(&options, &config, &store, &ia).await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert_eq!(ia.calls(), 1, "uma chamada de teste com o que está salvo");
+    assert!(out.contains("✓ ia: foundry (gpt-5)"), "{out}");
+    assert!(
+        !out.contains("chave-do-keyring"),
+        "a chave do keyring nunca aparece: {out}"
+    );
+    let raw = std::fs::read_to_string(&config).unwrap_or_default();
+    assert!(
+        !raw.contains("chave-secreta") && !raw.contains("chave-do-keyring"),
+        "config.toml continua sem segredo: {raw}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_reset_removes_the_foundry_key_and_its_public_config() {
+    let store = credentials::InMemory::new();
+    store
+        .set(CRED_KEY_PAT, "Aa2xTOKENCOMPLETO")
+        .unwrap_or_else(|err| panic!("set pat: {err}"));
+    store
+        .set(credentials::CRED_KEY_FOUNDRY_API_KEY, "chave-do-foundry")
+        .unwrap_or_else(|err| panic!("set foundry: {err}"));
+    let config = temp_config("reset-full");
+    credentials::write_config_file(
+        &config,
+        &[
+            ("organization", "minha-org"),
+            (
+                "foundry_endpoint",
+                "https://recurso.openai.azure.com/openai/v1",
+            ),
+            ("foundry_deployment", "gpt-5"),
+        ],
+    )
+    .expect("pré-gravar config");
+    let ia = IaStub::without_ollama();
+    let options = SetupOptions {
+        reset: true,
+        ..SetupOptions::default()
+    };
+    let make_board =
+        |_pat: &str, _org: &str, _project: &str| -> Result<Box<dyn BoardProvider>, Error> {
+            panic!("--reset não consulta o board");
+        };
+    let mut input = BufReader::new(Cursor::new(String::new()));
+    let mut output: Vec<u8> = Vec::new();
+    let code = setup::run(
+        &options,
+        &store,
+        Some(&config),
+        &|_| None,
+        &mut input,
+        &mut output,
+        &make_board,
+        &ia.hooks(),
+    )
+    .await;
+    let out = String::from_utf8_lossy(&output).to_string();
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    // Simetria com o que o wizard grava: PAT, chave do Foundry e o par público.
+    assert_eq!(store.get(CRED_KEY_PAT).ok().flatten(), None);
+    assert_eq!(
+        store
+            .get(credentials::CRED_KEY_FOUNDRY_API_KEY)
+            .ok()
+            .flatten(),
+        None,
+        "a chave do Foundry sai junto"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        !pairs.iter().any(|(k, _)| k == "foundry_endpoint"),
+        "{pairs:?}"
+    );
+    assert!(
+        !pairs.iter().any(|(k, _)| k == "foundry_deployment"),
+        "{pairs:?}"
+    );
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "organization" && v == "minha-org"),
+        "org/projeto/dev são identidade do projeto, não credencial: {pairs:?}"
+    );
+    assert!(out.contains("PAT removido"), "{out}");
+    assert!(out.contains("chave do Foundry removida"), "{out}");
+    assert!(
+        out.contains("endpoint/deployment do Foundry removidos"),
+        "{out}"
+    );
+    assert!(!out.contains("chave-do-foundry"), "nunca o valor: {out}");
+
+    // Idempotente: rodar de novo não é erro e diz que não havia nada.
+    let mut output: Vec<u8> = Vec::new();
+    let code = setup::run(
+        &options,
+        &store,
+        Some(&config),
+        &|_| None,
+        &mut input,
+        &mut output,
+        &make_board,
+        &ia.hooks(),
+    )
+    .await;
+    let out = String::from_utf8_lossy(&output).to_string();
+    assert_eq!(code, ExitCode::SUCCESS, "{out}");
+    assert!(out.contains("não havia chave do Foundry"), "{out}");
     let _ = std::fs::remove_file(&config);
 }
 

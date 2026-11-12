@@ -6,16 +6,29 @@
 //! lido do disco no início e no `r` (nunca por frame), `keymap` traduz tecla →
 //! ação, `theme` guarda a paleta com fallback mono e `widgets` os painéis.
 //!
-//! Contratos vividos aqui: read-only total (nenhuma escrita em disco, nada de
-//! rede, nada de LLM — `src/tui` está fora da allowlist do
-//! `tests/llm_allowlist.rs` por construção) e honestidade de dado: ausente
-//! aparece como `—` com a causa, nunca inventado (docs/kira-w6-dashboard.md,
-//! docs/kira-persona.md §7: denso, setas E vim, nenhuma tecla escreve).
+//! Contratos vividos aqui: **navegar nunca executa** (ADR-0033) — o
+//! [`app::Outcome`] só ganha `ConfirmExecute` depois de `s`/`t`/`d` + folha de
+//! alvo + popup, e quem spawna é `action::runner`, com `current_exe` e argv
+//! allowlist (`action::Action::argv`), `stdin(null)` e saída sanitizada por
+//! `action::log`. `src/tui` continua fora da allowlist do
+//! `tests/llm_allowlist.rs` por construção: quem fala com modelo é o filho.
+//! Honestidade de dado: ausente aparece como `—` com a causa, nunca inventado
+//! (docs/kira-w6-dashboard.md, docs/kira-persona.md §7: denso, setas E vim).
 
+/// Camada de ação (ADR-0033): allowlist de argv, confirmação e execução.
+pub mod action;
 pub mod app;
+/// Chrome fixo: linha de status e abas de fonte (casca do statui).
+pub mod chrome;
+/// Glifos do dashboard: Unicode (padrão) e ASCII (`KIRA_GLYPHS=ascii`).
+pub mod glyph;
 pub mod keymap;
+/// Geometria pura da casca (faixas do chrome, 100% × 50–50 do inspetor).
+pub mod layout;
 /// Renderizador markdown mínimo do painel de wiki (W6-PR4).
 pub mod markdown;
 pub mod state;
 pub mod theme;
+/// Viewport das listas: offset que mantém o cursor visível e rótulo `12/87`.
+pub mod viewport;
 pub mod widgets;
