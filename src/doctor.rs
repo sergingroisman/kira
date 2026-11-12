@@ -88,6 +88,22 @@ pub fn format_unauthorized_check(organization: &str) -> String {
     )
 }
 
+/// Explicação CURTA do PAT (a aula completa vive no `kira setup`; o doctor
+/// repete o resumo quando o PAT está ausente ou inválido — ADR-0025). Quando
+/// a org não é conhecida, usa `<sua-org>` no link.
+pub fn format_pat_lesson_short(organization: Option<&str>) -> String {
+    let url = match organization {
+        Some(org) => format!("https://dev.azure.com/{org}/_usersSettings/tokens"),
+        None => "https://dev.azure.com/<sua-org>/_usersSettings/tokens".to_string(),
+    };
+    format!(
+        "PAT = senha descartável de leitura de Work Items: expira na data escolhida \
+         (30/90 dias) e aparece uma única vez.\n   \
+         Crie em {url} com o escopo Work Items → Read; depois rode `kira setup` para colar\n   \
+         (ou pule: o KIRA funciona em modo local com `kira triage --file`)."
+    )
+}
+
 /// Linha do nome do dev no `kira doctor`: `dev: Sergin` quando há nome salvo
 /// em `config.toml`, `dev: —` quando ausente (configs antigas seguem válidas).
 pub fn format_dev_check(name: Option<&str>) -> String {
@@ -196,6 +212,13 @@ pub async fn run() -> (bool, String) {
         let (line, ok) = format_resolved_check(name, resolved);
         emit(&mut out, &format!("   {line}"));
         if !ok {
+            // PAT ausente: repete a explicação curta (ADR-0025) — o usuário
+            // que desistiu do token entende o que está faltando sem rodar o
+            // wizard de novo.
+            if *name == *"AZURE_DEVOPS_PAT" {
+                let org = organization.as_ref().ok().map(|found| found.value.as_str());
+                emit(&mut out, &format!("   {}", format_pat_lesson_short(org)));
+            }
             missing.push(name);
         }
     }
@@ -242,6 +265,11 @@ pub async fn run() -> (bool, String) {
         }
         Err(Error::AdoUnauthorized { organization: org }) => {
             emit(&mut out, &format!("   {}", format_unauthorized_check(&org)));
+            // PAT inválido: repete a explicação curta (ADR-0025).
+            emit(
+                &mut out,
+                &format!("   {}", format_pat_lesson_short(Some(&org))),
+            );
             emit(&mut out, "");
             emit(
                 &mut out,
@@ -417,5 +445,25 @@ mod tests {
     fn dev_check_shows_the_saved_name_or_a_dash() {
         assert_eq!(format_dev_check(Some("Sergin")), "dev: Sergin");
         assert_eq!(format_dev_check(None), "dev: —");
+    }
+
+    #[test]
+    fn pat_lesson_short_teaches_and_points_to_setup_or_local_mode() {
+        let lesson = format_pat_lesson_short(Some("minha-org"));
+        assert!(lesson.contains("senha descartável"), "{lesson}");
+        assert!(
+            lesson.contains("https://dev.azure.com/minha-org/_usersSettings/tokens"),
+            "{lesson}"
+        );
+        assert!(lesson.contains("Work Items → Read"), "{lesson}");
+        assert!(lesson.contains("kira setup"), "{lesson}");
+        assert!(lesson.contains("modo local"), "{lesson}");
+
+        // Sem org conhecida: o link usa o placeholder (nunca link quebrado).
+        let lesson = format_pat_lesson_short(None);
+        assert!(
+            lesson.contains("https://dev.azure.com/<sua-org>/_usersSettings/tokens"),
+            "{lesson}"
+        );
     }
 }

@@ -1,21 +1,26 @@
-//! End-to-end tests of `kira setup` and of the `BoardProvider` seam.
+//! End-to-end tests of `kira setup` (ADR-0025: o wizard que ENSINA) and of
+//! the `BoardProvider` seam.
 //!
 //! No real Azure DevOps, no OS keyring: a std `TcpListener` serves canned
 //! Azure DevOps REST responses on 127.0.0.1 (same pattern as the fake Ollama
-//! server), and the credential store is `credentials::InMemory`. Stdin is a
-//! fake buffer and the browser opener just records the URL.
+//! server), the credential store is `credentials::InMemory`, stdin is a fake
+//! buffer and the hooks de IA (ollama/copilot/foundry) são esboços — nenhuma
+//! chamada de rede ou processo real acontece nos testes.
 
+use std::future::Future;
 use std::io::{BufReader, Cursor, Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, ExitCode};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kira::board::azure::AdoBoard;
 use kira::board::{self, BoardProvider};
 use kira::credentials::{self, CRED_KEY_PAT, CredStore};
 use kira::error::Error;
-use kira::setup::{self, SetupOptions};
+use kira::setup::{self, FoundryChoice, IaHooks, SetupOptions};
 
 /// Two visible projects for the happy path.
 const PROJECTS_BODY: &str = r#"{"count":2,"value":[{"id":"a","name":"Kira","state":"wellFormed","visibility":"private"},{"id":"b","name":"Outro","state":"wellFormed","visibility":"private"}]}"#;
@@ -95,6 +100,135 @@ fn temp_config(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kira-setup-{}-{name}-{nanos}", std::process::id()))
 }
 
+/// Esboço dos hooks de IA: resultados determinísticos + contador de chamadas
+/// do Foundry (o teste verifica "sem chamada" quando deve). As células de
+/// estado vivem em `Arc<Mutex<_>>` e os hooks guardam clones desses `Arc`s,
+/// porque `IaHooks` guarda REFERÊNCIAS — os closures têm que viver tanto
+/// quanto o esboço (por isso são campos, não temporários).
+struct IaStub {
+    /// Saída simulada de `ollama list` (`None` = ollama ausente).
+    ollama: Arc<Mutex<Option<String>>>,
+    /// Caminho simulado do `copilot` no PATH (`None` = ausente).
+    copilot: Arc<Mutex<Option<String>>>,
+    /// Resultado simulado da chamada de teste do Foundry.
+    foundry: Arc<Mutex<FoundryStub>>,
+    foundry_calls: Arc<Mutex<usize>>,
+    ollama_hook: Box<dyn Fn() -> Option<String> + Send + Sync>,
+    copilot_hook: Box<dyn Fn() -> Option<String> + Send + Sync>,
+    foundry_hook: Box<FoundryStubCallFn>,
+}
+
+/// Tipo do hook do Foundry no esboço (verboso por causa do `Future` em caixa
+/// — o alias mantém `clippy::type_complexity` longe).
+type FoundryStubCallFn =
+    dyn Fn(&FoundryChoice) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> + Send + Sync;
+
+/// Resultado simulado da chamada de teste do Foundry (`Error` não é `Clone`,
+/// então o esboço guarda a variante e reconstrói o erro no hook).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FoundryStub {
+    Ok,
+    Auth401,
+}
+
+impl IaStub {
+    fn build(ollama: Option<String>, copilot: Option<String>, foundry: FoundryStub) -> Self {
+        let ollama_cell = Arc::new(Mutex::new(ollama));
+        let ollama_hook = {
+            let cell = Arc::clone(&ollama_cell);
+            Box::new(move || {
+                cell.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            }) as Box<dyn Fn() -> Option<String> + Send + Sync>
+        };
+        let copilot_cell = Arc::new(Mutex::new(copilot));
+        let copilot_hook = {
+            let cell = Arc::clone(&copilot_cell);
+            Box::new(move || {
+                cell.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            }) as Box<dyn Fn() -> Option<String> + Send + Sync>
+        };
+        let foundry_cell = Arc::new(Mutex::new(foundry));
+        let foundry_calls = Arc::new(Mutex::new(0));
+        let foundry_hook = {
+            let cell = Arc::clone(&foundry_cell);
+            let calls = Arc::clone(&foundry_calls);
+            Box::new(move |_choice: &FoundryChoice| {
+                *calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+                let stub = *cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let result = match stub {
+                    FoundryStub::Ok => Ok(()),
+                    FoundryStub::Auth401 => Err(Error::FoundryAuth { status: 401 }),
+                };
+                Box::pin(async move { result })
+                    as Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>
+            }) as Box<FoundryStubCallFn>
+        };
+        Self {
+            ollama: ollama_cell,
+            copilot: copilot_cell,
+            foundry: foundry_cell,
+            foundry_calls,
+            ollama_hook,
+            copilot_hook,
+            foundry_hook,
+        }
+    }
+
+    fn new() -> Self {
+        Self::build(
+            Some("name\nqwen3.5:4b:1.2 GB\n".to_string()),
+            Some("/usr/bin/copilot".to_string()),
+            FoundryStub::Ok,
+        )
+    }
+
+    fn without_ollama() -> Self {
+        Self::build(None, None, FoundryStub::Ok)
+    }
+
+    fn set_ollama(&self, value: Option<String>) {
+        *self
+            .ollama
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+    }
+
+    fn set_copilot(&self, value: Option<String>) {
+        *self
+            .copilot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+    }
+
+    fn set_foundry(&self, value: FoundryStub) {
+        *self
+            .foundry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+    }
+
+    fn calls(&self) -> usize {
+        *self
+            .foundry_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn hooks(&self) -> IaHooks<'_> {
+        IaHooks {
+            ollama_models: self.ollama_hook.as_ref(),
+            copilot_bin: self.copilot_hook.as_ref(),
+            foundry_call: self.foundry_hook.as_ref(),
+        }
+    }
+}
+
 /// Runs `kira setup` with all inputs faked; returns (exit code, stdout).
 #[allow(clippy::too_many_arguments)]
 async fn run_setup(
@@ -103,13 +237,15 @@ async fn run_setup(
     project_flag: Option<String>,
     env_values: &[(&str, &str)],
     endpoint: Option<String>,
-    config_path: Option<&std::path::Path>,
+    config_path: Option<&Path>,
     store: &dyn CredStore,
-    opened: &std::sync::Mutex<Vec<String>>,
     pat_flag: Option<String>,
-    no_browser: bool,
     interactive: bool,
     name_flag: Option<String>,
+    yes: bool,
+    backend: Option<String>,
+    skip: &[&str],
+    ia: &IaStub,
 ) -> (ExitCode, String) {
     let make_board =
         move |pat: &str, org: &str, project: &str| -> Result<Box<dyn BoardProvider>, Error> {
@@ -120,10 +256,6 @@ async fn run_setup(
                 None => Ok(Box::new(AdoBoard::new(pat, org, project))),
             }
         };
-    let open_url = |url: &str| -> Result<(), std::io::Error> {
-        opened.lock().expect("lock aberto").push(url.to_string());
-        Ok(())
-    };
     let env_lookup = move |name: &str| -> Option<String> {
         env_values
             .iter()
@@ -137,9 +269,12 @@ async fn run_setup(
         project: project_flag,
         reset: false,
         pat: pat_flag,
-        no_browser,
         interactive,
         name: name_flag,
+        yes,
+        backend,
+        skip: skip.iter().map(|item| (*item).to_string()).collect(),
+        hidden_input: false,
     };
     let code = setup::run(
         &options,
@@ -149,144 +284,404 @@ async fn run_setup(
         &mut input,
         &mut output,
         &make_board,
-        &open_url,
+        &ia.hooks(),
     )
     .await;
     (code, String::from_utf8_lossy(&output).to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Fluxo interativo (TTY): aula do PAT → menu (1 colar / 2 env / 3 pular) →
+// validação na hora → nome → backend de IA → resumo final.
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
-async fn setup_prompts_org_project_validates_and_saves_the_pat() {
+async fn setup_interactive_teaches_menu_validates_and_saves_the_pat() {
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let store = credentials::InMemory::new();
-    let config = temp_config("ok");
-    let opened = std::sync::Mutex::new(Vec::new());
+    let config = temp_config("interactive-ok");
+    let ia = IaStub::new();
 
-    // Piped stdin: org and project answered as prompts, then the PAT line.
-    let stdin_text = "minha-org\nKira\nAa2xTOKENCOMPLETO\n";
+    // Menu 1 (colar) + PAT + Enter no nome + Enter no menu de IA.
     let (code, out) = run_setup(
-        stdin_text,
-        None,
-        None,
+        "1\nAa2xTOKENCOMPLETO\n\n\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
         &[],
-        Some(endpoint.clone()),
+        Some(endpoint),
         Some(&config),
         &store,
-        &opened,
         None,
+        true, /* interactive */
+        None, /* name */
         false,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
+        None, /* backend */
+        &[],
+        &ia,
     )
     .await;
 
     assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
-    // Piped stdin = fast path do jeito antigo: a pergunta "já tem um PAT?"
-    // NÃO aparece no modo não-interativo.
+    // A aula vem ANTES do menu: o que é, como criar, escopo e valor único.
     assert!(
-        !out.contains("Você já tem um PAT pronto?"),
-        "stdin pipado não deve mostrar a pergunta nova: {out}"
-    );
-    // Prompts were shown, the PAT URL was printed and opened in the browser.
-    assert!(
-        out.contains("Organização do Azure DevOps"),
-        "deve pedir a organização: {out}"
-    );
-    assert!(
-        out.contains("Projeto do Azure DevOps"),
-        "deve pedir o projeto: {out}"
+        out.contains("senha descartável"),
+        "deve ensinar o que é um PAT: {out}"
     );
     assert!(
         out.contains("https://dev.azure.com/minha-org/_usersSettings/tokens"),
         "deve mostrar a URL do PAT: {out}"
     );
-    assert_eq!(
-        *opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        vec!["https://dev.azure.com/minha-org/_usersSettings/tokens"]
-    );
     assert!(
-        out.contains("Work Items (Read)"),
-        "deve citar os escopos: {out}"
+        out.contains("Work Items → Read"),
+        "deve citar o escopo: {out}"
     );
-    // Validation happened against the fake server and the PAT was saved.
+    assert!(out.contains("30 dias"), "deve citar a validade: {out}");
     assert!(
-        out.contains("Validando"),
-        "deve validar antes de salvar: {out}"
+        out.contains("ele aparece uma única vez"),
+        "deve avisar o valor único: {out}"
     );
+    // Menu obrigatório com as 3 opções.
+    assert!(
+        out.contains("Como o KIRA vai falar com o Azure DevOps?"),
+        "deve mostrar o menu: {out}"
+    );
+    assert!(out.contains("1) Colar um PAT agora"), "{out}");
+    assert!(
+        out.contains("2) Usar AZURE_DEVOPS_PAT do ambiente"),
+        "{out}"
+    );
+    assert!(out.contains("3) Pular por agora"), "{out}");
+    // Validação na hora com a mensagem exata de 200.
+    assert!(
+        out.contains("PAT ok — lê Work Items de minha-org/Kira"),
+        "deve validar com a mensagem da spec: {out}"
+    );
+    // PAT salvo e mascarado; o valor completo NUNCA aparece na saída.
     assert_eq!(
         store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
         Some("Aa2xTOKENCOMPLETO"),
         "PAT deve estar no store"
     );
-    // Confirmation masks the secret.
-    assert!(
-        out.contains("Aa2x****"),
-        "confirmação deve mascarar o PAT: {out}"
-    );
+    assert!(out.contains("Aa2x****"), "confirmação deve mascarar: {out}");
     assert!(
         !out.contains("Aa2xTOKENCOMPLETO"),
         "o PAT completo nunca pode aparecer na saída: {out}"
     );
-    // org/project went to config.toml.
-    let pairs = credentials::read_config_file(&config).unwrap_or_default();
-    let org = pairs
-        .iter()
-        .find(|(k, _)| k == "organization")
-        .map(|(_, v)| v.clone());
-    let project = pairs
-        .iter()
-        .find(|(k, _)| k == "project")
-        .map(|(_, v)| v.clone());
-    assert_eq!(org.as_deref(), Some("minha-org"));
-    assert_eq!(project.as_deref(), Some("Kira"));
+    // Backend de IA: pré-requisito verificado e custo explicado.
     assert!(
-        out.contains("setup concluído — rode kira triage <id>"),
-        "mensagem final: {out}"
+        out.contains("✓ ia: ollama (qwen3.5:4b)"),
+        "deve verificar o ollama: {out}"
+    );
+    assert!(
+        out.contains("0 custo, o código não sai da sua máquina"),
+        "deve explicar custo/dados: {out}"
+    );
+    // Resumo final no formato da spec.
+    assert!(out.contains("pronto:"), "resumo: {out}");
+    assert!(out.contains("próximo passo:  kira scan"), "{out}");
+    assert!(
+        !out.contains("configuração concluída"),
+        "nunca termina com 'configuração concluída': {out}"
     );
     let _ = std::fs::remove_file(&config);
 }
 
 #[tokio::test]
-async fn setup_with_401_shows_what_to_review_and_does_not_save() {
-    let (endpoint, _server) =
-        spawn_fake_ado("HTTP/1.1 401 Unauthorized", r#"{"message":"TF400813"}"#);
+async fn setup_interactive_invalid_menu_answers_fall_back_to_the_default() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let store = credentials::InMemory::new();
-    let config = temp_config("unauthorized");
-    let opened = std::sync::Mutex::new(Vec::new());
+    let config = temp_config("menu-invalid");
+    let ia = IaStub::new();
 
+    // 'x' duas vezes: aviso em cada resposta inválida e o default '1'
+    // (colar) é assumido — o fluxo segue até o prompt de colar.
     let (code, out) = run_setup(
-        "minha-org\nMeuProjeto\nPATRUIM\n",
-        None,
-        None,
+        "x\nx\nAa2xTOKENCOMPLETO\n\n\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
         &[],
         Some(endpoint),
         Some(&config),
         &store,
-        &opened,
+        None,
+        true,
         None,
         false,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("resposta inválida ('x')"),
+        "deve avisar a resposta inválida: {out}"
+    );
+    assert!(
+        out.contains("assumindo '1' (padrão)"),
+        "deve assumir o default: {out}"
+    );
+    assert!(
+        out.contains("Cole o PAT e pressione Enter"),
+        "default '1' deve levar ao prompt de colar: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO")
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_interactive_menu_option_2_uses_the_env_pat() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("menu-env");
+    let ia = IaStub::new();
+
+    // Opção 2: token já está na env — validado, NÃO copiado para o keyring.
+    let (code, out) = run_setup(
+        "2\n\n\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        None,
+        true,
+        None,
+        false,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("usando AZURE_DEVOPS_PAT do ambiente"),
+        "deve dizer que usou a env: {out}"
+    );
+    assert!(
+        out.contains("PAT ok — lê Work Items de minha-org/Kira"),
+        "deve validar: {out}"
+    );
+    assert!(
+        out.contains("da env AZURE_DEVOPS_PAT"),
+        "resumo deve apontar a origem: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "token da env não deve ser copiado para o keyring"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_interactive_menu_skip_leaves_local_mode_and_doctor_teaches_again() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("menu-skip");
+    let ia = IaStub::without_ollama();
+
+    // Opção 3 (pular): sem servidor ADO — nada é validado, nada é salvo;
+    // nome e IA seguem com os defaults (nunca bloqueia além do menu).
+    let (code, out) = run_setup(
+        "3\n\n\n",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
+        None,
+        Some(&config),
+        &store,
+        None,
+        true,
+        None,
+        false,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("PAT pulado — o KIRA funciona em modo local (kira triage --file)."),
+        "deve dizer o que acontece ao pular: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "nenhum PAT deve ser salvo ao pular"
+    );
+    assert!(
+        out.contains("pat: não configurado (modo local)"),
+        "resumo deve registrar o modo local: {out}"
+    );
+    assert!(
+        out.contains("pulado (dá para fazer depois):"),
+        "resumo deve listar o pulado: {out}"
+    );
+    assert!(out.contains("pat — kira setup --pat"), "{out}");
+    // org/projeto/nome vão para o config mesmo com o PAT pulado — a
+    // retomada (`kira setup --pat`) já tem contexto.
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "organization" && v == "minha-org"),
+        "config deve ser escrito: {pairs:?}"
+    );
+    assert!(pairs.iter().any(|(k, v)| k == "dev_name" && v == "Joao"));
+
+    // O `kira doctor` ensina de novo quando o PAT está ausente (binário
+    // real, offline — a seção 1 imprime a explicação curta antes do corte).
+    let doctor_out = run_doctor(&config, &[]);
+    assert!(
+        doctor_out.contains("senha descartável"),
+        "doctor deve repetir a explicação curta: {doctor_out}"
+    );
+    assert!(
+        doctor_out.contains("Work Items → Read"),
+        "doctor deve apontar o escopo: {doctor_out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+// ---------------------------------------------------------------------------
+// Validação imediata: as 4 mensagens exatas (200 / 401 / 403 / sem rede).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn setup_with_401_shows_the_exact_message_with_the_link_and_does_not_save() {
+    let (endpoint, _server) =
+        spawn_fake_ado("HTTP/1.1 401 Unauthorized", r#"{"message":"TF400813"}"#);
+    let store = credentials::InMemory::new();
+    let config = temp_config("unauthorized");
+    let ia = IaStub::without_ollama();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        Some("PATRUIM".to_string()),
+        false,
+        None,
+        false,
+        None,
+        &[],
+        &ia,
     )
     .await;
 
     assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
     assert!(
-        out.contains("PAT não aceito (401)"),
-        "deve explicar o 401: {out}"
-    );
-    assert!(
-        out.contains("Work Items (Read)"),
-        "deve dizer o que revisar: {out}"
+        out.contains(
+            "PAT não autenticou (401). O token pode ter expirado ou foi copiado incompleto — crie outro em https://dev.azure.com/minha-org/_usersSettings/tokens"
+        ),
+        "mensagem exata da spec com o link: {out}"
     );
     assert_eq!(
         store.get(CRED_KEY_PAT).ok().flatten(),
         None,
         "PAT rejeitado NÃO pode ser salvo"
     );
-    assert!(!out.contains("setup concluído"), "não pode concluir: {out}");
+    assert!(!out.contains("pronto:"), "não pode concluir: {out}");
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_with_403_shows_the_exact_message_and_does_not_save() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 403 Forbidden", r#"{}"#);
+    let store = credentials::InMemory::new();
+    let config = temp_config("forbidden");
+    let ia = IaStub::without_ollama();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        Some("PATSEMESCOPO".to_string()),
+        false,
+        None,
+        false,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains(
+            "PAT autenticou, mas sem escopo Work Items (403). Edite o token e marque Work Items → Read"
+        ),
+        "mensagem exata da spec: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "PAT sem escopo NÃO pode ser salvo"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_network_failure_saves_the_pat_and_continues() {
+    // Endpoint recusado (conexão recusada = sem rede): a mensagem de rede
+    // aparece, o token É salvo (spec) e o fluxo termina com o resumo.
+    let store = credentials::InMemory::new();
+    let config = temp_config("no-network");
+    let ia = IaStub::without_ollama();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some("http://127.0.0.1:1".to_string()),
+        Some(&config),
+        &store,
+        Some("Aa2xTOKENCOMPLETO".to_string()),
+        false,
+        None,
+        false,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains(
+            "não foi possível validar agora (sem rede?). O token foi salvo; rode kira doctor depois"
+        ),
+        "mensagem exata da spec: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "sem rede o token é salvo (spec)"
+    );
+    assert!(
+        out.contains("validação pendente — rode kira doctor"),
+        "resumo marca a validação pendente: {out}"
+    );
+    assert!(
+        !out.contains("Aa2xTOKENCOMPLETO"),
+        "o PAT completo nunca pode aparecer na saída: {out}"
+    );
     let _ = std::fs::remove_file(&config);
 }
 
@@ -295,21 +690,23 @@ async fn setup_with_wrong_project_name_does_not_save() {
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let store = credentials::InMemory::new();
     let config = temp_config("wrong-project");
-    let opened = std::sync::Mutex::new(Vec::new());
+    let ia = IaStub::without_ollama();
 
     let (code, out) = run_setup(
-        "minha-org\nProjeto Errado\nAa2xTOKENCOMPLETO\n",
-        None,
-        None,
+        "",
+        Some("minha-org".to_string()),
+        Some("Projeto Errado".to_string()),
         &[],
         Some(endpoint),
         Some(&config),
         &store,
-        &opened,
+        Some("Aa2xTOKENCOMPLETO".to_string()),
+        false,
         None,
         false,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
+        None,
+        &[],
+        &ia,
     )
     .await;
 
@@ -326,57 +723,146 @@ async fn setup_with_wrong_project_name_does_not_save() {
     let _ = std::fs::remove_file(&config);
 }
 
-#[tokio::test]
-async fn setup_uses_flags_and_env_before_prompting() {
-    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
-    let store = credentials::InMemory::new();
-    let config = temp_config("flags");
-    let opened = std::sync::Mutex::new(Vec::new());
+// ---------------------------------------------------------------------------
+// Não-interativo (--yes / sem TTY): usa a env se existir, senão pula — e
+// imprime o pulado. Nunca bloqueia; o caro nunca é default.
+// ---------------------------------------------------------------------------
 
-    // org comes from --org, project from env; only the PAT is read from stdin.
+#[tokio::test]
+async fn setup_yes_without_env_skips_and_prints_the_skipped() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("yes-skip");
+    let ia = IaStub::without_ollama();
+
     let (code, out) = run_setup(
-        "Aa2xTOKENCOMPLETO\n",
+        "",
         Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("USER", "joao")],
         None,
-        &[("AZURE_DEVOPS_PROJECT", "Kira")],
-        Some(endpoint),
         Some(&config),
         &store,
-        &opened,
         None,
         false,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
+        None,
+        true, /* --yes */
+        None,
+        &[],
+        &ia,
     )
     .await;
 
     assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
     assert!(
-        !out.contains("Organização do Azure DevOps (ex."),
-        "não deve pedir org quando veio por flag: {out}"
+        out.contains("PAT pulado — o KIRA funciona em modo local"),
+        "deve imprimir o pulado: {out}"
     );
     assert!(
-        !out.contains("Projeto do Azure DevOps (ex."),
-        "não deve pedir projeto quando veio do env: {out}"
+        out.contains("pat: não configurado (modo local)"),
+        "resumo: {out}"
     );
-    let pairs = credentials::read_config_file(&config).unwrap_or_default();
-    let org = pairs
-        .iter()
-        .find(|(k, _)| k == "organization")
-        .map(|(_, v)| v.clone());
-    assert_eq!(org.as_deref(), Some("minha-org"));
+    assert!(out.contains("pat — kira setup --pat"), "{out}");
+    assert!(
+        !out.contains("Como devo te chamar?"),
+        "sem TTY o setup não pode perguntar o nome: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "nada pode ser salvo ao pular"
+    );
     let _ = std::fs::remove_file(&config);
 }
 
 #[tokio::test]
-async fn setup_pat_flag_is_fully_non_interactive() {
+async fn setup_yes_uses_the_env_pat_and_validates() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("yes-env");
+    let ia = IaStub::new();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("usando AZURE_DEVOPS_PAT do ambiente"),
+        "deve usar a env: {out}"
+    );
+    assert!(
+        out.contains("PAT ok — lê Work Items de minha-org/Kira"),
+        "deve validar na hora: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "token da env não é copiado para o keyring"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_yes_non_interactive_defaults_to_ollama_and_never_to_a_costly_backend() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("yes-ia-default");
+    let ia = IaStub::new();
+
+    // --yes sem --backend: o default é o barato (Ollama); copilot/foundry
+    // nunca são escolhidos por omissão.
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("✓ ia: ollama (qwen3.5:4b)"),
+        "default de IA deve ser o ollama: {out}"
+    );
+    assert!(!out.contains("foundry"), "foundry nunca é default: {out}");
+    let _ = std::fs::remove_file(&config);
+}
+
+// ---------------------------------------------------------------------------
+// `--pat` por CLI: zero aula, zero menu, zero prompt; o valor nunca é ecoado.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn setup_pat_flag_is_fully_non_interactive_and_never_echoes_the_token() {
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let store = credentials::InMemory::new();
     let config = temp_config("pat-flag");
-    let opened = std::sync::Mutex::new(Vec::new());
+    let ia = IaStub::new();
 
-    // org, project and PAT all via flags: zero prompts (stdin empty), no
-    // instructions, no browser open — validate and save.
     let (code, out) = run_setup(
         "",
         Some("minha-org".to_string()),
@@ -385,11 +871,13 @@ async fn setup_pat_flag_is_fully_non_interactive() {
         Some(endpoint),
         Some(&config),
         &store,
-        &opened,
         Some("Aa2xTOKENCOMPLETO".to_string()),
         false,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
+        None,
+        false,
+        None,
+        &[],
+        &ia,
     )
     .await;
 
@@ -403,33 +891,19 @@ async fn setup_pat_flag_is_fully_non_interactive() {
         "não deve pedir projeto: {out}"
     );
     assert!(
-        !out.contains("Cole o PAT e pressione Enter"),
-        "não deve pedir o PAT por stdin: {out}"
+        !out.contains("Como o KIRA vai falar"),
+        "--pat não mostra o menu: {out}"
     );
     assert!(
-        !out.contains("_usersSettings/tokens"),
-        "não deve imprimir os passos do PAT: {out}"
-    );
-    assert!(
-        !out.contains("Work Items (Read)"),
-        "não deve imprimir os escopos: {out}"
-    );
-    assert!(
-        opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty(),
-        "o navegador não pode ser aberto com --pat"
+        !out.contains("Como criar (2 minutos)"),
+        "--pat não imprime a aula: {out}"
     );
     assert_eq!(
         store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
         Some("Aa2xTOKENCOMPLETO"),
         "PAT da CLI deve estar no store"
     );
-    assert!(
-        out.contains("Aa2x****"),
-        "confirmação deve mascarar o PAT: {out}"
-    );
+    assert!(out.contains("Aa2x****"), "confirmação deve mascarar: {out}");
     assert!(
         !out.contains("Aa2xTOKENCOMPLETO"),
         "o PAT completo nunca pode aparecer na saída: {out}"
@@ -441,81 +915,17 @@ async fn setup_pat_flag_is_fully_non_interactive() {
             .any(|(k, v)| k == "organization" && v == "minha-org"),
         "config.toml deve ser escrito: {pairs:?}"
     );
-    assert!(
-        pairs.iter().any(|(k, v)| k == "project" && v == "Kira"),
-        "config.toml deve ser escrito: {pairs:?}"
-    );
-    assert!(
-        out.contains("setup concluído — rode kira triage <id>"),
-        "mensagem final: {out}"
-    );
-    let _ = std::fs::remove_file(&config);
-}
-
-#[tokio::test]
-async fn setup_no_browser_skips_steps_and_opener_but_still_prompts() {
-    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
-    let store = credentials::InMemory::new();
-    let config = temp_config("no-browser");
-    let opened = std::sync::Mutex::new(Vec::new());
-
-    // --no-browser: no instruction steps, no browser open; org/project come
-    // from flags and the PAT is still pasted via stdin.
-    let (code, out) = run_setup(
-        "Aa2xTOKENCOMPLETO\n",
-        Some("minha-org".to_string()),
-        Some("Kira".to_string()),
-        &[],
-        Some(endpoint),
-        Some(&config),
-        &store,
-        &opened,
-        None,
-        true,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
-    )
-    .await;
-
-    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
-    assert!(
-        !out.contains("_usersSettings/tokens"),
-        "não deve imprimir a URL do PAT: {out}"
-    );
-    assert!(
-        !out.contains("Work Items (Read)"),
-        "não deve imprimir os escopos: {out}"
-    );
-    assert!(
-        opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty(),
-        "o navegador não pode ser aberto com --no-browser"
-    );
-    assert!(
-        out.contains("Cole o PAT e pressione Enter"),
-        "deve pedir o PAT: {out}"
-    );
-    assert_eq!(
-        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
-        Some("Aa2xTOKENCOMPLETO"),
-        "PAT deve validado e salvo"
-    );
-    assert!(
-        out.contains("setup concluído — rode kira triage <id>"),
-        "mensagem final: {out}"
-    );
+    assert!(pairs.iter().any(|(k, v)| k == "project" && v == "Kira"));
     let _ = std::fs::remove_file(&config);
 }
 
 #[tokio::test]
 async fn setup_pat_flag_with_401_does_not_save_or_echo_the_token() {
     let (endpoint, _server) =
-        spawn_fake_ado("HTTP/1.1 401 Unauthorized", r#"{"message":"TF400813"}"#);
+        spawn_fake_ado("HTTP/1.1 401 Unauthorized", r#""{"message":"TF400813"}""#);
     let store = credentials::InMemory::new();
     let config = temp_config("pat-flag-401");
-    let opened = std::sync::Mutex::new(Vec::new());
+    let ia = IaStub::without_ollama();
 
     let (code, out) = run_setup(
         "",
@@ -525,17 +935,19 @@ async fn setup_pat_flag_with_401_does_not_save_or_echo_the_token() {
         Some(endpoint),
         Some(&config),
         &store,
-        &opened,
         Some("PATRUIMSEGREDO".to_string()),
-        true,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
+        false,
+        None,
+        false,
+        None,
+        &[],
+        &ia,
     )
     .await;
 
     assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
     assert!(
-        out.contains("PAT não aceito (401)"),
+        out.contains("PAT não autenticou (401)"),
         "deve explicar o 401: {out}"
     );
     assert!(
@@ -547,9 +959,309 @@ async fn setup_pat_flag_with_401_does_not_save_or_echo_the_token() {
         None,
         "PAT rejeitado NÃO pode ser salvo"
     );
-    assert!(!out.contains("setup concluído"), "não pode concluir: {out}");
     let _ = std::fs::remove_file(&config);
 }
+
+// ---------------------------------------------------------------------------
+// Passo de backend de IA: pré-requisito verificado; foundry sem endpoint
+// falha SEM chamada; o caro nunca é default.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn setup_foundry_without_endpoint_fails_without_calling() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("foundry-no-endpoint");
+    let ia = IaStub::new();
+
+    // --yes --backend foundry sem as envs do Foundry: erro acionável e
+    // ZERO chamadas (a chave/endpoint nunca são perguntados fora de TTY).
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO")],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        Some("foundry".to_string()),
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains("endpoint do Foundry não informado"),
+        "erro acionável: {out}"
+    );
+    assert!(
+        out.contains("KIRA_FOUNDRY_ENDPOINT"),
+        "deve apontar a env: {out}"
+    );
+    assert_eq!(ia.calls(), 0, "sem endpoint nenhuma chamada pode acontecer");
+    assert!(!out.contains("pronto:"), "{out}");
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_foundry_reports_401_and_keeps_the_key_hidden() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("foundry-401");
+    let ia = IaStub::new();
+    ia.set_foundry(FoundryStub::Auth401);
+
+    // Com endpoint/deployment/chave na env, UMA chamada acontece e o 401 é
+    // reportado com a causa; a IA fica pulada (nunca fallback silencioso) e
+    // a chave nunca aparece em claro.
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[
+            ("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO"),
+            (
+                "KIRA_FOUNDRY_ENDPOINT",
+                "https://recurso.openai.azure.com/openai/v1",
+            ),
+            ("KIRA_FOUNDRY_DEPLOYMENT", "gpt-5"),
+            ("KIRA_FOUNDRY_API_KEY", "chave-secreta-foundry"),
+        ],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        Some("foundry".to_string()),
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("chave recusada pelo Foundry (HTTP 401)"),
+        "deve reportar o 401: {out}"
+    );
+    assert!(
+        out.contains("ia — kira setup --backend ollama"),
+        "IA fica pulada com comando de retomada: {out}"
+    );
+    assert!(
+        !out.contains("chave-secreta-foundry"),
+        "a chave nunca pode aparecer em claro: {out}"
+    );
+    assert_eq!(ia.calls(), 1, "exatamente UMA chamada de teste barata");
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_foundry_ok_reports_the_deployment_and_reminds_the_env() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("foundry-ok");
+    let ia = IaStub::new();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[
+            ("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO"),
+            (
+                "KIRA_FOUNDRY_ENDPOINT",
+                "https://recurso.openai.azure.com/openai/v1",
+            ),
+            ("KIRA_FOUNDRY_DEPLOYMENT", "gpt-5"),
+            ("KIRA_FOUNDRY_API_KEY", "chave-secreta-foundry"),
+        ],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        Some("foundry".to_string()),
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("✓ ia: foundry (gpt-5)"),
+        "deve confirmar o backend: {out}"
+    );
+    assert!(
+        out.contains("custo por token"),
+        "deve explicar o custo: {out}"
+    );
+    assert!(
+        out.contains("KIRA_FOUNDRY_API_KEY"),
+        "lembrete das envs: {out}"
+    );
+    assert!(out.contains("  ia:  foundry (gpt-5)"), "resumo: {out}");
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_ollama_without_the_model_shows_the_pull_command_and_skips() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("ollama-no-model");
+    let ia = IaStub::new();
+    ia.set_ollama(Some("name\noutro-modelo:1b\n".to_string()));
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("qwen3.5:4b não está no ollama — rode: ollama pull qwen3.5:4b (3,3 GB)"),
+        "pré-requisito com o comando exato: {out}"
+    );
+    assert!(
+        out.contains("ia — kira setup --backend ollama"),
+        "IA fica pulada com retomada: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_copilot_missing_from_path_is_reported_and_skipped() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("copilot-missing");
+    let ia = IaStub::new();
+    ia.set_copilot(None);
+
+    // Escolha EXPLÍCITA (flag) do copilot: o pré-requisito é verificado e a
+    // ausência é reportada — nunca fallback silencioso para o ollama.
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO")],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        Some("copilot".to_string()),
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("copilot não está no PATH"),
+        "deve reportar a ausência: {out}"
+    );
+    assert!(
+        out.contains("política da sua empresa"),
+        "deve citar o pré-requisito de política: {out}"
+    );
+    assert!(
+        !out.contains("✓ ia: ollama"),
+        "sem fallback silencioso para o ollama: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_unknown_backend_fails_without_silently_defaulting() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("bad-backend");
+    let ia = IaStub::new();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        Some("gpt-pro".to_string()),
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains("backend desconhecido 'gpt-pro'"),
+        "erro acionável: {out}"
+    );
+    assert!(
+        out.contains("use ollama, copilot ou foundry"),
+        "deve listar as opções: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_unknown_skip_step_fails_with_actionable_error() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("bad-skip");
+    let ia = IaStub::new();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &["fonte"],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains("--skip aceita 'pat' ou 'ia'"),
+        "erro acionável: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+// ---------------------------------------------------------------------------
+// `--reset` (comportamento existente, preservado).
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn setup_reset_removes_the_pat_from_the_store() {
@@ -563,7 +1275,7 @@ async fn setup_reset_removes_the_pat_from_the_store() {
         reset: true,
         ..SetupOptions::default()
     };
-    let opened = |_url: &str| Ok::<(), std::io::Error>(());
+    let ia = IaStub::without_ollama();
     let make_board =
         |_pat: &str, _org: &str, _project: &str| -> Result<Box<dyn BoardProvider>, Error> {
             panic!("--reset não deve consultar o board");
@@ -576,7 +1288,7 @@ async fn setup_reset_removes_the_pat_from_the_store() {
         &mut input,
         &mut output,
         &make_board,
-        &opened,
+        &ia.hooks(),
     )
     .await;
     let out = String::from_utf8_lossy(&output).to_string();
@@ -590,14 +1302,13 @@ async fn setup_reset_removes_the_pat_from_the_store() {
 // `dev_name` em config.toml e mostrado pelo `kira doctor`.
 // ---------------------------------------------------------------------------
 
-/// Runs the REAL binary `kira doctor` with `KIRA_CONFIG` pointing at `config`
-/// and the Azure env vars removed, so the doctor stops offline at the missing
-/// PAT — section 1 (com a linha `dev:`) é impressa antes desse corte.
-fn run_doctor(config: &std::path::Path) -> String {
+/// Runs the REAL binary `kira doctor` with `KIRA_CONFIG` pointing at `config`.
+/// The Azure env vars are removed first (o doctor corta offline no PAT
+/// ausente, imprimindo a explicação curta — ADR-0025); `extra_envs` repõe as
+/// variáveis que o teste quiser (ex.: `AZURE_DEVOPS_PAT` para a máscara).
+fn run_doctor(config: &Path, extra_envs: &[(&str, &str)]) -> String {
     // Sandbox próprio: o doctor grava o resumo no store de sessões, e o
-    // KIRA_CONFIG aponta para o config gravado pelo setup; as envs do Azure
-    // saem para o doctor cortar offline no PAT ausente (a seção 1, com a
-    // linha `dev:`, é impressa antes desse corte).
+    // KIRA_CONFIG aponta para o config gravado pelo setup.
     let sandbox = std::env::temp_dir().join(format!(
         "kira-doctor-e2e-{}-{}",
         std::process::id(),
@@ -607,13 +1318,18 @@ fn run_doctor(config: &std::path::Path) -> String {
             .unwrap_or_default()
     ));
     let _ = std::fs::create_dir_all(&sandbox);
-    let output = Command::new(env!("CARGO_BIN_EXE_kira"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
+    command
         .arg("doctor")
         .env("KIRA_CONFIG", config)
         .env("KIRA_STORE_DIR", &sandbox)
         .env_remove("AZURE_DEVOPS_PAT")
         .env_remove("AZURE_DEVOPS_ORG")
-        .env_remove("AZURE_DEVOPS_PROJECT")
+        .env_remove("AZURE_DEVOPS_PROJECT");
+    for (name, value) in extra_envs {
+        command.env(name, value);
+    }
+    let output = command
         .output()
         .unwrap_or_else(|err| panic!("executar kira doctor: {err}"));
     let _ = std::fs::remove_dir_all(&sandbox);
@@ -625,23 +1341,28 @@ async fn setup_non_interactive_uses_the_default_dev_name_and_doctor_shows_it() {
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let store = credentials::InMemory::new();
     let config = temp_config("dev-name-default");
-    let opened = std::sync::Mutex::new(Vec::new());
+    let ia = IaStub::new();
 
     // Sem TTY, sem --name e sem dev_name salvo: o padrão vem do SO via a env
     // injetada (USER=sergin ⇒ "Sergin") — NUNCA há prompt esperando input.
     let (code, out) = run_setup(
-        "minha-org\nKira\nAa2xTOKENCOMPLETO\n",
-        None,
-        None,
-        &[("USER", "sergin")],
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[
+            ("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO"),
+            ("USER", "sergin"),
+        ],
         Some(endpoint),
         Some(&config),
         &store,
-        &opened,
         None,
         false,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
+        None,
+        true,
+        None,
+        &[],
+        &ia,
     )
     .await;
 
@@ -660,7 +1381,7 @@ async fn setup_non_interactive_uses_the_default_dev_name_and_doctor_shows_it() {
         "dev_name deve ir ao config.toml: {pairs:?}"
     );
 
-    let doctor_out = run_doctor(&config);
+    let doctor_out = run_doctor(&config, &[]);
     assert!(
         doctor_out.contains("dev: Sergin"),
         "kira doctor deve mostrar o nome salvo: {doctor_out}"
@@ -669,28 +1390,68 @@ async fn setup_non_interactive_uses_the_default_dev_name_and_doctor_shows_it() {
 }
 
 #[tokio::test]
+async fn setup_valid_pat_shows_masked_in_doctor() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("doctor-masked");
+    let ia = IaStub::new();
+
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        Some("Kira".to_string()),
+        &[],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        Some("Aa2xTOKENCOMPLETO".to_string()),
+        false,
+        None,
+        false,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    // O doctor do binário real resolve o PAT da env (o keyring do teste não
+    // é tocado) e mostra SÓ a máscara.
+    assert_eq!(code, ExitCode::SUCCESS, "setup deve salvar o PAT: {out}");
+    let doctor_out = run_doctor(&config, &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO")]);
+    assert!(
+        doctor_out.contains("Aa2x****"),
+        "doctor deve mostrar o PAT mascarado: {doctor_out}"
+    );
+    assert!(
+        !doctor_out.contains("Aa2xTOKENCOMPLETO"),
+        "doctor nunca pode mostrar o PAT completo: {doctor_out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
 async fn setup_name_flag_wins_over_the_default_and_the_saved_name() {
     let store = credentials::InMemory::new();
     let config = temp_config("dev-name-flag");
-    let opened = std::sync::Mutex::new(Vec::new());
+    let ia = IaStub::new();
 
     // Parte 1: --name vence o padrão do SO (USER=joao ⇒ "Joao" não aparece).
-    // Cada setup consome UM servidor falso (um accept por spawn): um novo
-    // servidor por execução.
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let (code, out) = run_setup(
         "",
         Some("minha-org".to_string()),
         Some("Kira".to_string()),
-        &[("USER", "joao")],
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO"), ("USER", "joao")],
         Some(endpoint.clone()),
         Some(&config),
         &store,
-        &opened,
-        Some("Aa2xTOKENCOMPLETO".to_string()),
+        None,
         false,
-        false, /* interactive: stdin pipado = fast path */
         Some("Sergin".to_string()),
+        true,
+        None,
+        &[],
+        &ia,
     )
     .await;
 
@@ -713,15 +1474,17 @@ async fn setup_name_flag_wins_over_the_default_and_the_saved_name() {
         "",
         Some("minha-org".to_string()),
         Some("Kira".to_string()),
-        &[],
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO")],
         Some(endpoint),
         Some(&config),
         &store,
-        &opened,
-        Some("Aa2xTOKENCOMPLETO".to_string()),
+        None,
         false,
-        false, /* interactive: stdin pipado = fast path */
         Some("Sergin".to_string()),
+        true,
+        None,
+        &[],
+        &ia,
     )
     .await;
 
@@ -744,7 +1507,7 @@ async fn setup_greets_when_a_name_is_already_saved() {
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let store = credentials::InMemory::new();
     let config = temp_config("dev-name-saved");
-    let opened = std::sync::Mutex::new(Vec::new());
+    let ia = IaStub::new();
     credentials::write_config_file(&config, &[("dev_name", "Sergin")]).expect("pre-gravar");
 
     // Nome já existe: pergunta não aparece (nem em TTY, nem pipado) — só a
@@ -753,15 +1516,17 @@ async fn setup_greets_when_a_name_is_already_saved() {
         "",
         Some("minha-org".to_string()),
         Some("Kira".to_string()),
-        &[("USER", "joao")],
+        &[("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO"), ("USER", "joao")],
         Some(endpoint),
         Some(&config),
         &store,
-        &opened,
-        Some("Aa2xTOKENCOMPLETO".to_string()),
+        None,
         false,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
+        None,
+        true,
+        None,
+        &[],
+        &ia,
     )
     .await;
 
@@ -783,78 +1548,28 @@ async fn setup_greets_when_a_name_is_already_saved() {
 }
 
 #[tokio::test]
-async fn config_without_dev_name_stays_valid_and_doctor_shows_a_dash() {
-    // Config antigo (só org/projeto, sem dev_name): continua válido e o
-    // doctor mostra `—` em vez de um nome.
-    let config = temp_config("dev-name-absent");
-    credentials::write_config_file(
-        &config,
-        &[("organization", "minha-org"), ("project", "Kira")],
-    )
-    .expect("pre-gravar");
-    let doctor_out = run_doctor(&config);
-    assert!(
-        doctor_out.contains("dev: —"),
-        "doctor deve mostrar — sem dev_name: {doctor_out}"
-    );
-
-    // `kira setup` sobre esse config antigo segue funcionando e adiciona o
-    // campo novo com o padrão derivado do SO.
-    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
-    let store = credentials::InMemory::new();
-    let opened = std::sync::Mutex::new(Vec::new());
-    let (code, out) = run_setup(
-        "Aa2xTOKENCOMPLETO\n",
-        Some("minha-org".to_string()),
-        Some("Kira".to_string()),
-        &[("USER", "joao")],
-        Some(endpoint),
-        Some(&config),
-        &store,
-        &opened,
-        None,
-        false,
-        false, /* interactive: stdin pipado = fast path */
-        None,  /* name */
-    )
-    .await;
-
-    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
-    let pairs = credentials::read_config_file(&config).unwrap_or_default();
-    assert!(
-        pairs.iter().any(|(k, v)| k == "dev_name" && v == "Joao"),
-        "dev_name derivado do SO deve ser gravado: {pairs:?}"
-    );
-    assert!(
-        pairs
-            .iter()
-            .any(|(k, v)| k == "organization" && v == "minha-org"),
-        "as chaves antigas devem ser preservadas: {pairs:?}"
-    );
-    let _ = std::fs::remove_file(&config);
-}
-
-#[tokio::test]
 async fn setup_interactive_prompts_for_the_name_with_repeat_and_eof_fallbacks() {
-    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let store = credentials::InMemory::new();
-    let opened = std::sync::Mutex::new(Vec::new());
+    let ia = IaStub::new();
 
-    // TTY: 's' no PAT, colar o PAT e responder o nome por extenso.
+    // TTY: menu 1, colar o PAT, responder o nome por extenso, Enter na IA.
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let config = temp_config("dev-name-interactive");
     let (code, out) = run_setup(
-        "s\nAa2xTOKENCOMPLETO\nSerginho\n",
+        "1\nAa2xTOKENCOMPLETO\nSerginho\n\n",
         Some("minha-org".to_string()),
         Some("Kira".to_string()),
         &[("USER", "joao")],
         Some(endpoint.clone()),
         Some(&config),
         &store,
-        &opened,
+        None,
+        true,
         None,
         false,
-        true, /* interactive */
-        None, /* name */
+        None,
+        &[],
+        &ia,
     )
     .await;
 
@@ -873,23 +1588,24 @@ async fn setup_interactive_prompts_for_the_name_with_repeat_and_eof_fallbacks() 
     let _ = std::fs::remove_file(&config);
 
     // TTY com resposta inválida (41 chars > limite de 40): repete a pergunta
-    // (sem erro fatal) e o valor seguinte é aceito. Servidor novo: um accept
-    // por execução do setup.
+    // (sem erro fatal) e o valor seguinte é aceito.
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let config = temp_config("dev-name-interactive-invalid");
     let (code, out) = run_setup(
-        &format!("s\nAa2xTOKENCOMPLETO\n{}\nSerginho\n", "x".repeat(41)),
+        &format!("1\nAa2xTOKENCOMPLETO\n{}\nSerginho\n\n", "x".repeat(41)),
         Some("minha-org".to_string()),
         Some("Kira".to_string()),
         &[("USER", "joao")],
         Some(endpoint.clone()),
         Some(&config),
         &store,
-        &opened,
+        None,
+        true,
         None,
         false,
-        true, /* interactive */
-        None, /* name */
+        None,
+        &[],
+        &ia,
     )
     .await;
 
@@ -911,22 +1627,23 @@ async fn setup_interactive_prompts_for_the_name_with_repeat_and_eof_fallbacks() 
     // cai no padrão — nunca erro fatal.
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let config = temp_config("dev-name-interactive-default");
-    let (code, out) = run_setup(
-        "s\nAa2xTOKENCOMPLETO\n\n",
+    let (_code, _out) = run_setup(
+        "1\nAa2xTOKENCOMPLETO\n\n\n",
         Some("minha-org".to_string()),
         Some("Kira".to_string()),
         &[("USER", "joao")],
         Some(endpoint.clone()),
         Some(&config),
         &store,
-        &opened,
+        None,
+        true,
         None,
         false,
-        true, /* interactive */
-        None, /* name */
+        None,
+        &[],
+        &ia,
     )
     .await;
-    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
     let pairs = credentials::read_config_file(&config).unwrap_or_default();
     assert!(
         pairs.iter().any(|(k, v)| k == "dev_name" && v == "Joao"),
@@ -936,22 +1653,23 @@ async fn setup_interactive_prompts_for_the_name_with_repeat_and_eof_fallbacks() 
 
     let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
     let config = temp_config("dev-name-interactive-eof");
-    let (code, out) = run_setup(
-        "s\nAa2xTOKENCOMPLETO\n",
+    let (_code, _out) = run_setup(
+        "1\nAa2xTOKENCOMPLETO\n\n\n",
         Some("minha-org".to_string()),
         Some("Kira".to_string()),
         &[("USER", "joao")],
         Some(endpoint),
         Some(&config),
         &store,
-        &opened,
+        None,
+        true,
         None,
         false,
-        true, /* interactive */
-        None, /* name */
+        None,
+        &[],
+        &ia,
     )
     .await;
-    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
     let pairs = credentials::read_config_file(&config).unwrap_or_default();
     assert!(
         pairs.iter().any(|(k, v)| k == "dev_name" && v == "Joao"),
@@ -960,238 +1678,56 @@ async fn setup_interactive_prompts_for_the_name_with_repeat_and_eof_fallbacks() 
     let _ = std::fs::remove_file(&config);
 }
 
+#[tokio::test]
+async fn setup_uses_flags_and_env_before_prompting() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("flags");
+    let ia = IaStub::new();
+
+    // org comes from --org, project from env, PAT from env: zero prompts.
+    let (code, out) = run_setup(
+        "",
+        Some("minha-org".to_string()),
+        None,
+        &[
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+            ("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO"),
+        ],
+        Some(endpoint),
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &[],
+        &ia,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        !out.contains("Organização do Azure DevOps (ex."),
+        "não deve pedir org quando veio por flag: {out}"
+    );
+    assert!(
+        !out.contains("Projeto do Azure DevOps (ex."),
+        "não deve pedir projeto quando veio do env: {out}"
+    );
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    let org = pairs
+        .iter()
+        .find(|(k, _)| k == "organization")
+        .map(|(_, v)| v.clone());
+    assert_eq!(org.as_deref(), Some("minha-org"));
+    let _ = std::fs::remove_file(&config);
+}
+
 // ---------------------------------------------------------------------------
-// Fluxo interativo (TTY): "Você já tem um PAT pronto?" antes de qualquer
-// navegador; o opener só é chamado com confirmação. O modo interativo é
-// injetado (`interactive: true`) — o binário real usa `stdin().is_terminal()`.
+// BoardProvider seam (sem mudanças de comportamento).
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn setup_interactive_yes_past_the_pat_question_takes_the_paste_path() {
-    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
-    let store = credentials::InMemory::new();
-    let config = temp_config("interactive-yes");
-    let opened = std::sync::Mutex::new(Vec::new());
-
-    // 's' na pergunta: NÃO abre navegador, NÃO imprime os passos — direto ao
-    // prompt de colar; o PAT é validado e salvo.
-    let (code, out) = run_setup(
-        "s\nAa2xTOKENCOMPLETO\n",
-        Some("minha-org".to_string()),
-        Some("Kira".to_string()),
-        &[],
-        Some(endpoint),
-        Some(&config),
-        &store,
-        &opened,
-        None,
-        false,
-        true, /* interactive */
-        None, /* name */
-    )
-    .await;
-
-    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
-    assert!(
-        out.contains("Você já tem um PAT pronto? [S/n]"),
-        "deve fazer a pergunta do PAT: {out}"
-    );
-    assert!(
-        out.contains("Cole o PAT e pressione Enter"),
-        "deve ir direto ao prompt de colar: {out}"
-    );
-    assert!(
-        !out.contains("_usersSettings/tokens"),
-        "nada de passos/URL do PAT: {out}"
-    );
-    assert!(!out.contains("Work Items (Read)"), "nada de escopos: {out}");
-    assert!(
-        !out.contains("Abrir no navegador agora"),
-        "não deve perguntar sobre abrir o navegador: {out}"
-    );
-    assert!(
-        opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty(),
-        "'s' não pode chamar o opener: {out}"
-    );
-    assert_eq!(
-        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
-        Some("Aa2xTOKENCOMPLETO"),
-        "PAT deve estar no store"
-    );
-    assert!(
-        !out.contains("Aa2xTOKENCOMPLETO"),
-        "o PAT completo nunca pode aparecer na saída: {out}"
-    );
-    let _ = std::fs::remove_file(&config);
-}
-
-#[tokio::test]
-async fn setup_interactive_no_then_enter_opens_the_browser_once() {
-    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
-    let store = credentials::InMemory::new();
-    let config = temp_config("interactive-no-enter");
-    let opened = std::sync::Mutex::new(Vec::new());
-
-    // 'n' na pergunta + Enter na pergunta de abrir (comando default 's'): o
-    // opener é chamado EXATAMENTE 1x com a URL correta; o fluxo continua
-    // colando o PAT.
-    let (code, out) = run_setup(
-        "n\n\nAa2xTOKENCOMPLETO\n",
-        Some("minha-org".to_string()),
-        Some("Kira".to_string()),
-        &[],
-        Some(endpoint),
-        Some(&config),
-        &store,
-        &opened,
-        None,
-        false,
-        true, /* interactive */
-        None, /* name */
-    )
-    .await;
-
-    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
-    assert!(out.contains("Você já tem um PAT pronto? [S/n]"), "{out}");
-    assert!(
-        out.contains("https://dev.azure.com/minha-org/_usersSettings/tokens"),
-        "deve imprimir os passos com a URL: {out}"
-    );
-    assert!(
-        out.contains("Abrir no navegador agora? [S/n]"),
-        "deve perguntar antes de abrir: {out}"
-    );
-    assert!(
-        out.contains("se não abrir, a URL está acima"),
-        "deve avisar sobre o navegador: {out}"
-    );
-    assert_eq!(
-        *opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        vec!["https://dev.azure.com/minha-org/_usersSettings/tokens"],
-        "opener deve ser chamado exatamente 1x com a URL correta: {out}"
-    );
-    assert_eq!(
-        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
-        Some("Aa2xTOKENCOMPLETO"),
-        "PAT deve estar no store"
-    );
-    let _ = std::fs::remove_file(&config);
-}
-
-#[tokio::test]
-async fn setup_interactive_no_and_no_never_opens_the_browser() {
-    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
-    let store = credentials::InMemory::new();
-    let config = temp_config("interactive-no-no");
-    let opened = std::sync::Mutex::new(Vec::new());
-
-    // 'n' + 'n': passos impressos, mas o opener NUNCA é chamado; o fluxo
-    // simplesmente continua até o prompt de colar.
-    let (code, out) = run_setup(
-        "n\nn\nAa2xTOKENCOMPLETO\n",
-        Some("minha-org".to_string()),
-        Some("Kira".to_string()),
-        &[],
-        Some(endpoint),
-        Some(&config),
-        &store,
-        &opened,
-        None,
-        false,
-        true, /* interactive */
-        None, /* name */
-    )
-    .await;
-
-    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
-    assert!(
-        out.contains("Abrir no navegador agora? [S/n]"),
-        "deve perguntar antes de abrir: {out}"
-    );
-    assert!(
-        opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty(),
-        "'n' na confirmação não pode abrir o navegador: {out}"
-    );
-    assert!(
-        !out.contains("não foi possível abrir o navegador"),
-        "não deve reportar falha de spawn: {out}"
-    );
-    assert!(
-        out.contains("Cole o PAT e pressione Enter"),
-        "fluxo deve continuar para colar o PAT: {out}"
-    );
-    assert_eq!(
-        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
-        Some("Aa2xTOKENCOMPLETO"),
-        "PAT deve estar no store"
-    );
-    let _ = std::fs::remove_file(&config);
-}
-
-#[tokio::test]
-async fn setup_interactive_invalid_answers_fall_back_to_the_default_s() {
-    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
-    let store = credentials::InMemory::new();
-    let config = temp_config("interactive-invalid");
-    let opened = std::sync::Mutex::new(Vec::new());
-
-    // 'x' duas vezes: aviso em cada resposta inválida e, ao esgotar as 2
-    // repetições, assume o default 's' (tem o PAT) e vai para o prompt de colar.
-    let (code, out) = run_setup(
-        "x\nx\nAa2xTOKENCOMPLETO\n",
-        Some("minha-org".to_string()),
-        Some("Kira".to_string()),
-        &[],
-        Some(endpoint),
-        Some(&config),
-        &store,
-        &opened,
-        None,
-        false,
-        true, /* interactive */
-        None, /* name */
-    )
-    .await;
-
-    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
-    assert!(
-        out.contains("resposta inválida ('x') — responda 's' ou 'n'."),
-        "deve avisar sobre a resposta inválida: {out}"
-    );
-    assert!(
-        out.contains("assumindo 's' (padrão)"),
-        "deve dizer que assumiu o default: {out}"
-    );
-    assert!(
-        out.contains("Cole o PAT e pressione Enter"),
-        "default 's' deve levar ao prompt de colar: {out}"
-    );
-    assert!(
-        !out.contains("Abrir no navegador agora"),
-        "default 's' não pode perguntar sobre navegador: {out}"
-    );
-    assert!(
-        opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty(),
-        "nada de navegador com o default: {out}"
-    );
-    assert_eq!(
-        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
-        Some("Aa2xTOKENCOMPLETO"),
-        "PAT deve estar no store"
-    );
-    let _ = std::fs::remove_file(&config);
-}
 
 #[tokio::test]
 async fn ado_board_fetches_work_item_and_projects_through_the_trait() {

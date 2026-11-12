@@ -83,7 +83,7 @@ enum Command {
     },
     /// Save the Azure DevOps configuration and the PAT in the OS keyring
     #[command(
-        after_help = "Exemplos:\n  kira setup                    # organização, projeto e a pergunta 'Já tem um PAT pronto? [S/n]'\n                                #   S: cole o PAT | n: passos + confirmar abrir no navegador\n  kira setup --no-browser       # pede org/projeto/PAT sem abrir o navegador\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas"
+        after_help = "Exemplos:\n  kira setup                # ensina o PAT, menu (colar / env / pular) e backend de IA\n  kira setup --yes          # não-interativo: usa AZURE_DEVOPS_PAT se existir, senão pula (e imprime o pulado)\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas\n  kira setup --skip pat     # pula um passo (repetível: pat, ia)\n  kira setup --reset        # remove o PAT do keyring"
     )]
     Setup {
         /// Azure DevOps organization name (skips the prompt)
@@ -95,12 +95,22 @@ enum Command {
         /// Remove the saved PAT from the keyring and exit
         #[arg(long)]
         reset: bool,
-        /// PAT passed straight on the command line (skips the prompt; never echoed)
+        /// PAT passed straight on the command line (pula a aula, o menu e o
+        /// prompt; nunca é ecoado — só a máscara aparece)
         #[arg(long)]
         pat: Option<String>,
-        /// Skip the PAT steps and the browser open; paste the PAT when asked
+        /// Modo não-interativo: usa AZURE_DEVOPS_PAT do ambiente se existir,
+        /// senão pula o PAT (e imprime o pulado); nunca bloqueia
         #[arg(long)]
-        no_browser: bool,
+        yes: bool,
+        /// Backend de IA para verificar: ollama (default, barato) |
+        /// copilot | foundry. O caro NUNCA é default nem fallback
+        /// silencioso — só entra por escolha explícita
+        #[arg(long, value_parser = ["ollama", "copilot", "foundry"])]
+        backend: Option<String>,
+        /// Pula um passo (repetível): `pat` ou `ia`
+        #[arg(long)]
+        skip: Vec<String>,
         /// How the dev wants to be called (saved as `dev_name` in config.toml;
         /// shown by `kira doctor` — never sent to any LLM prompt)
         #[arg(long)]
@@ -332,10 +342,12 @@ async fn run(command: Command) -> Outcome {
             project,
             reset,
             pat,
-            no_browser,
+            yes,
+            backend,
+            skip,
             name,
         } => Outcome {
-            code: setup_command(org, project, reset, pat, no_browser, name).await,
+            code: setup_command(org, project, reset, pat, yes, backend, skip, name).await,
             ok: true,
             records: false,
             summary: String::new(),
@@ -1405,12 +1417,15 @@ fn record_triage_episode_inner(report: &triage::TriageReport) -> EpisodeCapture 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn setup_command(
     org: Option<String>,
     project: Option<String>,
     reset: bool,
     pat: Option<String>,
-    no_browser: bool,
+    yes: bool,
+    backend: Option<String>,
+    skip: Vec<String>,
     name: Option<String>,
 ) -> ExitCode {
     // Fail fast (before the user creates a token) when there is nowhere to
@@ -1422,8 +1437,9 @@ async fn setup_command(
             return ExitCode::FAILURE;
         }
     };
-    // Modo interativo = stdin é um TTY: só nele o fluxo pergunta
-    // "Você já tem um PAT pronto?"; stdin pipado mantém o fast path antigo.
+    // Modo interativo = stdin é um TTY: só nele o menu do PAT e do backend de
+    // IA aparecem; `--yes` força o modo não-interativo (usa a env do PAT se
+    // existir, senão pula — e imprime o pulado).
     let interactive = std::io::stdin().is_terminal();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -1435,9 +1451,14 @@ async fn setup_command(
             project,
             reset,
             pat,
-            no_browser,
             interactive,
             name,
+            yes,
+            backend,
+            skip,
+            // Entrada de segredo com eco do terminal escondido (melhor
+            // esforço via `stty`); o valor lido nunca é impresso.
+            hidden_input: true,
         },
         store.as_ref(),
         credentials::config_path().as_deref(),
@@ -1445,7 +1466,7 @@ async fn setup_command(
         &mut input,
         &mut output,
         &setup::default_board_factory,
-        &setup::open_url_in_browser,
+        &setup::real_ia_hooks(),
     )
     .await
 }
