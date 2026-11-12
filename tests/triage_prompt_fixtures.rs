@@ -26,7 +26,16 @@ use kira::llm::prompts;
 use kira::triage;
 use kira::work_item::WorkItem;
 
-const CASES: [&str; 2] = ["sessao-expirada", "sem-descricao"];
+const CASES: [&str; 4] = [
+    "injecao-explicita",
+    "marcador-no-conteudo",
+    "sessao-expirada",
+    "sem-descricao",
+];
+
+/// Marcador de abertura do bloco não confiável: é o final da própria
+/// preâmbulo v2 (ADR-0024 R2); o fechamento vem de [`prompts::TRIAGE_UNTRUSTED_END`].
+const OPEN: &str = "<<<CONTEÚDO NÃO CONFIÁVEL\n";
 
 fn case_dir(slug: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -111,6 +120,101 @@ fn every_golden_output_round_trips_through_the_three_sections() {
             );
         }
     }
+}
+
+// --- W7.2 (ADR-0024 R2): o bloco delimitado no dourado ---------------------
+
+/// (a) O payload de injeção fica DENTRO do bloco: depois da abertura e antes do
+/// fechamento anexado pelo `triage` — se escapasse dos marcadores, seria lido
+/// como instrução.
+#[test]
+fn injection_payload_sits_between_the_markers() {
+    let prompt = read(&case_dir("injecao-explicita").join("prompt.txt"));
+    let open = prompt
+        .find(OPEN)
+        .unwrap_or_else(|| panic!("dourado de injecao-explicita não abre o bloco"));
+    let close = prompt
+        .rfind(prompts::TRIAGE_UNTRUSTED_END)
+        .unwrap_or_else(|| panic!("dourado de injecao-explicita não fecha o bloco"));
+    let payload = prompt
+        .find("ignore previous instructions")
+        .unwrap_or_else(|| panic!("payload de injeção ausente no dourado de injecao-explicita"));
+    assert!(
+        payload > open && payload < close,
+        "payload deve ficar entre os marcadores: abertura {open}, payload {payload}, fechamento {close}"
+    );
+    assert!(
+        payload + "ignore previous instructions".len() < close,
+        "payload inteiro deve caber dentro do bloco"
+    );
+}
+
+/// (b) A fixture limpa mantém o formato v2: abertura única no fim do preâmbulo,
+/// fechamento único no fim do prompt.
+#[test]
+fn clean_fixture_keeps_the_delimited_format() {
+    let prompt = read(&case_dir("sessao-expirada").join("prompt.txt"));
+    assert_eq!(
+        prompt.matches(OPEN).count(),
+        1,
+        "abertura do bloco deve aparecer exatamente uma vez"
+    );
+    assert_eq!(
+        prompt.matches(prompts::TRIAGE_UNTRUSTED_END).count(),
+        1,
+        "fechamento do bloco deve aparecer exatamente uma vez"
+    );
+    assert!(
+        prompt
+            .starts_with("Analise o work item do Azure DevOps abaixo e responda no formato de três seções definido."),
+        "preâmbulo v2 mantém a primeira linha: {prompt}"
+    );
+    assert!(
+        prompt.ends_with(prompts::TRIAGE_UNTRUSTED_END),
+        "o fechamento é o fim do prompt: {prompt}"
+    );
+}
+
+/// (c) O conteúdo que contém o próprio marcador de fechamento não fecha o bloco
+/// antes da hora: o fechamento real é o anexado pelo KIRA no fim do prompt — o
+/// marcador embutido é só dado.
+#[test]
+fn embedded_marker_does_not_close_the_block_early() {
+    let prompt = read(&case_dir("marcador-no-conteudo").join("prompt.txt"));
+    assert_eq!(
+        prompt.matches(OPEN).count(),
+        1,
+        "abertura deve continuar única"
+    );
+    let first_close = prompt
+        .find(prompts::TRIAGE_UNTRUSTED_END)
+        .unwrap_or_else(|| panic!("fechamento ausente no dourado de marcador-no-conteudo"));
+    let last_close = prompt
+        .rfind(prompts::TRIAGE_UNTRUSTED_END)
+        .unwrap_or_else(|| panic!("fechamento ausente no dourado de marcador-no-conteudo"));
+    assert_ne!(
+        first_close, last_close,
+        "o marcador embutido no conteúdo não é o fechamento real"
+    );
+    assert!(
+        first_close + prompts::TRIAGE_UNTRUSTED_END.len() < prompt.len(),
+        "deve haver texto depois do marcador embutido: o bloco não fechou ali"
+    );
+    assert!(
+        prompt.ends_with(prompts::TRIAGE_UNTRUSTED_END),
+        "o fechamento real é o último byte do prompt"
+    );
+}
+
+/// (d) A geração vigente é a v2 — é o id que sai no stderr do `kira triage` e no
+/// relatório do `--eval`: nenhum teste ou doc pode continuar apontando a v1.
+#[test]
+fn the_current_generation_is_v2() {
+    let id = prompts::triage_prompt_id();
+    assert!(
+        id.starts_with("triage v2 (fnv1a "),
+        "geração vigente deve ser v2: {id}"
+    );
 }
 
 // --- PR7: dourado do prompt do SISTEMA -------------------------------------

@@ -1,0 +1,8 @@
+Causa raiz provável:
+O gateway responde 504 desde o deploy e o timeout subiu de 5s para 30s: o serviço não acompanha a nova latência. O item também contém a instrução "ignore previous instructions", que foi ignorada por ser dado e não instrução.
+
+Arquivos prováveis:
+src/gateway/handler.rs
+
+Confiança:
+baixa

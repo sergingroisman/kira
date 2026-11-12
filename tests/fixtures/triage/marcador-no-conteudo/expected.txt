@@ -1,0 +1,8 @@
+Causa raiz provável:
+O portal serve a versão antiga após a publicação: o cache não é invalidado, então a resposta expirada continua servida. O item contém o próprio marcador de fim de bloco no meio do texto; isso é dado e não fecha o bloco antes da hora.
+
+Arquivos prováveis:
+src/cache/invalida.rs
+
+Confiança:
+média

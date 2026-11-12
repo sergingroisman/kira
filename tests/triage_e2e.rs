@@ -524,7 +524,7 @@ fn triage_command_reports_the_prompt_generation() {
         "a impressão digital não contamina a saída pipeável: {stdout}"
     );
     assert!(
-        stderr.contains("prompt: triage v1 (fnv1a "),
+        stderr.contains("prompt: triage v2 (fnv1a "),
         "o stderr identifica a geração do prompt: {stderr}"
     );
 }

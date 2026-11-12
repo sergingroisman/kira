@@ -62,6 +62,7 @@ pub fn build_prompt_with_context(item: &WorkItem, pack: &crate::context::Context
     // the evidence. Excerpts are already redacted (they come from the wiki, which
     // masks on write) and already bounded by the packer.
     prompt.push_str(&pack.render());
+    prompt.push_str(crate::llm::prompts::TRIAGE_UNTRUSTED_END);
     prompt
 }
 
@@ -355,8 +356,19 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("Login & logout não resolvem."), "{prompt}");
+        // Os marcadores do bloco delimitado (ADR-0024 R2) carregam < e > por
+        // design; fora deles o prompt não pode conter tag HTML.
+        let without_markers = prompt
+            .replace(
+                crate::llm::prompts::TRIAGE_USER_PREAMBLE,
+                crate::llm::prompts::TRIAGE_PROMPT_VERSION,
+            )
+            .replace(
+                crate::llm::prompts::TRIAGE_UNTRUSTED_END,
+                crate::llm::prompts::TRIAGE_PROMPT_VERSION,
+            );
         assert!(
-            !prompt.contains('<'),
+            !without_markers.contains('<'),
             "prompt não pode conter tag HTML: {prompt}"
         );
         assert!(
