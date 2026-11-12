@@ -152,6 +152,35 @@ enum Command {
         #[arg(long)]
         snapshot: bool,
     },
+    /// Generate the markdown PR draft from what KIRA already knows — no
+    /// network and no LLM (W4: triage + findings + wiki, evidence cited)
+    #[command(
+        after_help = "Exemplos:\n  kira pr draft 4821                          # stdout\n  kira pr draft 4821 --file item.json         # usa o item do board do JSON local\n  kira pr draft 4821 --out draft.md           # escreve o arquivo (caminho explícito)\n  kira pr draft 4821 --json                   # estrutura para consumo por máquina"
+    )]
+    Pr {
+        #[command(subcommand)]
+        action: PrAction,
+    },
+}
+
+/// `kira pr` actions: for now only the local draft.
+#[derive(Debug, Subcommand)]
+enum PrAction {
+    /// Build the deterministic PR draft (triage + findings + wiki); item data
+    /// comes only from `--file` (this command never touches the network)
+    Draft {
+        /// Work item id whose triage recorded in the store anchors the draft
+        id: i32,
+        /// Work item JSON saved locally (adds title/context; no PAT, no net)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Write the markdown at this explicit path (never chosen on its own)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Emit the structure as JSON (markdown stays the same content)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `kira wiki` actions (ADR-0013: markdown is the source of truth).
@@ -302,6 +331,7 @@ async fn run(command: Command) -> Outcome {
             json,
         } => context_command(id, file, explain, json),
         Command::Dashboard { snapshot } => dashboard_command(snapshot),
+        Command::Pr { action } => pr_command(action),
     }
 }
 
@@ -456,6 +486,26 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             },
             None,
         ),
+        Command::Pr { action } => match action {
+            PrAction::Draft {
+                id,
+                file,
+                out,
+                json,
+            } => {
+                let mut args = format!("draft {id}");
+                if let Some(file) = file {
+                    args.push_str(&format!(" --file {}", file.display()));
+                }
+                if let Some(out) = out {
+                    args.push_str(&format!(" --out {}", out.display()));
+                }
+                if *json {
+                    args.push_str(" --json");
+                }
+                ("pr".to_string(), args, None)
+            }
+        },
     }
 }
 
@@ -991,6 +1041,46 @@ fn dashboard_command(snapshot: bool) -> Outcome {
                     summary: message,
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `kira pr draft` — rascunho local, sem rede e sem LLM (W4)
+// ---------------------------------------------------------------------------
+
+/// `kira pr draft <id> [--file item.json] [--out caminho.md] [--json]`.
+///
+/// O rascunho é montado só com o que o KIRA já sabe (triage no store,
+/// findings.json, wiki, item em `--file`): NÃO faz push, NÃO abre PR e NÃO
+/// chama LLM. Read-only total: nem grava sessão na trilha (como
+/// `context`/`dashboard`). Falha de leitura do `--file`/`--out` é erro;
+/// store/findings/wiki ausentes viram `—` com causa e o comando sai 0.
+fn pr_command(action: PrAction) -> Outcome {
+    let PrAction::Draft {
+        id,
+        file,
+        out,
+        json,
+    } = action;
+    match kira::prdraft::run(&kira::prdraft::DraftOptions {
+        item_id: id,
+        file,
+        out,
+        json,
+    }) {
+        Ok(text) => {
+            print!("{text}");
+            Outcome {
+                code: ExitCode::SUCCESS,
+                ok: true,
+                records: false,
+                summary: first_line(&text, HISTORY_SUMMARY_LINE_CHARS),
+            }
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
         }
     }
 }

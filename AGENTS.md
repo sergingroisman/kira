@@ -53,6 +53,7 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Prompts são versados no repo, em `src/llm/prompts.rs` (constantes públicas, revisadas em PR) — sem framework de orquestração.
 - Nunca enviar segredos ao LLM: PAT, env e credenciais não entram no prompt. Além dos campos do work item, o prompt leva só o **context packer** (abaixo), já redigido por `redact`.
 - `kira triage` é somente leitura: o prompt do sistema nunca pede para escrever/editar código e o comando nunca altera o Azure DevOps.
+- `kira pr draft` é LOCAL: rascunho de PR montado só do store/findings/wiki/`--file` — evidência literal, nada inventado, sem rede, sem LLM, sem push e sem abrir PR.
 - Segredos no keyring: `src/credentials.rs` concentra `CredStore` (`OsKeyring` no runtime, `InMemory` só em testes). Testes NUNCA tocam o keyring do OS.
 ## Contexto (context packer, ADR-0015)
 - RETRIEVAL-FIRST: o KIRA busca, o modelo só interpreta. Nada de tool-calling, embedding, LangGraph ou índice vetorial — `walkdir` + casamento de termos e FTS5 da wiki, tudo em `src/context/`.

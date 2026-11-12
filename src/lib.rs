@@ -16,6 +16,7 @@ pub mod format;
 pub mod guard;
 pub mod html;
 pub mod llm;
+pub mod prdraft;
 pub mod redact;
 pub mod scan;
 pub mod setup;
