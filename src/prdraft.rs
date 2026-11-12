@@ -212,17 +212,25 @@ fn collect(item_id: i32, item_file: Option<&Path>) -> Result<DraftData, Error> {
 }
 
 /// Acha a última sessão de triage do item na trilha e recorta as seções.
+///
+/// A chave é `sessions.item_id` — o item é dado da sessão (issue #78), então
+/// funciona igual para `triage 4821` e para `triage --file item.json`. O
+/// casamento pela string dos argumentos fica como fallback para linhas
+/// gravadas antes da migração v5, que não têm a coluna preenchida.
 fn triage_source(store: &Store, project_id: &str, item_id: i32) -> Option<TriageSource> {
     let sessions = store.last_sessions(project_id, TRIAGE_LOOKBACK).ok()?;
     let id_token = item_id.to_string();
     // `last_sessions` vem mais recente primeiro: o primeiro casamento é o último triage.
-    sessions
+    let por_item = sessions
         .iter()
-        .find(|session| {
+        .find(|session| session.command == "triage" && session.item_id == Some(item_id));
+    let legado = || {
+        sessions.iter().find(|session| {
             session.command == "triage"
                 && session.args.split_whitespace().next() == Some(id_token.as_str())
         })
-        .and_then(triage_from_session)
+    };
+    por_item.or_else(legado).and_then(triage_from_session)
 }
 
 /// Recorta o resumo gravado (o output formatado do triage, primeiros 2000
@@ -985,8 +993,53 @@ mod tests {
             duration_ms: 10,
             ok: true,
             summary: "resumo truncado sem formato algum".to_string(),
+            item_id: None,
         };
         assert!(triage_from_session(&session).is_none());
+    }
+
+    /// Regressão da issue #78: `triage --file item.json` grava `--file` nos
+    /// argumentos, então o casamento pela string NUNCA acha. O id na coluna
+    /// `sessions.item_id` faz o rascunho recuperar o julgamento do mesmo jeito.
+    #[test]
+    fn triage_por_item_id_acha_o_que_foi_julgado_via_file() {
+        let dir = std::env::temp_dir().join(format!("kira-prdraft-78-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("criar tempdir");
+        let store = Store::open_in_dir(&dir).expect("abrir store");
+        // O projeto tem que existir no disco: `ensure_project` canonicaliza.
+        let projeto = store.ensure_project(&dir).expect("projeto do teste");
+
+        // Sessão exatamente como o `triage --file` grava: args sem o id.
+        store
+            .record(
+                &projeto,
+                "triage",
+                "--file item.json --llm copilot",
+                Some("shim"),
+                "2026-11-12T10:00:00Z",
+                10,
+                true,
+                "Causa raiz provável:\nTTL do token muito curto.\nArquivos prováveis:\nsrc/auth/session.rs\nConfiança:\nmédia",
+                Some(4821),
+            )
+            .expect("gravar sessão de triage");
+
+        let achado = triage_source(&store, &projeto.id, 4821)
+            .expect("o triage do item 4821 deve ser encontrado pelo item_id");
+        assert!(
+            achado.causa_raiz.contains("TTL do token muito curto."),
+            "causa recuperada: {:?}",
+            achado.causa_raiz
+        );
+
+        // Outro item não herda o julgamento deste.
+        assert!(
+            triage_source(&store, &projeto.id, 9999).is_none(),
+            "item sem triage não recebe a causa de outro"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Caminho feliz do parser de sessão: as 3 seções saem na ordem fixa.
@@ -1002,6 +1055,7 @@ mod tests {
             duration_ms: 10,
             ok: true,
             summary: "Causa raiz provável:\nTTL do token muito curto.\n\nArquivos prováveis:\nsrc/auth/session.rs\n\nConfiança:\nmédia\n".to_string(),
+            item_id: None,
         };
         let source = triage_from_session(&session).unwrap_or_else(|| panic!("deve parsear"));
         assert_eq!(source.causa_raiz, "TTL do token muito curto.");

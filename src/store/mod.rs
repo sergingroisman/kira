@@ -33,7 +33,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -230,11 +230,13 @@ impl Store {
         duration_ms: i64,
         ok: bool,
         summary: &str,
+        item_id: Option<i32>,
     ) -> Result<(), StoreError> {
         self.conn
             .execute(
                 "INSERT INTO sessions (project_id, command, args, model, started_at, \
-                 duration_ms, ok, summary) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 duration_ms, ok, summary, item_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     project.id,
                     command,
@@ -244,6 +246,7 @@ impl Store {
                     duration_ms.max(0),
                     i64::from(ok),
                     cap_summary(summary),
+                    item_id,
                 ],
             )
             .map_err(StoreError::Sql)?;
@@ -270,7 +273,7 @@ impl Store {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT id, command, args, model, started_at, duration_ms, ok, summary \
+                "SELECT id, command, args, model, started_at, duration_ms, ok, summary, item_id \
                  FROM sessions WHERE project_id = ?1 ORDER BY id DESC LIMIT ?2",
             )
             .map_err(StoreError::Sql)?;
@@ -290,6 +293,7 @@ impl Store {
                     duration_ms: row.get(5)?,
                     ok: row.get::<_, i64>(6)? != 0,
                     summary,
+                    item_id: row.get(8)?,
                 })
             })
             .map_err(StoreError::Sql)?;
@@ -594,6 +598,10 @@ pub struct SessionRow {
     pub ok: bool,
     /// Truncated command output (first line is shown by `kira history`).
     pub summary: String,
+    /// Work item desta sessão, quando a jornada é de item (issue #78) — é a
+    /// chave pela qual o `pr draft <id>` recupera o triage, sem depender de
+    /// como a triagem foi invocada (`<id>` ou `--file`).
+    pub item_id: Option<i32>,
 }
 
 /// One profile fact (`kira note`).
@@ -605,6 +613,22 @@ pub struct FactRow {
     pub updated_at: String,
     /// `updated_at` already converted to local time for display.
     pub local_updated_at: Option<String>,
+}
+
+/// `true` quando `column` já existe em `table` (checagem que torna a migração
+/// v5 segura de repetir).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(StoreError::Sql)?;
+    let mut rows = statement.query([]).map_err(StoreError::Sql)?;
+    while let Some(row) = rows.next().map_err(StoreError::Sql)? {
+        let nome: String = row.get(1).map_err(StoreError::Sql)?;
+        if nome == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Creates the missing tables and stamps `PRAGMA user_version`.
@@ -642,7 +666,8 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
                 started_at TEXT NOT NULL,
                 duration_ms INTEGER NOT NULL,
                 ok INTEGER NOT NULL,
-                summary TEXT NOT NULL DEFAULT ''
+                summary TEXT NOT NULL DEFAULT '',
+                item_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS facts (
                 project_id TEXT,
@@ -731,6 +756,20 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
             );",
         )
         .map_err(schema_error)?;
+    }
+
+    // v5 — `sessions.item_id` (issue #78): o item vira DADO da sessão.
+    // Antes, o `pr draft <id>` descobria o triage casando o primeiro token de
+    // `args` com o id — e quem julgou por `triage --file item.json` tinha
+    // `--file` nesse lugar, então o rascunho saía oco mesmo com o julgamento
+    // gravado. Guardar o id resolve na fonte, para qualquer forma de invocação.
+    //
+    // `ALTER TABLE ADD COLUMN` não é idempotente (ao contrário do
+    // `CREATE TABLE IF NOT EXISTS` que domina este arquivo), então a coluna é
+    // checada antes: um banco onde a migração rodou pela metade não quebra.
+    if current < 5 && !column_exists(&conn, "sessions", "item_id")? {
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN item_id INTEGER;")
+            .map_err(schema_error)?;
     }
 
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
@@ -1268,6 +1307,7 @@ mod tests {
                 10,
                 true,
                 "sessão da v3",
+                None,
             )
             .unwrap_or_else(|err| panic!("record: {err}"));
         store
@@ -1512,6 +1552,7 @@ mod tests {
                 150,
                 true,
                 "#4821  Bug  Active\nTítulo: sessão",
+                None,
             )
             .unwrap_or_else(|err| panic!("record: {err}"));
         store
@@ -1524,6 +1565,7 @@ mod tests {
                 2_100,
                 false,
                 "PAT não encontrado — defina AZURE_DEVOPS_PAT",
+                None,
             )
             .unwrap_or_else(|err| panic!("record: {err}"));
 
@@ -1577,6 +1619,7 @@ mod tests {
                 10,
                 true,
                 &long,
+                None,
             )
             .unwrap_or_else(|err| panic!("record: {err}"));
         let sessions = store

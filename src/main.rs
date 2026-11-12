@@ -321,6 +321,10 @@ async fn main() -> ExitCode {
     let started_at = store::now_rfc3339_utc();
     let started = Instant::now();
     let (command, args, model) = session_context(&cli.command);
+    // O item é resolvido AQUI, antes de `run` consumir o comando: o `triage
+    // --file` não tem o id nos argumentos, e é justamente esse caminho que
+    // deixava o `pr draft` oco (issue #78).
+    let item_id = command_item_id(&cli.command);
     let outcome = run(cli.command).await;
     // Automatic session trail: never breaks the main command. The store is
     // opened twice per run (here and only here) to keep the trail decoupled
@@ -334,6 +338,7 @@ async fn main() -> ExitCode {
             duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(0),
             ok: outcome.ok,
             summary: &outcome.summary,
+            item_id,
         });
     }
     outcome.code
@@ -577,6 +582,41 @@ fn print_error(err: &dyn StdError) {
     }
 }
 
+/// Item do board desta execução, quando a jornada é de item.
+///
+/// Hoje só o `triage` precisa: o `pr draft <id>` recupera o triage pela trilha
+/// e, sem o id gravado, casava a string dos argumentos — o que falhava para
+/// `triage --file item.json` (issue #78). `--eval` não é jornada de item.
+///
+/// Fail-open de propósito: arquivo ilegível devolve `None` e a trilha segue; a
+/// falta do id degrada o rascunho (que mostra `—`), nunca a triagem em si.
+fn command_item_id(command: &Command) -> Option<i32> {
+    match command {
+        Command::Triage { id, file, eval, .. } => {
+            if eval.is_some() {
+                return None;
+            }
+            match (id, file) {
+                (Some(id), _) => Some(*id),
+                (None, Some(path)) => item_id_from_file(path),
+                (None, None) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Lê só o `id` do JSON do item (sem desserializar o resto e sem tocar rede).
+fn item_id_from_file(path: &std::path::Path) -> Option<i32> {
+    let texto = std::fs::read_to_string(path).ok()?;
+    let documento: serde_json::Value = serde_json::from_str(&texto).ok()?;
+    let id = documento.get("id")?;
+    // A API do Azure DevOps manda número; `as_i64` cobre também "4821" quando
+    // o JSON vier com string, e o `try_from` recusa qualquer coisa fora de i32.
+    let valor = id.as_i64().or_else(|| id.as_str()?.parse().ok())?;
+    i32::try_from(valor).ok()
+}
+
 /// Description of the current run for the automatic session trail: named
 /// command, how it was invoked and (only for triage) the resolved model.
 fn session_context(command: &Command) -> (String, String, Option<String>) {
@@ -748,6 +788,8 @@ struct SessionRun<'a> {
     duration_ms: i64,
     ok: bool,
     summary: &'a str,
+    /// Item da jornada, quando houver (issue #78) — gravado na trilha.
+    item_id: Option<i32>,
 }
 
 /// Records the session trail, FIRST-CLASS fail-open: every store problem is
@@ -776,6 +818,7 @@ fn record_session_inner(run: &SessionRun<'_>) -> Result<(), String> {
             run.duration_ms,
             run.ok,
             run.summary,
+            run.item_id,
         )
         .map_err(|error| error.to_string())
 }

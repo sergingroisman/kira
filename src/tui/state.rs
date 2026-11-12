@@ -2076,6 +2076,7 @@ mod tests {
             duration_ms,
             ok,
             summary: summary.to_string(),
+            item_id: None,
         }
     }
 

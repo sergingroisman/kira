@@ -425,17 +425,14 @@ fn ciclo_cru_offline_do_setup_ao_dashboard() {
 
     // ======================================================================
     // ETAPA 4 — `kira pr draft 4821 --file item.json`: a escrita. Sem LLM,
-    // sem rede: o markdown é montado SÓ com o que o KIRA já sabe, com `—`
-    // onde não houver dado — NUNCA texto inventado.
+    // sem rede: o markdown é montado SÓ com o que o KIRA já sabe, com `—` onde
+    // não houver dado — NUNCA texto inventado.
     //
-    // Comportamento REAL observado do produto hoje: o scribe só recupera um
-    // triage gravado como `triage <id>` (a trilha guarda os args e o
-    // `triage --file <path>` grava `--file <path>`), então o rascunho por id
-    // mostra `—` com a causa concreta em vez de chutar a causa do triage.
-    // A honestidade é o contrato deste bloco: dado ausente vira `—` com o
-    // comando de retomada. Se o ciclo aprender a consumir o triage `--file`
-    // (registro da lacuna em um PR futuro), ESTE bloco muda para as
-    // asserções de dados reais.
+    // Até a issue #78 este passo saía OCO: o `scribe` procurava o triage
+    // casando o primeiro token de `args` com o id, e o `triage --file` gravava
+    // `--file` ali. Agora o item é DADO da sessão (`sessions.item_id`, migração
+    // v5), então o rascunho recupera o julgamento da etapa 3 seja qual for a
+    // forma de invocação — que é o modo padrão de quem não conectou board.
     // ======================================================================
     let (code, markdown, stderr) = sandbox.run(&["pr", "draft", "4821", "--file", "item.json"]);
     assert_eq!(code, 0, "pr draft deve sair 0 — stderr: {stderr}");
@@ -459,27 +456,31 @@ fn ciclo_cru_offline_do_setup_ao_dashboard() {
             "seção obrigatória do template: '{secao}' ausente — {markdown}"
         );
     }
-    for honesto in [
-        "## Causa raiz provável\n— (não há dado; rode kira triage 4821 antes)",
-        "## Mudança proposta\n— (não há dado; rode kira triage 4821 antes)",
-        "## Evidências\n— (não há dado; rode kira triage 4821 antes ou rode kira scan)",
-        "## Riscos\n— (não há achado de scan relacionado aos arquivos citados; rode kira scan antes)",
-    ] {
-        assert!(
-            markdown.contains(honesto),
-            "dado ausente vira `—` com a causa — nunca invenção: esperado {honesto:?} — {markdown}"
-        );
-    }
+    // O julgamento da ETAPA 3 chega aqui. Antes da #78 este bloco esperava `—`.
+    assert!(
+        markdown.contains("TTL do token muito curto."),
+        "a causa do triage (etapa 3) é recuperada pelo item, não por argumento: {markdown}"
+    );
+    assert!(
+        markdown.contains("src/auth/session.rs"),
+        "os arquivos citados pelo triage entram no rascunho: {markdown}"
+    );
+    // O que continua honesto: não há evidência ligada a `src/auth/session.rs`
+    // (os achados do scan são npm), então a seção diz que não há dado e manda
+    // rodar os dois passos — em vez de inventar relação.
+    assert!(
+        markdown.contains(
+            "## Evidências\n— (não há dado; rode kira triage 4821 antes ou rode kira scan)"
+        ),
+        "evidência ausente vira `—` com a causa, nunca invenção: {markdown}"
+    );
+    assert!(
+        !markdown.contains("Prototype Pollution"),
+        "achado de scan não relacionado não é usado como evidência: {markdown}"
+    );
     assert!(
         markdown.contains("o merge é sempre humano"),
         "o checklist fixo (gates locais + merge humano) está no template: {markdown}"
-    );
-    // ANTI-INVENÇÃO: a causa do triage e os achados do scan EXISTEM no store
-    // (etapas 2 e 3) mas NÃO podem aparecer aqui como se tivessem sido
-    // consultados — o rascunho por id não chuta; `—` é a resposta honesta.
-    assert!(
-        !markdown.contains("TTL") && !markdown.contains("Prototype Pollution"),
-        "nenhum texto inventado: o rascunho não usa dado que não consultou — {markdown}"
     );
     // DETERMINISMO: mesma entrada, mesma saída, byte a byte.
     let (code_novamente, markdown_novamente, _) =
