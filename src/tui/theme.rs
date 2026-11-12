@@ -23,6 +23,8 @@ pub struct Palette {
     pub value: Color,
     /// Valores ausentes (`—` + causa): destaque honesto, não erro gritado.
     pub missing: Color,
+    /// Execução viva (`[exec]`, spinner): estado transitório, nunca resultado.
+    pub running: Color,
     /// Rodapé de atalhos (descrição).
     pub footer: Color,
     /// Overlay de ajuda.
@@ -56,6 +58,7 @@ pub const fn colorful() -> Palette {
         rule: Color::DarkGray,
         value: Color::Green,
         missing: Color::Yellow,
+        running: Color::Cyan,
         footer: Color::DarkGray,
         help: Color::Magenta,
         // Semântica de severidade (semáforo): quanto pior, mais quente.
@@ -83,6 +86,7 @@ pub const fn mono() -> Palette {
         rule: Color::Reset,
         value: Color::Reset,
         missing: Color::Reset,
+        running: Color::Reset,
         footer: Color::Reset,
         help: Color::Reset,
         // Mono não perde informação: a severidade segue legível no texto da
@@ -157,6 +161,7 @@ mod tests {
         let mono = mono();
         assert_eq!(mono.title, Color::Reset);
         assert_eq!(mono.missing, Color::Reset);
+        assert_eq!(mono.running, Color::Reset);
         assert_eq!(mono.footer, Color::Reset);
         assert_eq!(mono.key_bg, Color::Reset);
         assert_eq!(mono.rule, Color::Reset);

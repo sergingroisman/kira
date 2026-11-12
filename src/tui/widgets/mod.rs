@@ -1,4 +1,10 @@
 //! Painéis do dashboard (casca do statui: painel, seção, rodapé, tabelas).
+/// Moldura de cartão: borda + título + coluna de fatos (PR-UX2).
+pub mod card;
+/// Os seis cartões do Resumo e o grid que os posiciona (PR-UX2).
+pub mod cards;
+/// Chips de estado das sessões: `[ok]`, `[falhou]`, `[exec]` (PR-UX2).
+pub mod chips;
 pub mod findings;
 pub mod footer;
 /// Barra de proporção (uso do índice) com glifo escolhido pelo modo.
