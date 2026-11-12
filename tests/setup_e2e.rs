@@ -25,9 +25,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kira::board::azure::AdoBoard;
 use kira::board::{self, BoardProvider};
+use kira::capabilities::{Capability, require_connected};
 use kira::credentials::{self, CRED_KEY_PAT, CredStore};
 use kira::error::Error;
-use kira::setup::{self, FoundryChoice, IaHooks, SetupOptions};
+use kira::setup::{self, ConnectAzureOptions, FoundryChoice, IaHooks, SetupOptions};
+use kira::store::Store;
 
 /// Two visible projects for the happy path (usado só pelos testes de `--pat`).
 const PROJECTS_BODY: &str = r#"{"count":2,"value":[{"id":"a","name":"Kira","state":"wellFormed","visibility":"private"},{"id":"b","name":"Outro","state":"wellFormed","visibility":"private"}]}"#;
@@ -2403,4 +2405,496 @@ fn factory_selects_azure_by_default() {
     // No network here: only checks the name → impl selection.
     let board = board::for_board("azure", "pat", "org", "proj");
     assert!(board.is_ok(), "azure deve ser aceito");
+}
+
+// ---------------------------------------------------------------------------
+// `kira connect azure` (MVP-3): TTY (aula + menu 1/2/3 + segredo sem eco),
+// não-interativo (só a env) e as 4 mensagens exatas — com servidor ADO falso,
+// store InMemory e store de capacidades isolado. O keyring do OS nunca é
+// tocado; o binário real é coberto por tests/capabilities_e2e.rs.
+// ---------------------------------------------------------------------------
+
+/// Roda `setup::connect_azure` com tudo falso; devolve (exit, saída, store de
+/// capacidades, raiz do projeto) para o teste conferir o estado gravado.
+#[allow(clippy::too_many_arguments)]
+async fn run_connect(
+    stdin_text: &str,
+    interactive: bool,
+    env_values: &[(&str, &str)],
+    endpoint: Option<String>,
+    config_path: Option<&Path>,
+    secret_store: &dyn CredStore,
+) -> (ExitCode, String, Store, PathBuf) {
+    let make_board =
+        move |pat: &str, org: &str, project: &str| -> Result<Box<dyn BoardProvider>, Error> {
+            match &endpoint {
+                Some(endpoint) => Ok(Box::new(AdoBoard::with_endpoint(
+                    endpoint, pat, org, project,
+                ))),
+                None => Ok(Box::new(AdoBoard::new(pat, org, project))),
+            }
+        };
+    let env_lookup = move |name: &str| -> Option<String> {
+        env_values
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string())
+    };
+    // Store de capacidades + raiz ÚNICOS por chamada: o estado é POR PROJETO.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("kira-connect-db-{}-{nanos}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap_or_else(|err| panic!("criar {root:?}: {err}"));
+    let state_store = Store::open_in_dir(&dir).unwrap_or_else(|err| panic!("abrir store: {err}"));
+    let mut input = BufReader::new(Cursor::new(stdin_text.to_string()));
+    let mut output: Vec<u8> = Vec::new();
+    let options = ConnectAzureOptions {
+        interactive,
+        hidden_input: false,
+        secret_store,
+        config_path,
+        env: &env_lookup,
+        make_board: &make_board,
+        project_root: &root,
+        state_store: &state_store,
+    };
+    let code = setup::connect_azure(&options, &mut input, &mut output).await;
+    let root_cloned = root.clone();
+    (
+        code,
+        String::from_utf8_lossy(&output).to_string(),
+        state_store,
+        root_cloned,
+    )
+}
+
+/// Limpa o diretório temporário do store de capacidades do run_connect.
+fn drop_connect_dir(root: &Path) {
+    if let Some(dir) = root.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn connect_azure_tty_imprime_a_aula_e_o_menu_e_conecta_sem_eco() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("connect-tty");
+    let (code, out, state, root) = run_connect(
+        "1\nAa2xTOKENCOMPLETO\n",
+        true,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+        ],
+        Some(endpoint),
+        Some(&config),
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    // Aula (fonte única) com a org vinda da env no link.
+    assert!(out.contains("Como criar (2 minutos)"), "aula: {out}");
+    assert!(
+        out.contains("https://dev.azure.com/minha-org/_usersSettings/tokens"),
+        "{out}"
+    );
+    // Menu exato do escopo do MVP-3.
+    assert!(out.contains("1) colar PAT"), "{out}");
+    assert!(
+        out.contains("2) usar AZURE_DEVOPS_PAT do ambiente"),
+        "{out}"
+    );
+    assert!(out.contains("3) cancelar"), "{out}");
+    assert!(out.contains("Cole o PAT"), "{out}");
+    // Validação na hora + gravação + máscara (o valor completo NUNCA sai).
+    assert!(
+        out.contains("PAT ok — lê Work Items de minha-org/Kira"),
+        "{out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "PAT colado vai para o keyring (store)"
+    );
+    assert!(out.contains("Aa2x****"), "confirmação mascarada: {out}");
+    assert!(
+        !out.contains("Aa2xTOKENCOMPLETO"),
+        "o PAT completo nunca pode aparecer na saída: {out}"
+    );
+    assert!(out.contains("board.azure conectada"), "{out}");
+    assert!(
+        out.contains("kira triage <work-item-id>"),
+        "próximo passo: {out}"
+    );
+    // Capacidade conectada PARA ESTE PROJETO.
+    require_connected(&state, &root, Capability::BoardAzure)
+        .unwrap_or_else(|err| panic!("board.azure deveria estar conectada: {err}"));
+    // org/projeto (públicos) foram ao config.toml no sucesso.
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "organization" && v == "minha-org")
+    );
+    assert!(pairs.iter().any(|(k, v)| k == "project" && v == "Kira"));
+    let _ = std::fs::remove_file(&config);
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_sem_org_mostra_o_marcador_e_falha_acionavel_sem_tocar_rede() {
+    let store = credentials::InMemory::new();
+    // Endpoint morto: se o código tentasse validar, o erro viria da rede —
+    // o teste espera o erro acionável de org ANTES de qualquer conexão.
+    let (code, out, state, root) = run_connect(
+        "1\nAa2xTOKENCOMPLETO\n",
+        true,
+        &[],
+        Some("http://127.0.0.1:1".to_string()),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains("<sua-org>"),
+        "sem org a aula usa o marcador: {out}"
+    );
+    assert!(
+        out.contains("organização do Azure DevOps não configurada"),
+        "erro acionável com o comando que resolve: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "sem org NADA é gravado"
+    );
+    assert!(
+        require_connected(&state, &root, Capability::BoardAzure).is_err(),
+        "capacidade continua desconectada"
+    );
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_cancelar_nada_grava_e_exit_nao_zero() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let (code, out, state, root) = run_connect(
+        "3\n",
+        true,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+        ],
+        Some(endpoint),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "cancelar sai ≠ 0: {out}");
+    assert!(out.contains("connect cancelado"), "{out}");
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "cancelar não grava PAT"
+    );
+    assert!(
+        require_connected(&state, &root, Capability::BoardAzure).is_err(),
+        "cancelar não conecta a capacidade"
+    );
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_opcao_2_usa_a_env_sem_eco() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let (code, out, state, root) = run_connect(
+        "2\n",
+        true,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+            ("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO"),
+        ],
+        Some(endpoint),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "PAT da env vai para o keyring (store)"
+    );
+    assert!(out.contains("Aa2x****"), "{out}");
+    assert!(
+        !out.contains("Aa2xTOKENCOMPLETO"),
+        "o PAT da env nunca pode ser ecoado: {out}"
+    );
+    require_connected(&state, &root, Capability::BoardAzure)
+        .unwrap_or_else(|err| panic!("conectada: {err}"));
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_opcao_2_sem_env_falha_acionavel_sem_perguntar() {
+    let store = credentials::InMemory::new();
+    let (code, out, state, root) = run_connect(
+        "2\n",
+        true,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+        ],
+        Some("http://127.0.0.1:1".to_string()),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains("AZURE_DEVOPS_PAT não está definida"),
+        "erro acionável: {out}"
+    );
+    assert_eq!(store.get(CRED_KEY_PAT).ok().flatten(), None);
+    assert!(
+        require_connected(&state, &root, Capability::BoardAzure).is_err(),
+        "nada conectado"
+    );
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_401_mostra_a_mensagem_exata_e_nao_salva() {
+    let (endpoint, _server) =
+        spawn_fake_ado("HTTP/1.1 401 Unauthorized", r#"{"message":"TF400813"}"#);
+    let store = credentials::InMemory::new();
+    let (code, out, state, root) = run_connect(
+        "1\nPATRUIMSEGREDO\n",
+        true,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+        ],
+        Some(endpoint),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains(
+            "PAT não autenticou (401). O token pode ter expirado ou foi copiado incompleto — crie outro em https://dev.azure.com/minha-org/_usersSettings/tokens"
+        ),
+        "mensagem exata da spec: {out}"
+    );
+    assert!(
+        !out.contains("PATRUIMSEGREDO"),
+        "o PAT nunca pode ser ecoado: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "PAT rejeitado NÃO é salvo"
+    );
+    assert!(
+        require_connected(&state, &root, Capability::BoardAzure).is_err(),
+        "401 não conecta a capacidade"
+    );
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_403_mostra_a_mensagem_exata_e_nao_salva() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 403 Forbidden", r#"{}"#);
+    let store = credentials::InMemory::new();
+    let (code, out, state, root) = run_connect(
+        "1\nPATSEMSCOPO\n",
+        true,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+        ],
+        Some(endpoint),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains(
+            "PAT autenticou, mas sem escopo Work Items (403). Edite o token e marque Work Items → Read"
+        ),
+        "mensagem exata da spec: {out}"
+    );
+    assert!(!out.contains("PATSEMSCOPO"), "{out}");
+    assert_eq!(store.get(CRED_KEY_PAT).ok().flatten(), None);
+    assert!(
+        require_connected(&state, &root, Capability::BoardAzure).is_err(),
+        "403 não conecta a capacidade"
+    );
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_sem_rede_salva_o_pat_mas_nao_conecta_a_capacidade() {
+    let store = credentials::InMemory::new();
+    let (code, out, state, root) = run_connect(
+        "1\nAa2xTOKENCOMPLETO\n",
+        true,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+        ],
+        Some("http://127.0.0.1:1".to_string()),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains(
+            "não foi possível validar agora (sem rede?). O token foi salvo; rode kira doctor depois"
+        ),
+        "mensagem exata da spec (origem colada): {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO"),
+        "sem rede o token É salvo (spec) — é o que torna a mensagem verdadeira"
+    );
+    assert!(
+        require_connected(&state, &root, Capability::BoardAzure).is_err(),
+        "sem rede a capacidade NÃO é marcada"
+    );
+    assert!(
+        out.contains("board.azure continua desconectada"),
+        "o próximo passo fica claro: {out}"
+    );
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_nao_interativo_com_env_conecta_sem_aula_nem_menu() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let config = temp_config("connect-nao-interativo");
+    let (code, out, state, root) = run_connect(
+        // stdin VAZIO: o modo não-interativo NUNCA o lê.
+        "",
+        false,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+            ("AZURE_DEVOPS_PAT", "Aa2xTOKENCOMPLETO"),
+        ],
+        Some(endpoint),
+        Some(&config),
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        !out.contains("Como criar (2 minutos)"),
+        "fora de TTY não imprime a aula: {out}"
+    );
+    assert!(
+        !out.contains("1) colar PAT"),
+        "fora de TTY não oferece o menu: {out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten().as_deref(),
+        Some("Aa2xTOKENCOMPLETO")
+    );
+    assert!(out.contains("board.azure conectada"), "{out}");
+    require_connected(&state, &root, Capability::BoardAzure)
+        .unwrap_or_else(|err| panic!("conectada: {err}"));
+    let _ = std::fs::remove_file(&config);
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_nao_interativo_sem_env_falha_acionavel_sem_ler_stdin() {
+    let store = credentials::InMemory::new();
+    let (code, out, state, root) = run_connect(
+        // stdin VAZIO: se o modo lesse o stdin, cairia no default do menu
+        // (cancelar) — o teste distingue isso do erro acionável esperado.
+        "",
+        false,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "Kira"),
+        ],
+        Some("http://127.0.0.1:1".to_string()),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains("precisa de AZURE_DEVOPS_PAT"),
+        "erro acionável aponta a env: {out}"
+    );
+    assert!(
+        !out.contains("cancelado"),
+        "o stdin NUNCA é lido fora de TTY: {out}"
+    );
+    assert_eq!(store.get(CRED_KEY_PAT).ok().flatten(), None);
+    assert!(
+        require_connected(&state, &root, Capability::BoardAzure).is_err(),
+        "nada conectado"
+    );
+    drop_connect_dir(&root);
+}
+
+#[tokio::test]
+async fn connect_azure_projeto_incorreto_nao_salva_nada() {
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_BODY);
+    let store = credentials::InMemory::new();
+    let (code, out, state, root) = run_connect(
+        "1\nAa2xTOKENCOMPLETO\n",
+        true,
+        &[
+            ("AZURE_DEVOPS_ORG", "minha-org"),
+            ("AZURE_DEVOPS_PROJECT", "ProjetoQueNaoExiste"),
+        ],
+        Some(endpoint),
+        None,
+        &store,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
+    assert!(
+        out.contains("projeto incorreto — o token NÃO foi salvo"),
+        "{out}"
+    );
+    assert_eq!(
+        store.get(CRED_KEY_PAT).ok().flatten(),
+        None,
+        "projeto errado: nada é salvo"
+    );
+    assert!(
+        require_connected(&state, &root, Capability::BoardAzure).is_err(),
+        "projeto errado não conecta"
+    );
+    drop_connect_dir(&root);
 }

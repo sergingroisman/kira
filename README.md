@@ -23,6 +23,7 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira triage <id\|--file> --llm foundry` | Usa o **Microsoft Foundry** (BYOK, HTTP OpenAI-compatible) no lugar do Ollama para esta execução — ver [Backend foundry](#backend-foundry-byok-microsoft-foundry) abaixo. |
 | `kira triage --eval <dir>` | **Gate M2 medido (ADR-0018)**: compara o triage com os rótulos do dono (`item.json` + `gold.json` por pasta) de forma **determinística, sem LLM juiz**; exit 0 = ≥70% (`PASSOU`), 1 = <70% ou erro. `--json` para automação; `--seed` copia 3 fixtures sintéticas num diretório vazio. Ver [seção do gate](#kira-triage---eval--o-gate-m2-medido-adr-0018). |
 | `kira setup [--org --project --name --pat --yes --backend --skip --reset]` | Setup **local-first** (ADR-0030): nome do dev → projeto (raiz detectada + confirmar) → backend de IA (4 opções, com **"4) nenhuma por agora"** como default quando o Ollama não está instalado) → resumo do que funciona. PAT NÃO é pedido — credencial nasce em `kira connect <provider>`; `--pat` segue como atalho explícito (valida na hora e vai para o keyring do OS, service `kira`). `--reset` apaga o que ele gravou de credencial (PAT, chave do Foundry) e o par público do Foundry, mantendo org/projeto/dev. |
+| `kira connect azure [--yes]` | Conecta o board (capacidade `board.azure`, ADR-0030): imprime a **aula do PAT** e oferece o menu `1) colar PAT  2) usar AZURE_DEVOPS_PAT do ambiente  3) cancelar` no TTY; entrada do segredo **sem eco**; valida na hora (200/401/403/sem rede — as 4 mensagens da spec) e, no 200, grava no keyring e marca `board.azure` **conectada para o projeto atual** (próximo passo: `kira triage <id>`). Falha/401/403/cancelar ⇒ nada gravado, exit ≠ 0. `--yes` (ou sem TTY): usa SÓ a env `AZURE_DEVOPS_PAT`, nunca bloqueia; sem a env, erro acionável. `kira connect github\|gitlab`: aceito, "ainda não implementado". |
 | `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
 | `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
 | `kira note "<texto>"` / `kira note --remove N` | Fato do perfil do projeto (append-only, numerado). |
@@ -172,6 +173,22 @@ Org/projeto vindos de flag/env vão para `~/.config/kira/config.toml` (0600) —
 `kira connect azure` acha o contexto ali. O `kira doctor` mostra a linha
 `capacidades: nenhuma conectada (modo local)` (ou a lista das conectadas) e não
 ensina mais o PAT: a credencial é assunto de `kira connect`.
+
+É lá que a aula vive agora:
+
+```bash
+kira connect azure
+# ... aula do PAT (o que é, como criar, escopo Work Items → Read) ...
+#     1) colar PAT
+#     2) usar AZURE_DEVOPS_PAT do ambiente
+#     3) cancelar
+```
+
+A validação é imediata (as 4 mensagens da spec) e, no 200, o PAT vai para o
+keyring do OS e `board.azure` fica **conectada para o projeto atual** — o
+`kira triage <id>` passa a ler o board. Fora de TTY (ou com `--yes`) a única
+origem do segredo é a env `AZURE_DEVOPS_PAT`: sem ela, erro acionável, nunca
+um prompt pendurado.
 
 Verificação:
 

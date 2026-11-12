@@ -39,9 +39,10 @@ use std::process::ExitCode;
 pub mod wizard;
 
 use crate::board::{self, BoardProvider};
+use crate::capabilities::{self, Capability, CapabilityState};
 use crate::credentials::{
     self, CONFIG_KEY_DEV_NAME, CONFIG_KEY_ORG, CONFIG_KEY_PROJECT, CRED_KEY_PAT, CredStore,
-    ORG_ENV, PROJECT_ENV,
+    ORG_ENV, PAT_ENV, PROJECT_ENV,
 };
 use crate::doctor;
 use crate::error::Error;
@@ -1214,14 +1215,30 @@ fn ask_dev_name(default: &str, input: &mut dyn BufRead, output: &mut dyn Write) 
     }
 }
 
+/// Env que aponta o Azure DevOps para OUTRO endpoint (`KIRA_ADO_URL`).
+///
+/// Existe para o e2e do binário (`tests/capabilities_e2e.rs`) provar os 4
+/// estados de validação contra um servidor falso LOCAL — nunca dev.azure.com.
+/// Nenhum fluxo de produto a define; sem a env o comportamento é o de sempre.
+pub const ADO_URL_ENV: &str = "KIRA_ADO_URL";
+
 /// Board factory used by the real binary: the Azure DevOps provider selected
-/// by `KIRA_BOARD` (default `azure`).
+/// by `KIRA_BOARD` (default `azure`), com o override de endpoint de teste.
 pub fn default_board_factory(
     pat: &str,
     organization: &str,
     project: &str,
 ) -> Result<Box<dyn BoardProvider>, Error> {
-    board::for_board(&board::name_from_env(), pat, organization, project)
+    let endpoint = std::env::var(ADO_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let name = board::name_from_env();
+    match (name.trim().to_lowercase().as_str(), endpoint) {
+        (board::azure::BOARD_NAME, Some(endpoint)) => Ok(Box::new(
+            board::azure::AdoBoard::with_endpoint(&endpoint, pat, organization, project),
+        )),
+        _ => board::for_board(&name, pat, organization, project),
+    }
 }
 
 /// Env lookup used by the real binary.
@@ -1229,6 +1246,328 @@ pub fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// `kira connect azure` (MVP-3, ADR-0030 #4): a credencial nasce AQUI.
+// ---------------------------------------------------------------------------
+
+/// Menu do `kira connect azure` (texto do escopo do MVP-3): colar, usar a env
+/// ou cancelar. O default é CANCELAR (3) — a opção que não grava nada; Enter
+/// ou EOF nunca viram ação que guarda segredo.
+pub const CONNECT_AZURE_MENU: &str = "Como o KIRA conecta o board (Azure DevOps)?\n     1) colar PAT\n     2) usar AZURE_DEVOPS_PAT do ambiente\n     3) cancelar\n";
+
+/// Opções do `kira connect azure` — tudo injetado, como em [`run`]: os testes
+/// dirigem o fluxo com stdin falso, [`credentials::InMemory`], servidor ADO
+/// falso e store isolado; o keyring do OS nunca é tocado em teste.
+pub struct ConnectAzureOptions<'a> {
+    /// stdin é TTY E o dev não passou `--yes`: só aqui a aula e o menu
+    /// aparecem. Fora disso o fluxo é não-interativo — nunca bloqueia.
+    pub interactive: bool,
+    /// Pede eco escondido na entrada do PAT colado (binário real: `true`;
+    /// testes `false`, porque stdin é buffer e `stty` não pode rodar).
+    pub hidden_input: bool,
+    /// Onde o PAT validado é gravado (keyring do OS no binário real).
+    pub secret_store: &'a dyn CredStore,
+    /// config.toml: org/projeto lidos daqui quando as envs faltam e gravados
+    /// no SUCESSO (valores públicos; segredo nunca mora nesse arquivo).
+    pub config_path: Option<&'a Path>,
+    /// Lookup de env injetado (os testes nunca tocam nas variáveis do processo).
+    pub env: &'a dyn Fn(&str) -> Option<String>,
+    /// Fábrica do board para a validação imediata (endpoint falso em teste).
+    pub make_board: &'a BoardFactory<'a>,
+    /// Raiz do projeto atual: o estado da capacidade é POR PROJETO (ADR-0030).
+    pub project_root: &'a Path,
+    /// Store do sqlite onde o estado da capacidade é gravado.
+    pub state_store: &'a store::Store,
+}
+
+/// `kira connect azure` (MVP-3).
+///
+/// TTY: imprime a aula (fonte ÚNICA [`pat_lesson_lines`], com a org vinda do
+/// config/env quando existir e `<sua-org>` como marcador), oferece o menu
+/// [`CONNECT_AZURE_MENU`], lê o segredo SEM ECO, valida na hora com as 4
+/// mensagens exatas da spec (200/401/403/sem rede) e, no 200, grava o PAT no
+/// keyring e marca `board.azure` como conectada PARA O PROJETO ATUAL.
+///
+/// Regras de falha do escopo: 401/403/projeto-incorreto/cancelar/sem PAT/sem
+/// org ⇒ NADA é gravado, a mensagem traz a causa e o link de correção, exit ≠
+/// 0. Sem rede o token É salvo (mesma conduta do `setup --pat` — é isso que
+/// torna [`msg_pat_rede`] verdadeira), mas a capacidade NÃO é marcada.
+///
+/// Fora de TTY (ou com `--yes`): a única origem do segredo é
+/// `AZURE_DEVOPS_PAT` — sem ela, erro acionável; nunca fica pendurado lendo
+/// stdin. O `github`/`gitlab` seguem "ainda não implementado" (no `main`).
+///
+/// # Errors
+/// Erros do board/store são impressos com causa; o exit code é o resultado.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_azure(
+    options: &ConnectAzureOptions<'_>,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> ExitCode {
+    let config_pairs = read_config(options.config_path, output);
+    // org/projeto: env > config.toml — a MESMA resolução do `kira doctor` e
+    // do `kira triage`, para o que o connect validar ser o que eles usam.
+    let organization = resolve_saved(
+        None,
+        (options.env)(ORG_ENV),
+        config_pairs
+            .as_ref()
+            .and_then(|pairs| value_of(pairs, CONFIG_KEY_ORG)),
+    );
+    let project = resolve_saved(
+        None,
+        (options.env)(PROJECT_ENV),
+        config_pairs
+            .as_ref()
+            .and_then(|pairs| value_of(pairs, CONFIG_KEY_PROJECT)),
+    );
+
+    // Fora de TTY: nada de aula, nada de menu, nada de leitura do stdin —
+    // a env é a única origem e a ausência dela é erro acionável.
+    if !options.interactive {
+        return connect_azure_from_env(options, organization, project, output).await;
+    }
+
+    // Aula do PAT (texto do ADR-0025, uma única fonte): com org conhecida o
+    // link aponta a página certa; sem ela, `<sua-org>` é o marcador honesto.
+    let lesson_url = pat_url(organization.as_deref().unwrap_or("<sua-org>"));
+    for line in pat_lesson_lines(&lesson_url) {
+        let _ = writeln!(output, "{line}");
+    }
+    let _ = writeln!(output);
+
+    let choice = ask_menu_choice(CONNECT_AZURE_MENU, &["1", "2", "3"], "3", input, output);
+    let (token, pasted) = match choice.as_str() {
+        "3" => {
+            let _ = writeln!(
+                output,
+                "connect cancelado — nada foi gravado; board.azure continua desconectada."
+            );
+            return ExitCode::FAILURE;
+        }
+        "1" => {
+            let Some(token) = connect_secret_input(options.hidden_input, input, output) else {
+                let _ = writeln!(
+                    output,
+                    "erro: nenhum PAT informado — rode `kira connect azure` de novo."
+                );
+                return ExitCode::FAILURE;
+            };
+            (token, true)
+        }
+        // Qualquer resposta fora de 1/2/3 já virou cancelamento no menu; 2 é
+        // a env — e a env VAZIA nunca é segredo.
+        _ => match (options.env)(PAT_ENV).filter(|value| !value.trim().is_empty()) {
+            Some(token) => (token, false),
+            None => {
+                let _ = writeln!(
+                    output,
+                    "erro: {PAT_ENV} não está definida — exporte a env e escolha 2 de novo, ou escolha 1 para colar o PAT."
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    // org/projeto: sem eles a validação não tem contra quem conferir — o
+    // erro sai ANTES de qualquer rede, com o comando que resolve.
+    let Some(organization) = organization else {
+        let _ = writeln!(
+            output,
+            "erro: organização do Azure DevOps não configurada (a aula acima usa <sua-org> como marcador) — rode `kira setup --org <nome> --project <nome>` ou defina {ORG_ENV}."
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(project) = project else {
+        let _ = writeln!(
+            output,
+            "erro: projeto do Azure DevOps não configurado — rode `kira setup --org <nome> --project <nome>` ou defina {PROJECT_ENV}."
+        );
+        return ExitCode::FAILURE;
+    };
+
+    connect_azure_validate(options, &token, pasted, &organization, &project, output).await
+}
+
+/// Caminho NÃO-interativo (sem TTY ou com `--yes`): a env é a única origem do
+/// segredo; sem ela o erro é acionável e o stdin NUNCA é lido — `--yes` em CI
+/// não pode ficar pendurado esperando o menu.
+async fn connect_azure_from_env(
+    options: &ConnectAzureOptions<'_>,
+    organization: Option<String>,
+    project: Option<String>,
+    output: &mut dyn Write,
+) -> ExitCode {
+    let Some(token) = (options.env)(PAT_ENV).filter(|value| !value.trim().is_empty()) else {
+        let _ = writeln!(
+            output,
+            "erro: kira connect azure não-interativo precisa de {PAT_ENV} — exporte a env e rode de novo (ou rode `kira connect azure` em um terminal para colar o PAT)."
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(organization) = organization else {
+        let _ = writeln!(
+            output,
+            "erro: organização do Azure DevOps não configurada — rode `kira setup --org <nome> --project <nome>` ou defina {ORG_ENV}."
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(project) = project else {
+        let _ = writeln!(
+            output,
+            "erro: projeto do Azure DevOps não configurado — rode `kira setup --org <nome> --project <nome>` ou defina {PROJECT_ENV}."
+        );
+        return ExitCode::FAILURE;
+    };
+    connect_azure_validate(options, &token, false, &organization, &project, output).await
+}
+
+/// Validação imediata do `connect azure`: as 4 mensagens EXATAS da spec
+/// (reaproveitadas de cima, nunca reescritas) e a gravação só onde elas são
+/// verdadeiras. 200 valida também o projeto (mesmo check do `setup --pat`).
+async fn connect_azure_validate(
+    options: &ConnectAzureOptions<'_>,
+    token: &str,
+    pasted: bool,
+    organization: &str,
+    project: &str,
+    output: &mut dyn Write,
+) -> ExitCode {
+    let _ = writeln!(output, "Validando o PAT na organização {organization}...");
+    let board = match (options.make_board)(token, organization, project) {
+        Ok(board) => board,
+        Err(err) => {
+            let _ = writeln!(output, "erro: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match board.project_names().await {
+        Ok(project_names) => {
+            if doctor::find_project_case_insensitive(project, &project_names).is_none() {
+                let _ = writeln!(output);
+                let _ = writeln!(
+                    output,
+                    "{}",
+                    doctor::format_project_check(project, &project_names)
+                );
+                let _ = writeln!(
+                    output,
+                    "projeto incorreto — o token NÃO foi salvo; rode `kira connect azure` de novo com o nome exato."
+                );
+                return ExitCode::FAILURE;
+            }
+            let _ = writeln!(output, "{}", msg_pat_ok(organization, project));
+            if let Err(err) = options.secret_store.set(CRED_KEY_PAT, token) {
+                let _ = writeln!(output, "erro: {err}");
+                return ExitCode::FAILURE;
+            }
+            let _ = writeln!(
+                output,
+                "✓ PAT salvo no keyring do OS ({} chars: {}).",
+                token.chars().count(),
+                doctor::mask_pat(token)
+            );
+            // Sucesso = consentimento explícito (decisão 6 do ADR-0030): só
+            // AGORA a capacidade fica conectada, e só para ESTE projeto.
+            if let Err(err) = capabilities::set_state(
+                options.state_store,
+                options.project_root,
+                Capability::BoardAzure,
+                CapabilityState::Conectada,
+            ) {
+                let _ = writeln!(
+                    output,
+                    "erro: PAT salvo, mas board.azure não foi marcada como conectada ({err}) — rode `kira doctor`."
+                );
+                return ExitCode::FAILURE;
+            }
+            // org/projeto (públicos) vão ao config.toml para o `kira triage`
+            // achar depois — mesmo caminho do setup; segredo nunca mora aqui.
+            if let Some(path) = options.config_path
+                && let Err(err) = credentials::write_config_file(
+                    path,
+                    &[
+                        (CONFIG_KEY_ORG, organization),
+                        (CONFIG_KEY_PROJECT, project),
+                    ],
+                )
+            {
+                let _ = writeln!(output, "aviso: não salvei org/projeto no config: {err}");
+            }
+            let _ = writeln!(
+                output,
+                "✓ board.azure conectada — próximo passo: kira triage <work-item-id>"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(Error::AdoUnauthorized { .. }) => {
+            let _ = writeln!(output, "{}", msg_pat_401(organization));
+            let _ = writeln!(
+                output,
+                "o token NÃO foi salvo; rode `kira connect azure` de novo."
+            );
+            ExitCode::FAILURE
+        }
+        Err(Error::AdoStatus { status: 403, .. }) => {
+            let _ = writeln!(output, "{}", msg_pat_403());
+            let _ = writeln!(
+                output,
+                "o token NÃO foi salvo; rode `kira connect azure` de novo."
+            );
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            // Sem rede: o PAT é salvo (mesma conduta do `setup --pat`) — é o
+            // que torna a mensagem de rede verdadeira — mas a capacidade NÃO
+            // é marcada: nada foi validado. Refazer o connect com rede marca.
+            if let Err(err) = options.secret_store.set(CRED_KEY_PAT, token) {
+                let _ = writeln!(output, "erro: {err}");
+                return ExitCode::FAILURE;
+            }
+            let _ = writeln!(
+                output,
+                "✓ {} — salvo no keyring do OS; validação pendente (rode kira doctor)",
+                doctor::mask_pat(token)
+            );
+            let _ = writeln!(output, "{}", msg_pat_rede(pasted, false));
+            let _ = writeln!(
+                output,
+                "board.azure continua desconectada — com rede, rode `kira connect azure` de novo."
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Entrada do PAT colado no `connect azure` (sem eco onde o SO permite):
+/// mesma mecânica do prompt de segredo do setup. O valor lido NUNCA é
+/// impresso; vazio ⇒ `None` — o erro é do chamador, com o comando de retomada
+/// do connect (não do setup).
+fn connect_secret_input(
+    hidden: bool,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Option<String> {
+    let can_hide = hidden && cfg!(unix);
+    let _ = writeln!(
+        output,
+        "{}",
+        secret_prompt_line("Cole o PAT", hidden, can_hide)
+    );
+    let _ = output.flush();
+    if can_hide {
+        terminal_echo(false);
+    }
+    let value = read_line(input);
+    if can_hide {
+        terminal_echo(true);
+        // Com o eco desligado o Enter não desenha linha nova: fecha a linha.
+        let _ = writeln!(output);
+    }
+    value.filter(|pat| !pat.is_empty())
 }
 
 #[cfg(test)]
