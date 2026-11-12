@@ -54,6 +54,10 @@ pub const SCREEN_COUNT: usize = 4;
 /// Passo de PgUp/PgDn no preview/lista (linhas por "página" de scroll).
 pub const SCROLL_PAGE_STEP: isize = 10;
 
+/// Quantos scans a ajuda lista antes de resumir o resto. A série inteira
+/// continua no `--snapshot`; aqui o teto é a ALTURA da tela, não o dado.
+pub const HELP_TREND_LINES: usize = 10;
+
 /// Opções de abertura do dashboard (ADR-0033).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunOptions {
@@ -1306,12 +1310,23 @@ fn help_paragraph(palette: &Palette, snapshot: &Snapshot, glyphs: Glyphs) -> Par
     // que some da tela é dado que o dono vai pedir depois.
     text.push(String::new());
     if snapshot.scan_series.len() >= 2 {
+        // A ajuda é modal de altura fixa: 50 scans = 50 linhas, e a lista
+        // empurraria o rodapé ("dado ausente aparece como —") para fora da
+        // tela. Os mais NOVOS ficam; os antigos continuam no `--snapshot`.
+        let total = snapshot.scan_series.len();
+        let shown = total.min(HELP_TREND_LINES);
         text.push(format!(
-            "tendência de achados ({} scans, mais antigo primeiro):",
-            snapshot.scan_series.len()
+            "tendência de achados ({total} scans, mais antigo primeiro):"
         ));
-        for (index, count) in snapshot.scan_series.iter().enumerate() {
-            text.push(format!("  #{:<3} {count} achados", index + 1));
+        if total > shown {
+            text.push(format!(
+                "  … {rest} scans mais antigos no --snapshot",
+                rest = total - shown
+            ));
+        }
+        for (offset, count) in snapshot.scan_series.iter().skip(total - shown).enumerate() {
+            let number = total - shown + offset + 1;
+            text.push(format!("  #{number:<3} {count} achados"));
         }
     } else {
         let note = snapshot
@@ -1862,6 +1877,33 @@ mod tests {
         // Sem `--read-only`, o rodapé oferece as teclas de ação.
         assert!(text.contains(" Scan"), "{text}");
         assert!(text.contains("Triage"), "{text}");
+    }
+
+    /// A série de tendência saiu do cartão em 80×24, então a ajuda é o lugar
+    /// dela — e ela tem teto: 30 scans não podem empurrar o rodapé da ajuda
+    /// para fora da tela. Os antigos ficam no `--snapshot`.
+    #[test]
+    fn help_lists_the_trend_series_and_caps_it() {
+        let mut snapshot = snapshot_with_findings();
+        snapshot.scan_series = (1..=30).collect();
+        let state = AppState {
+            help_open: true,
+            ..AppState::default()
+        };
+        let text = render_text(&state, &snapshot, 120, 40);
+        // A ajuda quebra linha ao desenhar; a asserção é sobre as PALAVRAS.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("30 scans"), "{text}");
+        assert!(
+            flat.contains("20 scans mais antigos no --snapshot"),
+            "{text}"
+        );
+        assert!(flat.contains("#30"), "o mais novo aparece: {text}");
+        assert!(!flat.contains("#1 "), "o mais antigo sai da tela: {text}");
+        assert!(
+            flat.contains("Dado ausente"),
+            "rodapé da ajuda preservado: {text}"
+        );
     }
 
     #[test]
