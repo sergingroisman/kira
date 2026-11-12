@@ -3,13 +3,13 @@
 - **Data**: 11/Nov/2026
 - **Fontes**: 4 repositórios escolhidos a dedo pelo dono, analisados por README/docs/
   issues públicas (nenhum código copiado; licenças conferidas)
-- **ADR proposto**: ADR-0026 (cache de raciocínio + economia medida) — draft na
-  seção final, vira arquivo só com aceite do dono (ADR-0024/0025 já foram tomados
-  por outras sessões — e há uma colisão de dois ADR-0025 em `docs/adr/`, para o
-  Orchestrator resolver)
-- **Dumps**: `docs/dumps/snapshot-{gsd-2,openclaude,rea}.md` (fornecidos pelo dono
-  em 12/Nov; proveniência em `docs/dumps/snapshot-README.md`) — o dump do RTK
-  segue faltando
+- **ADR proposto**: ADR-0027 (cache de raciocínio + economia medida) — draft na
+  seção final, vira arquivo só com aceite do dono (ADR-0024/0025/0026 já foram
+  tomados por outras sessões — a 0026 é dos tech-leads; a colisão de dois
+  ADR-0025 em `docs/adr/` cabe ao Orchestrator resolver)
+- **Dumps**: `docs/dumps/snapshot-{gsd-2,openclaude,rea}.md` — **locais, não
+  comitados** (fornecidos pelo dono em 12/Nov; a pedido dele ficam fora do git —
+  proveniência em `docs/dumps/snapshot-README.md`) — o dump do RTK segue faltando
 - **Veredito**: 1 pulo do gato + 10 melhorias (fila PR34–PR43); nenhum contrato do
   mandato quebrado; nenhuma dependência nova; nada disso depende de daemon, MCP,
   embeddings ou modelo caro.
@@ -192,14 +192,15 @@ por ciclo é microssegundos; o P9 é o único spawn e só sob comando explícito
 ## Pendências do dono
 
 1. **Dump do RTK não chegou** — os dumps de gsd-2, openclaude e rea estão em
-   `docs/dumps/snapshot-*.md` (12/Nov, com análise no apêndice); falta o do RTK,
-   o 4º repo escolhido. Sem ele, a análise do RTK fica no que o site/README
-   público mostram (e a licença mista Apache-2.0/BUSL-1.1 manda "só conceito" —
-   dump serve para confirmar as 4 estratégias, não para copiar).
+   `docs/dumps/snapshot-*.md` (12/Nov; **locais, não comitados** — decisão do
+   dono; análise no apêndice); falta o do RTK, o 4º repo escolhido. Sem ele, a
+   análise do RTK fica no que o site/README público mostram (e a licença mista
+   Apache-2.0/BUSL-1.1 manda "só conceito" — dump serve para confirmar as 4
+   estratégias, não para copiar).
 2. **Rotular os 20 bugs do `tests/fixtures/triage_gold/`** — pré-requisito (d) do
    mandato; é o que valida o PR35/PR36 **com número** no `--eval`.
 3. **Aprovar o plano** — os PRs viram fila no `docs/roadmap-prs.md` (ledger do
-   Orchestrator) e o ADR-0026 abaixo vira arquivo.
+   Orchestrator) e o ADR-0027 abaixo vira arquivo.
 
 ## Permanece rejeitado (desta rodada)
 
@@ -210,7 +211,7 @@ Slack/Discord · VS Code extension.
 
 ---
 
-## ADR-0026 (draft) — Cache de raciocínio e economia medida
+## ADR-0027 (draft) — Cache de raciocínio e economia medida
 
 **Contexto.** Sustentação é recorrente: o mesmo bug volta. Hoje cada triage chama o
 LLM mesmo quando a wiki já registrou a causa raiz do mesmo sintoma. Paralelamente, o
@@ -240,7 +241,8 @@ normalizados resolve sem dependência); sumário de arquivo por modelo pequeno
 ## Apêndice — o que os dumps confirmam (12/Nov)
 
 Análise feita sobre `docs/dumps/snapshot-{gsd-2,openclaude,rea}.md` (dumps do
-dono); nada copiado para o código. Citações curtas com endereço de linha no dump.
+dono, **locais**); nada copiado para o código. Citações curtas com endereço de
+linha no dump.
 
 - **GSD-2** (`snapshot-gsd-2.md`): o budget pressure é aplicado **antes** do
   scoring de capacidade — a linha 8926 do dump fecha o desenho: "cost constrains
