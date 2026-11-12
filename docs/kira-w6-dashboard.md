@@ -339,6 +339,22 @@ quatro módulos puros nossos (`glyph`, `viewport`, `widgets/scrollbar`, `widgets
 Ainda pendente desta spec: mascote de estado, `kira --about` e a captura no README (PR de
 fechamento).
 
+### Entregue no PR-UX2 (cartões, chips e spinner, ADR-0037)
+
+- **Resumo em grid de cartões**, ordem de ação primeiro: Risco, Sessões,
+  Projeto, Atividade, Índice e wiki, Pendências. Em 80×24 a coluna única fecha
+  exatamente as 21 linhas do workspace; a partir de 100 de largura são duas
+  colunas e a sobra de altura vai para os últimos cartões, nunca para um buraco.
+- **Geometria pura** (`tui/grid`): cartão que não cabe INTEIRO não aparece pela
+  metade — sai em `omitted`, e o teste do fit afirma 21/21 em 80×24.
+- **Chips de sessão** `[ok]`/`[falhou]` vindos de `SessionLine.ok` (nada de
+  estado deduzido) e um único chip vivo: `[exec]`, que existe só sob
+  `ExecStatus::Running` e morre com o processo.
+- **Spinner puro** (`tui/spinner`): 10 frames braille, 4 ascii, avançando pelo
+  `AppState.tick` do loop — tela parada não pisca.
+- **A série de tendência saiu do cartão em 80×24 e continua no `?`**, uma linha
+  por scan: esconder na tela não é perder o dado.
+
 ## Fora de escopo (rejeitado por ora)
 
 Mouse · edição de qualquer dado · gráfico temporal além de contagem · múltiplos
