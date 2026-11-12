@@ -1,0 +1,10 @@
+{
+  "id": 529511,
+  "rev": 1,
+  "fields": {
+    "System.Id": 529511,
+    "System.WorkItemType": "Bug",
+    "System.Title": "Sessão expira com token válido",
+    "System.State": "Active"
+  }
+}
