@@ -21,6 +21,7 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira triage <id\|--file> --model <tag>` | Troca o modelo do Ollama para esta execução. |
 | `kira triage <id\|--file> --llm copilot` | Usa o **Copilot CLI** como LLM caro desta execução (spawn de `copilot -p`; exige `copilot auth login`) — ver [Backend LLM (ADR-0019)](#backend-llm-adr-0019). |
 | `kira triage <id\|--file> --llm foundry` | Usa o **Microsoft Foundry** (BYOK, HTTP OpenAI-compatible) no lugar do Ollama para esta execução — ver [Backend foundry](#backend-foundry-byok-microsoft-foundry) abaixo. |
+| `kira triage --eval <dir>` | **Gate M2 medido (ADR-0018)**: compara o triage com os rótulos do dono (`item.json` + `gold.json` por pasta) de forma **determinística, sem LLM juiz**; exit 0 = ≥70% (`PASSOU`), 1 = <70% ou erro. `--json` para automação; `--seed` copia 3 fixtures sintéticas num diretório vazio. Ver [seção do gate](#kira-triage---eval--o-gate-m2-medido-adr-0018). |
 | `kira setup [--org --project --name --pat --no-browser --reset]` | Wizard: org, projeto, nome do dev (`--name`) e PAT validados **antes** de salvar; PAT vai para o keyring do OS (service `kira`). `--reset` remove o PAT. |
 | `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
 | `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
@@ -53,6 +54,54 @@ Trocável por env (`KIRA_MODEL`) ou por execução (`--model`). O triage roda
 
 ```powershell
 kira triage --file tests\fixtures\work_item_4821.json
+```
+
+## `kira triage --eval` — o gate M2 medido (ADR-0018)
+
+O gate do M2 é um **número**, não opinião: `kira triage --eval <dir>` mede o
+acerto do triage contra rótulos verdadeiros do dono (os 20 bugs do
+`triage_gold`). Cada item do diretório é uma **pasta** com 2 arquivos:
+
+```
+<pasta-do-bug>/
+  item.json  → JSON do work item do Azure DevOps (o mesmo do `kira triage --file`)
+  gold.json  → rótulo do dono:
+    {
+      "causa_raiz": "TTL do token de sessão expira antes do refresh",
+      "arquivos": ["src/Api/Auth/TokenService.cs"],
+      "confianca": "alta"          // alta|media|baixa (opcional)
+    }
+```
+
+O triage roda **offline** (`--file`) contra o backend escolhido
+(`--llm ollama` por default; `--llm copilot|foundry` respeitando as regras
+dos ADR-0019/0020). A comparação com o gold é **determinística e auditável —
+sem LLM como juiz** (um LLM julgando um produto de LLM não é gate):
+
+- **causa raiz**: similaridade de tokens de conteúdo (minúsculas, sem acento,
+  sem stopwords PT, palavras ≥ 4 caracteres; `score = |interseção| / |gold|`).
+  Acerto = **score ≥ 0.50**.
+- **arquivos**: pelo menos **1 basename** do gold presente na previsão
+  (comparação sem caixa).
+
+Saída: tabela por item (`id | causa % | arquivos ok? | veredito`) e a linha
+final `GATE M2: <acertos>/<total> = <pct>% (limiar 70%) — PASSOU|NÃO PASSOU`.
+`--json` devolve o mesmo relatório em JSON (com os textos previstos e gold)
+para automação.
+
+- **Exit code**: `0` = ≥ 70% (PASSOU) · `1` = < 70% (NÃO PASSOU) ou erro — o
+  gate é o exit code, pronto para CI.
+- Qualquer item que falhe **aborta a medição**: número parcial não é número.
+- `--seed`: copia 3 fixtures **sintéticas** (`seed-sintetico-01..03`,
+  embutidas no binário) num diretório **vazio** e roda a medição sobre elas —
+  para testar o formato antes de rotular os 20 reais. As seeds se declaram
+  sintéticas no próprio `gold.json` (`nota`) e nunca substituem rótulo do dono.
+- Diretório vazio sem `--seed` ⇒ erro acionável com o schema acima.
+
+```bash
+kira triage --eval tests/fixtures/triage_gold --llm ollama
+kira triage --eval ./gold --llm copilot --json      # automação
+kira triage --eval ./gold --seed                    # primeira vez, 3 fixtures sintéticas
 ```
 
 ## Instalação

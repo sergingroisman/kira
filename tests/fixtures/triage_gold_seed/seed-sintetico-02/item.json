@@ -1,0 +1,11 @@
+{
+  "id": 900002,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900002,
+    "System.WorkItemType": "Bug",
+    "System.Title": "SEED sintética 02 — listagem de pedidos fica lenta com muitos registros",
+    "System.State": "New",
+    "System.Description": "<div>Fixture sintética para testar o formato do --eval (não é um bug real). A tela de listagem demora minutos com poucos milhares de registros.</div>"
+  }
+}

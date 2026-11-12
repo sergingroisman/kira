@@ -42,6 +42,8 @@ Toda chamada ao `LlmBackend` precisa satisfazer as três condições:
 
 ```
 src/triage.rs        hipótese de causa raiz sobre contexto já montado
+src/eval.rs          o `--eval` (W2-bis) chama o triage item a item; a COMPARAÇÃO
+                     com o gold é determinística (similarity/basename) — nunca LLM juiz
 src/loop/            reavaliação de hipótese quando a verificação falha
 src/wiki/            consolidação de episódios em página (pós-M2)
 ```

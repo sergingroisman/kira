@@ -270,6 +270,13 @@ pub enum Error {
     /// site ever needs `unwrap`/`expect` on serialization.
     #[error("não foi possível serializar o relatório do contexto: {0}")]
     ContextReportJson(serde_json::Error),
+
+    /// The `kira triage --eval` measurement could not run (W2-bis, ADR-0018):
+    /// the directory/gold is malformed, an item failed, or the JSON report
+    /// could not be serialized. The String already carries the actionable
+    /// schema/example — the gate never measures with fake data.
+    #[error("{0}")]
+    Eval(String),
 }
 
 #[cfg(test)]

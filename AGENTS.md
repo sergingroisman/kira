@@ -52,6 +52,7 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 - Foundry tem duas superfícies pelo formato do endpoint (v1 termina em `/v1`: `{endpoint}/chat/completions` + `model` no corpo; legada: `/openai/deployments/{deployment}/chat/completions?api-version=...`); GPT-5/o-series recebem `max_completion_tokens` e NUNCA `temperature`/`max_tokens` (`KIRA_FOUNDRY_BODY_MODE=auto|classic|reasoning`).
 - Prompts são versados no repo, em `src/llm/prompts.rs` (constantes públicas, revisadas em PR) — sem framework de orquestração.
 - Nunca enviar segredos ao LLM: PAT, env e credenciais não entram no prompt. Além dos campos do work item, o prompt leva só o **context packer** (abaixo), já redigido por `redact`.
+- **O gate do M2 é medido por `kira triage --eval`** (ADR-0018): acerto determinístico contra o gold do dono (similaridade de tokens ≥ 0.50 para causa raiz + basename para arquivos), **sem LLM como juiz**; passou com ≥ 70%, o exit code traduz (0/1).
 - `kira triage` é somente leitura: o prompt do sistema nunca pede para escrever/editar código e o comando nunca altera o Azure DevOps.
 - `kira pr draft` é LOCAL: rascunho de PR montado só do store/findings/wiki/`--file` — evidência literal, nada inventado, sem rede, sem LLM, sem push e sem abrir PR.
 - Segredos no keyring: `src/credentials.rs` concentra `CredStore` (`OsKeyring` no runtime, `InMemory` só em testes). Testes NUNCA tocam o keyring do OS.

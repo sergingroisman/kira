@@ -18,12 +18,12 @@ use std::path::{Path, PathBuf};
 const COMPOSITION_ROOT: &str = "main.rs";
 
 /// Modules allowed to reference the LLM layer. Anything else is a regression.
-const ALLOWED_EXACT: [&str; 1] = ["triage.rs"];
+const ALLOWED_EXACT: [&str; 2] = ["triage.rs", "eval.rs"];
 const ALLOWED_PREFIXES: [&str; 2] = ["llm/", "loop/"];
 
 /// Modules allowed *and* required to justify each decision with the model.
 /// `wiki/` joins this list when it starts consolidating with an LLM (PR30).
-const MUST_JUSTIFY: [&str; 1] = ["triage.rs"];
+const MUST_JUSTIFY: [&str; 2] = ["triage.rs", "eval.rs"];
 
 const JUSTIFICATION: &str = "// LLM porque:";
 

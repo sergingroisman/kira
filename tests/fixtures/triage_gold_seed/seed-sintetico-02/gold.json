@@ -1,0 +1,6 @@
+{
+  "causa_raiz": "Consulta sem índice no banco de dados",
+  "arquivos": ["src/db/repositories.cs"],
+  "confianca": "media",
+  "nota": "fixture sintética (SEED) para testar o formato do --eval antes de rotular os 20 bugs reais do dono — substitua por rótulos verdadeiros"
+}
