@@ -22,7 +22,7 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira triage <id\|--file> --llm copilot` | Usa o **Copilot CLI** como LLM caro desta execução (spawn de `copilot -p`; exige `copilot auth login`) — ver [Backend LLM (ADR-0019)](#backend-llm-adr-0019). |
 | `kira triage <id\|--file> --llm foundry` | Usa o **Microsoft Foundry** (BYOK, HTTP OpenAI-compatible) no lugar do Ollama para esta execução — ver [Backend foundry](#backend-foundry-byok-microsoft-foundry) abaixo. |
 | `kira triage --eval <dir>` | **Gate M2 medido (ADR-0018)**: compara o triage com os rótulos do dono (`item.json` + `gold.json` por pasta) de forma **determinística, sem LLM juiz**; exit 0 = ≥70% (`PASSOU`), 1 = <70% ou erro. `--json` para automação; `--seed` copia 3 fixtures sintéticas num diretório vazio. Ver [seção do gate](#kira-triage---eval--o-gate-m2-medido-adr-0018). |
-| `kira setup [--org --project --name --pat --yes --backend --skip --reset]` | Wizard que **ensina** (ADR-0025): aula do PAT, menu (colar / env / pular), validação na hora e backend de IA com custo/dados; PAT vai para o keyring do OS (service `kira`). `--reset` apaga o que ele gravou de credencial (PAT, chave do Foundry) e o par público do Foundry, mantendo org/projeto/dev. |
+| `kira setup [--org --project --name --pat --yes --backend --skip --reset]` | Setup **local-first** (ADR-0030): nome do dev → projeto (raiz detectada + confirmar) → backend de IA (4 opções, com **"4) nenhuma por agora"** como default quando o Ollama não está instalado) → resumo do que funciona. PAT NÃO é pedido — credencial nasce em `kira connect <provider>`; `--pat` segue como atalho explícito (valida na hora e vai para o keyring do OS, service `kira`). `--reset` apaga o que ele gravou de credencial (PAT, chave do Foundry) e o par público do Foundry, mantendo org/projeto/dev. |
 | `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
 | `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
 | `kira note "<texto>"` / `kira note --remove N` | Fato do perfil do projeto (append-only, numerado). |
@@ -110,64 +110,68 @@ kira triage --eval ./gold --seed                    # primeira vez, 3 fixtures s
 cargo install --path .     # ou: cargo run -- <comando> direto do repo
 ```
 
-## Setup (o wizard que ensina — ADR-0025)
+## Setup (local-first — ADR-0030)
 
 Em TTY grande, `kira setup` abre um **wizard de tela cheia** (ADR-0034): trilha de
-etapas à esquerda (`Ambiente → Azure → Acesso → IA → Resumo`), painel à direita e
+etapas à esquerda (`Ambiente → Projeto → IA → Resumo`), painel à direita e
 rodapé de teclas. A etapa **Ambiente** só mostra o que foi detectado — SO,
 arquitetura, shell (`PowerShell`/`bash`/`zsh`), keyring, caminhos de config/store e
 quais ferramentas estão no PATH —, então você não responde o que a máquina já sabe.
-O segredo é digitado em raw mode (o terminal não ecoa nos três SOs, Windows
-incluído) e a tela mostra apenas `••••••••••••`. Flags explícitas (`--pat`, `--org`,
-`--project`, `--backend`, `--yes`, `--skip`, `--reset`) ou `--plain` mantêm o modo de
-texto linha a linha, que é o usado no CI.
+A etapa **Projeto** mostra a **raiz detectada** (mesma regra do store) e você só
+confirma. Flags explícitas (`--pat`, `--org`, `--project`, `--backend`, `--yes`,
+`--skip`, `--reset`) ou `--plain` mantêm o modo de texto linha a linha, que é o
+usado no CI.
 
-Cada passo do `kira setup` explica **o que é**, **por que pedimos**, **como
-fazer** e **o que acontece se pular** — nunca bloqueia, tudo tem caminho
-"depois".
+O KIRA funciona completo sem nenhuma integração externa — por isso o setup
+**não pede credencial** (ADR-0030): o PAT nasce em `kira connect <provider>`
+(MVP-3), no momento em que faz sentido. Nada é conectado implicitamente: PAT na
+env ou no keyring NÃO é usado pelo setup.
 
-- **Aula do PAT**: antes de pedir qualquer token, o setup imprime o bloco
-  "O que é um PAT" (senha descartável de leitura de Work Items, mais segura
-  que a senha) e o passo a passo com o link
-  `https://dev.azure.com/<sua-org>/_usersSettings/tokens`, escopo
-  **Work Items → Read**, validade 30/90 dias e o aviso de que o valor aparece
-  uma única vez. Com `--pat` a aula e o menu são pulados (o token já existe).
-- **Menu de 3 opções**: `1) Colar um PAT agora` (default em TTY),
-  `2) Usar AZURE_DEVOPS_PAT do ambiente`, `3) Pular por agora` (modo local:
-  `kira triage --file`). Fora de TTY ou com `--yes`: usa a env se existir,
-  senão pula — e imprime o pulado.
-- **Validação na hora** com mensagem explícita: `PAT ok — lê Work Items de
-  <org>/<projeto>`; 401 (expirado/copiado incompleto, com o link), 403 (sem
-  escopo) e "sem rede" (token salvo; rode `kira doctor` depois). 401/403 não
-  gravam nada. A entrada do token fica oculta (sem eco) **quando o sistema
-  permite** — no Unix o setup desliga o eco do terminal; no Windows, onde não
-  há mecanismo sem dependência nova, o prompt avisa que o valor pode aparecer
-  em vez de prometer ocultação. O valor nunca vai para log nem para prompt de
-  LLM, e as dicas de variável de ambiente saem na sintaxe do seu shell
-  (`export` no bash/zsh, `$VAR` no PowerShell, `setx` no cmd).
-- **Backend de IA** com custo e dados em cada opção e pré-requisito
+- **Nome do dev**: perguntado só em TTY ("Como devo te chamar?"), com o padrão
+  derivado do SO; `--name` troca sem perguntar. Nunca entra em prompt de LLM.
+- **Projeto**: a raiz é **detectada** (climb até `.git`/`Cargo.toml`/`package.json`,
+  a mesma do store) e o dono só confirma — nunca pergunta do zero.
+- **Backend de IA** com 4 opções, custo e dados em cada uma e pré-requisito
   verificado: `1) Ollama local` (0 custo, código não sai da máquina; confere
   `qwen3.5:4b` no `ollama list`), `2) Copilot CLI` (usa sua assinatura; mesma
   política da sua empresa; confere o PATH), `3) Microsoft Foundry` (BYOK:
   custo por token; pede endpoint + deployment + chave mascarada e faz UMA
-  chamada de teste barata reportando 401/403/404). O caro nunca é default nem
+  chamada de teste barata reportando 401/403/404) e **`4) nenhuma por agora`**
+  — o default quando o Ollama não está instalado. O caro nunca é default nem
   fallback silencioso.
-- **Resumo final** no formato `pronto: / pulado (dá para fazer depois): /
-  próximo passo:  kira scan` — com o PAT mascarado e o comando de retomada de
-  cada pendência.
+- **Atalho explícito `--pat`**: para quem já tem o token, `--org/--project/--pat`
+  validam na hora com mensagem explícita (`PAT ok — lê Work Items de
+  <org>/<projeto>`; 401 com o link; 403 sem escopo; "sem rede" salva e segue).
+  401/403 não gravam nada. A entrada fica oculta (sem eco) **quando o sistema
+  permite**, e o valor nunca vai para log nem para prompt de LLM.
+- **Resumo final** no formato do MVP-2:
+
+```
+pronto:
+  dev: <nome>
+  ia:  <backend ou "nenhuma">
+  store: <caminho>
+
+funciona agora:  scan · wiki · context · pr draft · dashboard
+desativado:      judge de item do board · read (board) · publicar PR
+ativar depois:   kira connect azure   (leitura de work items)
+                 kira setup --backend ollama
+próximo passo:   kira scan
+```
 
 ```bash
-kira setup                # interativo: aula do PAT, menu e backend de IA
-kira setup --yes          # não-interativo: usa AZURE_DEVOPS_PAT se existir, senão pula
-kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas
-kira setup --skip pat     # pula um passo (repetível: pat, ia)
+kira setup                # interativo: nome → projeto (raiz detectada) → IA → resumo
+kira setup --yes          # não-interativo: nunca bloqueia; sem Ollama escolhe "nenhuma" (e imprime o pulado)
+kira setup --org minha-org --project MeuProjeto --pat <token>   # atalho: valida e salva sem perguntas
+kira setup --skip ia      # pula um passo (repetível: ia)
 kira setup --name Sergin  # como o KIRA te chama (vai para config.toml, nunca para um LLM)
 kira setup --reset        # apaga PAT e chave do Foundry do keyring + endpoint/deployment do config.toml
 ```
 
-Org/projeto ficam em `~/.config/kira/config.toml` (0600) mesmo com o PAT
-pulado — a retomada (`kira setup --pat`) já tem contexto. O `kira doctor`
-repete a explicação curta do PAT quando ele está ausente ou inválido.
+Org/projeto vindos de flag/env vão para `~/.config/kira/config.toml` (0600) — o
+`kira connect azure` acha o contexto ali. O `kira doctor` mostra a linha
+`capacidades: nenhuma conectada (modo local)` (ou a lista das conectadas) e não
+ensina mais o PAT: a credencial é assunto de `kira connect`.
 
 Verificação:
 

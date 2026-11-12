@@ -82,35 +82,40 @@ enum Command {
         #[arg(long)]
         seed: bool,
     },
-    /// Save the Azure DevOps configuration and the PAT in the OS keyring
+    /// Configure the local-first setup: dev name → project root → IA backend
     #[command(
-        after_help = "Exemplos:\n  kira setup                # ensina o PAT, menu (colar / env / pular) e backend de IA\n  kira setup --yes          # não-interativo: usa AZURE_DEVOPS_PAT se existir, senão pula (e imprime o pulado)\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas\n  kira setup --skip pat     # pula um passo (repetível: pat, ia)\n  kira setup --reset        # remove o PAT e a chave do Foundry do keyring; org/projeto/dev ficam"
+        after_help = "Exemplos:\n  kira setup                # nome → projeto (raiz detectada) → backend de IA → resumo\n  kira setup --yes          # não-interativo: nunca bloqueia; sem Ollama escolhe \"nenhuma\" (e imprime o pulado)\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # atalho: valida e salva sem perguntas\n  kira setup --skip ia      # pula um passo (repetível: ia; 'pat' segue aceito como no-op)\n  kira setup --reset        # remove o PAT e a chave do Foundry do keyring; org/projeto/dev ficam\n\n  # A credencial do board nasce em `kira connect azure` (MVP-3), não aqui."
     )]
     Setup {
-        /// Azure DevOps organization name (skips the prompt)
+        /// Azure DevOps organization (atalho para quem já tem — nunca é
+        /// perguntada; vai ao config.toml para o `kira connect` achar)
         #[arg(long)]
         org: Option<String>,
-        /// Azure DevOps project name (skips the prompt)
+        /// Azure DevOps project (atalho para quem já tem — nunca é
+        /// perguntado; vai ao config.toml para o `kira connect` achar)
         #[arg(long)]
         project: Option<String>,
         /// Remove o PAT e a chave do Foundry do keyring (e endpoint/deployment
         /// do config.toml) e sai; idempotente
         #[arg(long)]
         reset: bool,
-        /// PAT passed straight on the command line (pula a aula, o menu e o
-        /// prompt; nunca é ecoado — só a máscara aparece)
+        /// Atalho EXPLÍCITO para quem já tem o token: valida na hora e salva
+        /// no keyring (precisa de --org/--project). Sem a flag o setup não
+        /// usa credencial nenhuma — a env `AZURE_DEVOPS_PAT` continua sendo
+        /// lida pelo `kira connect`; nunca é ecoado — só a máscara aparece
         #[arg(long)]
         pat: Option<String>,
-        /// Modo não-interativo: usa AZURE_DEVOPS_PAT do ambiente se existir,
-        /// senão pula o PAT (e imprime o pulado); nunca bloqueia
+        /// Modo não-interativo: nunca bloqueia; sem Ollama escolhe "nenhuma
+        /// por agora" e imprime o pulado
         #[arg(long)]
         yes: bool,
-        /// Backend de IA para verificar: ollama (default, barato) |
-        /// copilot | foundry. O caro NUNCA é default nem fallback
-        /// silencioso — só entra por escolha explícita
-        #[arg(long, value_parser = ["ollama", "copilot", "foundry"])]
+        /// Backend de IA para verificar: ollama (barato) | copilot | foundry
+        /// | nenhuma. O caro NUNCA é default nem fallback silencioso — só
+        /// entra por escolha explícita
+        #[arg(long, value_parser = ["ollama", "copilot", "foundry", "nenhuma"])]
         backend: Option<String>,
-        /// Pula um passo (repetível): `pat` ou `ia`
+        /// Pula um passo (repetível): `ia` (`pat` segue aceito como no-op —
+        /// o passo deixou de existir no fluxo local-first)
         #[arg(long)]
         skip: Vec<String>,
         /// How the dev wants to be called (saved as `dev_name` in config.toml;
@@ -1550,9 +1555,9 @@ async fn setup_command(
             return ExitCode::FAILURE;
         }
     };
-    // Modo interativo = stdin é um TTY: só nele o menu do PAT e do backend de
-    // IA aparecem; `--yes` força o modo não-interativo (usa a env do PAT se
-    // existir, senão pula — e imprime o pulado).
+    // Modo interativo = stdin é um TTY: só nele o nome é perguntado e o menu
+    // de IA aparece; `--yes` força o modo não-interativo (nunca bloqueia;
+    // sem Ollama escolhe "nenhuma" e imprime o pulado).
     let interactive = std::io::stdin().is_terminal();
     let options = setup::SetupOptions {
         org,
@@ -1564,6 +1569,9 @@ async fn setup_command(
         yes,
         backend,
         skip,
+        // Raiz do projeto DETECTADA (mesma regra do store): entra no passo
+        // "projeto" do fluxo local-first.
+        project_root: store::detect_project_root().map(|root| store::display_path(&root)),
         // O wizard de tela cheia entrega aqui o Foundry digitado no
         // formulário inline (ADR-0035); em modo texto vem `None`.
         foundry: None,
