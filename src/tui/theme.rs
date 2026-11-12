@@ -1,30 +1,33 @@
 //! Paleta do dashboard, com fallback mono obrigatório.
 //!
-//! ADR-0014 pede paleta própria ("fofinho/colorido") com **a mesma informação
-//! em texto** quando `NO_COLOR=1` ou o terminal não tem cor: aqui a troca é
-//! feita apenas trocando as cores por `Color::Reset` (padrão do terminal), sem
-//! tocar no conteúdo das linhas. Nada de degradar informação — persona §7.
+//! A casca vem do statui (MIT — `third_party/statui/NOTICE.md`): borda dupla,
+//! título entre `| |`, rodapé de teclas em chip. O que muda é a semântica:
+//! cada cor aqui representa um dado do KIRA (severidade, ok/falhou, ausência),
+//! nunca decoração. `mono()` não perde informação — severidade e resultado
+//! continuam escritos na célula, e o foco usa `REVERSED`/colchetes.
 
 use ratatui::style::Color;
 
-/// Uma paleta: só as cores que a casca usa hoje (W6-PR1 = cabeçalho + rodapé).
+/// Uma paleta: papéis de chrome + semântica de dados.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    /// Título do painel (nome do projeto).
+    /// Título de painel (nome da tela/registro).
     pub title: Color,
     /// Borda do painel em foco.
     pub border_focus: Color,
     /// Borda de painel fora de foco.
     pub border_idle: Color,
+    /// Régua de seção e brackets `| x |`.
+    pub rule: Color,
     /// Valores presentes (dado real do disco).
     pub value: Color,
     /// Valores ausentes (`—` + causa): destaque honesto, não erro gritado.
     pub missing: Color,
-    /// Rodapé de atalhos.
+    /// Rodapé de atalhos (descrição).
     pub footer: Color,
     /// Overlay de ajuda.
     pub help: Color,
-    /// Severidade critical (painel de achados, W6-PR2).
+    /// Severidade critical.
     pub critical: Color,
     /// Severidade high.
     pub high: Color,
@@ -32,14 +35,25 @@ pub struct Palette {
     pub medium: Color,
     /// Severidade low.
     pub low: Color,
+    /// Texto de resultado `ok` (sucesso).
+    pub ok: Color,
+    /// Texto de resultado `falhou` (execução que falhou).
+    pub failed: Color,
+    /// Fundo do chip de tecla do rodapé (padrão do statui).
+    pub key_bg: Color,
+    /// Texto do chip de tecla.
+    pub key_fg: Color,
+    /// Descrição do chip de tecla.
+    pub desc: Color,
 }
 
-/// Paleta colorida do KIRA (verde/roxo, tom fofinho do mascote futuro).
+/// Paleta colorida do KIRA (verde/roxo do mascote, sem virar arco-íris).
 pub const fn colorful() -> Palette {
     Palette {
         title: Color::Cyan,
         border_focus: Color::Green,
         border_idle: Color::DarkGray,
+        rule: Color::DarkGray,
         value: Color::Green,
         missing: Color::Yellow,
         footer: Color::DarkGray,
@@ -49,16 +63,24 @@ pub const fn colorful() -> Palette {
         high: Color::Yellow,
         medium: Color::Cyan,
         low: Color::DarkGray,
+        ok: Color::Green,
+        failed: Color::Red,
+        // Chip do statui: texto escuro sobre ciano (assinatura da casca).
+        key_bg: Color::Cyan,
+        key_fg: Color::Black,
+        desc: Color::DarkGray,
     }
 }
 
 /// Paleta mono: `Color::Reset` em tudo = a cor que o terminal já tem. A
-/// informação é a mesma linha por linha.
+/// informação é a mesma linha por linha; o chip usa `REVERSED` para continuar
+/// distinguível sem cor.
 pub const fn mono() -> Palette {
     Palette {
         title: Color::Reset,
         border_focus: Color::Reset,
         border_idle: Color::Reset,
+        rule: Color::Reset,
         value: Color::Reset,
         missing: Color::Reset,
         footer: Color::Reset,
@@ -69,7 +91,18 @@ pub const fn mono() -> Palette {
         high: Color::Reset,
         medium: Color::Reset,
         low: Color::Reset,
+        ok: Color::Reset,
+        failed: Color::Reset,
+        key_bg: Color::Reset,
+        key_fg: Color::Reset,
+        desc: Color::Reset,
     }
+}
+
+/// A paleta tem cor de verdade? O chip do rodapé precisa de `REVERSED` quando
+/// não há cor, para não virar texto solto.
+pub fn is_colorful(palette: &Palette) -> bool {
+    palette.key_bg != Color::Reset
 }
 
 /// Função pura: decide cor dado o `NO_COLOR` e o `TERM` já lidos.
@@ -125,7 +158,16 @@ mod tests {
         assert_eq!(mono.title, Color::Reset);
         assert_eq!(mono.missing, Color::Reset);
         assert_eq!(mono.footer, Color::Reset);
+        assert_eq!(mono.key_bg, Color::Reset);
+        assert_eq!(mono.rule, Color::Reset);
         // E a colorida tem cor de verdade, para o par nunca virar mono-mudo.
         assert_ne!(colorful().title, Color::Reset);
+        assert_ne!(colorful().key_bg, Color::Reset);
+    }
+
+    #[test]
+    fn colorful_is_detected_for_chip_rendering() {
+        assert!(is_colorful(&colorful()));
+        assert!(!is_colorful(&mono()));
     }
 }

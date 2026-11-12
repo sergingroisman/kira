@@ -296,7 +296,9 @@ async fn triage_item(
         // LOUDLY (CopilotMissing/CopilotAuth; FoundryMissingKey/...) — never a
         // silent fallback to Ollama.
         LlmKind::Copilot => TriageBackend::Copilot(CopilotBackend::from_env()?),
-        LlmKind::Foundry => TriageBackend::Foundry(FoundryBackend::from_env()?),
+        // `from_sources`: env > `config.toml`/keyring gravados por
+        // `kira setup` (ADR-0035) — configurar pelo wizard basta.
+        LlmKind::Foundry => TriageBackend::Foundry(FoundryBackend::from_sources()?),
     };
     let pack = context_pack(item, exclude_from_grep);
     let prompt = build_prompt_with_context(item, &pack);

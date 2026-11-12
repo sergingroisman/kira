@@ -66,6 +66,22 @@ pub struct Snapshot {
     pub last_scan_age_secs: Option<i64>,
     /// Data/hora local do último scan, já pronta para exibição.
     pub last_scan_local: Option<String>,
+    /// Achados por scan, MAIS ANTIGO → MAIS NOVO, lido do summary de cada
+    /// sessão `command = "scan"` da trilha ([`scan_series_from`]).
+    ///
+    /// O `findings.json` é sobrescrito a cada execução; a trilha é a única
+    /// memória histórica, e o número vem do texto que o próprio `kira scan`
+    /// gravou (`scan::findings_count_in_summary`) — nunca de estimativa.
+    pub scan_series: Vec<u64>,
+    /// Causa quando a série não tem pontos suficientes para uma tendência.
+    pub scan_series_note: Option<String>,
+    /// Arquivos hoje no índice de retrieval do repositório (`repo_file`).
+    /// `None` = índice não existe/ilegível; a causa vive em `index_note`.
+    pub index_files: Option<usize>,
+    /// Teto de arquivos do índice (`KIRA_INDEX_MAX_FILES`, default 5000).
+    pub index_cap: usize,
+    /// Causa quando o índice não pôde ser contado.
+    pub index_note: Option<String>,
 }
 
 /// Constante exibida como backend LLM default.
@@ -134,17 +150,20 @@ fn load_store(snapshot: &mut Snapshot) {
                     .last_sessions(&project.id, SESSION_HISTORY_LIMIT)
                     .and_then(|sessions| {
                         // A MESMA conexão read-only alimenta o painel de
-                        // wiki (W6-PR4) — nenhuma segunda abertura, nenhum
-                        // write no disco.
-                        store
-                            .wiki_pages()
-                            .map(|wiki| Some((project, sessions, wiki)))
+                        // wiki (W6-PR4) e a contagem do índice de retrieval —
+                        // nenhuma segunda abertura, nenhum write no disco.
+                        store.wiki_pages().map(|wiki| {
+                            // `ok()` de propósito: índice ausente é dado
+                            // ausente (`—` com causa), nunca erro do painel.
+                            let index_files = store.repo_file_count(&project.id).ok();
+                            Some((project, sessions, wiki, index_files))
+                        })
                     })
             })
         })
     });
     match opened {
-        Ok(Some((project, sessions, wiki))) => {
+        Ok(Some((project, sessions, wiki, index_files))) => {
             if let Some(scan_session) = sessions
                 .iter()
                 .find(|session| session.command == "scan")
@@ -157,6 +176,20 @@ fn load_store(snapshot: &mut Snapshot) {
             snapshot.session_rows = session_rows_from(&sessions);
             if sessions.is_empty() {
                 snapshot.sessions_note = Some("store sem sessões".to_string());
+            }
+            // Série e índice saem do MESMO recorte já lido: nenhuma query nova.
+            snapshot.scan_series = scan_series_from(&snapshot.session_rows);
+            if snapshot.scan_series.len() < 2 {
+                snapshot.scan_series_note = Some(
+                    "menos de 2 scans na trilha — rode `kira scan` de novo para ver tendência"
+                        .to_string(),
+                );
+            }
+            snapshot.index_files = index_files.and_then(|count| usize::try_from(count).ok());
+            snapshot.index_cap = crate::context::index::max_files_from_env();
+            if snapshot.index_files.is_none() {
+                snapshot.index_note =
+                    Some("índice do repositório vazio — rode `kira context`".to_string());
             }
             snapshot.project = Some(project);
             apply_wiki(snapshot, Ok(wiki), &root);
@@ -268,6 +301,12 @@ pub struct FindingRow {
     /// Severidade em minúsculas (exibição; o dado cru fica no findings.json).
     pub severity: String,
     pub tool: String,
+    /// Regra do scan (`vulnerable` | `outdated`) — entra no detalhe.
+    pub rule: String,
+    /// Pacote afetado (coluna PACOTE da tabela).
+    pub package: String,
+    /// Versão do pacote encontrada no lockfile.
+    pub version: String,
     pub path: String,
     /// Linha quando o path veio como `arquivo:N`; `None` = sem linha conhecida.
     pub line: Option<u32>,
@@ -287,6 +326,16 @@ impl FindingRow {
         match self.line {
             Some(line) => format!("{}:{line}", self.path),
             None => self.path.clone(),
+        }
+    }
+
+    /// PACOTE da tabela: `nome versão`; só o nome quando a versão veio vazia
+    /// (nunca inventamos uma versão).
+    pub fn package_line(&self) -> String {
+        if self.version.is_empty() {
+            self.package.clone()
+        } else {
+            format!("{} {}", self.package, self.version)
         }
     }
 }
@@ -333,6 +382,9 @@ pub fn rows_from(findings: Vec<Finding>) -> Vec<FindingRow> {
             FindingRow {
                 severity,
                 tool: finding.tool.trim().to_string(),
+                rule: finding.rule.trim().to_string(),
+                package: finding.package.trim().to_string(),
+                version: finding.version.trim().to_string(),
                 path,
                 line,
                 fingerprint_short: fingerprint.chars().take(8).collect(),
@@ -355,6 +407,16 @@ pub fn rows_from(findings: Vec<Finding>) -> Vec<FindingRow> {
 /// Contagem por severidade, na ordem canônica do painel (critical→low com
 /// zeros visíveis) + severidades fora do padrão em ordem alfabética.
 pub fn severity_counts(rows: &[FindingRow]) -> Vec<(String, usize)> {
+    severity_counts_of(rows.iter())
+}
+
+/// Contagem por severidade sobre uma lista FILTRADA de referências (a tabela
+/// não clona linhas por frame).
+pub fn severity_counts_refs(rows: &[&FindingRow]) -> Vec<(String, usize)> {
+    severity_counts_of(rows.iter().copied())
+}
+
+fn severity_counts_of<'a>(rows: impl Iterator<Item = &'a FindingRow>) -> Vec<(String, usize)> {
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for row in rows {
         *counts.entry(row.severity.clone()).or_default() += 1;
@@ -379,6 +441,15 @@ pub fn severity_counts(rows: &[FindingRow]) -> Vec<(String, usize)> {
 /// Contagem por ferramenta, alfabética (determinismo; o painel mostra
 /// `ferramentas: audit 2, dotnet 1` quando há achados).
 pub fn tool_counts(rows: &[FindingRow]) -> Vec<(String, usize)> {
+    tool_counts_of(rows.iter())
+}
+
+/// Contagem por ferramenta sobre uma lista FILTRADA de referências.
+pub fn tool_counts_refs(rows: &[&FindingRow]) -> Vec<(String, usize)> {
+    tool_counts_of(rows.iter().copied())
+}
+
+fn tool_counts_of<'a>(rows: impl Iterator<Item = &'a FindingRow>) -> Vec<(String, usize)> {
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for row in rows {
         *counts.entry(row.tool.clone()).or_default() += 1;
@@ -386,10 +457,51 @@ pub fn tool_counts(rows: &[FindingRow]) -> Vec<(String, usize)> {
     counts.into_iter().collect()
 }
 
+/// Filtro em MEMÓRIA da tela de Achados (função pura): severidade e/ou
+/// ferramenta. Nada é reescrito no `findings.json`; a lista filtrada só muda o
+/// que a tabela mostra e o que o inspetor abre.
+pub fn filter_findings<'a>(
+    rows: &'a [FindingRow],
+    severity: Option<&str>,
+    tool: Option<&str>,
+) -> Vec<&'a FindingRow> {
+    rows.iter()
+        .filter(|row| severity.is_none_or(|wanted| row.severity == wanted))
+        .filter(|row| tool.is_none_or(|wanted| row.tool == wanted))
+        .collect()
+}
+
+/// Severidades PRESENTES no snapshot, na ordem canônica — é por elas que o `f`
+/// cicla (nunca uma lista fixa com valores que não existem no projeto).
+pub fn severities_present(rows: &[FindingRow]) -> Vec<String> {
+    severity_counts(rows)
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(severity, _)| severity)
+        .collect()
+}
+
+/// Ferramentas PRESENTES no snapshot, em ordem alfabética (ciclo do `m`).
+pub fn tools_present(rows: &[FindingRow]) -> Vec<String> {
+    tool_counts(rows)
+        .into_iter()
+        .map(|(tool, _)| tool)
+        .collect()
+}
+
 /// Cabeçalho de contagem do painel: `critical 1 · high 2 · medium 0 · low 0`
 /// (severidades fora do padrão entram no fim, também com ` · `).
 pub fn count_header_line(rows: &[FindingRow]) -> String {
-    severity_counts(rows)
+    header_of(severity_counts(rows))
+}
+
+/// Contagem canônica sobre a lista FILTRADA da tela de Achados.
+pub fn count_header_line_refs(rows: &[&FindingRow]) -> String {
+    header_of(severity_counts_refs(rows))
+}
+
+fn header_of(counts: Vec<(String, usize)>) -> String {
+    counts
         .iter()
         .map(|(severity, count)| format!("{severity} {count}"))
         .collect::<Vec<_>>()
@@ -399,7 +511,15 @@ pub fn count_header_line(rows: &[FindingRow]) -> String {
 /// Linha de ferramentas do painel: `ferramentas: audit 2, dotnet 1`; vazia
 /// quando não há achados (o chamador omite a linha inteira).
 pub fn tools_line(rows: &[FindingRow]) -> String {
-    let counts = tool_counts(rows);
+    tools_text(tool_counts(rows))
+}
+
+/// Linha de ferramentas sobre a lista FILTRADA da tela de Achados.
+pub fn tools_line_refs(rows: &[&FindingRow]) -> String {
+    tools_text(tool_counts_refs(rows))
+}
+
+fn tools_text(counts: Vec<(String, usize)>) -> String {
     if counts.is_empty() {
         return String::new();
     }
@@ -442,15 +562,16 @@ pub fn findings_lines(snapshot: &Snapshot) -> Vec<String> {
             tools_line(rows)
         ),
         format!(
-            "{:<10} {:<12} {:<26}{}",
-            "SEVERIDADE", "FERRAMENTA", "LOCAL", "RESUMO"
+            "{:<10} {:<12} {:<24} {:<22}{}",
+            "SEVERIDADE", "FERRAMENTA", "PACOTE", "LOCAL", "RESUMO"
         ),
     ];
     for row in rows {
         lines.push(format!(
-            "{:<10} {:<12} {:<26}{}",
+            "{:<10} {:<12} {:<24} {:<22}{}",
             row.severity,
             row.tool,
+            row.package_line(),
             row.location(),
             row.message_first_line
         ));
@@ -465,11 +586,91 @@ pub fn detail_lines(row: &FindingRow) -> Vec<String> {
     vec![
         format!("severidade: {}", row.severity),
         format!("ferramenta: {}", row.tool),
+        format!("regra: {}", row.rule),
+        format!("pacote: {}", row.package_line()),
         format!("local: {}", row.location()),
         format!("fingerprint: {}", row.fingerprint),
         String::from("mensagem:"),
         row.message.clone(),
     ]
+}
+
+/// Quantos scans entram na sparkline de tendência (14 pontos cabem em 14
+/// colunas sem apertar; mais que isso a série vira ruído no painel de 80).
+pub const SCAN_TREND_POINTS: usize = 14;
+
+/// Série histórica de achados por scan, MAIS ANTIGO → MAIS NOVO.
+///
+/// Função PURA sobre as sessões do snapshot: filtra `command == "scan"`,
+/// inverte (a lista vem da mais recente para a mais antiga), lê a contagem do
+/// texto que o próprio `kira scan` gravou e guarda os últimos
+/// [`SCAN_TREND_POINTS`]. Sessão de scan com summary fora do formato é
+/// DESCARTADA — um ponto inventado mentiria sobre a evolução do risco.
+pub fn scan_series_from(rows: &[SessionLine]) -> Vec<u64> {
+    let mut ordered: Vec<&SessionLine> = rows.iter().filter(|row| row.command == "scan").collect();
+    ordered.reverse();
+    let mut series: Vec<u64> = ordered
+        .iter()
+        .filter_map(|row| crate::scan::findings_count_in_summary(&row.summary))
+        .map(|count| u64::try_from(count).unwrap_or(u64::MAX))
+        .collect();
+    if series.len() > SCAN_TREND_POINTS {
+        series.drain(..series.len() - SCAN_TREND_POINTS);
+    }
+    series
+}
+
+/// Linha de texto da tendência (`tendência (5 scans): 3 5 4 4 7`).
+///
+/// `None` quando não há série suficiente: o `--snapshot` omite em vez de
+/// imprimir uma tendência de um ponto só, que não é tendência.
+pub fn scan_trend_line(snapshot: &Snapshot) -> Option<String> {
+    if snapshot.scan_series.len() < 2 {
+        return None;
+    }
+    let values = snapshot
+        .scan_series
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "tendência ({} scans, mais antigo primeiro): {values}",
+        snapshot.scan_series.len()
+    ))
+}
+
+/// Uso do índice de retrieval: `(arquivos, teto)`, ou `None` sem contagem.
+pub fn index_usage(snapshot: &Snapshot) -> Option<(usize, usize)> {
+    let files = snapshot.index_files?;
+    let cap = snapshot.index_cap.max(1);
+    Some((files, cap))
+}
+
+/// Linha de texto do índice (`índice do repositório: 812/5000 arquivos`).
+///
+/// Sem contagem, devolve a CAUSA (índice vazio ⇒ comando que conserta), nunca
+/// um `0/5000` que fingiria um repositório sem arquivos.
+pub fn index_line(snapshot: &Snapshot) -> String {
+    match index_usage(snapshot) {
+        Some((files, cap)) => format!("índice do repositório: {files}/{cap} arquivos"),
+        None => format!(
+            "índice do repositório: — ({})",
+            snapshot
+                .index_note
+                .as_deref()
+                .unwrap_or("índice não existe — rode `kira context`")
+        ),
+    }
+}
+
+/// Contagens de severidade PRESENTES (só o que tem achado), na ordem canônica:
+/// é o dado das barras do Resumo — barra de zero não tem o que comparar.
+pub fn severity_bars(snapshot: &Snapshot) -> Vec<(String, usize)> {
+    severity_counts(&snapshot.finding_rows)
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .collect()
 }
 
 /// Quantas sessões o painel de sessões mostra (spec W6: últimas N, default 50).
@@ -493,6 +694,10 @@ pub struct SessionLine {
     /// Id AUTOINCREMENT da store (maior = mais recente).
     pub id: i64,
     pub command: String,
+    /// Argumentos gravados pela trilha (`"4821"`, `"4821 --json"`). Serve para
+    /// a folha de alvo do dashboard listar work items já conhecidos — é o
+    /// único lugar onde a TUI descobre id sem tocar rede nem o board.
+    pub args: String,
     /// Modelo usado pelo comando; `None`/vazio = comando sem LLM.
     pub model: Option<String>,
     /// `started_at` em unix (s) — `None` = stamp não-parseável (mostra `—`).
@@ -524,6 +729,7 @@ pub fn session_rows_from(sessions: &[store::SessionRow]) -> Vec<SessionLine> {
             SessionLine {
                 id: session.id,
                 command: session.command.trim().to_string(),
+                args: session.args.trim().to_string(),
                 model: session
                     .model
                     .as_ref()
@@ -556,6 +762,67 @@ pub fn humanize_age(now_secs: i64, then_secs: i64) -> String {
 /// Coluna QUANDO da tabela: idade relativa pura sobre o `now` do snapshot —
 /// `—` quando o snapshot não tem relógio ou o stamp não parseou (honestidade,
 /// nunca "há 1970 dias" de mentira).
+/// Data de uma sessão, usada como separador de dia no painel.
+///
+/// Usa o `local_started_at` que a store já preenche (`YYYY-MM-DD HH:MM:SS`);
+/// sem ele, cai para a data UTC do `started_at`. `—` quando nenhum dos dois
+/// existe — nunca uma data inventada.
+pub fn session_day(line: &SessionLine) -> String {
+    line.local_started_at
+        .as_deref()
+        .filter(|value| value.len() >= 10)
+        .map(|value| value.chars().take(10).collect())
+        .or_else(|| {
+            line.started_at
+                .get(..10)
+                .filter(|value| value.len() == 10)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// Agrupa sessões CONSECUTIVAS por dia (a lista já vem mais recente primeiro),
+/// devolvendo `(dia, índices)` — os índices são a posição no slice original,
+/// o que mantém a seleção do app válida.
+pub fn session_days(rows: &[SessionLine]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let day = session_day(row);
+        match groups.last_mut() {
+            Some((current, indices)) if *current == day => indices.push(index),
+            _ => groups.push((day, vec![index])),
+        }
+    }
+    groups
+}
+
+/// Janela da sparkline de ritmo (dias).
+pub const ACTIVITY_DAYS: usize = 14;
+
+/// Sessões por dia na janela de [`ACTIVITY_DAYS`], mais antigo primeiro.
+///
+/// Conta apenas as sessões que o snapshot carrega (as últimas 50 da trilha) —
+/// é o que a tela pode afirmar sem mentir. Sem `now`, devolve vazio (nada de
+/// inventar escala).
+pub fn activity_per_day(rows: &[SessionLine], now_secs: Option<i64>) -> Vec<u64> {
+    let Some(now) = now_secs else {
+        return Vec::new();
+    };
+    const DAY: i64 = 86_400;
+    let today = now.div_euclid(DAY);
+    let mut counts = vec![0u64; ACTIVITY_DAYS];
+    for row in rows {
+        let Some(stamp) = row.started_unix else {
+            continue;
+        };
+        let delta = today - stamp.div_euclid(DAY);
+        if (0..ACTIVITY_DAYS as i64).contains(&delta) {
+            counts[ACTIVITY_DAYS - 1 - delta as usize] += 1;
+        }
+    }
+    counts
+}
+
 pub fn session_age_line(line: &SessionLine, now_secs: Option<i64>) -> String {
     match (now_secs, line.started_unix) {
         (Some(now), Some(then)) => humanize_age(now, then),
@@ -772,6 +1039,55 @@ pub fn filter_pages<'a>(pages: &'a [WikiPage], needle: &str) -> Vec<&'a WikiPage
             fold_text(&page.title).contains(&folded) || fold_text(&page.content).contains(&folded)
         })
         .collect()
+}
+
+/// Chave ESTÁVEL do registro selecionado — o que impede o `r` (e o fim de uma
+/// execução) de trocar de linha debaixo do dedo do dono.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionKey {
+    /// Fingerprint completo do achado (o único id estável entre dois scans).
+    Finding(String),
+    /// Id AUTOINCREMENT da sessão.
+    Session(i64),
+    /// Slug da página da wiki.
+    Wiki(String),
+}
+
+/// Ordem canônica dos tipos de página da wiki (ADR-0013).
+pub const WIKI_KIND_ORDER: [&str; 5] = ["contexto", "decisoes", "padroes", "glossario", "bug"];
+
+/// Reordena as páginas por tipo canônico, preservando a ordem por slug dentro
+/// de cada tipo. Tipos fora do padrão vão no fim, em ordem alfabética — a
+/// MESMA ordem que o widget desenha, para a seleção (`j`/`k`) seguir a tela.
+pub fn wiki_ordered<'a>(pages: &[&'a WikiPage]) -> Vec<&'a WikiPage> {
+    let mut ordered = Vec::with_capacity(pages.len());
+    for kind in WIKI_KIND_ORDER {
+        ordered.extend(pages.iter().copied().filter(|page| page.kind == kind));
+    }
+    let mut extras: Vec<&str> = pages
+        .iter()
+        .map(|page| page.kind.as_str())
+        .filter(|kind| !WIKI_KIND_ORDER.contains(kind))
+        .collect();
+    extras.sort_unstable();
+    extras.dedup();
+    for kind in extras {
+        ordered.extend(pages.iter().copied().filter(|page| page.kind == kind));
+    }
+    ordered
+}
+
+/// Agrupa páginas CONSECUTIVAS por tipo (a lista já vem de [`wiki_ordered`]),
+/// devolvendo `(tipo, índices)` — índices na lista recebida.
+pub fn wiki_groups(pages: &[&WikiPage]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, page) in pages.iter().enumerate() {
+        match groups.last_mut() {
+            Some((kind, indices)) if kind == &page.kind => indices.push(index),
+            _ => groups.push((page.kind.clone(), vec![index])),
+        }
+    }
+    groups
 }
 
 /// Normaliza um texto para comparação: minúsculas + tirar acento comum
@@ -1051,6 +1367,88 @@ pub fn header_lines(snapshot: &Snapshot) -> Vec<String> {
     lines
 }
 
+/// Seções da tela **Resumo** (home do dashboard), puras sobre o snapshot.
+///
+/// A ordem responde às perguntas de quem mantém o repositório: qual o risco
+/// (Achados + Primeiros achados), o que aconteceu por último (Sessões
+/// recentes) e o que falta plugar (Pendências). Nenhuma seção inventa texto de
+/// análise: são contagens, campos do snapshot e a causa honesta do dado
+/// ausente. Seções sem dado são OMITIDAS quando repetiriam a mesma causa.
+pub fn resumo_sections(snapshot: &Snapshot) -> Vec<(String, Vec<String>)> {
+    let rows = &snapshot.finding_rows;
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+
+    // Risco: contagem canônica (zeros visíveis) + ferramentas do último scan.
+    let mut achados = Vec::new();
+    if rows.is_empty() {
+        achados.push(empty_findings_line(snapshot));
+    } else {
+        achados.push(format!(
+            "{} · total {}",
+            count_header_line(rows),
+            rows.len()
+        ));
+        let tools = tools_line(rows);
+        if !tools.is_empty() {
+            achados.push(tools);
+        }
+    }
+    sections.push(("Achados".to_string(), achados));
+
+    // Evidência imediata: os primeiros da ordem canônica, sem análise.
+    if !rows.is_empty() {
+        let mut lines = vec![format!(
+            "{:<10} {:<12} {:<26}{}",
+            "SEVERIDADE", "FERRAMENTA", "LOCAL", "RESUMO"
+        )];
+        for row in rows.iter().take(5) {
+            lines.push(format!(
+                "{:<10} {:<12} {:<26}{}",
+                one_line(&row.severity, 10),
+                one_line(&row.tool, 12),
+                one_line(&row.location(), 26),
+                one_line(&row.message_first_line, 60),
+            ));
+        }
+        let rest = rows.len().saturating_sub(5);
+        if rest > 0 {
+            lines.push(format!("… {rest} mais em 2 Achados"));
+        }
+        sections.push(("Primeiros achados".to_string(), lines));
+    }
+
+    // Atividade: últimas sessões gravadas na trilha (mais recente primeiro).
+    if !snapshot.session_rows.is_empty() {
+        let mut lines = vec![format!(
+            "{:<12} {:<14} {:<10} {:<7} {:<6}{}",
+            "QUANDO", "COMANDO", "MODELO", "DURAÇÃO", "OK", "RESUMO"
+        )];
+        for row in snapshot.session_rows.iter().take(4) {
+            lines.push(format!(
+                "{:<12} {:<14} {:<10} {:<7} {:<6}{}",
+                one_line(&session_age_line(row, snapshot.now_secs), 12),
+                one_line(&row.command, 14),
+                one_line(row.model.as_deref().unwrap_or("—"), 10),
+                format_duration_ms(row.duration_ms),
+                if row.ok { "ok" } else { "falhou" },
+                one_line(&row.summary_first_line, 60),
+            ));
+        }
+        sections.push(("Sessões recentes".to_string(), lines));
+    }
+
+    // O que falta plugar: causa integral (texto, aceita várias linhas).
+    let mut pendings = pending_causes(snapshot);
+    if pendings.is_empty() {
+        pendings.push("— nenhuma pendência registrada".to_string());
+    } else {
+        pendings.truncate(3);
+    }
+    sections.push(("Pendências".to_string(), pendings));
+
+    sections
+}
+
 /// Rodapé de 1 linha com as teclas — mesmo texto no TUI e no snapshot.
 /// `q sair` é SEMPRE o primeiro item (contrato do dono) e `? ajuda` o último.
 pub fn footer_line() -> String {
@@ -1063,13 +1461,13 @@ pub fn footer_line() -> String {
 /// `None` = painel tem conteúdo (ou é o cabeçalho, que nunca está vazio).
 pub fn empty_panel_hint(
     snapshot: &Snapshot,
-    panel: crate::tui::app::Panel,
+    screen: crate::tui::app::Screen,
     findings_len: usize,
     sessions_len: usize,
     wiki_len: usize,
 ) -> Option<String> {
-    match panel {
-        crate::tui::app::Panel::Findings if findings_len == 0 => {
+    match screen {
+        crate::tui::app::Screen::Achados if findings_len == 0 => {
             if snapshot.findings == Some(0) {
                 Some("0 achados no último scan".to_string())
             } else {
@@ -1081,14 +1479,14 @@ pub fn empty_panel_hint(
                 )
             }
         }
-        crate::tui::app::Panel::Sessions if sessions_len == 0 => Some(
+        crate::tui::app::Screen::Sessoes if sessions_len == 0 => Some(
             snapshot
                 .sessions_note
                 .clone()
                 .or_else(|| snapshot.store_note.clone())
                 .unwrap_or_else(|| "store sem sessões".to_string()),
         ),
-        crate::tui::app::Panel::Wiki if wiki_len == 0 => {
+        crate::tui::app::Screen::Wiki if wiki_len == 0 => {
             if snapshot.wiki_rows.is_empty() {
                 // Índice vazio de verdade: a causa é o comando que conserta.
                 Some(
@@ -1118,6 +1516,14 @@ pub fn text_report(snapshot: &Snapshot) -> String {
         text.push_str(&line);
         text.push('\n');
     }
+    // Tendência e índice: os dois números que o Resumo desenha em barra também
+    // existem em texto (o `--snapshot` é a saída canônica para CI e pipe).
+    if let Some(line) = scan_trend_line(snapshot) {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text.push_str(&index_line(snapshot));
+    text.push('\n');
     // Pendências (causa INTEGRAL, pode ter várias linhas — é texto, não
     // painel): o cabeçalho corta em 100 chars, o snapshot não mente.
     let pendings = pending_causes(snapshot);
@@ -1414,15 +1820,15 @@ mod tests {
         // painel — nunca inventada.
         let empty = Snapshot::default();
         assert_eq!(
-            empty_panel_hint(&empty, crate::tui::app::Panel::Wiki, 0, 0, 0),
+            empty_panel_hint(&empty, crate::tui::app::Screen::Wiki, 0, 0, 0),
             Some("wiki vazia — rode kira wiki reindex".to_string())
         );
         assert_eq!(
-            empty_panel_hint(&empty, crate::tui::app::Panel::Sessions, 0, 0, 0),
+            empty_panel_hint(&empty, crate::tui::app::Screen::Sessoes, 0, 0, 0),
             Some("store sem sessões".to_string())
         );
         assert_eq!(
-            empty_panel_hint(&empty, crate::tui::app::Panel::Findings, 0, 0, 0),
+            empty_panel_hint(&empty, crate::tui::app::Screen::Achados, 0, 0, 0),
             Some("nunca rodou kira scan".to_string())
         );
         // Arquivo presente e vazio: contagem zero explícita (sem `—` falso).
@@ -1431,17 +1837,17 @@ mod tests {
             ..Snapshot::default()
         };
         assert_eq!(
-            empty_panel_hint(&zero, crate::tui::app::Panel::Findings, 0, 0, 0),
+            empty_panel_hint(&zero, crate::tui::app::Screen::Achados, 0, 0, 0),
             Some("0 achados no último scan".to_string())
         );
         // Cabeçalho nunca tem dica (não é lista); painel com conteúdo idem.
         assert_eq!(
-            empty_panel_hint(&empty, crate::tui::app::Panel::Header, 0, 0, 0),
+            empty_panel_hint(&empty, crate::tui::app::Screen::Resumo, 0, 0, 0),
             None
         );
         let full = full_snapshot();
         assert_eq!(
-            empty_panel_hint(&full, crate::tui::app::Panel::Wiki, 2, 2, 2),
+            empty_panel_hint(&full, crate::tui::app::Screen::Wiki, 2, 2, 2),
             None
         );
         // Wiki COM páginas, mas a lista FILTRADA vazia: a dica é a agulha.
@@ -1456,7 +1862,7 @@ mod tests {
             ..full
         };
         assert_eq!(
-            empty_panel_hint(&with_pages, crate::tui::app::Panel::Wiki, 2, 2, 0),
+            empty_panel_hint(&with_pages, crate::tui::app::Screen::Wiki, 2, 2, 0),
             Some("a busca não casou nada — Backspace apaga a agulha".to_string())
         );
         // Store ausente: a causa concreta da store (nunca genérica).
@@ -1467,7 +1873,7 @@ mod tests {
             ..Snapshot::default()
         };
         assert_eq!(
-            empty_panel_hint(&absent, crate::tui::app::Panel::Wiki, 0, 0, 0),
+            empty_panel_hint(&absent, crate::tui::app::Screen::Wiki, 0, 0, 0),
             Some("nenhuma trilha em store.db — rode `kira scan` ou `kira doctor`".to_string())
         );
     }
@@ -1747,6 +2153,76 @@ mod tests {
     }
 
     #[test]
+    fn session_days_group_consecutive_dates_and_activity_counts_real_sessions() {
+        let line = |id: i64, day: &str, started_unix: i64| SessionLine {
+            id,
+            command: "scan".to_string(),
+            args: String::new(),
+            model: None,
+            started_unix: Some(started_unix),
+            started_at: format!("{day}T09:00:00Z"),
+            local_started_at: Some(format!("{day} 09:00:00")),
+            duration_ms: 1_200,
+            ok: true,
+            summary_first_line: "x".to_string(),
+            summary: "x".to_string(),
+        };
+        let rows = vec![
+            line(3, "2026-11-11", 1_762_861_200),
+            line(2, "2026-11-11", 1_762_861_100),
+            line(1, "2026-11-10", 1_762_861_200 - 86_400),
+        ];
+
+        let groups = session_days(&rows);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(groups[0].0, "2026-11-11");
+        assert_eq!(groups[0].1, vec![0, 1]);
+        assert_eq!(groups[1].0, "2026-11-10");
+        assert_eq!(groups[1].1, vec![2]);
+
+        // Ritmo: 2 sessões hoje, 1 ontem, zeros no resto da janela.
+        let activity = activity_per_day(&rows, Some(1_762_861_380));
+        assert_eq!(activity.len(), ACTIVITY_DAYS);
+        assert_eq!(activity[ACTIVITY_DAYS - 1], 2);
+        assert_eq!(activity[ACTIVITY_DAYS - 2], 1);
+        assert_eq!(activity[0], 0);
+        // Sem `now`: janela vazia (nada de escala inventada).
+        assert!(activity_per_day(&rows, None).is_empty());
+    }
+
+    #[test]
+    fn session_day_falls_back_to_the_utc_date_then_to_a_dash() {
+        let with_local = SessionLine {
+            id: 1,
+            command: "scan".to_string(),
+            args: String::new(),
+            model: None,
+            started_unix: None,
+            started_at: "2026-11-11T09:00:00Z".to_string(),
+            local_started_at: Some("2026-11-12 23:00:00".to_string()),
+            duration_ms: 1,
+            ok: true,
+            summary_first_line: String::new(),
+            summary: String::new(),
+        };
+        assert_eq!(
+            session_day(&with_local),
+            "2026-11-12",
+            "usa o horário local"
+        );
+        let only_utc = SessionLine {
+            local_started_at: None,
+            ..with_local.clone()
+        };
+        assert_eq!(session_day(&only_utc), "2026-11-11", "cai para a data UTC");
+        let neither = SessionLine {
+            started_at: String::new(),
+            ..only_utc
+        };
+        assert_eq!(session_day(&neither), "—", "nunca inventa data");
+    }
+
+    #[test]
     fn session_age_line_falls_back_to_dash_without_clock_or_stamp() {
         // Stamp que a store não escreve (o formato real é RFC 3339 UTC):
         // sem idade inventada — `—` honesto.
@@ -1976,6 +2452,33 @@ mod tests {
     }
 
     #[test]
+    fn wiki_is_ordered_by_canonical_kind_and_groups_stay_consecutive() {
+        // Entrada fora de ordem: bugs primeiro, contexto depois. A função
+        // devolve contexto primeiro (ordem canônica) sem perder a ordem por
+        // slug dentro do tipo.
+        let bug = fixture_page("bugs/1", "bug", "Bug 1", "2026-11-11T09:00:00Z", "conteúdo");
+        let contexto = fixture_page(
+            "contexto",
+            "contexto",
+            "Contexto",
+            "2026-11-11T09:00:00Z",
+            "conteúdo",
+        );
+        let bug_two = fixture_page("bugs/2", "bug", "Bug 2", "2026-11-11T09:00:00Z", "conteúdo");
+        let refs = vec![&bug, &contexto, &bug_two];
+        let ordered = wiki_ordered(&refs);
+        let kinds: Vec<&str> = ordered.iter().map(|page| page.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["contexto", "bug", "bug"]);
+
+        let groups = wiki_groups(&ordered);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(groups[0].0, "contexto");
+        assert_eq!(groups[0].1, vec![0]);
+        assert_eq!(groups[1].0, "bug");
+        assert_eq!(groups[1].1, vec![1, 2]);
+    }
+
+    #[test]
     fn wiki_lines_show_kind_title_and_relative_age() {
         // now = 2026-11-11T09:00:00Z (1_794_387_600) + 3 dias ⇒ "há 3 dias"
         // determinístico (o stamp é PARSEADO, o relógio é fixo do teste).
@@ -2058,5 +2561,145 @@ mod tests {
         assert!(report.contains("■ Decisão"), "{report}");
         assert!(report.contains("• item"), "{report}");
         assert!(!report.contains("##"), "{report}");
+    }
+
+    // ------------------------------------------------------------------
+    // PR-UX1: série de scans, índice e barras (dado real, nunca inventado)
+    // ------------------------------------------------------------------
+
+    /// A trilha é a única memória histórica do scan: a série lê o texto que o
+    /// próprio `kira scan` gravou, em ordem cronológica, e descarta o resto.
+    #[test]
+    fn scan_series_reads_the_trail_oldest_first_and_skips_foreign_summaries() {
+        let summary = |count: usize| {
+            format!(
+                "kira scan em '/' — stacks: npm | achados: {count} (high {count}) | arquivo: /f.json"
+            )
+        };
+        let sessions = vec![
+            fixture_session(
+                1,
+                "scan",
+                None,
+                "2026-11-09T09:00:00Z",
+                10,
+                true,
+                &summary(9),
+            ),
+            fixture_session(
+                2,
+                "triage",
+                None,
+                "2026-11-10T09:00:00Z",
+                10,
+                true,
+                "kira scan em '/' | achados: 99",
+            ),
+            fixture_session(
+                3,
+                "scan",
+                None,
+                "2026-11-11T09:00:00Z",
+                10,
+                true,
+                &summary(5),
+            ),
+            // `scan` cujo summary não está no formato: descartado, não vira 0.
+            fixture_session(
+                4,
+                "scan",
+                None,
+                "2026-11-11T10:00:00Z",
+                10,
+                true,
+                "scan fixture: 3 achados",
+            ),
+        ];
+        let series = scan_series_from(&session_rows_from(&sessions));
+        assert_eq!(
+            series,
+            vec![9, 5],
+            "mais antigo primeiro, só scans com contagem real: {series:?}"
+        );
+    }
+
+    #[test]
+    fn scan_trend_line_needs_at_least_two_scans() {
+        // Um ponto não é tendência: o texto omite em vez de fingir direção.
+        let single = Snapshot {
+            scan_series: vec![4],
+            ..Snapshot::default()
+        };
+        assert_eq!(scan_trend_line(&single), None);
+        let two = Snapshot {
+            scan_series: vec![3, 5],
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            scan_trend_line(&two).unwrap_or_default(),
+            "tendência (2 scans, mais antigo primeiro): 3 5"
+        );
+    }
+
+    #[test]
+    fn index_line_shows_the_real_ratio_or_the_actionable_cause() {
+        let measured = Snapshot {
+            index_files: Some(812),
+            index_cap: 5000,
+            ..Snapshot::default()
+        };
+        assert_eq!(index_usage(&measured), Some((812, 5000)));
+        assert_eq!(
+            index_line(&measured),
+            "índice do repositório: 812/5000 arquivos"
+        );
+        // Sem contagem: `—` com a causa, nunca `0/5000` (que fingiria repositório
+        // sem arquivos).
+        let absent = Snapshot {
+            index_note: Some("índice do repositório vazio — rode `kira context`".to_string()),
+            ..Snapshot::default()
+        };
+        assert_eq!(index_usage(&absent), None);
+        assert_eq!(
+            index_line(&absent),
+            "índice do repositório: — (índice do repositório vazio — rode `kira context`)"
+        );
+    }
+
+    #[test]
+    fn severity_bars_only_include_severities_that_have_findings() {
+        let mut snapshot = Snapshot::default();
+        apply_findings(
+            &mut snapshot,
+            Ok(Some(vec![
+                fixture_finding("audit", "critical", "src/a.rs", "A"),
+                fixture_finding("audit", "low", "src/b.rs", "B"),
+            ])),
+        );
+        let bars = severity_bars(&snapshot);
+        let names: Vec<&str> = bars.iter().map(|(severity, _)| severity.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["critical", "low"],
+            "ordem canônica e sem barra de zero: {bars:?}"
+        );
+        // Sem achados, nenhuma barra (o estado vazio honesto vive no painel).
+        assert!(severity_bars(&Snapshot::default()).is_empty());
+    }
+
+    #[test]
+    fn text_report_carries_the_trend_and_the_index_lines() {
+        let snapshot = Snapshot {
+            scan_series: vec![3, 5, 4],
+            index_files: Some(120),
+            index_cap: 5000,
+            ..Snapshot::default()
+        };
+        let report = text_report(&snapshot);
+        assert!(report.contains("tendência (3 scans"), "{report}");
+        assert!(
+            report.contains("índice do repositório: 120/5000 arquivos"),
+            "{report}"
+        );
     }
 }

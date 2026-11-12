@@ -34,6 +34,10 @@ use std::path::Path;
 use std::pin::Pin;
 use std::process::ExitCode;
 
+/// Wizard de tela cheia (ADR-0025 + layout do opencode): coleta as respostas e
+/// devolve `SetupOptions` para o motor de texto abaixo executar.
+pub mod wizard;
+
 use crate::board::{self, BoardProvider};
 use crate::credentials::{
     self, CONFIG_KEY_DEV_NAME, CONFIG_KEY_ORG, CONFIG_KEY_PROJECT, CRED_KEY_PAT, CredStore,
@@ -58,7 +62,8 @@ pub struct SetupOptions {
     pub org: Option<String>,
     /// `--project <nome>`
     pub project: Option<String>,
-    /// `--reset`: remove the PAT from the store and exit.
+    /// `--reset`: remove o que o setup guardou como credencial (PAT e chave do
+    /// Foundry no keyring, endpoint/deployment no `config.toml`) e sai.
     pub reset: bool,
     /// `--pat <token>`: PAT passed straight on the command line (skips the
     /// aula, o menu e o prompt; o valor nunca é ecoado — só a máscara).
@@ -78,9 +83,15 @@ pub struct SetupOptions {
     pub backend: Option<String>,
     /// `--skip <passo>` (repetível): pula um passo — `pat` ou `ia`.
     pub skip: Vec<String>,
-    /// O eco do terminal é escondido na entrada de segredo (`stty -echo`,
-    /// melhor esforço no Unix). O binário real marca `true`; testes `false`
-    /// (stdin é buffer, não há tty para esconder).
+    /// Dados do Foundry já coletados (pelo wizard de tela cheia, ADR-0035).
+    /// Quando presentes, o motor NÃO pergunta nada: testa estes valores e, se
+    /// o teste passar, grava endpoint/deployment no config e a chave no
+    /// keyring. `None` mantém o caminho de sempre (env ou prompt em TTY).
+    pub foundry: Option<FoundryChoice>,
+    /// Pede eco escondido na entrada de segredo. O binário real marca `true`;
+    /// testes `false` (stdin é buffer e `stty` não pode rodar). Onde o SO não
+    /// tem mecanismo (Windows, sem dependência nova), o texto do prompt AVISA
+    /// que o valor pode aparecer — o pedido nunca vira promessa falsa.
     pub hidden_input: bool,
 }
 
@@ -94,6 +105,9 @@ enum PatResult {
     Pasted(String),
     /// Token já presente em `AZURE_DEVOPS_PAT` (opção 2).
     FromEnv(String),
+    /// Token do keyring do OS (setup anterior, ou o wizard mantendo o que já
+    /// existia): é VALIDADO, mas não é regravado.
+    FromStore(String),
     /// Pular por agora ⇒ modo local (opção 3).
     Skipped,
 }
@@ -209,7 +223,7 @@ pub async fn run(
     ia_hooks: &IaHooks<'_>,
 ) -> ExitCode {
     if options.reset {
-        return reset(store, output);
+        return reset(store, config_path, output);
     }
 
     let config_pairs = read_config(config_path, output);
@@ -284,20 +298,27 @@ pub async fn run(
             );
             PatResult::Skipped
         } else if options.interactive && !options.yes {
-            match pat_menu_interactive(env, input, output) {
+            match pat_menu_interactive(env, options.hidden_input, input, output) {
                 Some(result) => result,
                 // Entrada vazia no prompt de colar: erro acionável e fim.
                 None => return ExitCode::FAILURE,
             }
         } else {
-            // Não-interativo (--yes/sem TTY): usa a env se existir, senão
-            // pula — e imprime o pulado. Nunca bloqueia esperando stdin.
-            let non_interactive = pat_from_env_or_skip(env(PAT_ENV));
+            // Não-interativo (--yes/sem TTY): env > keyring > pular. O PAT do
+            // keyring entra aqui porque o wizard pode ter mantido o que já
+            // existia — reusar é o que o dono espera, e nada é bloqueante.
+            let non_interactive = pat_from_env_store_or_skip(env(PAT_ENV), stored_pat(store));
             match &non_interactive {
                 PatResult::FromEnv(_) => {
                     let _ = writeln!(
                         output,
-                        "usando AZURE_DEVOPS_PAT do ambiente (o token já está nesta máquina)"
+                        "usando AZURE_DEVOPS_PAT do ambiente (o PAT já está nesta máquina)"
+                    );
+                }
+                PatResult::FromStore(_) => {
+                    let _ = writeln!(
+                        output,
+                        "usando o PAT do keyring do OS (salvo por um `kira setup` anterior)"
                     );
                 }
                 PatResult::Skipped => {
@@ -306,7 +327,7 @@ pub async fn run(
                         "PAT pulado — o KIRA funciona em modo local (kira triage --file)."
                     );
                 }
-                // Colar por stdin não existe fora de TTY: `pat_from_env_or_skip`
+                // Colar por stdin não existe fora de TTY: a resolução acima
                 // nunca devolve esse caso.
                 PatResult::Pasted(_) => {}
             }
@@ -325,8 +346,14 @@ pub async fn run(
         PatResult::Skipped => {
             skipped_steps.push("pat");
         }
-        PatResult::Pasted(token) | PatResult::FromEnv(token) => {
+        PatResult::Pasted(token) | PatResult::FromEnv(token) | PatResult::FromStore(token) => {
             let is_pasted = matches!(pat_result, PatResult::Pasted(_));
+            // Origem do token, para o resumo não dizer "da env" quando veio
+            // do keyring (nem o contrário).
+            let origin = match &pat_result {
+                PatResult::FromStore(_) => "do keyring do OS",
+                _ => "da env AZURE_DEVOPS_PAT",
+            };
             let _ = writeln!(output, "Validando o PAT na organização {organization}...");
             let board = match make_board(token, &organization, &project) {
                 Ok(board) => board,
@@ -367,10 +394,10 @@ pub async fn run(
                             doctor::mask_pat(token)
                         ));
                     } else {
-                        // Token da env fica onde está (env vence keyring na
-                        // resolução); gravar seria cópia inútil.
+                        // Token da env/keyring fica onde está (env vence o
+                        // keyring na resolução); gravar seria cópia inútil.
                         pat_summary = Some(format!(
-                            "{} (da env AZURE_DEVOPS_PAT — lê Work Items de {organization}/{project})",
+                            "{} ({origin} — lê Work Items de {organization}/{project})",
                             doctor::mask_pat(token)
                         ));
                     }
@@ -399,11 +426,12 @@ pub async fn run(
                         ));
                     } else {
                         pat_summary = Some(format!(
-                            "{} (da env AZURE_DEVOPS_PAT; validação pendente — rode kira doctor)",
+                            "{} ({origin}; validação pendente — rode kira doctor)",
                             doctor::mask_pat(token)
                         ));
                     }
-                    let _ = writeln!(output, "{}", msg_pat_rede(is_pasted));
+                    let from_store = matches!(pat_result, PatResult::FromStore(_));
+                    let _ = writeln!(output, "{}", msg_pat_rede(is_pasted, from_store));
                 }
             }
         }
@@ -527,7 +555,8 @@ pub async fn run(
                 }
             },
             IaChoice::Foundry => {
-                match collect_foundry_choice(options, env, input, output) {
+                let saved_pairs = config_pairs.clone().unwrap_or_default();
+                match collect_foundry_choice(options, env, store, &saved_pairs, input, output) {
                     Some(foundry_choice) => {
                         let _ = writeln!(
                             output,
@@ -541,10 +570,28 @@ pub async fn run(
                                     "✓ ia: foundry ({}) — BYOK: custo por token",
                                     foundry_choice.deployment
                                 );
-                                let _ = writeln!(
-                                    output,
-                                    "lembrete: para o kira triage usar este backend, exporte KIRA_FOUNDRY_ENDPOINT, KIRA_FOUNDRY_DEPLOYMENT e KIRA_FOUNDRY_API_KEY nesta máquina."
-                                );
+                                if options.foundry.is_some() {
+                                    // Coletado no wizard (ADR-0035): gravar é o
+                                    // que torna o formulário útil — o dono não
+                                    // deve exportar nada depois.
+                                    persist_foundry(config_path, store, &foundry_choice, output);
+                                } else {
+                                    // A dica de env segue o shell do SO — `export`
+                                    // no PowerShell é texto que não roda.
+                                    let hint = [
+                                        foundry::ENV_ENDPOINT,
+                                        foundry::ENV_DEPLOYMENT,
+                                        foundry::ENV_API_KEY,
+                                    ]
+                                    .iter()
+                                    .map(|name| doctor::set_env_command(name, "..."))
+                                    .collect::<Vec<_>>()
+                                    .join(" · ");
+                                    let _ = writeln!(
+                                        output,
+                                        "lembrete: para o kira triage usar este backend, defina as três variáveis nesta máquina — {hint}"
+                                    );
+                                }
                                 ia_summary =
                                     Some(format!("foundry ({})", foundry_choice.deployment));
                             }
@@ -579,17 +626,9 @@ pub async fn run(
         }
     }
 
-    // ------------------------------------------------------------------
-    // Passo fonte (opcional): ensina, oferece o comando e nunca instala
-    // sem `--apply`. Neste PR o passo é sempre "dá para fazer depois".
-    // ------------------------------------------------------------------
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Fonte (opcional): o KIRA fica mais bonito com uma fonte Nerd (ícones e gráficos)."
-    );
-    let _ = writeln!(output, "Sem ela, ele usa só ASCII e continua funcionando.");
-    skipped_steps.push("fonte");
+    // O passo "fonte Nerd" saiu: o resumo mandava rodar `kira setup --deps
+    // --only font`, comando que o binário nunca teve. Prometer retomada
+    // inexistente é pior que não oferecer a etapa.
 
     // ------------------------------------------------------------------
     // Resumo final: o que ficou pronto, o que ficou pulado (com o comando
@@ -613,18 +652,72 @@ pub async fn run(
     ExitCode::SUCCESS
 }
 
-/// `--reset`: removes the PAT from the store (idempotent).
-fn reset(store: &dyn CredStore, output: &mut dyn Write) -> ExitCode {
-    match store.remove(CRED_KEY_PAT) {
-        Ok(()) => {
-            let _ = writeln!(output, "PAT removido do keyring do OS.");
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            let _ = writeln!(output, "erro: {err}");
-            ExitCode::FAILURE
+/// `--reset`: remove TUDO o que o `kira setup` gravou como credencial ou
+/// configuração de credencial — PAT e chave do Foundry no keyring, e
+/// endpoint/deployment (públicos) do `config.toml` (ADR-0035).
+///
+/// Simetria de propósito: o wizard grava os três; o reset apaga os três. Org,
+/// projeto e `dev_name` ficam — são identidade do projeto, não credencial, e
+/// apagá-los obrigaria o dono a redigitar tudo. Idempotente: ausência não é
+/// erro, e ausência de arquivo também não.
+fn reset(store: &dyn CredStore, config_path: Option<&Path>, output: &mut dyn Write) -> ExitCode {
+    let had_foundry_key = store
+        .get(credentials::CRED_KEY_FOUNDRY_API_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|key| !key.trim().is_empty());
+    if let Err(err) = store
+        .remove(CRED_KEY_PAT)
+        .and_then(|()| store.remove(credentials::CRED_KEY_FOUNDRY_API_KEY))
+    {
+        let _ = writeln!(output, "erro: {err}");
+        return ExitCode::FAILURE;
+    }
+    let _ = writeln!(output, "PAT removido do keyring do OS.");
+    if had_foundry_key {
+        let _ = writeln!(output, "chave do Foundry removida do keyring do OS.");
+    } else {
+        let _ = writeln!(
+            output,
+            "não havia chave do Foundry no keyring — nada a remover."
+        );
+    }
+    match config_path {
+        Some(path) => match credentials::remove_config_keys(
+            path,
+            &[
+                credentials::CONFIG_KEY_FOUNDRY_ENDPOINT,
+                credentials::CONFIG_KEY_FOUNDRY_DEPLOYMENT,
+            ],
+        ) {
+            Ok(true) => {
+                let _ = writeln!(
+                    output,
+                    "endpoint/deployment do Foundry removidos do config.toml."
+                );
+            }
+            Ok(false) => {
+                let _ = writeln!(
+                    output,
+                    "config.toml já não tinha endpoint/deployment do Foundry."
+                );
+            }
+            Err(err) => {
+                let _ = writeln!(
+                    output,
+                    "aviso: config.toml não pôde ser limpo ({err}) — remova `foundry_endpoint`/`foundry_deployment` à mão."
+                );
+            }
+        },
+        None => {
+            let _ = writeln!(output, "sem diretório home: nada a limpar em config.toml.");
         }
     }
+    let _ = writeln!(
+        output,
+        "org, projeto e dev foram mantidos em config.toml — o comando de retomada é `kira setup`."
+    );
+    ExitCode::SUCCESS
 }
 
 /// Reads the config pairs, printing a warning (never crashing) on failure.
@@ -735,6 +828,7 @@ pub const IA_MENU: &str = "Como o KIRA deve pensar?\n\
 /// silenciosamente para outra opção).
 fn pat_menu_interactive(
     env: &dyn Fn(&str) -> Option<String>,
+    hidden: bool,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Option<PatResult> {
@@ -751,7 +845,8 @@ fn pat_menu_interactive(
                 None => {
                     let _ = writeln!(
                         output,
-                        "AZURE_DEVOPS_PAT não está definida nesta máquina — exporte-a (export AZURE_DEVOPS_PAT=...) ou escolha 1."
+                        "AZURE_DEVOPS_PAT não está definida nesta máquina — defina-a ({}) ou escolha 1.",
+                        doctor::set_env_command(PAT_ENV, "...")
                     );
                 }
             },
@@ -763,19 +858,30 @@ fn pat_menu_interactive(
                 return Some(PatResult::Skipped);
             }
             _ => {
-                return prompt_for_pat(input, output).map(PatResult::Pasted);
+                return prompt_for_pat(input, output, hidden).map(PatResult::Pasted);
             }
         }
     }
 }
 
-/// Seleção do PAT fora de TTY (pura, testável): usa a env quando existe;
-/// senão pula. Nunca bloqueia e nunca inventa default caro.
-fn pat_from_env_or_skip(env_pat: Option<String>) -> PatResult {
+/// Seleção do PAT fora de TTY (pura, testável): env > keyring > pular.
+///
+/// O keyring entra na conta porque o wizard pode ter MANTIDO o PAT que já
+/// existia — pedir para colar de novo o token que está salvo seria trabalho
+/// inventado. Nunca bloqueia e nunca inventa default caro.
+fn pat_from_env_store_or_skip(env_pat: Option<String>, stored: Option<String>) -> PatResult {
     match env_pat.filter(|pat| !pat.trim().is_empty()) {
         Some(pat) => PatResult::FromEnv(pat),
-        None => PatResult::Skipped,
+        None => match stored.filter(|pat| !pat.trim().is_empty()) {
+            Some(pat) => PatResult::FromStore(pat),
+            None => PatResult::Skipped,
+        },
     }
+}
+
+/// PAT guardado no keyring, quando existir (reuso; o valor nunca é impresso).
+fn stored_pat(store: &dyn CredStore) -> Option<String> {
+    store.get(CRED_KEY_PAT).ok().flatten()
 }
 
 /// Pergunta de menu genérica: imprime o menu + `Escolha [<default>]: ` e
@@ -820,8 +926,9 @@ fn ask_menu_choice(
 
 /// Melhor esforço para esconder o que o usuário digita: `stty -echo`/`echo`
 /// no Unix (o eco é do terminal, não do KIRA; o valor lido nunca é impresso
-/// de qualquer forma). Windows não tem mecanismo sem dependência nova — fica
-/// registrado na ADR-0025 como limitação. Nunca é fatal.
+/// de qualquer forma). Chamado SÓ quando `hidden_input` é `true` e o SO tem
+/// mecanismo: antes disso o `stty` rodava até nos testes. Windows não tem
+/// mecanismo sem dependência nova — o prompt avisa em vez de prometer.
 fn terminal_echo(enable: bool) {
     #[cfg(unix)]
     {
@@ -839,26 +946,45 @@ fn terminal_echo(enable: bool) {
     }
 }
 
-/// Prompt "Cole o PAT": uma linha de stdin SEM ECO; vazia ⇒ erro acionável.
-fn prompt_for_pat(input: &mut dyn BufRead, output: &mut dyn Write) -> Option<String> {
-    prompt_secret(
-        "Cole o PAT e pressione Enter (a entrada não aparece na tela):",
-        input,
-        output,
-    )
+/// Prompt "Cole o PAT": uma linha de stdin; vazia ⇒ erro acionável.
+fn prompt_for_pat(input: &mut dyn BufRead, output: &mut dyn Write, hidden: bool) -> Option<String> {
+    prompt_secret("Cole o PAT e pressione Enter", hidden, input, output)
 }
 
-/// Prompt de segredo com eco do terminal escondido (melhor esforço): nada do
-/// que foi digitado volta para stdout/stderr/log — e nunca para prompt de
-/// LLM (a camada `redact` é a segunda barreira).
-fn prompt_secret(prompt: &str, input: &mut dyn BufRead, output: &mut dyn Write) -> Option<String> {
-    let _ = writeln!(output, "{prompt}");
+/// Linha do prompt de segredo, HONESTA sobre o eco: prometer "não aparece"
+/// onde o SO não esconde é mentira que o dono descobre colando o token.
+fn secret_prompt_line(prompt: &str, hidden: bool, can_hide: bool) -> String {
+    if can_hide {
+        format!("{prompt} (a entrada não aparece na tela):")
+    } else if hidden {
+        format!("{prompt} (o terminal pode ecoar o valor — cole com cuidado):")
+    } else {
+        format!("{prompt}:")
+    }
+}
+
+/// Prompt de segredo. O eco só é escondido onde existe mecanismo sem
+/// dependência nova (`cfg!(unix)` + `stty`); o texto acompanha a realidade.
+/// Nada do que foi digitado volta para stdout/stderr/log — e nunca para
+/// prompt de LLM (a camada `redact` é a segunda barreira).
+fn prompt_secret(
+    prompt: &str,
+    hidden: bool,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Option<String> {
+    let can_hide = hidden && cfg!(unix);
+    let _ = writeln!(output, "{}", secret_prompt_line(prompt, hidden, can_hide));
     let _ = output.flush();
-    terminal_echo(false);
+    if can_hide {
+        terminal_echo(false);
+    }
     let value = read_line(input);
-    terminal_echo(true);
-    // Com o eco desligado o Enter não desenha linha nova: fecha a linha aqui.
-    let _ = writeln!(output);
+    if can_hide {
+        terminal_echo(true);
+        // Com o eco desligado o Enter não desenha linha nova: fecha a linha.
+        let _ = writeln!(output);
+    }
     match value {
         Some(pat) if !pat.is_empty() => Some(pat),
         _ => {
@@ -891,10 +1017,13 @@ pub fn msg_pat_403() -> &'static str {
     "PAT autenticou, mas sem escopo Work Items (403). Edite o token e marque Work Items → Read"
 }
 
-/// rede/timeout: para token colado o salvamento acontece (spec).
-pub fn msg_pat_rede(pasted: bool) -> &'static str {
+/// rede/timeout: para token colado o salvamento acontece (spec). A origem do
+/// token muda a frase — dizer "está na env" para quem usa keyring é mentira.
+pub fn msg_pat_rede(pasted: bool, from_store: bool) -> &'static str {
     if pasted {
         "não foi possível validar agora (sem rede?). O token foi salvo; rode kira doctor depois"
+    } else if from_store {
+        "não foi possível validar agora (sem rede?). O PAT do keyring do OS está intacto; rode kira doctor depois"
     } else {
         "não foi possível validar agora (sem rede?). O token está na env AZURE_DEVOPS_PAT; rode kira doctor depois"
     }
@@ -906,9 +1035,16 @@ pub fn msg_pat_rede(pasted: bool) -> &'static str {
 fn collect_foundry_choice(
     options: &SetupOptions,
     env: &dyn Fn(&str) -> Option<String>,
+    store: &dyn CredStore,
+    saved: &[(String, String)],
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Option<FoundryChoice> {
+    // O wizard já coletou no formulário inline: usar exatamente o que o dono
+    // digitou evita perguntar de novo (e evita perder os valores).
+    if let Some(choice) = &options.foundry {
+        return Some(choice.clone());
+    }
     if options.interactive && !options.yes {
         let _ = write!(
             output,
@@ -938,7 +1074,8 @@ fn collect_foundry_choice(
             }
         };
         let api_key = match prompt_secret(
-            "Cole a chave do Foundry (a entrada não aparece na tela):",
+            "Cole a chave do Foundry",
+            options.hidden_input,
             input,
             output,
         ) {
@@ -955,24 +1092,49 @@ fn collect_foundry_choice(
         });
     }
 
-    // Não-interativo: tudo vem de env; nada é perguntado, nada é chamado.
-    let endpoint = env(foundry::ENV_ENDPOINT).or_else(|| env(foundry::ENV_URL));
+    // Não-interativo: env > config.toml (endpoint/deployment públicos) >
+    // keyring (chave) — a MESMA ordem do runtime (ADR-0035), para o que o
+    // wizard gravou valer aqui sem exportar nada. Nada é perguntado.
+    //
+    // `saved` vem do caminho de config INJETADO em `run` (não do
+    // `credentials::read_config()`, que ignoraria `KIRA_CONFIG` dos testes).
+    let saved_value = |key: &str| {
+        saved
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let endpoint = env(foundry::ENV_ENDPOINT)
+        .or_else(|| env(foundry::ENV_URL))
+        .or_else(|| saved_value(credentials::CONFIG_KEY_FOUNDRY_ENDPOINT));
     let Some(endpoint) = endpoint.filter(|value| !value.trim().is_empty()) else {
         let _ = writeln!(
             output,
-            "erro: endpoint do Foundry não informado — defina KIRA_FOUNDRY_ENDPOINT (ou KIRA_FOUNDRY_URL) e rode kira setup --backend foundry de novo."
+            "erro: endpoint do Foundry não informado — defina KIRA_FOUNDRY_ENDPOINT (ou KIRA_FOUNDRY_URL) ou rode kira setup e preencha o formulário do Foundry."
         );
         return None;
     };
-    let Some(deployment) = env(foundry::ENV_DEPLOYMENT).filter(|value| !value.trim().is_empty())
-    else {
+    let deployment = env(foundry::ENV_DEPLOYMENT)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| saved_value(credentials::CONFIG_KEY_FOUNDRY_DEPLOYMENT));
+    let Some(deployment) = deployment else {
         let _ = writeln!(
             output,
-            "erro: deployment do Foundry não informado — defina KIRA_FOUNDRY_DEPLOYMENT e rode kira setup --backend foundry de novo."
+            "erro: deployment do Foundry não informado — defina KIRA_FOUNDRY_DEPLOYMENT ou rode kira setup e preencha o formulário do Foundry."
         );
         return None;
     };
-    let Some(api_key) = env(foundry::ENV_API_KEY).filter(|value| !value.trim().is_empty()) else {
+    let api_key = env(foundry::ENV_API_KEY)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            store
+                .get(credentials::CRED_KEY_FOUNDRY_API_KEY)
+                .ok()
+                .flatten()
+                .filter(|key| !key.trim().is_empty())
+        });
+    let Some(api_key) = api_key else {
         let _ = writeln!(output, "erro: {}", Error::FoundryMissingKey);
         return None;
     };
@@ -983,12 +1145,94 @@ fn collect_foundry_choice(
     })
 }
 
+/// Grava o Foundry coletado pelo wizard: endpoint/deployment (públicos) em
+/// `config.toml` e a chave no keyring do OS (ADR-0035).
+///
+/// Só é chamada DEPOIS do teste barato passar — chave recusada (401/403/404)
+/// nunca é gravada, a mesma regra do PAT. Falha de gravação é `aviso:` e o
+/// comando segue: o dono ainda pode exportar as envs.
+fn persist_foundry(
+    config_path: Option<&Path>,
+    store: &dyn CredStore,
+    choice: &FoundryChoice,
+    output: &mut dyn Write,
+) {
+    let config_saved = match config_path {
+        Some(path) => match credentials::write_config_file(
+            path,
+            &[
+                (
+                    credentials::CONFIG_KEY_FOUNDRY_ENDPOINT,
+                    choice.endpoint.as_str(),
+                ),
+                (
+                    credentials::CONFIG_KEY_FOUNDRY_DEPLOYMENT,
+                    choice.deployment.as_str(),
+                ),
+            ],
+        ) {
+            Ok(()) => true,
+            Err(err) => {
+                let _ = writeln!(
+                    output,
+                    "aviso: endpoint/deployment do Foundry não foram salvos em config.toml ({err})"
+                );
+                false
+            }
+        },
+        None => false,
+    };
+    let key_saved = match store.set(credentials::CRED_KEY_FOUNDRY_API_KEY, &choice.api_key) {
+        Ok(()) => true,
+        Err(err) => {
+            let _ = writeln!(
+                output,
+                "aviso: chave do Foundry não foi para o keyring ({err}) — defina {} nesta sessão",
+                foundry::ENV_API_KEY
+            );
+            false
+        }
+    };
+    match (config_saved, key_saved) {
+        (true, true) => {
+            let _ = writeln!(
+                output,
+                "✓ foundry gravado: endpoint/deployment em config.toml, chave no keyring do OS ({} no ambiente continua vencendo)",
+                foundry::ENV_API_KEY
+            );
+        }
+        (false, true) => {
+            let _ = writeln!(
+                output,
+                "foundry parcial: só a chave foi para o keyring — informe endpoint/deployment por {} / {}",
+                foundry::ENV_ENDPOINT,
+                foundry::ENV_DEPLOYMENT
+            );
+        }
+        (true, false) => {
+            let _ = writeln!(
+                output,
+                "foundry parcial: endpoint/deployment salvos; a chave ficou só nesta sessão — defina {}",
+                foundry::ENV_API_KEY
+            );
+        }
+        (false, false) => {
+            let _ = writeln!(
+                output,
+                "foundry NÃO foi gravado — configure {} / {} / {} para usar este backend",
+                foundry::ENV_ENDPOINT,
+                foundry::ENV_DEPLOYMENT,
+                foundry::ENV_API_KEY
+            );
+        }
+    }
+}
+
 /// Comando de retomada de cada passo pulado (o resumo imprime os dois juntos).
 pub fn resume_command(step: &str) -> &'static str {
     match step {
         "pat" => "kira setup --pat",
         "ia" => "kira setup --backend ollama",
-        "fonte" => "kira setup --deps --only font",
         _ => "kira setup",
     }
 }
@@ -1128,13 +1372,17 @@ mod tests {
              marque Work Items → Read"
         );
         assert_eq!(
-            msg_pat_rede(true),
+            msg_pat_rede(true, false),
             "não foi possível validar agora (sem rede?). O token foi salvo; rode kira doctor depois"
         );
         assert_eq!(
-            msg_pat_rede(false),
+            msg_pat_rede(false, false),
             "não foi possível validar agora (sem rede?). O token está na env \
              AZURE_DEVOPS_PAT; rode kira doctor depois"
+        );
+        assert!(
+            msg_pat_rede(false, true).contains("keyring do OS"),
+            "origem keyring não pode ser chamada de env"
         );
     }
 
@@ -1168,6 +1416,24 @@ mod tests {
         assert!(IA_MENU.contains("2) Copilot CLI"));
         assert!(IA_MENU.contains("3) Microsoft Foundry"));
         assert!(IA_MENU.contains("custo por token"));
+    }
+
+    #[test]
+    fn secret_prompt_only_claims_hiding_when_the_os_can_do_it() {
+        assert!(
+            secret_prompt_line("Cole o PAT", true, true).contains("não aparece na tela"),
+            "onde o eco some, o texto pode prometer"
+        );
+        let honest = secret_prompt_line("Cole o PAT", true, false);
+        assert!(honest.contains("pode ecoar"), "{honest}");
+        assert!(
+            !honest.contains("não aparece"),
+            "sem mecanismo, nada de promessa falsa: {honest}"
+        );
+        assert_eq!(
+            secret_prompt_line("Cole o PAT", false, false),
+            "Cole o PAT:"
+        );
     }
 
     #[test]
@@ -1205,13 +1471,22 @@ mod tests {
     // nunca inventa token).
     // ------------------------------------------------------------------
     #[test]
-    fn non_interactive_pat_uses_env_or_skips() {
+    fn non_interactive_pat_prefers_env_then_the_keyring_then_skips() {
         assert_eq!(
-            pat_from_env_or_skip(Some("tok".into())),
-            PatResult::FromEnv("tok".into())
+            pat_from_env_store_or_skip(Some("tok".into()), Some("keyring".into())),
+            PatResult::FromEnv("tok".into()),
+            "env vence o keyring"
         );
-        assert_eq!(pat_from_env_or_skip(None), PatResult::Skipped);
-        assert_eq!(pat_from_env_or_skip(Some("   ".into())), PatResult::Skipped);
+        assert_eq!(
+            pat_from_env_store_or_skip(None, Some("keyring".into())),
+            PatResult::FromStore("keyring".into()),
+            "o PAT salvo é reusado e validado"
+        );
+        assert_eq!(pat_from_env_store_or_skip(None, None), PatResult::Skipped);
+        assert_eq!(
+            pat_from_env_store_or_skip(Some("   ".into()), Some("  ".into())),
+            PatResult::Skipped
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1225,7 +1500,7 @@ mod tests {
             Some("Aa2x**** (lê Work Items de avanade/pague-menos)"),
             Some("ollama (qwen3.5:4b)"),
             "/home/x/.config/kira/store.db",
-            &["pat", "fonte"],
+            &["pat"],
         );
         assert!(text.starts_with("pronto:\n  dev: Sergin\n"), "{text}");
         assert!(text.contains("  pat: Aa2x**** (lê Work Items de avanade/pague-menos)"));
@@ -1233,7 +1508,8 @@ mod tests {
         assert!(text.contains("  store: /home/x/.config/kira/store.db"));
         assert!(text.contains("pulado (dá para fazer depois):"));
         assert!(text.contains("  pat — kira setup --pat"));
-        assert!(text.contains("  fonte — kira setup --deps --only font"));
+        // Nenhuma etapa inventada no "pulado": sem fonte, sem comando fantasma.
+        assert!(!text.contains("--deps"), "{text}");
         assert!(text.contains("próximo passo:  kira scan"));
         assert!(
             !text.contains("configuração concluída"),
@@ -1243,7 +1519,7 @@ mod tests {
 
     #[test]
     fn summary_without_pat_and_ia_marks_local_mode() {
-        let text = format_summary("dev", None, None, "store.db", &["pat", "ia", "fonte"]);
+        let text = format_summary("dev", None, None, "store.db", &["pat", "ia"]);
         assert!(
             text.contains("  pat: não configurado (modo local)"),
             "{text}"
@@ -1262,7 +1538,8 @@ mod tests {
     fn resume_commands_point_to_the_right_flags() {
         assert_eq!(resume_command("pat"), "kira setup --pat");
         assert_eq!(resume_command("ia"), "kira setup --backend ollama");
-        assert_eq!(resume_command("fonte"), "kira setup --deps --only font");
+        // Passo desconhecido cai no comando neutro (nada de fantasma).
+        assert_eq!(resume_command("fonte"), "kira setup");
     }
 
     // ------------------------------------------------------------------

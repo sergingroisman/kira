@@ -1,22 +1,24 @@
-//! Loop de eventos do `kira dashboard` — o coração da casca (ADR-0014).
+//! Loop de eventos do `kira dashboard` — casca derivada do statui (ADR-0014).
 //!
 //! Ciclo: draw (ratatui) → poll de tecla (crossterm) → [`decide`] → mutação
-//! mínima de estado de tela (painel/scroll/detalhe/ajuda) ou releitura do
-//! disco (`r`). Nenhuma ação escreve em disco, rede ou LLM; o snapshot é
-//! recomposto apenas em `Reload` — nunca por frame.
+//! mínima de estado de tela ou releitura do disco (`r`). O snapshot é
+//! recomposto apenas em `Reload` — nunca por frame (spec W6).
 //!
-//! A decisão está EXTRAÍDA em função pura ([`decide`] + [`apply_move`] +
-//! [`next_panel`]): a cobertura de `tui/app.rs` estava em 0% no W6-PR1 porque
-//! o `match` vivia dentro do loop impensável — agora cada transição é
-//! unit-testável sem terminal (meta do W6-PR2: >60% de linhas).
+//! Quatro fontes (`1–4`/`Tab`): Resumo, Achados, Sessões, Wiki. Cada uma ocupa
+//! a área de trabalho inteira; o inspetor abre ao lado em 50–50 (`i`/`Enter`),
+//! como no statui (`third_party/statui/NOTICE.md`).
+//!
+//! Contrato (ADR-0033): navegar NUNCA executa. O [`Outcome`] não tem variante
+//! de escrita — a camada de ação só entra com tecla explícita + confirmação.
 //!
 //! A tela NUNCA é deixada suja: o guard [`ScreenGuard`] devolve raw
-//! mode/alternate screen no Drop (erro de desenho no meio do loop incluso) e
-//! o hook de pânico instalado em [`run`] restaura o terminal ANTES do
-//! backtrace — panic/erro nunca deixa o terminal quebrado.
+//! mode/alternate screen no Drop e o hook de pânico restaura o terminal ANTES
+//! do backtrace.
 
-use std::io::{self};
+use std::io;
+use std::time::Duration;
 
+use crossterm::event::KeyModifiers as Mods;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -25,23 +27,40 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::tui::keymap::{self, Action};
+use crate::tui::action::{
+    self, Action as StepAction, ActionCtx, ConfirmState, ExecState, Request, RunEvent, Runner,
+    TargetSheet,
+};
+use crate::tui::chrome;
+use crate::tui::glyph::Glyphs;
+use crate::tui::keymap::{self, Action as Key};
+use crate::tui::layout;
 use crate::tui::state::{self, Snapshot, WikiPage};
 use crate::tui::theme::{self, Palette};
 use crate::tui::widgets::findings::{DetailWidget, FindingsWidget};
-use crate::tui::widgets::header::HeaderWidget;
+use crate::tui::widgets::footer;
+use crate::tui::widgets::resumo::{ResumoWidget, Visual};
 use crate::tui::widgets::sessions::SessionsWidget;
 use crate::tui::widgets::wiki::{WikiPageWidget, WikiWidget};
 
-/// Tamanho mínimo para o layout denso (spec W6). Abaixo disso a casca degrada
-/// para lista única com aviso claro — nunca quebra.
-const MIN_WIDTH: u16 = 80;
-const MIN_HEIGHT: u16 = 24;
+/// Quantidade de fontes no ciclo de `Tab`/`1–4`.
+pub const SCREEN_COUNT: usize = 4;
+
+/// Passo de PgUp/PgDn no preview/lista (linhas por "página" de scroll).
+pub const SCROLL_PAGE_STEP: isize = 10;
+
+/// Opções de abertura do dashboard (ADR-0033).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Desliga toda tecla de ação; navegação continua. É o modo do e2e de
+    /// hash e de quem só quer olhar.
+    pub read_only: bool,
+}
 
 /// Guard de terminal: entra raw mode + alternate screen na criação e desfaz
 /// TUDO no Drop — inclusive quando o loop sai por erro.
@@ -64,91 +83,125 @@ impl Drop for ScreenGuard {
     }
 }
 
-/// Painel em foco (W6-PR4: os QUATRO da spec).
+/// Fonte de dados em foco (as quatro telas do dashboard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Panel {
-    /// Cabeçalho: identidade do projeto e saúde básica (W6-PR1).
-    Header,
-    /// Tabela de achados de `findings.json` (W6-PR2).
-    Findings,
-    /// Tabela das últimas 50 sessões da store (W6-PR3).
-    Sessions,
-    /// Lista de páginas da wiki + busca `/` + preview em tela cheia (W6-PR4).
+pub enum Screen {
+    /// Home: risco, atividade recente e pendências.
+    Resumo,
+    /// Tabela de `findings.json`.
+    Achados,
+    /// Trilha de sessões da store.
+    Sessoes,
+    /// Páginas da wiki.
     Wiki,
 }
 
-impl Panel {
-    /// Posição do painel no ciclo (1-based para o rodapé `painel 1/4`).
+impl Screen {
+    /// Posição na ordem do ciclo (0-based; o chrome mostra 1-based nos rótulos).
     pub fn index(self) -> usize {
         match self {
-            Panel::Header => 0,
-            Panel::Findings => 1,
-            Panel::Sessions => 2,
-            Panel::Wiki => 3,
+            Screen::Resumo => 0,
+            Screen::Achados => 1,
+            Screen::Sessoes => 2,
+            Screen::Wiki => 3,
         }
+    }
+
+    /// Constrói a partir da posição do ciclo, saturando em Resumo.
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            1 => Screen::Achados,
+            2 => Screen::Sessoes,
+            3 => Screen::Wiki,
+            _ => Screen::Resumo,
+        }
+    }
+
+    /// A tela tem registro que abre inspetor?
+    pub fn has_inspector(self) -> bool {
+        !matches!(self, Screen::Resumo)
     }
 }
 
-/// Quantidade de painéis do ciclo de Tab nesta PR.
-pub const PANEL_COUNT: usize = 4;
+/// Próxima fonte do ciclo, com wrap nas duas direções.
+pub fn next_screen(screen: Screen, direction: i32) -> Screen {
+    let next = (screen.index() as i32 + direction).rem_euclid(SCREEN_COUNT as i32) as usize;
+    Screen::from_index(next)
+}
 
 /// Estado de TELA (não de domínio): o que o loop muta por tecla. O snapshot de
 /// dados vive à parte (`Snapshot`) e só muda em `Reload`.
-///
-/// NÃO é `Copy` (a agulha da busca é `String`) — o loop sempre passa por
-/// referência e muta campos individualmente.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppState {
-    /// Painel em foco.
-    pub panel: Panel,
-    /// Índice de seleção do painel de achados (o ➤ da tabela). UM POR PAINEL:
-    /// o índice único compartilhado fazia ↓ em achados mover a seleção das
-    /// sessões/wiki junto (defeito real do smoke do dono).
+    /// Fonte em foco.
+    pub screen: Screen,
+    /// Inspetor 50–50 aberto na fonte atual.
+    pub inspecting: bool,
+    /// Seleção da tabela de achados (o ➤). UM POR TELA.
     pub findings_selected: usize,
-    /// Índice de seleção do painel de sessões — próprio, nunca compartilhado.
+    /// Filtro de severidade ativo (`f` cicla; `None` = todas).
+    pub severity_filter: Option<String>,
+    /// Filtro de ferramenta ativo (`m` cicla; `None` = todas).
+    pub tool_filter: Option<String>,
+    /// Valores de severidade PRESENTES no snapshot (ordem canônica).
+    pub severity_values: Vec<String>,
+    /// Ferramentas PRESENTES no snapshot (ordem alfabética).
+    pub tool_values: Vec<String>,
+    /// Seleção da tabela de sessões — própria, nunca compartilhada.
     pub sessions_selected: usize,
-    /// Índice de seleção do painel de wiki (sobre a lista FILTRADA).
+    /// Seleção da lista de wiki (sobre a lista FILTRADA).
     pub wiki_selected: usize,
-    /// Índice de scroll da lista ÚNICA do modo degradado (não há painéis).
+    /// Scroll da lista ÚNICA do modo degradado.
     pub degraded_selected: usize,
-    /// Modo degradado ativo (terminal menor que 80×24)? `run` atualiza a cada
-    /// frame; `Move` roteia para a lista única em vez do painel em foco.
+    /// Modo degradado ativo (terminal menor que 80×24).
     pub degraded: bool,
-    /// Detalhe de achado aberto (Enter abre; Enter ou Esc voltam).
-    pub detail_open: bool,
     /// Overlay de ajuda aberto (?).
     pub help_open: bool,
-    /// Quantidade de linhas de achados que o loop enxerga — decide precisa
-    /// dela para saber se `Enter` tem o que abrir (lista vazia não abre).
+    /// Quantidade de linhas que `decide` enxerga por fonte.
     pub findings_len: usize,
-    /// Quantidade de linhas de sessões que o loop enxerga — idem, para o
-    /// `Enter` do painel de sessões (W6-PR3).
     pub sessions_len: usize,
-    /// Quantidade de páginas FILTRADAS que o loop enxerga no painel de wiki
-    /// (W6-PR4) — o `Enter` precisa saber se há página para abrir e o clamp
-    /// da seleção usa a lista filtrada, não a do índice inteiro.
     pub wiki_len: usize,
-    /// Busca incremental da wiki aberta (`/`): as teclas viram texto no
-    /// rodapé até `Esc` cancelar.
+    /// Busca incremental da wiki aberta (`/`).
     pub wiki_search_open: bool,
-    /// Agulha da busca incremental (aplicada por `state::filter_pages`).
+    /// Agulha da busca (aplicada por `state::filter_pages`).
     pub wiki_query: String,
-    /// Preview de página aberto em tela cheia (Enter abre, Enter volta).
+    /// Leitura de página em tela cheia (Enter na wiki).
     pub page_open: bool,
-    /// Scroll vertical do preview (linhas; o widget clampa pelo tamanho real).
+    /// Scroll vertical do preview (clampado pelo widget).
     pub preview_scroll: usize,
+    /// `--read-only`: a UI mostra o estado e não oferece ação.
+    pub read_only: bool,
+    /// Ids de work item já conhecidos (args de sessões + wiki), recarregados a
+    /// cada frame a partir do snapshot — a folha de alvo não inventa id.
+    pub known_work_items: Vec<u32>,
+    /// Folha de alvo aberta (`t`/`d` antes de qualquer execução).
+    pub target: Option<TargetSheet>,
+    /// Popup de confirmação aberto: plano montado, NADA executado.
+    pub confirm: Option<ConfirmState>,
+    /// Ação já com id, aguardando o `run` montar o plano (I/O fica lá).
+    pub pending: Option<StepAction>,
+    /// Execução em andamento (ou a última que terminou), para o overlay `o`.
+    pub exec: Option<ExecState>,
+    /// Overlay de execução aberto.
+    pub exec_open: bool,
+    /// Aviso de uma linha no rodapé (erro acionável, plano recusado).
+    pub notice: Option<String>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            panel: Panel::Header,
+            screen: Screen::Resumo,
+            inspecting: false,
             findings_selected: 0,
+            severity_filter: None,
+            tool_filter: None,
+            severity_values: Vec::new(),
+            tool_values: Vec::new(),
             sessions_selected: 0,
             wiki_selected: 0,
             degraded_selected: 0,
             degraded: false,
-            detail_open: false,
             help_open: false,
             findings_len: 0,
             sessions_len: 0,
@@ -157,109 +210,229 @@ impl Default for AppState {
             wiki_query: String::new(),
             page_open: false,
             preview_scroll: 0,
+            read_only: false,
+            known_work_items: Vec::new(),
+            target: None,
+            confirm: None,
+            pending: None,
+            exec: None,
+            exec_open: false,
+            notice: None,
         }
     }
 }
 
 /// O que o loop executa depois de [`decide`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Não existe variante de escrita/rede/LLM: navegar nunca executa (ADR-0033).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Sair do dashboard.
     Quit,
-    /// Redesenhar sem mudar estado (Ctrl+L, clássico de shell).
+    /// Redesenhar sem mudar estado (Ctrl+L).
     Redraw,
-    /// Reler o disco e recompor o snapshot (`r`) — sem rede, sem escrita.
+    /// Reler o dashboard e o store (`r`).
     Reload,
-    /// Abrir/fechar o detalhe do achado (Enter/Esc).
-    ToggleDetail,
-    /// Mover a seleção (+1 desce; `isize::MIN`/`MAX` = topo/fim de `g`/`G`).
+    /// Abrir/fechar o inspetor da fonte atual (`i`/`Enter`/`Esc`).
+    ToggleInspector,
+    /// Ir direto para uma fonte (`1`–`4`).
+    GoScreen(Screen),
+    /// Ciclar fonte (+1 = Tab, -1 = Shift+Tab), com wrap.
+    CycleScreen(i32),
+    /// Mover a seleção (+1 desce; `isize::MIN`/`MAX` = topo/fim).
     Move(isize),
-    /// Ciclar painel (+1 = Tab, -1 = Shift+Tab), com wrap.
-    CyclePanel(i32),
+    /// Ciclar o filtro de severidade dos achados (`f`).
+    CycleSeverityFilter,
+    /// Ciclar o filtro de ferramenta dos achados (`m`).
+    CycleToolFilter,
+    /// Limpar os dois filtros (`Esc` sem outra camada aberta).
+    ClearFindingsFilters,
     /// Abrir a busca incremental da wiki (`/`).
     SearchWiki,
-    /// Digitar um caractere na busca aberta (query é estado de tela).
+    /// Digitar um caractere na busca aberta.
     SearchChar(char),
-    /// Apagar o último caractere da busca (Backspace).
+    /// Apagar o último caractere da busca.
     SearchBackspace,
-    /// Fechar a busca (Esc cancela a agulha).
+    /// Fechar a busca (`Esc` cancela a agulha).
     CloseSearch,
-    /// Abrir a página selecionada da wiki em tela cheia (Enter).
+    /// Abrir a página selecionada da wiki em tela cheia.
     OpenPage,
-    /// Fechar o preview em tela cheia (Esc volta à lista).
+    /// Fechar a leitura em tela cheia.
     ClosePage,
-    /// Rolar o preview em tela cheia (j/k por linha, PgUp/PgDn por página).
+    /// Rolar a leitura (j/k por linha, PgUp/PgDn por página).
     ScrollPage(isize),
     /// Alternar o overlay de ajuda (?).
     Help,
-    /// Tecla ignorada (nada a fazer).
+    /// Pedido de ação (`s`/`t`/`d`): abre folha de alvo ou vira plano.
+    RequestAction(Request),
+    /// Dígito digitado na folha de alvo.
+    TargetPush(char),
+    /// Apagar o último dígito da folha de alvo.
+    TargetBackspace,
+    /// Andar na lista de ids conhecidos (Tab/Shift+Tab/↑/↓).
+    TargetCycle(isize),
+    /// Confirmar o id da folha (Enter) — ainda NÃO executa.
+    TargetConfirm,
+    /// Fechar a folha de alvo.
+    TargetCancel,
+    /// Executar o plano confirmado (só `Enter` no popup, com `read_only` off).
+    ConfirmExecute,
+    /// Fechar o popup sem executar.
+    ConfirmCancel,
+    /// Abrir/fechar o overlay da execução (`o`).
+    ToggleExecution,
+    /// Rolar o log da execução.
+    ScrollExecution(isize),
+    /// Religar o follow no fim do log (`G`).
+    FollowExecution,
+    /// Tecla ignorada.
     Ignore,
 }
 
-/// Próximo painel do ciclo, com wrap nas duas direções. Com 4 painéis o ciclo
-/// é cabeçalho → achados → sessões → wiki (W6-PR4).
-pub fn next_panel(panel: Panel, direction: i32) -> Panel {
-    let index = panel.index();
-    let count = PANEL_COUNT;
-    let next = (index as i32 + direction).rem_euclid(count as i32) as usize;
-    match next {
-        1 => Panel::Findings,
-        2 => Panel::Sessions,
-        3 => Panel::Wiki,
-        _ => Panel::Header,
-    }
-}
-
 /// Aplica um offset de movimento com saturação nas duas pontas: `g`/`G`
-/// chegam como `isize::MIN`/`MAX` e nunca desvaziam o `usize`.
+/// chegam como `isize::MIN`/`MAX` e nunca dão a volta no `usize`.
 pub fn apply_move(selected: usize, offset: isize) -> usize {
     if offset < 0 {
         selected.saturating_sub(offset.unsigned_abs())
+    } else if offset == isize::MAX {
+        // `G` = fim absoluto; o loop clampa pela quantidade real de linhas.
+        usize::MAX
     } else {
         selected.saturating_add(offset as usize)
     }
 }
 
-/// Executa um [`Outcome`] sobre o estado de TELA — a mutação EXTRAÍDA do loop,
-/// função pura de mutação unit-testável sem terminal (mesma disciplina do
-/// [`decide`]): é aqui que o ESCOPO POR PAINEL do `Move` acontece.
+/// Limite de seleção pela quantidade REAL de linhas visíveis.
+pub fn max_selected_for(
+    screen: Screen,
+    findings_len: usize,
+    sessions_len: usize,
+    wiki_len: usize,
+    degraded_total_lines: usize,
+    degraded: bool,
+) -> usize {
+    if degraded {
+        return degraded_total_lines.max(1) - 1;
+    }
+    match screen {
+        Screen::Achados => findings_len.max(1) - 1,
+        Screen::Sessoes => sessions_len.max(1) - 1,
+        Screen::Wiki => wiki_len.max(1) - 1,
+        Screen::Resumo => 0,
+    }
+}
+
+/// A fonte atual tem registro para abrir?
+fn screen_has_rows(screen: &AppState) -> bool {
+    match screen.screen {
+        Screen::Achados => screen.findings_len > 0,
+        Screen::Sessoes => screen.sessions_len > 0,
+        Screen::Wiki => screen.wiki_len > 0,
+        Screen::Resumo => false,
+    }
+}
+
+/// Próximo valor do ciclo de filtro: `None` → values[0] → … → `None`.
+fn next_filter(current: Option<&str>, values: &[String]) -> Option<String> {
+    let Some(current) = current else {
+        return values.first().cloned();
+    };
+    let index = values.iter().position(|value| value == current);
+    match index {
+        Some(index) if index + 1 < values.len() => Some(values[index + 1].clone()),
+        // Fim do ciclo volta para "todas" — o filtro nunca fica preso.
+        Some(_) | None => None,
+    }
+}
+
+/// Os dois filtros estão ativos? (`Esc` sem outra camada limpa).
+pub fn filters_active(screen: &AppState) -> bool {
+    screen.severity_filter.is_some() || screen.tool_filter.is_some()
+}
+
+/// Rótulo do filtro para o título do bloco (`critical` / `critical · audit`).
+pub fn findings_filter_label(screen: &AppState) -> Option<String> {
+    match (&screen.severity_filter, &screen.tool_filter) {
+        (None, None) => None,
+        (Some(severity), None) => Some(severity.clone()),
+        (None, Some(tool)) => Some(tool.clone()),
+        (Some(severity), Some(tool)) => Some(format!("{severity} · {tool}")),
+    }
+}
+
+/// Lista VISÍVEL de achados (filtro em memória, puro sobre o snapshot).
+pub fn filtered_findings<'a>(
+    snapshot: &'a Snapshot,
+    screen: &AppState,
+) -> Vec<&'a state::FindingRow> {
+    state::filter_findings(
+        &snapshot.finding_rows,
+        screen.severity_filter.as_deref(),
+        screen.tool_filter.as_deref(),
+    )
+}
+
+/// Executa um [`Outcome`] sobre o estado de TELA — função pura de mutação.
 ///
 /// `Quit` e `Reload` NÃO são daqui: o primeiro devolve o controle ao `run`
-/// (saída/restauro do terminal) e o segundo relê o disco (I/O fica no loop).
+/// (restauro do terminal), o segundo relê o disco (I/O fica no loop).
 pub fn apply_outcome(screen: &mut AppState, outcome: Outcome) {
     match outcome {
-        // Redraw: o próximo passo do loop desenha de novo — nada a mutar.
         Outcome::Redraw => {}
-        Outcome::ToggleDetail => screen.detail_open = !screen.detail_open,
+        Outcome::ToggleInspector => {
+            if screen.screen.has_inspector() && screen_has_rows(screen) {
+                screen.inspecting = !screen.inspecting;
+            }
+        }
+        Outcome::GoScreen(next) => {
+            screen.screen = next;
+            screen.inspecting = false;
+            screen.page_open = false;
+            screen.wiki_search_open = false;
+        }
+        Outcome::CycleScreen(direction) => {
+            screen.screen = next_screen(screen.screen, direction);
+            screen.inspecting = false;
+            screen.page_open = false;
+            screen.wiki_search_open = false;
+        }
         Outcome::Move(offset) => {
-            // ESCOPO POR PAINEL (defeito real do smoke do dono): mover muta
-            // SOMENTE o índice do painel em foco — ↓ em achados nunca mais
-            // mexe na seleção de sessões ou wiki (cada painel tem o seu
-            // índice e o seu scroll).
             if screen.degraded {
-                // Degradado não há painéis visíveis: a lista única tem o
-                // próprio índice de scroll.
                 screen.degraded_selected = apply_move(screen.degraded_selected, offset);
             } else {
-                match screen.panel {
-                    Panel::Findings => {
+                match screen.screen {
+                    Screen::Achados => {
                         screen.findings_selected = apply_move(screen.findings_selected, offset)
                     }
-                    Panel::Sessions => {
+                    Screen::Sessoes => {
                         screen.sessions_selected = apply_move(screen.sessions_selected, offset)
                     }
-                    Panel::Wiki => screen.wiki_selected = apply_move(screen.wiki_selected, offset),
-                    // O cabeçalho denso não tem linhas para mover.
-                    Panel::Header => {}
+                    Screen::Wiki => screen.wiki_selected = apply_move(screen.wiki_selected, offset),
+                    // O Resumo não é lista: ↑/↓ não inventam seleção.
+                    Screen::Resumo => {}
                 }
             }
         }
-        Outcome::CyclePanel(direction) => screen.panel = next_panel(screen.panel, direction),
-        // W6-PR4: busca incremental e preview em tela cheia.
+        Outcome::CycleSeverityFilter => {
+            screen.severity_filter =
+                next_filter(screen.severity_filter.as_deref(), &screen.severity_values);
+            // Lista nova começa do topo e fecha o inspetor do registro antigo.
+            screen.findings_selected = 0;
+            screen.inspecting = false;
+        }
+        Outcome::CycleToolFilter => {
+            screen.tool_filter = next_filter(screen.tool_filter.as_deref(), &screen.tool_values);
+            screen.findings_selected = 0;
+            screen.inspecting = false;
+        }
+        Outcome::ClearFindingsFilters => {
+            screen.severity_filter = None;
+            screen.tool_filter = None;
+            screen.findings_selected = 0;
+        }
         Outcome::SearchWiki => {
             screen.wiki_search_open = true;
             screen.wiki_query.clear();
-            // A lista filtrada recomeça do topo.
             screen.wiki_selected = 0;
         }
         Outcome::SearchChar(c) => screen.wiki_query.push(c),
@@ -273,62 +446,255 @@ pub fn apply_outcome(screen: &mut AppState, outcome: Outcome) {
             screen.wiki_search_open = false;
         }
         Outcome::ClosePage => screen.page_open = false,
-        // O scroll do preview é clamped DENTRO do widget (a largura/altura
-        // reais são dele) — aqui só aplica o movimento.
         Outcome::ScrollPage(offset) => {
             screen.preview_scroll = apply_move(screen.preview_scroll, offset)
         }
+        Outcome::RequestAction(request) => {
+            if !screen.read_only {
+                if request.needs_work_item() {
+                    // O id vem da lista conhecida ou do teclado (folha de alvo).
+                    let known = screen.known_work_items.clone();
+                    screen.target = Some(TargetSheet::new(request, known));
+                } else {
+                    screen.pending = request.into_action(None);
+                }
+            }
+        }
+        Outcome::TargetPush(value) => {
+            if let Some(sheet) = &mut screen.target {
+                sheet.push_digit(value);
+            }
+        }
+        Outcome::TargetBackspace => {
+            if let Some(sheet) = &mut screen.target {
+                sheet.backspace();
+            }
+        }
+        Outcome::TargetCycle(direction) => {
+            if let Some(sheet) = &mut screen.target {
+                sheet.cycle(direction);
+            }
+        }
+        Outcome::TargetConfirm => {
+            let chosen = screen.target.as_ref().and_then(TargetSheet::action);
+            match chosen {
+                Some(step) => {
+                    screen.target = None;
+                    screen.pending = Some(step);
+                }
+                // Sem id válido a folha CONTINUA aberta: Enter não inventa
+                // work item nem fecha o que o dono ainda está digitando.
+                None => {
+                    screen.notice =
+                        Some("work item inválido — digite um número maior que zero".to_string());
+                }
+            }
+        }
+        Outcome::TargetCancel => screen.target = None,
+        // Quem spawna é o `run` (I/O fica lá); aqui o popup apenas fecha.
+        Outcome::ConfirmExecute | Outcome::ConfirmCancel => screen.confirm = None,
+        Outcome::ToggleExecution => {
+            if screen.exec.is_some() {
+                screen.exec_open = !screen.exec_open;
+            }
+        }
+        Outcome::ScrollExecution(offset) => {
+            if let Some(exec) = &mut screen.exec {
+                exec.scroll_by(offset);
+                screen.exec_open = true;
+            }
+        }
+        Outcome::FollowExecution => {
+            if let Some(exec) = &mut screen.exec {
+                exec.follow = true;
+                exec.scroll = 0;
+                screen.exec_open = true;
+            }
+        }
         Outcome::Help => screen.help_open = !screen.help_open,
         Outcome::Ignore => {}
-        // Quit e Reload pertencem ao loop (saída/restauro e leitura do disco).
         Outcome::Quit | Outcome::Reload => {}
+    }
+}
+
+/// A tecla é uma das três de AÇÃO? (`s`/`t`/`d` — `o` é só visualização).
+fn is_action_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('s' | 't' | 'd'))
+}
+
+/// Monta o [`action::ActionPlan`] com o ambiente REAL (binário, PATH,
+/// credenciais). É o único ponto com I/O — e roda só quando já existe um
+/// pedido de ação, nunca por frame.
+fn build_plan(step: StepAction, snapshot: &Snapshot) -> Result<action::ActionPlan, String> {
+    let program = std::env::current_exe()
+        .map_err(|err| format!("não foi possível localizar o binário do kira: {err}"))?;
+    let org_project = credentials_org_project();
+    let tools = |name: &str| {
+        crate::binresolve::find_on_path(std::env::var_os("PATH").as_deref(), name).is_some()
+    };
+    let ctx = ActionCtx {
+        root: snapshot.root.as_deref(),
+        program: &program,
+        org_project: org_project
+            .as_ref()
+            .map(|(org, project)| (org.as_str(), project.as_str())),
+        pat_present: snapshot.pat_masked.is_some(),
+        tools: &tools,
+    };
+    action::plan(step, &ctx).map_err(|err| err.message().to_string())
+}
+
+/// `(org, projeto)` resolvidos como o CLI resolveria (config/env), sem rede.
+fn credentials_org_project() -> Option<(String, String)> {
+    let org = crate::credentials::resolve_org_with_source().ok()?.value;
+    let project = crate::credentials::resolve_project_with_source(None)
+        .ok()?
+        .value;
+    Some((org, project))
+}
+
+/// Drena o canal da execução sem bloquear: aplica linha a linha e, quando o
+/// processo sai, relê o disco (o filho gravou trilha/findings/wiki) e reancora
+/// a seleção na MESMA linha.
+fn drain_execution(
+    state_screen: &mut AppState,
+    runner: &mut Option<Runner>,
+    snapshot: &mut Snapshot,
+) {
+    let Some(active) = runner.take() else {
+        return;
+    };
+    let mut finished = false;
+    while let Ok(event) = active.rx.try_recv() {
+        finished |= matches!(&event, RunEvent::Exited { .. });
+        if let Some(exec) = &mut state_screen.exec {
+            exec.apply(event);
+        }
+    }
+    if !finished {
+        *runner = Some(active);
+        return;
+    }
+    let key = selection_key(snapshot, state_screen);
+    *snapshot = state::load();
+    reanchor(state_screen, key, snapshot);
+    // `active` cai aqui; o `Drop` só faz `join` (o filho já saiu).
+}
+
+/// Lista visível de achados (mesmo filtro da tabela) — base da reancoragem.
+fn visible_findings<'a>(
+    snapshot: &'a Snapshot,
+    state_screen: &AppState,
+) -> Vec<&'a state::FindingRow> {
+    state::filter_findings(
+        &snapshot.finding_rows,
+        state_screen.severity_filter.as_deref(),
+        state_screen.tool_filter.as_deref(),
+    )
+}
+
+/// Chave estável do que está selecionado na tela atual.
+fn selection_key(snapshot: &Snapshot, state_screen: &AppState) -> Option<state::SelectionKey> {
+    match state_screen.screen {
+        Screen::Achados => visible_findings(snapshot, state_screen)
+            .get(state_screen.findings_selected)
+            .map(|row| state::SelectionKey::Finding(row.fingerprint.clone())),
+        Screen::Sessoes => snapshot
+            .session_rows
+            .get(state_screen.sessions_selected)
+            .map(|row| state::SelectionKey::Session(row.id)),
+        Screen::Wiki => {
+            let filtered = state::filter_pages(&snapshot.wiki_rows, &state_screen.wiki_query);
+            state::wiki_ordered(&filtered)
+                .get(state_screen.wiki_selected)
+                .map(|page| state::SelectionKey::Wiki(page.slug.clone()))
+        }
+        Screen::Resumo => None,
+    }
+}
+
+/// Move a seleção para o registro da chave; se ele sumiu, mantém o índice
+/// (o clamp do loop cuida do resto) — nunca "pula" para outro item.
+fn reanchor(state_screen: &mut AppState, key: Option<state::SelectionKey>, snapshot: &Snapshot) {
+    let Some(key) = key else {
+        return;
+    };
+    match key {
+        state::SelectionKey::Finding(fingerprint) => {
+            if let Some(index) = visible_findings(snapshot, state_screen)
+                .iter()
+                .position(|row| row.fingerprint == fingerprint)
+            {
+                state_screen.findings_selected = index;
+            }
+        }
+        state::SelectionKey::Session(id) => {
+            if let Some(index) = snapshot.session_rows.iter().position(|row| row.id == id) {
+                state_screen.sessions_selected = index;
+            }
+        }
+        state::SelectionKey::Wiki(slug) => {
+            let filtered = state::filter_pages(&snapshot.wiki_rows, &state_screen.wiki_query);
+            if let Some(index) = state::wiki_ordered(&filtered)
+                .iter()
+                .position(|page| page.slug == slug)
+            {
+                state_screen.wiki_selected = index;
+            }
+        }
     }
 }
 
 /// DECISÃO PURA da tecla: estado de tela + `KeyEvent` → [`Outcome`].
 ///
-/// Toda a semântica de interação do loop mora aqui, sem terminal, sem I/O —
-/// o loop só executa o outcome. SAIR (`Ctrl+C`, e `q` fora da busca) é a
-/// primeira checagem, antes de qualquer modal — sem SIGINT em raw mode, é o
-/// handler que obedece ao Ctrl+C. `Esc` é VOLTAR (fecha a camada aberta),
-/// padrão de mercado: ele nunca tira o usuário do app. Setas E vim (persona §7)
-/// chegam pelo `keymap`; Enter/TAB têm semântica dependente do estado (painel
-/// em foco, detalhe aberto) e por isso são decididos AQUI, não no keymap sem
-/// estado do W6-PR1. Nenhuma tecla escreve: não existe outcome de escrita.
+/// Ordem dos modais: busca → leitura → ajuda. SAIR (Ctrl+C e `q` fora da
+/// busca) vem antes de tudo. `Esc` é SEMPRE voltar (fecha a camada aberta),
+/// nunca sai do app — contrato do dono. Nenhuma tecla escreve.
 pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
-    // SAIR: Ctrl+C encerra em QUALQUER estado — em raw mode não existe
-    // SIGINT, então a tecla chega aqui como evento e ignorá-la prende o
-    // usuário. `q` também sai, EXCETO na busca (ali `q` é texto: quem digita
-    // uma palavra com q não pode ser expulso no meio da digitação).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Outcome::Quit;
     }
-    // VOLTAR: `Esc` fecha a camada aberta e, sem camada, não faz nada.
-    // Contrato do dono (teste em Windows): Esc é o "voltar" que todo dev
-    // aperta; a saída fica com q/Ctrl+C.
+    // `--read-only` desliga a tecla de AÇÃO antes de qualquer modal: navegar
+    // continua, pedir execução não (ADR-0033 §4). A guarda é aqui, não só no
+    // rodapé — é o que o e2e de hash prova.
+    if state.read_only && is_action_key(key) {
+        return Outcome::Ignore;
+    }
     match key.code {
         KeyCode::Esc => {
+            // Cascata: o overlay da execução fecha primeiro, depois a folha de
+            // alvo e o popup — nenhuma dessas camadas executa nada.
+            if state.exec_open {
+                return Outcome::ToggleExecution;
+            }
+            if state.target.is_some() {
+                return Outcome::TargetCancel;
+            }
+            if state.confirm.is_some() {
+                return Outcome::ConfirmCancel;
+            }
             if state.wiki_search_open {
                 return Outcome::CloseSearch;
             }
             if state.page_open {
                 return Outcome::ClosePage;
             }
-            if state.detail_open {
-                return Outcome::ToggleDetail;
-            }
             if state.help_open {
                 return Outcome::Help;
+            }
+            if state.inspecting {
+                return Outcome::ToggleInspector;
+            }
+            // Esc sem camada aberta limpa os filtros de achados.
+            if filters_active(state) {
+                return Outcome::ClearFindingsFilters;
             }
             return Outcome::Ignore;
         }
         KeyCode::Char('q') if !state.wiki_search_open => return Outcome::Quit,
         _ => {}
     }
-    // Busca aberta é modal: toda tecla vira texto no rodapé; Enter CONFIRMA e
-    // fecha a caixa (o filtro é incremental, a agulha fica). Só caracteres
-    // sem CONTROL entram; SHIFT entra (maiúscula é busca). Esc cancela a
-    // busca (voltou ao padrão de mercado: Esc é voltar).
+    // Busca aberta é modal: toda tecla vira texto no rodapé.
     if state.wiki_search_open {
         return match key.code {
             KeyCode::Enter => Outcome::CloseSearch,
@@ -339,88 +705,116 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
             _ => Outcome::Ignore,
         };
     }
-    // Preview de página aberto é modal: Enter volta à lista, j/k/PgUp/PgDn
-    // rolam e `r` relê o disco (o mesmo serviço do modal de detalhe). Esc
-    // fecha o preview (voltou a ser "voltar"). Mover/Tab por baixo do preview
-    // confundiria o foco.
+    // Leitura da wiki em tela cheia é modal.
     if state.page_open {
         return match key.code {
             KeyCode::Enter => Outcome::ClosePage,
             KeyCode::Char('r') => Outcome::Reload,
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => {
-                Outcome::ScrollPage(if key.code == KeyCode::PageDown {
-                    SCROLL_PAGE_STEP
-                } else {
-                    1
-                })
-            }
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => {
-                Outcome::ScrollPage(if key.code == KeyCode::PageUp {
-                    -SCROLL_PAGE_STEP
-                } else {
-                    -1
-                })
-            }
+            KeyCode::Char('j') | KeyCode::Down => Outcome::ScrollPage(1),
+            KeyCode::Char('k') | KeyCode::Up => Outcome::ScrollPage(-1),
+            KeyCode::PageDown => Outcome::ScrollPage(SCROLL_PAGE_STEP),
+            KeyCode::PageUp => Outcome::ScrollPage(-SCROLL_PAGE_STEP),
             KeyCode::Char('g') => Outcome::ScrollPage(isize::MIN),
             KeyCode::Char('G') => Outcome::ScrollPage(isize::MAX),
             _ => Outcome::Ignore,
         };
     }
-    // Detalhe aberto é modal: Enter fecha (toggle), `r` relê o disco e Esc
-    // também fecha (Esc = voltar).
-    // Mover/Tab por baixo do detalhe confundiria o foco.
-    if state.detail_open {
+    // Ajuda é modal: `?`/`Esc` fecham, o resto não navega por baixo.
+    if state.help_open {
         return match key.code {
-            KeyCode::Enter => Outcome::ToggleDetail,
-            KeyCode::Char('r') => Outcome::Reload,
+            KeyCode::Char('?') => Outcome::Help,
+            _ => Outcome::Ignore,
+        };
+    }
+    // Overlay da execução: rola o log, `G` religa o follow, `o`/`Esc` fecham.
+    // Nenhuma tecla aqui mata o processo (ADR-0033: Esc não cancela).
+    if state.exec_open {
+        return match key.code {
+            KeyCode::Enter | KeyCode::Char('o') => Outcome::ToggleExecution,
+            KeyCode::Char('j') | KeyCode::Down => Outcome::ScrollExecution(1),
+            KeyCode::Char('k') | KeyCode::Up => Outcome::ScrollExecution(-1),
+            KeyCode::PageDown => Outcome::ScrollExecution(SCROLL_PAGE_STEP),
+            KeyCode::PageUp => Outcome::ScrollExecution(-SCROLL_PAGE_STEP),
+            KeyCode::Char('g') => Outcome::ScrollExecution(isize::MIN),
+            KeyCode::Char('G') => Outcome::FollowExecution,
+            _ => Outcome::Ignore,
+        };
+    }
+    // Folha de alvo é modal: dígitos digitam o id, Tab/↑/↓ andam na lista.
+    if state.target.is_some() {
+        return match key.code {
+            KeyCode::Enter => Outcome::TargetConfirm,
+            KeyCode::Tab | KeyCode::Down => Outcome::TargetCycle(1),
+            KeyCode::BackTab | KeyCode::Up => Outcome::TargetCycle(-1),
+            KeyCode::Backspace => Outcome::TargetBackspace,
+            KeyCode::Char(value) if value.is_ascii_digit() => Outcome::TargetPush(value),
+            _ => Outcome::Ignore,
+        };
+    }
+    // Popup de confirmação: Enter executa (o ÚNICO caminho), Esc cancela.
+    if state.confirm.is_some() {
+        return match key.code {
+            KeyCode::Enter => Outcome::ConfirmExecute,
             _ => Outcome::Ignore,
         };
     }
     match key.code {
-        KeyCode::Enter => {
-            // Enter só abre detalhe com linha para abrir: lista vazia é
-            // Ignore (e no cabeçalho Enter nunca teve significado). W6-PR3:
-            // o painel de sessões abre o MESMO modal com o summary da
-            // sessão selecionada. W6-PR4: o painel de wiki abre a página
-            // em tela cheia (`OpenPage`).
-            match state.panel {
-                Panel::Findings if state.findings_len > 0 => Outcome::ToggleDetail,
-                Panel::Sessions if state.sessions_len > 0 => Outcome::ToggleDetail,
-                Panel::Wiki if state.wiki_len > 0 => Outcome::OpenPage,
-                _ => Outcome::Ignore,
-            }
-        }
-        // Esc NÃO chega aqui: o bloco de VOLTAR no topo já tratou o Esc
-        // (fecha camada aberta ou Ignore), então este match não o vê.
-        // Ctrl+L: redesenhar sem mudar nada (a tela de um terminal bagunçado
-        // por outra aplicação volta sozinha).
-        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => Outcome::Redraw,
+        KeyCode::Enter => match state.screen {
+            // Enter abre o inspetor com o registro selecionado.
+            Screen::Achados if state.findings_len > 0 => Outcome::ToggleInspector,
+            Screen::Sessoes if state.sessions_len > 0 => Outcome::ToggleInspector,
+            // Wiki: Enter abre a leitura integral (o `i` abre o preview ao lado).
+            Screen::Wiki if state.wiki_len > 0 => Outcome::OpenPage,
+            _ => Outcome::Ignore,
+        },
+        KeyCode::Char('1') => Outcome::GoScreen(Screen::Resumo),
+        KeyCode::Char('2') => Outcome::GoScreen(Screen::Achados),
+        KeyCode::Char('3') => Outcome::GoScreen(Screen::Sessoes),
+        KeyCode::Char('4') => Outcome::GoScreen(Screen::Wiki),
+        KeyCode::Char('l') if key.modifiers.contains(Mods::CONTROL) => Outcome::Redraw,
         _ => match keymap::map(key) {
-            Some(Action::Quit) => Outcome::Quit,
-            Some(Action::NextPanel) => Outcome::CyclePanel(1),
-            Some(Action::PrevPanel) => Outcome::CyclePanel(-1),
-            Some(Action::Down) => Outcome::Move(1),
-            Some(Action::Up) => Outcome::Move(-1),
-            // g/G = extremos: satura via [`apply_move`], o loop clampa pela
-            // quantidade real de linhas.
-            Some(Action::Top) => Outcome::Move(isize::MIN),
-            Some(Action::Bottom) => Outcome::Move(isize::MAX),
-            Some(Action::Reload) => Outcome::Reload,
-            Some(Action::Help) => Outcome::Help,
-            // `/` só significa algo no painel de wiki: nos outros, Ignore.
-            Some(Action::SearchWiki) if state.panel == Panel::Wiki => Outcome::SearchWiki,
-            Some(Action::SearchWiki) => Outcome::Ignore,
+            Some(Key::Quit) => Outcome::Quit,
+            Some(Key::NextPanel) => Outcome::CycleScreen(1),
+            Some(Key::PrevPanel) => Outcome::CycleScreen(-1),
+            Some(Key::Down) => Outcome::Move(1),
+            Some(Key::Up) => Outcome::Move(-1),
+            Some(Key::Top) => Outcome::Move(isize::MIN),
+            Some(Key::Bottom) => Outcome::Move(isize::MAX),
+            Some(Key::Reload) => Outcome::Reload,
+            Some(Key::Help) => Outcome::Help,
+            Some(Key::Inspect) => Outcome::ToggleInspector,
+            Some(Key::SearchWiki) if state.screen == Screen::Wiki => Outcome::SearchWiki,
+            Some(Key::SearchWiki) => Outcome::Ignore,
+            // Pedido de AÇÃO: nunca spawna aqui — o loop monta o plano e o
+            // popup é quem pede o Enter. `read_only` já foi barrado acima.
+            Some(Key::Request(request)) => {
+                if state.read_only {
+                    Outcome::Ignore
+                } else {
+                    Outcome::RequestAction(request)
+                }
+            }
+            // `o` só vale quando existe execução para abrir.
+            Some(Key::Execution) if state.exec.is_some() => Outcome::ToggleExecution,
+            Some(Key::Execution) => Outcome::Ignore,
+            // `f`/`m` só existem na tela de Achados.
+            // Na lista única degradada o filtro não muda o que aparece:
+            // melhor ignorar do que fingir que filtrou.
+            Some(Key::FilterSeverity) if state.screen == Screen::Achados && !state.degraded => {
+                Outcome::CycleSeverityFilter
+            }
+            Some(Key::FilterTool) if state.screen == Screen::Achados && !state.degraded => {
+                Outcome::CycleToolFilter
+            }
+            Some(Key::FilterSeverity | Key::FilterTool) => Outcome::Ignore,
             None => Outcome::Ignore,
         },
     }
 }
 
-/// Passo de PgUp/PgDn no preview (linhas por "página" de scroll).
-pub const SCROLL_PAGE_STEP: isize = 10;
-
 /// Roda o modo interativo (só é chamado com stdout TTY). Erro é texto
 /// acionável, nunca panic.
-pub fn run(initial: Snapshot) -> Result<(), String> {
+pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
     let _guard = ScreenGuard::enter().map_err(|err| {
         format!(
             "não foi possível entrar no modo de tela do dashboard: {err} — \
@@ -430,11 +824,7 @@ pub fn run(initial: Snapshot) -> Result<(), String> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .map_err(|err| format!("não foi possível preparar a saída do dashboard: {err}"))?;
 
-    // Restauro do terminal GARANTIDO até em pânico: o hook devolve raw
-    // mode/alternate screen ANTES do backtrace. O Drop do guard já cobre erro
-    // e return; o hook cobre o caminho de panic — o dono nunca fica com o
-    // terminal quebrado (o defeito "não consigo fechar" não pode virar
-    // "terminal destruído").
+    // Restauro do terminal GARANTIDO até em pânico.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -443,741 +833,757 @@ pub fn run(initial: Snapshot) -> Result<(), String> {
     }));
 
     let palette = theme::palette_from_env();
-    let mut screen = AppState {
-        findings_len: initial.finding_rows.len(),
-        sessions_len: initial.session_rows.len(),
-        wiki_len: initial.wiki_rows.len(),
+    let mut snapshot = initial;
+    // A execução vive FORA do `AppState` (canal + thread não são dados de
+    // tela); o `Drop` do `Runner` mata o filho ao sair.
+    let mut runner: Option<Runner> = None;
+    let mut state_screen = AppState {
+        findings_len: snapshot.finding_rows.len(),
+        sessions_len: snapshot.session_rows.len(),
+        wiki_len: snapshot.wiki_rows.len(),
+        read_only: options.read_only,
         ..AppState::default()
     };
-    let mut snapshot = initial;
 
     loop {
-        screen.findings_len = snapshot.finding_rows.len();
-        screen.sessions_len = snapshot.session_rows.len();
-        // A lista da wiki é FILTRADA por frame (é texto puro sobre o
-        // snapshot, nunca I/O): a agulha vive no estado de tela.
+        // Valores de filtro são os PRESENTES no snapshot; se o valor escolhido
+        // sumiu (novo scan), o filtro cai — nunca se filtra por fantasma.
+        state_screen.severity_values = state::severities_present(&snapshot.finding_rows);
+        state_screen.tool_values = state::tools_present(&snapshot.finding_rows);
+        if let Some(severity) = &state_screen.severity_filter
+            && !state_screen.severity_values.contains(severity)
+        {
+            state_screen.severity_filter = None;
+        }
+        if let Some(tool) = &state_screen.tool_filter
+            && !state_screen.tool_values.contains(tool)
+        {
+            state_screen.tool_filter = None;
+        }
+        let visible_findings = filtered_findings(&snapshot, &state_screen).len();
+        state_screen.findings_len = visible_findings;
+        state_screen.sessions_len = snapshot.session_rows.len();
         let filtered_wiki: Vec<&WikiPage> =
-            state::filter_pages(&snapshot.wiki_rows, &screen.wiki_query);
-        screen.wiki_len = filtered_wiki.len();
-        let lines = state::header_lines(&snapshot);
-        let findings = state::findings_lines(&snapshot);
-        let sessions = state::sessions_lines(&snapshot);
+            state::filter_pages(&snapshot.wiki_rows, &state_screen.wiki_query);
+        state_screen.wiki_len = filtered_wiki.len();
+        // Ids que a folha de alvo pode oferecer, do snapshot (sem rede).
+        state_screen.known_work_items = action::known_work_items(&snapshot);
 
-        // Degradado? O tamanho vem do backend (cache do ratatui), não do frame.
         let size = terminal
             .size()
             .map_err(|err| format!("falha ao medir a tela: {err}"))?;
-        let degraded = size.width < MIN_WIDTH || size.height < MIN_HEIGHT;
+        let degraded = layout::is_degraded(Rect::new(0, 0, size.width, size.height));
+        state_screen.degraded = degraded;
 
-        // Clamp de TODOS os índices pela quantidade REAL de linhas visíveis:
-        // o ➤ nunca aponta para fora da lista, nem depois de um `r` que
-        // encolheu os dados, nem ao voltar para um painel. Um índice por
-        // painel, mais o scroll da lista única degradada.
-        let degraded_total_lines = lines.len() + findings.len() + sessions.len() + 1;
-        screen.degraded = degraded;
-        screen.findings_selected = screen.findings_selected.min(max_selected_for(
-            Panel::Findings,
-            screen.findings_len,
-            screen.sessions_len,
-            screen.wiki_len,
+        // Clamp de TODOS os índices pela quantidade REAL de linhas visíveis.
+        let degraded_total_lines = degraded_lines(&snapshot, state_screen.screen).len();
+        state_screen.findings_selected = state_screen.findings_selected.min(max_selected_for(
+            Screen::Achados,
+            state_screen.findings_len,
+            state_screen.sessions_len,
+            state_screen.wiki_len,
             degraded_total_lines,
             degraded,
         ));
-        screen.sessions_selected = screen.sessions_selected.min(max_selected_for(
-            Panel::Sessions,
-            screen.findings_len,
-            screen.sessions_len,
-            screen.wiki_len,
+        state_screen.sessions_selected = state_screen.sessions_selected.min(max_selected_for(
+            Screen::Sessoes,
+            state_screen.findings_len,
+            state_screen.sessions_len,
+            state_screen.wiki_len,
             degraded_total_lines,
             degraded,
         ));
-        screen.wiki_selected = screen.wiki_selected.min(max_selected_for(
-            Panel::Wiki,
-            screen.findings_len,
-            screen.sessions_len,
-            screen.wiki_len,
+        state_screen.wiki_selected = state_screen.wiki_selected.min(max_selected_for(
+            Screen::Wiki,
+            state_screen.findings_len,
+            state_screen.sessions_len,
+            state_screen.wiki_len,
             degraded_total_lines,
             degraded,
         ));
-        screen.degraded_selected = screen.degraded_selected.min(max_selected_for(
-            Panel::Header,
-            screen.findings_len,
-            screen.sessions_len,
-            screen.wiki_len,
+        state_screen.degraded_selected = state_screen.degraded_selected.min(max_selected_for(
+            Screen::Resumo,
+            state_screen.findings_len,
+            state_screen.sessions_len,
+            state_screen.wiki_len,
             degraded_total_lines,
             degraded,
         ));
+
+        // Drena a execução em andamento (nunca bloqueia: `try_recv`).
+        drain_execution(&mut state_screen, &mut runner, &mut snapshot);
+
+        // Ação pedida e já com id vira PLANO aqui (único I/O de ambiente);
+        // `decide`/`apply_outcome` continuam puros e testáveis.
+        if let Some(step) = state_screen.pending.take() {
+            match build_plan(step, &snapshot) {
+                Ok(plan) => {
+                    state_screen.notice = None;
+                    state_screen.confirm = Some(ConfirmState { plan });
+                }
+                Err(message) => state_screen.notice = Some(message),
+            }
+        }
 
         terminal
-            .draw(|frame| render_frame(frame, &snapshot, &screen, palette))
+            .draw(|frame| render_frame(frame, &snapshot, &state_screen, palette))
             .map_err(|err| format!("falha ao desenhar o dashboard: {err}"))?;
 
-        // Poll: decisão por tecla via função pura; sem tecla, nada acontece
-        // (sem spinner eterno — a persona proíbe; o dashboard só muda quando
-        // o mundo muda).
+        // Poll com timeout: sem tecla, nada acontece (sem spinner eterno).
+        let has_event = event::poll(Duration::from_millis(150))
+            .map_err(|err| format!("falha ao esperar teclado: {err}"))?;
+        if !has_event {
+            continue;
+        }
         if let Event::Key(key) =
             event::read().map_err(|err| format!("falha ao ler teclado: {err}"))?
         {
-            // O Windows entrega Press E Release para a MESMA tecla (no Unix só
-            // existe Press): tratar os dois repetia cada tecla — o Tab pulava
-            // painel (o Release repetia o ciclo e a wiki vazia nunca ficava
-            // em foco) e o ↓ andava dois passos. Só Press executa a decisão.
+            // O Windows entrega Press E Release; só Press executa.
             if key.kind == KeyEventKind::Press {
-                match decide(&screen, key) {
+                match decide(&state_screen, key) {
                     Outcome::Quit => return Ok(()),
-                    // `r` relê o disco (read-only), nunca outra coisa — I/O
-                    // fica no loop; toda mutação de tela é função pura.
                     Outcome::Reload => {
+                        // Reler sem perder a linha selecionada (fingerprint/id/slug).
+                        let key = selection_key(&snapshot, &state_screen);
                         snapshot = state::load();
+                        reanchor(&mut state_screen, key, &snapshot);
                     }
-                    outcome => apply_outcome(&mut screen, outcome),
+                    // `Enter` no popup é o ÚNICO caminho que spawna — e o
+                    // plano já nasceu com argv allowlist.
+                    Outcome::ConfirmExecute => {
+                        if let Some(confirm) = state_screen.confirm.take() {
+                            if state_screen
+                                .exec
+                                .as_ref()
+                                .is_some_and(ExecState::is_running)
+                            {
+                                state_screen.notice = Some(
+                                    "já existe uma execução em andamento — espere terminar"
+                                        .to_string(),
+                                );
+                            } else {
+                                let action = confirm.plan.action;
+                                match Runner::spawn(confirm.plan) {
+                                    Ok(spawned) => {
+                                        let now = snapshot.now_secs.unwrap_or(0);
+                                        state_screen.exec = Some(ExecState::new(action, now));
+                                        state_screen.exec_open = true;
+                                        state_screen.notice = None;
+                                        runner = Some(spawned);
+                                    }
+                                    Err(err) => state_screen.notice = Some(err.to_string()),
+                                }
+                            }
+                        }
+                    }
+                    outcome => apply_outcome(&mut state_screen, outcome),
                 }
             }
         }
     }
 }
 
-/// Limite de seleção pela quantidade REAL de linhas visíveis: o ➤ nunca
-/// aponta para fora da lista. Função pura (unit-testada) — o loop só aplica.
-pub fn max_selected_for(
-    panel: Panel,
-    findings_len: usize,
-    sessions_len: usize,
-    wiki_len: usize,
-    degraded_total_lines: usize,
-    degraded: bool,
-) -> usize {
-    if degraded {
-        degraded_total_lines.max(1) - 1
-    } else {
-        match panel {
-            Panel::Findings => findings_len.max(1) - 1,
-            Panel::Sessions => sessions_len.max(1) - 1,
-            Panel::Wiki => wiki_len.max(1) - 1,
-            Panel::Header => 0,
+/// Linhas da lista única do modo degradado (função pura, testável).
+pub fn degraded_lines(snapshot: &Snapshot, screen: Screen) -> Vec<String> {
+    let mut lines = vec![format!(
+        "aviso: terminal menor que {0}×{1} — lista única; aumente a janela para o layout denso",
+        layout::MIN_WIDTH,
+        layout::MIN_HEIGHT
+    )];
+    lines.push(chrome::status_line(snapshot));
+    lines.push(chrome::tabs_text(snapshot, screen.index()));
+    match screen {
+        Screen::Resumo => {
+            for (title, section_lines) in state::resumo_sections(snapshot) {
+                lines.push(format!("| {title} |"));
+                lines.extend(section_lines);
+            }
         }
+        Screen::Achados => lines.extend(state::findings_lines(snapshot)),
+        Screen::Sessoes => lines.extend(state::sessions_lines(snapshot)),
+        Screen::Wiki => lines.extend(state::wiki_lines(snapshot)),
     }
+    lines
 }
 
-/// Desenha UM frame completo do dashboard: cabeçalho + painel de achados +
-/// painel de sessões (com o detalhe lateral quando `Enter` o abriu) + rodapé
-/// (+ overlay de ajuda). Função pura sobre o frame — o loop só a chama, e os
-/// testes a exercitam com `TestBackend`, o que dá cobertura real ao desenho
-/// sem TTY.
+/// Desenha UM frame completo: chrome (status + abas), fonte ativa e rodapé.
 pub fn render_frame(frame: &mut Frame, snapshot: &Snapshot, screen: &AppState, palette: Palette) {
+    // Modo de glifo lido UMA vez por frame (`KIRA_GLYPHS=ascii`): todos os
+    // painéis desta pintura usam o mesmo conjunto — misturar Unicode com ASCII
+    // na mesma tela é pior que ficar no conjunto degradado inteiro.
+    render_frame_with(frame, snapshot, screen, palette, Glyphs::from_env());
+}
+
+/// [`render_frame`] com o conjunto de glifos injetado.
+///
+/// Existe para o teste poder afirmar o critério "ASCII sem glifo especial" na
+/// TELA INTEIRA: variável de ambiente é estado global do processo e teste que
+/// muta env é proibido aqui (edition 2024 torna `set_var` unsafe).
+pub fn render_frame_with(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    screen: &AppState,
+    palette: Palette,
+    glyphs: Glyphs,
+) {
     let area = frame.area();
-    let degraded = area.width < MIN_WIDTH || area.height < MIN_HEIGHT;
-    let lines = state::header_lines(snapshot);
-    let findings = state::findings_lines(snapshot);
-    let sessions = state::sessions_lines(snapshot);
-    let wiki = state::wiki_lines(snapshot);
-    let empty_line = state::empty_findings_line(snapshot);
-    let empty_sessions_line = state::empty_sessions_line(snapshot);
-    let empty_wiki_line = state::empty_wiki_line(snapshot);
-    // A lista de páginas mostrada é a FILTRADA pela agulha da busca (pura);
-    // sem busca aberta, a agulha está vazia e o filtro devolve tudo.
+    let shell = layout::shell(area);
+
+    let mut status = chrome::status_line(snapshot);
+    if screen.read_only {
+        status.push_str("   ·   leitura");
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            status,
+            Style::default().fg(palette.footer),
+        ))),
+        shell.status,
+    );
+    frame.render_widget(
+        Paragraph::new(chrome::tabs_line(snapshot, screen.screen.index(), palette)),
+        shell.tabs,
+    );
+
     let filtered_wiki: Vec<&WikiPage> =
         state::filter_pages(&snapshot.wiki_rows, &screen.wiki_query);
-    // Rodapé: na busca aberta vira a caixa de texto (cursor no fim); fora
-    // dela é a barra de teclas com o painel N/4. EXTRA: painel focado vazio ⇒
-    // a dica do que fazer entra no rodapé (uma linha, causa honesta — o dev
-    // vê que o painel existe e está vazio).
-    let hint = if screen.degraded {
-        // Degradado não há painel em foco visível: sem dica.
-        None
-    } else {
-        state::empty_panel_hint(
-            snapshot,
-            screen.panel,
-            screen.findings_len,
-            screen.sessions_len,
-            screen.wiki_len,
-        )
-    };
-    let footer = if screen.wiki_search_open {
-        format!(
-            "busca wiki: {}▌ (j/k mover · Enter confirma · Esc volta · Ctrl+C sai)",
-            screen.wiki_query
-        )
-    } else {
-        match hint {
-            Some(hint) => format!(
-                "painel {}/{} · {} · {}",
-                screen.panel.index() + 1,
-                PANEL_COUNT,
-                hint,
-                state::footer_line()
-            ),
-            None => format!(
-                "painel {}/{} · {}",
-                screen.panel.index() + 1,
-                PANEL_COUNT,
-                state::footer_line()
-            ),
-        }
-    };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if degraded {
-            // Degradado: lista única ocupa a tela inteira (menos o rodapé).
-            vec![Constraint::Min(1), Constraint::Length(1)]
-        } else {
-            // Denso: cabeçalho + achados + sessões + wiki + rodapé de 1 linha.
-            vec![
-                Constraint::Length(lines.len() as u16 + 2),
-                Constraint::Min(1),
-                Constraint::Min(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ]
-        })
-        .split(area);
-    let (list_area, footer_area) = if degraded {
-        (rows[0], rows[1])
-    } else {
-        (rows[0], rows[4])
-    };
-    if degraded {
-        // Lista única com aviso: mesma informação, sem layout denso.
-        let mut narrow = vec![format!(
-            "aviso: terminal {}×{} menor que {MIN_WIDTH}×{MIN_HEIGHT} — layout de lista única",
-            area.width, area.height
-        )];
-        narrow.extend(lines.iter().cloned());
-        narrow.extend(findings.iter().cloned());
-        narrow.extend(sessions.iter().cloned());
-        narrow.extend(wiki.iter().cloned());
+    // Ordem canônica por tipo (contexto → … → bugs): a MESMA que a seleção
+    // percorre, para `j`/`k` andar na ordem em que a tela desenha.
+    let ordered_wiki = state::wiki_ordered(&filtered_wiki);
+    let inspecting = screen.inspecting && screen_has_rows(screen) && !screen.degraded;
+
+    if screen.degraded {
+        let lines = degraded_lines(snapshot, screen.screen);
+        let block = crate::tui::widgets::panel::block_with("lista única", true, palette, glyphs);
+        let scroll = u16::try_from(screen.degraded_selected.min(lines.len().saturating_sub(1)))
+            .unwrap_or(u16::MAX);
         frame.render_widget(
             Paragraph::new(
-                narrow
+                lines
                     .iter()
                     .map(|line| {
-                        ratatui::text::Line::from(Span::styled(
+                        Line::from(Span::styled(
                             line.clone(),
                             Style::default().fg(palette.value),
                         ))
                     })
                     .collect::<Vec<_>>(),
             )
-            .block(Block::default().borders(Borders::ALL))
-            // `degraded_selected` vira scroll da lista única: as teclas j/k
-            // continuam fazendo algo útil na degradação.
-            .scroll((
-                u16::try_from(screen.degraded_selected.min(narrow.len().saturating_sub(1)))
-                    .unwrap_or(u16::MAX),
-                0,
-            )),
-            list_area,
+            .block(block)
+            .scroll((scroll, 0)),
+            shell.workspace,
         );
     } else {
-        let header_focused = screen.panel == Panel::Header;
-        let title = snapshot
-            .project
-            .as_ref()
-            .map(|project| project.name.as_str());
-        frame.render_widget(
-            HeaderWidget::new(&lines, title, palette).focused(header_focused),
-            rows[0],
+        let ws = layout::workspace(shell.workspace, inspecting);
+        render_screen(
+            frame,
+            snapshot,
+            screen,
+            palette,
+            glyphs,
+            ws.primary,
+            ws.inspector,
+            &ordered_wiki,
         );
-        match screen.panel {
-            Panel::Findings if screen.detail_open => {
-                // Detalhe lateral do achado: tabela à esquerda, achado
-                // inteiro à direita — o contexto nunca desaparece ao abrir.
-                let detail_cols = split_detail(rows[1]);
-                frame.render_widget(
-                    FindingsWidget::new(
-                        &snapshot.finding_rows,
-                        screen.findings_selected,
-                        true,
-                        empty_line.clone(),
-                        palette,
-                    ),
-                    detail_cols[0],
-                );
-                if let Some(row) = snapshot.finding_rows.get(screen.findings_selected) {
-                    let detail = state::detail_lines(row);
-                    frame.render_widget(DetailWidget::new(&detail, palette), detail_cols[1]);
-                }
-            }
-            Panel::Sessions if screen.detail_open => {
-                // Detalhe lateral da sessão (W6-PR3): tabela à esquerda,
-                // summary inteiro (≤2000 chars gravados) à direita.
-                let detail_cols = split_detail(rows[2]);
-                frame.render_widget(
-                    SessionsWidget::new(
-                        &snapshot.session_rows,
-                        snapshot.now_secs,
-                        screen.sessions_selected,
-                        true,
-                        empty_sessions_line.clone(),
-                        palette,
-                    ),
-                    detail_cols[0],
-                );
-                if let Some(row) = snapshot.session_rows.get(screen.sessions_selected) {
-                    let detail = state::session_detail_lines(row, snapshot.now_secs);
-                    frame.render_widget(DetailWidget::new(&detail, palette), detail_cols[1]);
-                }
-            }
-            _ => {
-                // Sem detalhe: os painéis de tabela empilhados verticalmente
-                // (achados, sessões, wiki) — a wiki sempre fica visível.
-                frame.render_widget(
-                    FindingsWidget::new(
-                        &snapshot.finding_rows,
-                        screen.findings_selected,
-                        screen.panel == Panel::Findings,
-                        empty_line.clone(),
-                        palette,
-                    ),
-                    rows[1],
-                );
-                frame.render_widget(
-                    SessionsWidget::new(
-                        &snapshot.session_rows,
-                        snapshot.now_secs,
-                        screen.sessions_selected,
-                        screen.panel == Panel::Sessions,
-                        empty_sessions_line.clone(),
-                        palette,
-                    ),
-                    rows[2],
-                );
-                frame.render_widget(
-                    WikiWidget::new(
-                        &filtered_wiki,
-                        snapshot.now_secs,
-                        screen.wiki_selected,
-                        screen.panel == Panel::Wiki,
-                        empty_wiki_line.clone(),
-                        palette,
-                    ),
-                    rows[3],
-                );
-            }
-        }
     }
-    frame.render_widget(
-        Paragraph::new(Span::styled(footer, Style::default().fg(palette.footer))),
-        footer_area,
-    );
-    // Preview em tela cheia da página (W6-PR4): cobre o dashboard inteiro,
-    // como um "blog" — `Enter` abriu, `Esc` volta.
+
+    // Rodapé: aviso (erro acionável) > busca aberta > chips de tecla.
+    if let Some(notice) = &screen.notice {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {notice}"),
+                Style::default().fg(palette.failed),
+            ))),
+            shell.footer,
+        );
+    } else if screen.wiki_search_open {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    "busca wiki: {}▌   (Enter confirma · Esc volta · Backspace apaga)",
+                    screen.wiki_query
+                ),
+                Style::default().fg(palette.help),
+            ))),
+            shell.footer,
+        );
+    } else {
+        footer::render(
+            frame,
+            shell.footer,
+            &footer::keys_for(
+                screen.screen.index(),
+                !screen.read_only,
+                screen.exec.is_some(),
+            ),
+            palette,
+        );
+    }
+
+    // Popups modais POR CIMA do chrome; `Clear` impede o texto de baixo de
+    // vazar entre as linhas do popup (o statui usa o mesmo recurso).
+    if let Some(sheet) = &screen.target {
+        render_target(frame, area, sheet, palette, glyphs);
+    }
+    if let Some(confirm) = &screen.confirm {
+        render_confirm(frame, area, confirm, palette, glyphs);
+    }
+    if screen.exec_open
+        && let Some(exec) = &screen.exec
+    {
+        render_exec(frame, area, exec, snapshot.now_secs, palette, glyphs);
+    }
+
+    // Leitura da wiki em tela cheia cobre tudo (modal): `Enter` abriu.
     if screen.page_open
-        && let Some(page) = filtered_wiki.get(screen.wiki_selected)
+        && let Some(page) = ordered_wiki.get(screen.wiki_selected)
     {
         frame.render_widget(
-            WikiPageWidget::new(page, screen.preview_scroll, palette),
+            WikiPageWidget::new(page, screen.preview_scroll, palette).with_glyphs(glyphs),
             area,
         );
     }
     if screen.help_open {
-        // As pendências (causas integrais) vêm do snapshot — mesma função
-        // pura que alimenta a seção do `--snapshot`.
+        // `Clear` antes: a ajuda é modal e cobre a tela inteira — sem limpar, o
+        // painel de trás vaza nas células que o texto não pinta (defeito que só
+        // aparecia de verdade em `KIRA_GLYPHS=ascii`, onde as barras usam `#`).
+        frame.render_widget(Clear, area);
         frame.render_widget(
-            help_paragraph(&palette, &state::pending_causes(snapshot)),
+            help_paragraph(&palette, &state::pending_causes(snapshot), glyphs),
             area,
         );
     }
 }
 
-/// Divide a área de um painel em tabela (60%) + detalhe lateral (40%) — a
-/// mesma proporção dos achados no W6-PR2, agora usada pelas sessões também.
-fn split_detail(area: Rect) -> std::rc::Rc<[Rect]> {
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area)
+/// Pinta a fonte ativa (e o inspetor, quando aberto).
+#[allow(clippy::too_many_arguments)]
+fn render_screen(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    screen: &AppState,
+    palette: Palette,
+    glyphs: Glyphs,
+    primary: Rect,
+    inspector: Option<Rect>,
+    filtered_wiki: &[&WikiPage],
+) {
+    match screen.screen {
+        Screen::Resumo => {
+            let sections = state::resumo_sections(snapshot);
+            // Faixa visual: os três números que respondem "como estamos hoje"
+            // (risco, tendência, índice) antes das tabelas de texto.
+            let severities = state::severity_bars(snapshot);
+            let index_fallback = state::index_line(snapshot);
+            let visual = Visual {
+                severities: &severities,
+                trend: &snapshot.scan_series,
+                index: state::index_usage(snapshot),
+                index_fallback: &index_fallback,
+            };
+            frame.render_widget(
+                ResumoWidget::new(&sections, true, palette)
+                    .with_visual(visual)
+                    .with_glyphs(glyphs),
+                primary,
+            );
+        }
+        Screen::Achados => {
+            // A tabela desenha a lista FILTRADA (f/m), por referência.
+            let filtered = filtered_findings(snapshot, screen);
+            let filter_label = findings_filter_label(screen);
+            let empty = if filter_label.is_some() {
+                "— nenhum achado com o filtro atual (Esc limpa)".to_string()
+            } else {
+                state::empty_findings_line(snapshot)
+            };
+            frame.render_widget(
+                FindingsWidget::new(&filtered, screen.findings_selected, true, empty, palette)
+                    .with_filter(filter_label)
+                    .with_glyphs(glyphs),
+                primary,
+            );
+            if let Some(area) = inspector
+                && let Some(row) = filtered.get(screen.findings_selected)
+            {
+                let detail = state::detail_lines(row);
+                frame.render_widget(DetailWidget::new(&detail, palette), area);
+            }
+        }
+        Screen::Sessoes => {
+            frame.render_widget(
+                SessionsWidget::new(
+                    &snapshot.session_rows,
+                    snapshot.now_secs,
+                    screen.sessions_selected,
+                    true,
+                    state::empty_sessions_line(snapshot),
+                    palette,
+                )
+                .with_glyphs(glyphs),
+                primary,
+            );
+            if let Some(area) = inspector
+                && let Some(row) = snapshot.session_rows.get(screen.sessions_selected)
+            {
+                let detail = state::session_detail_lines(row, snapshot.now_secs);
+                frame.render_widget(DetailWidget::new(&detail, palette), area);
+            }
+        }
+        Screen::Wiki => {
+            frame.render_widget(
+                WikiWidget::new(
+                    filtered_wiki,
+                    snapshot.now_secs,
+                    screen.wiki_selected,
+                    true,
+                    state::empty_wiki_line(snapshot),
+                    palette,
+                )
+                .with_glyphs(glyphs),
+                primary,
+            );
+            if let Some(area) = inspector
+                && let Some(page) = filtered_wiki.get(screen.wiki_selected)
+            {
+                frame.render_widget(
+                    WikiPageWidget::new(page, screen.preview_scroll, palette).with_glyphs(glyphs),
+                    area,
+                );
+            }
+        }
+    }
 }
 
-/// Overlay de ajuda: os mesmos atalhos do rodapé, com o que cada um faz —
-/// mais a seção de pendências com a causa INTEGRAL de cada dado ausente (o
-/// cabeçalho corta o valor em 100 chars; o `?` mostra o passo a passo todo,
-/// inclusive a dica do `kira doctor`, em várias linhas — é texto, não painel).
-fn help_paragraph(palette: &Palette, pendings: &[String]) -> Paragraph<'static> {
+/// Overlay de ajuda: matriz de teclas + causas integrais das pendências.
+fn help_paragraph(palette: &Palette, pendings: &[String], glyphs: Glyphs) -> Paragraph<'static> {
+    // Setas são glifo: em modo ASCII a linha ensina o nome da tecla ("setas")
+    // em vez de desenhar uma seta que o console não tem.
+    let arrows = if glyphs.mode().is_ascii() {
+        "setas"
+    } else {
+        "↑ / ↓"
+    };
     let mut text = vec![
-        "ajuda do kira dashboard (read-only — nenhuma tecla escreve)".to_string(),
+        "ajuda do kira dashboard (navegar não executa — ADR-0033)".to_string(),
         String::new(),
         "q                sair".to_string(),
-        "Ctrl+C           sair (em qualquer estado, inclusive modal aberto)".to_string(),
-        "Esc              voltar (fecha ajuda/detalhe/página/busca)".to_string(),
-        "Tab / Shift+Tab  ciclar painel (cabeçalho ↔ achados ↔ sessões ↔ wiki)".to_string(),
-        "j / k ou ↑ / ↓   mover linha do painel em foco".to_string(),
+        "Ctrl+C           sair (em qualquer estado)".to_string(),
+        "Esc              voltar (fecha ajuda/leitura/inspetor/busca)".to_string(),
+        "1–4 / Tab        trocar de tela (Resumo · Achados · Sessões · Wiki)".to_string(),
+        format!("j / k ou {arrows}   mover a seleção da tela"),
         "g / G            topo / fim".to_string(),
-        "Enter            abrir/fechar detalhe (achado ou sessão) ou página da wiki".to_string(),
-        "/                busca incremental na wiki (Enter confirma)".to_string(),
-        "j/k, PgUp/PgDn   rolar a página da wiki aberta em tela cheia".to_string(),
+        "Enter            abrir inspetor (achado/sessão) ou ler a página".to_string(),
+        "i                abrir/fechar o inspetor 50–50".to_string(),
+        "s / t / d        pedir scan / triage / rascunho de PR (Enter confirma)".to_string(),
+        "o                abrir/fechar a saída da execução".to_string(),
+        "/                busca incremental na wiki (só na tela Wiki)".to_string(),
+        "PgUp/PgDn        rolar a leitura em tela cheia".to_string(),
         "r                reler o disco (sem rede, sem escrita)".to_string(),
         "?                abrir/fechar esta ajuda".to_string(),
     ];
-    if !pendings.is_empty() {
+    if pendings.is_empty() {
         text.push(String::new());
-        text.push(
-            "pendências (cabeçalho corta em uma linha; aqui vai a causa inteira):".to_string(),
-        );
+        text.push("pendências: — nenhuma pendência registrada".to_string());
+    } else {
+        text.push(String::new());
+        text.push("pendências (causa integral; o chrome corta em uma linha):".to_string());
         text.extend(pendings.iter().cloned());
     }
     text.push(String::new());
     text.push("Dado ausente aparece como — com a causa; nada é inventado.".to_string());
     Paragraph::new(
         text.into_iter()
-            .map(|line| {
-                ratatui::text::Line::from(Span::styled(line, Style::default().fg(palette.help)))
-            })
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(palette.help))))
             .collect::<Vec<_>>(),
     )
-    .block(Block::default().borders(Borders::ALL).title(" ajuda "))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(glyphs.border_set())
+            .title(" ajuda ")
+            .border_style(Style::default().fg(palette.help)),
+    )
+    .wrap(Wrap { trim: false })
+}
+
+/// Popup de confirmação: alvo, efeitos e pré-requisitos com cor por estado.
+/// Nada aqui executa — o widget só mostra o que o plano declarou.
+fn render_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    confirm: &ConfirmState,
+    palette: Palette,
+    glyphs: Glyphs,
+) {
+    use action::confirmacao::Kind;
+
+    let popup = layout::centered_rect(70, 62, area);
+    frame.render_widget(Clear, popup);
+    let mut text: Vec<Line> = action::confirmacao::lines(&confirm.plan)
+        .into_iter()
+        .map(|line| {
+            let color = match line.kind {
+                Kind::Target => palette.value,
+                Kind::Effect => palette.missing,
+                Kind::Ok => palette.ok,
+                Kind::Fail => palette.failed,
+            };
+            Line::from(Span::styled(line.text, Style::default().fg(color)))
+        })
+        .collect();
+    text.push(Line::from(""));
+    text.push(Line::from(vec![
+        Span::styled(
+            format!("Enter {}", confirm.plan.action.verb()),
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::raw("    "),
+        Span::styled("Esc cancelar", Style::default().fg(palette.help)),
+    ]));
+    text.push(Line::from(Span::styled(
+        "nada foi executado ainda",
+        Style::default().fg(palette.missing),
+    )));
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(crate::tui::widgets::panel::block_with(
+                &confirm.plan.action.title(),
+                true,
+                palette,
+                glyphs,
+            ))
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// Folha de alvo: lista de ids conhecidos + campo digitado.
+fn render_target(
+    frame: &mut Frame,
+    area: Rect,
+    sheet: &TargetSheet,
+    palette: Palette,
+    glyphs: Glyphs,
+) {
+    let popup = layout::centered_rect(56, 62, area);
+    frame.render_widget(Clear, popup);
+    // Marcadores do MESMO conjunto da sessão: a cor acompanha o glifo, então
+    // em ASCII a seleção continua destacada (`>` em vez de `➤`).
+    let selection = glyphs.selection().trim_end();
+    let field = glyphs.field_open();
+    let mut text: Vec<Line> = sheet
+        .lines_with(glyphs)
+        .into_iter()
+        .map(|line| {
+            let color = if line.starts_with(selection) {
+                palette.value
+            } else if line.starts_with(field) {
+                palette.title
+            } else {
+                palette.help
+            };
+            Line::from(Span::styled(line, Style::default().fg(color)))
+        })
+        .collect();
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        "Enter continuar   Tab completar   Esc cancelar",
+        Style::default().fg(palette.help),
+    )));
+    frame.render_widget(
+        Paragraph::new(text).block(crate::tui::widgets::panel::block_with(
+            sheet.title(),
+            true,
+            palette,
+            glyphs,
+        )),
+        popup,
+    );
+}
+
+/// Overlay `o`: a saída REAL do subprocesso, já sanitizada e redigida.
+///
+/// Gramática igual ao resto da casca: painel com título, cabeçalho de stream
+/// (`═| stdout |══`), linhas do processo e a dica de teclas no fim.
+fn render_exec(
+    frame: &mut Frame,
+    area: Rect,
+    exec: &ExecState,
+    now_secs: Option<i64>,
+    palette: Palette,
+    glyphs: Glyphs,
+) {
+    frame.render_widget(Clear, area);
+    let status = exec_status_label(exec, now_secs);
+    let block = crate::tui::widgets::panel::block_with(
+        &format!("{} · {status}", exec.action.title()),
+        true,
+        palette,
+        glyphs,
+    );
+    let inner = block.inner(area);
+
+    let mut body: Vec<Line> = Vec::new();
+    if exec.dropped > 0 {
+        body.push(Line::from(Span::styled(
+            format!(" ({} linhas antigas descartadas pelo teto)", exec.dropped),
+            Style::default().fg(palette.missing),
+        )));
+    }
+    let mut current: Option<bool> = None; // Some(true) = stderr
+    for line in &exec.lines {
+        match line {
+            action::LogLine::Stdout(text) => {
+                if current != Some(false) {
+                    body.push(exec_header("stdout", inner.width, palette, glyphs));
+                    current = Some(false);
+                }
+                body.push(Line::from(Span::styled(
+                    format!(" {text}"),
+                    Style::default().fg(palette.value),
+                )));
+            }
+            action::LogLine::Stderr(text) => {
+                if current != Some(true) {
+                    body.push(exec_header("stderr", inner.width, palette, glyphs));
+                    current = Some(true);
+                }
+                body.push(Line::from(Span::styled(
+                    format!(" {text}"),
+                    Style::default().fg(palette.failed),
+                )));
+            }
+            action::LogLine::Note(text) => body.push(Line::from(Span::styled(
+                format!(" {text}"),
+                Style::default().fg(palette.missing),
+            ))),
+        }
+    }
+    if body.is_empty() {
+        body.push(Line::from(Span::styled(
+            " aguardando a primeira linha…",
+            Style::default().fg(palette.missing),
+        )));
+    }
+
+    let height = usize::from(inner.height);
+    let scroll = if exec.follow {
+        body.len().saturating_sub(height)
+    } else {
+        exec.scroll.min(body.len().saturating_sub(1))
+    };
+    body.push(Line::from(Span::styled(
+        " j/k rolar · G seguir · Esc fechar (o processo continua)",
+        Style::default().fg(palette.help),
+    )));
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(body).block(block).scroll((scroll, 0)), area);
+}
+
+/// `═| stdout |══…` na largura real do painel (mesma régua do inspetor).
+///
+/// O traço vem do conjunto de glifos: em `KIRA_GLYPHS=ascii` vira `-| stdout |-`.
+fn exec_header(label: &str, width: u16, palette: Palette, glyphs: Glyphs) -> Line<'static> {
+    let bar = glyphs.border_set().horizontal_top;
+    let left = format!("{bar}| {label} |");
+    let fill = usize::from(width).saturating_sub(left.chars().count() + 1);
+    Line::from(Span::styled(
+        format!("{left}{}", bar.repeat(fill)),
+        Style::default().fg(palette.rule),
+    ))
+}
+
+/// Rótulo do estado: `executando há 4s` / `concluído (exit 0)`.
+fn exec_status_label(exec: &ExecState, now_secs: Option<i64>) -> String {
+    match exec.status {
+        action::ExecStatus::Running => match now_secs {
+            Some(now) => format!(
+                "executando há {}",
+                state::format_duration_ms((now - exec.started_unix).max(0) * 1_000)
+            ),
+            None => "executando".to_string(),
+        },
+        action::ExecStatus::Exited { code } => match code {
+            Some(0) => "concluído (exit 0)".to_string(),
+            Some(code) => format!("falhou (exit {code})"),
+            None => "encerrado sem código".to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::scan::Finding;
+    use crate::store::Project;
+    use crate::tui::state::rows_from;
+    use ratatui::backend::TestBackend;
 
-    /// Helper: monta o KeyEvent do jeito que o crossterm entrega teclas nuas.
     fn plain(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Estado de referência: painel de achados em foco, 3 linhas, nada aberto.
     fn findings_state() -> AppState {
         AppState {
-            panel: Panel::Findings,
+            screen: Screen::Achados,
             findings_len: 3,
             ..AppState::default()
         }
     }
 
-    #[test]
-    fn quit_reload_redraw_and_help_map_from_their_keys() {
-        let state = findings_state();
-        assert_eq!(decide(&state, plain(KeyCode::Char('q'))), Outcome::Quit);
-        assert_eq!(decide(&state, plain(KeyCode::Char('r'))), Outcome::Reload);
-        assert_eq!(decide(&state, plain(KeyCode::Char('?'))), Outcome::Help);
-        // Ctrl+L: redesenhar sem mudar estado (e `l` solto é Ignore).
-        let ctrl_l = KeyEvent {
-            modifiers: KeyModifiers::CONTROL,
-            ..KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)
-        };
-        assert_eq!(decide(&state, ctrl_l), Outcome::Redraw);
-        assert_eq!(decide(&state, plain(KeyCode::Char('l'))), Outcome::Ignore);
-    }
-
-    #[test]
-    fn enter_opens_detail_only_on_findings_with_rows() {
-        // Painel de achados com linhas: Enter abre o detalhe.
-        assert_eq!(
-            decide(&findings_state(), plain(KeyCode::Enter)),
-            Outcome::ToggleDetail
-        );
-        // Lista vazia: Enter não tem o que abrir.
-        assert_eq!(
-            decide(
-                &AppState {
-                    panel: Panel::Findings,
-                    ..AppState::default()
-                },
-                plain(KeyCode::Enter)
-            ),
-            Outcome::Ignore
-        );
-        // Painel de cabeçalho: Enter nunca teve significado aqui.
-        assert_eq!(
-            decide(&AppState::default(), plain(KeyCode::Enter)),
-            Outcome::Ignore
-        );
-        // W6-PR3: o mesmo Enter abre o detalhe da sessão no painel de
-        // sessões (com linhas) e é Ignore na lista vazia.
-        let sessions_state = AppState {
-            panel: Panel::Sessions,
-            sessions_len: 3,
-            ..AppState::default()
-        };
-        assert_eq!(
-            decide(&sessions_state, plain(KeyCode::Enter)),
-            Outcome::ToggleDetail
-        );
-        assert_eq!(
-            decide(
-                &AppState {
-                    panel: Panel::Sessions,
-                    ..AppState::default()
-                },
-                plain(KeyCode::Enter)
-            ),
-            Outcome::Ignore
-        );
-    }
-
-    #[test]
-    fn ctrl_c_quits_in_every_state_and_esc_goes_back() {
-        // Padrão de mercado (corrigido depois do teste do dono): Ctrl+C sai de
-        // QUALQUER estado (em raw mode não existe SIGINT — ignorar a tecla
-        // prende o usuário); Esc é VOLTAR e fecha a camada aberta; `q` sai
-        // fora da busca e é texto dentro dela.
-        let normal = findings_state();
-        let with_help = AppState {
-            help_open: true,
-            ..findings_state()
-        };
-        let with_detail = AppState {
-            detail_open: true,
-            ..findings_state()
-        };
-        let searching = AppState {
-            wiki_search_open: true,
-            wiki_query: "se".to_string(),
-            ..AppState::default()
-        };
-        let with_page = AppState {
-            page_open: true,
-            ..AppState::default()
-        };
-        let ctrl_c = KeyEvent {
-            modifiers: KeyModifiers::CONTROL,
-            ..KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
-        };
-        for state in [&normal, &with_help, &with_detail, &searching, &with_page] {
-            assert_eq!(decide(state, ctrl_c), Outcome::Quit, "{state:?}");
-            if !state.wiki_search_open {
-                assert_eq!(
-                    decide(state, plain(KeyCode::Char('q'))),
-                    Outcome::Quit,
-                    "q sai com overlay aberto: {state:?}"
-                );
-            }
+    fn snapshot_with_findings() -> Snapshot {
+        let findings = vec![
+            Finding {
+                tool: "audit".to_string(),
+                rule: "vulnerable".to_string(),
+                package: "minimist".to_string(),
+                version: "1.2.5".to_string(),
+                severity: "critical".to_string(),
+                path: "node_modules".to_string(),
+                message: "Prototype pollution".to_string(),
+                fingerprint: "0123456789abcdef".to_string(),
+            },
+            Finding {
+                tool: "dotnet".to_string(),
+                rule: "vulnerable".to_string(),
+                package: "Newtonsoft.Json".to_string(),
+                version: "12.0.3".to_string(),
+                severity: "high".to_string(),
+                path: "Kira.Backend".to_string(),
+                message: "Advisory".to_string(),
+                fingerprint: "fedcba9876543210".to_string(),
+            },
+        ];
+        Snapshot {
+            project: Some(Project {
+                id: "abc".to_string(),
+                root_path: "C:\\proj".to_string(),
+                name: "proj".to_string(),
+                first_seen_at: "2026-11-11T09:00:00Z".to_string(),
+            }),
+            dev_name: Some("Sérgio".to_string()),
+            pat_masked: Some("Aa2x****".to_string()),
+            findings: Some(2),
+            finding_rows: rows_from(findings),
+            ..Snapshot::default()
         }
-        // Na busca, `q` é texto (ninguém pode ser expulso digitando).
-        assert_eq!(
-            decide(&searching, plain(KeyCode::Char('q'))),
-            Outcome::SearchChar('q')
-        );
-        // Esc volta, camada por camada; sem camada aberta não faz nada.
-        assert_eq!(decide(&normal, plain(KeyCode::Esc)), Outcome::Ignore);
-        assert_eq!(decide(&with_help, plain(KeyCode::Esc)), Outcome::Help);
-        assert_eq!(
-            decide(&with_detail, plain(KeyCode::Esc)),
-            Outcome::ToggleDetail
-        );
-        assert_eq!(
-            decide(&searching, plain(KeyCode::Esc)),
-            Outcome::CloseSearch
-        );
-        assert_eq!(decide(&with_page, plain(KeyCode::Esc)), Outcome::ClosePage);
     }
 
-    #[test]
-    fn enter_closes_the_modals_because_esc_now_quits() {
-        // Overlay fecha com Enter (toggle) e TAMBÉM com Esc — as duas portas
-        // funcionam, porque Esc voltou a ser "voltar".
-        let with_detail = AppState {
-            detail_open: true,
-            ..findings_state()
-        };
-        assert_eq!(
-            decide(&with_detail, plain(KeyCode::Enter)),
-            Outcome::ToggleDetail
-        );
-        let with_page = AppState {
-            panel: Panel::Wiki,
-            wiki_len: 2,
-            page_open: true,
-            ..AppState::default()
-        };
-        assert_eq!(
-            decide(&with_page, plain(KeyCode::Enter)),
-            Outcome::ClosePage
-        );
-        let searching = AppState {
-            wiki_search_open: true,
-            wiki_query: "se".to_string(),
-            ..AppState::default()
-        };
-        assert_eq!(
-            decide(&searching, plain(KeyCode::Enter)),
-            Outcome::CloseSearch
-        );
-        // A ajuda continua fechando com `?` (toggle).
-        let with_help = AppState {
-            help_open: true,
-            ..findings_state()
-        };
-        assert_eq!(decide(&with_help, plain(KeyCode::Char('?'))), Outcome::Help);
+    /// Plano de teste: sem pré-requisitos resolvidos (o popup é o alvo aqui).
+    fn sample_plan(step: StepAction) -> action::ActionPlan {
+        action::ActionPlan {
+            action: step,
+            program: std::path::PathBuf::from("C:/bin/kira.exe"),
+            argv: step.argv(std::path::Path::new("C:/proj")),
+            root: std::path::PathBuf::from("C:/proj"),
+            effects: step.effects(),
+            prerequisites: Vec::new(),
+        }
     }
 
-    #[test]
-    fn tab_cycles_panels_in_both_directions_with_wrap() {
-        let state = findings_state();
-        assert_eq!(decide(&state, plain(KeyCode::Tab)), Outcome::CyclePanel(1));
-        assert_eq!(
-            decide(&state, plain(KeyCode::BackTab)),
-            Outcome::CyclePanel(-1)
-        );
-        // O ciclo de 4 painéis (W6-PR4): cabeçalho → achados → sessões →
-        // wiki → cabeçalho, com wrap nas duas direções.
-        assert_eq!(next_panel(Panel::Header, 1), Panel::Findings);
-        assert_eq!(next_panel(Panel::Findings, 1), Panel::Sessions);
-        assert_eq!(next_panel(Panel::Sessions, 1), Panel::Wiki);
-        assert_eq!(next_panel(Panel::Wiki, 1), Panel::Header);
-        assert_eq!(next_panel(Panel::Header, -1), Panel::Wiki);
-        assert_eq!(next_panel(Panel::Findings, -1), Panel::Header);
-        assert_eq!(next_panel(Panel::Sessions, -1), Panel::Findings);
-        assert_eq!(next_panel(Panel::Wiki, -1), Panel::Sessions);
-    }
-
-    #[test]
-    fn move_is_scoped_to_the_focused_panel_never_the_others() {
-        // Defeito real do smoke do dono (bug 2): com foco em achados, ↓
-        // movia também a seleção da lista de sessões — o índice era único e
-        // compartilhado. Agora cada painel tem o seu índice e o Move muta
-        // SOMENTE o painel em foco.
-        let mut screen = AppState {
-            panel: Panel::Findings,
-            findings_selected: 0,
-            sessions_selected: 2,
-            wiki_selected: 1,
-            findings_len: 3,
-            sessions_len: 3,
-            wiki_len: 2,
-            ..AppState::default()
-        };
-        let outcome = decide(&screen, plain(KeyCode::Down));
-        apply_outcome(&mut screen, outcome);
-        assert_eq!(screen.findings_selected, 1, "achados anda 1 linha");
-        assert_eq!(screen.sessions_selected, 2, "sessões NÃO anda (bug 2)");
-        assert_eq!(screen.wiki_selected, 1, "wiki NÃO anda (bug 2)");
-        // E vice-versa: mover em sessões não mexe em achados.
-        let mut other = AppState {
-            panel: Panel::Sessions,
-            findings_selected: 2,
-            sessions_selected: 0,
-            findings_len: 3,
-            sessions_len: 3,
-            ..AppState::default()
-        };
-        apply_outcome(&mut other, Outcome::Move(1));
-        assert_eq!(other.sessions_selected, 1, "sessões anda 1 linha");
-        assert_eq!(other.findings_selected, 2, "achados NÃO anda");
-        // g/G satura no índice do próprio painel, sem tocar nos outros.
-        let mut third = AppState {
-            panel: Panel::Wiki,
-            wiki_selected: 0,
-            ..AppState::default()
-        };
-        apply_outcome(&mut third, Outcome::Move(isize::MAX));
-        assert_eq!(
-            third.wiki_selected,
-            isize::MAX as usize,
-            "wiki vai ao fim (saturação do apply_move)"
-        );
-        assert_eq!(third.findings_selected, 0, "achados intocado");
-        assert_eq!(third.sessions_selected, 0, "sessões intocada");
-        // Degradado: a lista única tem o próprio índice de scroll.
-        let mut degraded = AppState {
-            degraded: true,
-            degraded_selected: 0,
-            ..AppState::default()
-        };
-        apply_outcome(&mut degraded, Outcome::Move(1));
-        assert_eq!(degraded.degraded_selected, 1, "lista única anda");
-        assert_eq!(degraded.findings_selected, 0);
-    }
-
-    #[test]
-    fn tab_visits_the_empty_wiki_panel_full_cycle_of_four() {
-        // Defeito real do smoke no Windows (bug 3): o Release repetia o ciclo
-        // e a wiki vazia nunca ficava em foco. Aqui o ciclo é provado passo a
-        // passo COM a wiki vazia: painel vazio existe e nunca é pulado.
-        let mut screen = AppState::default(); // cabeçalho; wiki_len = 0
-        assert_eq!(screen.panel, Panel::Header);
-        let outcome = decide(&screen, plain(KeyCode::Tab));
-        apply_outcome(&mut screen, outcome);
-        assert_eq!(screen.panel, Panel::Findings);
-        let outcome = decide(&screen, plain(KeyCode::Tab));
-        apply_outcome(&mut screen, outcome);
-        assert_eq!(screen.panel, Panel::Sessions);
-        let outcome = decide(&screen, plain(KeyCode::Tab));
-        apply_outcome(&mut screen, outcome);
-        assert_eq!(
-            screen.panel,
-            Panel::Wiki,
-            "a wiki VAZIA é visitada pelo Tab"
-        );
-        let outcome = decide(&screen, plain(KeyCode::Tab));
-        apply_outcome(&mut screen, outcome);
-        assert_eq!(screen.panel, Panel::Header, "o ciclo fecha em 4");
-        // Shift+Tab também volta passando pela wiki vazia.
-        let outcome = decide(&screen, plain(KeyCode::BackTab));
-        apply_outcome(&mut screen, outcome);
-        assert_eq!(screen.panel, Panel::Wiki, "Shift+Tab visita a wiki vazia");
-    }
-
-    #[test]
-    fn movement_covers_arrows_vim_and_extremes() {
-        let state = findings_state();
-        assert_eq!(decide(&state, plain(KeyCode::Char('j'))), Outcome::Move(1));
-        assert_eq!(decide(&state, plain(KeyCode::Down)), Outcome::Move(1));
-        assert_eq!(decide(&state, plain(KeyCode::Char('k'))), Outcome::Move(-1));
-        assert_eq!(decide(&state, plain(KeyCode::Up)), Outcome::Move(-1));
-        // g/G = extremos via saturação, nunca desvaziar o usize.
-        assert_eq!(
-            decide(&state, plain(KeyCode::Char('g'))),
-            Outcome::Move(isize::MIN)
-        );
-        assert_eq!(
-            decide(&state, plain(KeyCode::Char('G'))),
-            Outcome::Move(isize::MAX)
-        );
-    }
-
-    #[test]
-    fn apply_move_saturates_and_clamps_to_the_real_list() {
-        assert_eq!(apply_move(2, 1), 3);
-        assert_eq!(apply_move(2, -1), 1);
-        // Extremos: saturação nas duas pontas (o loop clampa pelo tamanho).
-        assert_eq!(apply_move(2, isize::MIN), 0);
-        assert_eq!(apply_move(2, isize::MAX), (isize::MAX as usize) + 2);
-        assert_eq!(apply_move(0, -5), 0);
-    }
-
-    #[test]
-    fn unknown_keys_are_ignored() {
-        let state = findings_state();
-        assert_eq!(decide(&state, plain(KeyCode::Char('x'))), Outcome::Ignore);
-        assert_eq!(decide(&state, plain(KeyCode::F(1))), Outcome::Ignore);
-    }
-
-    #[test]
-    fn panel_index_numbers_the_footer_cycle() {
-        assert_eq!(Panel::Header.index(), 0);
-        assert_eq!(Panel::Findings.index(), 1);
-        assert_eq!(Panel::Sessions.index(), 2);
-        assert_eq!(Panel::Wiki.index(), 3);
-        assert_eq!(PANEL_COUNT, 4);
-    }
-
-    #[test]
-    fn max_selected_clamps_per_panel_and_degradation() {
-        // Painel de achados: limite = nº de achados - 1.
-        assert_eq!(max_selected_for(Panel::Findings, 3, 5, 7, 0, false), 2);
-        // Painel de sessões: limite = nº de sessões - 1 (W6-PR3).
-        assert_eq!(max_selected_for(Panel::Sessions, 3, 5, 7, 0, false), 4);
-        // Painel de wiki: limite = nº de páginas FILTRADAS - 1 (W6-PR4).
-        assert_eq!(max_selected_for(Panel::Wiki, 3, 5, 7, 0, false), 6);
-        // Listas vazias: ainda assim nunca negativo (0).
-        assert_eq!(max_selected_for(Panel::Findings, 0, 0, 0, 0, false), 0);
-        assert_eq!(max_selected_for(Panel::Sessions, 0, 0, 0, 0, false), 0);
-        assert_eq!(max_selected_for(Panel::Wiki, 0, 0, 0, 0, false), 0);
-        // Cabeçalho denso: seleção não usada, limite 0.
-        assert_eq!(max_selected_for(Panel::Header, 5, 5, 5, 0, false), 0);
-        // Degradado: limite = total de linhas visíveis - 1 (com aviso).
-        assert_eq!(max_selected_for(Panel::Header, 3, 3, 3, 10, true), 9);
-    }
-
-    /// Renderiza um frame completo com `TestBackend` e devolve o texto — o
-    /// mesmo smith determinístico do widget, agora sobre o frame inteiro.
-    fn render_full(snapshot: &Snapshot, screen: &AppState, width: u16, height: u16) -> String {
-        use ratatui::backend::TestBackend;
+    fn render_text(screen: &AppState, snapshot: &Snapshot, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap_or_else(|err| panic!("backend: {err}"));
         terminal
@@ -1194,583 +1600,689 @@ mod tests {
         text
     }
 
-    /// Snapshot com 1 achado de referência (caminho do fluxo feliz).
-    fn snapshot_with_one_finding() -> Snapshot {
-        Snapshot {
-            findings: Some(1),
-            finding_rows: state::rows_from(vec![crate::scan::Finding {
-                tool: "audit".to_string(),
-                rule: "vulnerable".to_string(),
-                package: "lodash".to_string(),
-                version: "4.17.19".to_string(),
-                severity: "critical".to_string(),
-                path: "src/lib.rs:42".to_string(),
-                message: "Prototype Pollution\nCVE-2020-8203".to_string(),
-                fingerprint: "0a1b2c3d4e5f6001".to_string(),
-            }]),
-            ..Snapshot::default()
-        }
-    }
-
-    /// Snapshot com 3 sessões de referência (W6-PR3): duas ok, uma falha —
-    /// o caminho feliz do painel de sessões, com `now` fixo (determinismo).
-    fn snapshot_with_three_sessions() -> Snapshot {
-        let sessions: Vec<crate::store::SessionRow> = [
-            (
-                3,
-                "scan",
-                None,
-                true,
-                "scan fixture: 3 achados\nlinha interna",
-            ),
-            (2, "triage", Some("qwen2.5:7b"), true, "nota gravada"),
-            (1, "doctor", None, false, "ollama não respondeu"),
-        ]
-        .into_iter()
-        .map(
-            |(id, command, model, ok, summary)| crate::store::SessionRow {
-                id,
-                command: command.to_string(),
-                args: String::new(),
-                model: model.map(|model| model.to_string()),
-                started_at: "2026-11-11T09:00:00Z".to_string(),
-                local_started_at: None,
-                duration_ms: 65_000,
-                ok,
-                summary: summary.to_string(),
-            },
-        )
-        .collect();
-        // now = started_at (2026-11-11T09:00:00Z) + 3 min ⇒ "há 3 min"
-        // determinístico, sem nenhum relógio do sistema no teste.
-        let now_secs = 1_794_387_600 + 180;
-        Snapshot {
-            session_rows: state::session_rows_from(&sessions),
-            now_secs: Some(now_secs),
-            ..Snapshot::default()
-        }
+    #[test]
+    fn digits_go_straight_to_their_screen() {
+        let state = AppState::default();
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('2'))),
+            Outcome::GoScreen(Screen::Achados)
+        );
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('3'))),
+            Outcome::GoScreen(Screen::Sessoes)
+        );
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('4'))),
+            Outcome::GoScreen(Screen::Wiki)
+        );
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('1'))),
+            Outcome::GoScreen(Screen::Resumo)
+        );
     }
 
     #[test]
-    fn full_frame_renders_header_findings_and_footer() {
-        let snapshot = snapshot_with_one_finding();
-        let screen = AppState {
-            panel: Panel::Findings,
-            findings_len: 1,
+    fn tab_cycles_the_four_screens_with_wrap() {
+        assert_eq!(next_screen(Screen::Resumo, 1), Screen::Achados);
+        assert_eq!(next_screen(Screen::Wiki, 1), Screen::Resumo);
+        assert_eq!(next_screen(Screen::Resumo, -1), Screen::Wiki);
+        let mut state = AppState::default();
+        apply_outcome(&mut state, Outcome::CycleScreen(1));
+        assert_eq!(state.screen, Screen::Achados);
+        assert!(!state.inspecting, "trocar de tela fecha o inspetor");
+    }
+
+    #[test]
+    fn move_is_scoped_per_screen() {
+        let mut state = AppState {
+            findings_len: 5,
+            sessions_len: 5,
+            wiki_len: 5,
             ..AppState::default()
         };
-        let text = render_full(&snapshot, &screen, 100, 30);
-        assert!(
-            text.contains("painel 2/4"),
-            "rodapé no painel de achados: {text}"
-        );
-        assert!(
-            text.contains("critical 1 · high 0 · medium 0 · low 0"),
-            "contagem no cabeçalho do painel: {text}"
-        );
-        assert!(text.contains("src/lib.rs:42"), "{text}");
-        assert!(text.contains("➤"), "seleção visível: {text}");
+        state.screen = Screen::Achados;
+        apply_outcome(&mut state, Outcome::Move(2));
+        assert_eq!(state.findings_selected, 2);
+        assert_eq!(state.sessions_selected, 0);
+        assert_eq!(state.wiki_selected, 0);
+        state.screen = Screen::Sessoes;
+        apply_outcome(&mut state, Outcome::Move(1));
+        assert_eq!(state.sessions_selected, 1);
+        assert_eq!(state.findings_selected, 2, "não muda a outra tela");
     }
 
     #[test]
-    fn detail_frame_shows_the_whole_finding_beside_the_table() {
-        let snapshot = snapshot_with_one_finding();
-        let screen = AppState {
-            panel: Panel::Findings,
-            findings_len: 1,
-            detail_open: true,
+    fn top_and_bottom_saturate() {
+        assert_eq!(apply_move(3, isize::MIN), 0);
+        assert_eq!(apply_move(3, isize::MAX), usize::MAX);
+        let mut state = findings_state();
+        apply_outcome(&mut state, Outcome::Move(isize::MIN));
+        assert_eq!(state.findings_selected, 0);
+    }
+
+    #[test]
+    fn enter_opens_the_inspector_only_when_there_is_a_record() {
+        let empty = AppState {
+            screen: Screen::Achados,
+            findings_len: 0,
             ..AppState::default()
         };
-        // Frame mais alto: com 4 painéis (W6-PR4) o modal de detalhe precisa
-        // de mais altura para caber a mensagem/summary INTEIRO visível.
-        let text = render_full(&snapshot, &screen, 100, 50);
-        assert!(text.contains("detalhe — Esc volta"), "{text}");
-        assert!(
-            text.contains("fingerprint: 0a1b2c3d4e5f6001"),
-            "fingerprint completo no detalhe: {text}"
+        assert_eq!(decide(&empty, plain(KeyCode::Enter)), Outcome::Ignore);
+        let state = findings_state();
+        assert_eq!(
+            decide(&state, plain(KeyCode::Enter)),
+            Outcome::ToggleInspector
         );
-        assert!(
-            text.contains("CVE-2020-8203"),
-            "mensagem inteira no detalhe: {text}"
-        );
-        // A tabela continua à esquerda (contexto nunca some).
-        assert!(text.contains("src/lib.rs:42"), "{text}");
+        let resumo = AppState::default();
+        assert_eq!(decide(&resumo, plain(KeyCode::Enter)), Outcome::Ignore);
     }
 
     #[test]
-    fn help_overlay_and_header_focus_render() {
-        let snapshot = Snapshot::default();
-        let screen = AppState {
-            panel: Panel::Header,
-            help_open: true,
-            ..AppState::default()
-        };
-        let text = render_full(&snapshot, &screen, 100, 24);
-        assert!(text.contains("ajuda do kira dashboard"), "{text}");
-        assert!(
-            text.contains("Enter            abrir/fechar detalhe"),
-            "{text}"
+    fn inspect_key_toggles_and_esc_closes_it_first() {
+        let state = findings_state();
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('i'))),
+            Outcome::ToggleInspector
         );
-        assert!(
-            text.contains("Esc              voltar"),
-            "o Esc documentado na ajuda (agora volta): {text}"
-        );
-        assert!(
-            text.contains("Ctrl+C           sair"),
-            "Ctrl+C precisa estar documentado como saída: {text}"
-        );
+        let mut open = findings_state();
+        open.inspecting = true;
+        assert_eq!(decide(&open, plain(KeyCode::Esc)), Outcome::ToggleInspector);
+        apply_outcome(&mut open, Outcome::ToggleInspector);
+        assert!(!open.inspecting);
     }
 
     #[test]
-    fn help_overlay_lists_the_full_pat_cause_with_the_doctor_hint() {
-        // A causa de DUAS linhas do PAT mora agora no `?` (texto) — o
-        // cabeçalho mostra só o ponteiro curto, nunca a causa estourada.
-        let snapshot = Snapshot {
-            pat_note: Some(
-                "PAT não encontrado — defina AZURE_DEVOPS_PAT (ex.: export AZURE_DEVOPS_PAT=...)\n\
-                 para diagnosticar a configuração desta máquina, rode `kira doctor`"
-                    .to_string(),
-            ),
-            ..Snapshot::default()
-        };
-        let screen = AppState {
-            panel: Panel::Header,
-            help_open: true,
-            ..AppState::default()
-        };
-        let text = render_full(&snapshot, &screen, 120, 40);
-        assert!(text.contains("pendências"), "seção na ajuda: {text}");
-        assert!(
-            text.contains("kira doctor"),
-            "a dica do doctor INTEIRA no overlay: {text}"
-        );
-        assert!(
-            text.contains("defina AZURE_DEVOPS_PAT"),
-            "o passo a passo completo no overlay: {text}"
-        );
-        // Sem pendências, a seção não existe (ajuda limpa).
-        let clean = render_full(&Snapshot::default(), &screen, 120, 40);
-        assert!(
-            !clean.contains("pendências"),
-            "nada de seção vazia: {clean}"
-        );
-    }
-
-    #[test]
-    fn header_focus_shows_panel_one_of_three_footer() {
-        let snapshot = Snapshot::default();
-        let screen = AppState {
-            panel: Panel::Header,
-            ..AppState::default()
-        };
-        let text = render_full(&snapshot, &screen, 100, 24);
-        assert!(text.contains("painel 1/4"), "{text}");
-        assert!(
-            text.contains("achados: — (nunca rodou kira scan)"),
-            "estado vazio honesto: {text}"
-        );
-        // Os TRÊS painéis de tabela ficam vazios de forma honesta.
-        assert!(
-            text.contains("sessões: — (store sem sessões)"),
-            "estado vazio honesto das sessões: {text}"
-        );
-        assert!(
-            text.contains("wiki: — (wiki vazia — rode kira wiki reindex)"),
-            "estado vazio honesto da wiki: {text}"
-        );
-    }
-
-    #[test]
-    fn tab_cycle_renders_each_panel_title_with_the_wiki_empty() {
-        // TestBackend (bug 3): o ciclo de Tab pelos 4 painéis COM a wiki
-        // vazia — o rodapé muda em cada passo e, no passo da wiki, o painel
-        // vazio aparece com a causa honesta (nunca pulado, nunca escondido).
-        let snapshot = Snapshot::default();
-        let mut screen = AppState::default();
-        for expected in ["painel 1/4", "painel 2/4", "painel 3/4", "painel 4/4"] {
-            let text = render_full(&snapshot, &screen, 100, 30);
+    fn navigation_never_returns_an_execution_outcome() {
+        // Contrato do ADR-0033: nenhuma tecla de navegação vira ação.
+        let state = findings_state();
+        let keys = [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('g'),
+            KeyCode::Char('G'),
+            KeyCode::Enter,
+            KeyCode::Char('i'),
+            KeyCode::Char('r'),
+            KeyCode::Char('?'),
+            KeyCode::Esc,
+        ];
+        for code in keys {
+            let outcome = decide(&state, plain(code));
             assert!(
-                text.contains(expected),
-                "o título do rodapé muda a cada passo ({expected}): {text}"
+                matches!(
+                    outcome,
+                    Outcome::Reload
+                        | Outcome::ToggleInspector
+                        | Outcome::GoScreen(_)
+                        | Outcome::CycleScreen(_)
+                        | Outcome::Move(_)
+                        | Outcome::SearchWiki
+                        | Outcome::SearchChar(_)
+                        | Outcome::SearchBackspace
+                        | Outcome::CloseSearch
+                        | Outcome::OpenPage
+                        | Outcome::ClosePage
+                        | Outcome::ScrollPage(_)
+                        | Outcome::Help
+                        | Outcome::Redraw
+                        | Outcome::Ignore
+                ),
+                "navegação produziu efeito inesperado: {code:?} -> {outcome:?}"
             );
-            if expected == "painel 4/4" {
-                assert!(
-                    text.contains("wiki: — (wiki vazia — rode kira wiki reindex)"),
-                    "o painel de wiki VAZIO está visível com a causa: {text}"
-                );
-                assert!(text.contains(" wiki "), "título do bloco da wiki: {text}");
-            }
-            let outcome = decide(&screen, plain(KeyCode::Tab));
-            apply_outcome(&mut screen, outcome);
-        }
-        // O ciclo fechou: de volta ao cabeçalho.
-        assert_eq!(screen.panel, Panel::Header);
-    }
-
-    #[test]
-    fn footer_shows_the_hint_when_the_focused_panel_is_empty() {
-        // EXTRA: painel focado vazio ⇒ o rodapé mostra a dica do que fazer em
-        // uma linha, e `q sair` continua sendo o primeiro item das teclas.
-        let snapshot = Snapshot::default();
-        let screen = AppState {
-            panel: Panel::Wiki,
-            ..AppState::default()
-        };
-        let text = render_full(&snapshot, &screen, 100, 30);
-        assert!(
-            text.contains("painel 4/4 · wiki vazia — rode kira wiki reindex"),
-            "dica do painel vazio no rodapé: {text}"
-        );
-        assert!(
-            text.contains("teclas: q sair"),
-            "`q sair` segue primeiro no rodapé: {text}"
-        );
-        // Painel focado COM conteúdo: sem dica (o rodapé volta ao padrão).
-        let full = snapshot_with_wiki_pages();
-        let screen = AppState {
-            panel: Panel::Wiki,
-            wiki_len: 2,
-            ..AppState::default()
-        };
-        let text = render_full(&full, &screen, 100, 30);
-        assert!(
-            text.contains("painel 4/4 · teclas: q sair"),
-            "sem dica quando o painel tem conteúdo: {text}"
-        );
-        // Cabeçalho em foco nunca tem dica (não é lista).
-        let screen = AppState::default();
-        let text = render_full(&full, &screen, 100, 30);
-        assert!(
-            text.contains("painel 1/4 · teclas: q sair"),
-            "cabeçalho não ganha dica de lista vazia: {text}"
-        );
-    }
-
-    #[test]
-    fn sessions_frame_renders_the_three_row_table_with_selection() {
-        let snapshot = snapshot_with_three_sessions();
-        let screen = AppState {
-            panel: Panel::Sessions,
-            sessions_len: 3,
-            ..AppState::default()
-        };
-        let text = render_full(&snapshot, &screen, 100, 30);
-        assert!(
-            text.contains("painel 3/4"),
-            "rodapé no painel de sessões: {text}"
-        );
-        assert!(
-            text.contains("sessões — últimas 3"),
-            "título do bloco com contagem: {text}"
-        );
-        assert!(text.contains("#ID"), "{text}");
-        assert!(text.contains("QUANDO"), "{text}");
-        assert!(text.contains("#3"), "{text}");
-        assert!(text.contains("triage"), "{text}");
-        assert!(text.contains("qwen2.5:7b"), "{text}");
-        assert!(text.contains("1m5s"), "{text}");
-        assert!(text.contains("há 3 min"), "idade relativa pura: {text}");
-        // Mais recente primeiro (id 3 antes do 1) e seleção visível.
-        let id3 = text.find("#3").unwrap_or(usize::MAX);
-        let id1 = text.find("#1").unwrap_or(usize::MAX);
-        assert!(id3 < id1, "ordem mais-recente-primeiro: {text}");
-        assert!(text.contains("➤"), "seleção visível: {text}");
-        // Só a 1ª linha do summary na tabela; o resto é do detalhe.
-        assert!(text.contains("scan fixture: 3 achados"), "{text}");
-        assert!(!text.contains("linha interna"), "{text}");
-    }
-
-    #[test]
-    fn session_detail_frame_shows_the_whole_summary_beside_the_table() {
-        let snapshot = snapshot_with_three_sessions();
-        let screen = AppState {
-            panel: Panel::Sessions,
-            sessions_len: 3,
-            detail_open: true,
-            ..AppState::default()
-        };
-        // Frame mais alto: com 3 painéis o modal de detalhe precisa de mais
-        // altura para caber o summary INTEIRO visível.
-        let text = render_full(&snapshot, &screen, 100, 50);
-        assert!(text.contains("detalhe — Esc volta"), "{text}");
-        // Seleção 0 = a sessão mais recente (id 3, comando scan).
-        assert!(text.contains("comando: scan"), "{text}");
-        assert!(text.contains("modelo: —"), "{text}");
-        assert!(text.contains("duração: 1m5s"), "{text}");
-        assert!(text.contains("status: ok"), "{text}");
-        // O summary inteiro aparece no detalhe (a tabela cortou a 2ª linha).
-        assert!(text.contains("linha interna"), "{text}");
-        // A tabela continua à esquerda (contexto nunca some).
-        assert!(text.contains("#3"), "{text}");
-    }
-
-    // ------------------------------------------------------------------
-    // Painel de wiki (W6-PR4)
-    // ------------------------------------------------------------------
-
-    /// Snapshot com 2 páginas de wiki de referência (o caminho feliz).
-    fn snapshot_with_wiki_pages() -> Snapshot {
-        Snapshot {
-            wiki_rows: vec![
-                state::WikiPage {
-                    slug: "contexto".to_string(),
-                    kind: "contexto".to_string(),
-                    title: "Contexto do projeto".to_string(),
-                    path: String::new(),
-                    updated_at: "2026-11-11T09:00:00Z".to_string(),
-                    updated_unix: Some(1_794_387_600),
-                    content: "# Contexto\n\n- item um\n\n**decisão** com `código`".to_string(),
-                },
-                state::WikiPage {
-                    slug: "bugs/4821".to_string(),
-                    kind: "bug".to_string(),
-                    title: "Sessão 4821".to_string(),
-                    path: String::new(),
-                    updated_at: "2026-11-10T09:00:00Z".to_string(),
-                    updated_unix: Some(1_794_387_600),
-                    content: "token expirado em produção".to_string(),
-                },
-            ],
-            now_secs: Some(1_794_387_600 + 180),
-            ..Snapshot::default()
         }
     }
 
     #[test]
-    fn wiki_enter_opens_the_page_and_empty_list_is_ignore() {
-        // Painel de wiki com páginas: Enter abre o preview em tela cheia.
-        let wiki_state = AppState {
-            panel: Panel::Wiki,
-            wiki_len: 2,
-            ..AppState::default()
-        };
-        assert_eq!(
-            decide(&wiki_state, plain(KeyCode::Enter)),
-            Outcome::OpenPage
-        );
-        // Lista vazia (ou filtro sem casamento): Enter não tem o que abrir.
-        assert_eq!(
-            decide(
-                &AppState {
-                    panel: Panel::Wiki,
-                    ..AppState::default()
-                },
-                plain(KeyCode::Enter)
-            ),
-            Outcome::Ignore
-        );
-    }
+    fn search_is_wiki_only_and_modal() {
+        let achados = findings_state();
+        assert_eq!(decide(&achados, plain(KeyCode::Char('/'))), Outcome::Ignore);
 
-    #[test]
-    fn slash_opens_the_search_only_in_the_wiki_panel() {
-        let wiki_state = AppState {
-            panel: Panel::Wiki,
+        let mut wiki = AppState {
+            screen: Screen::Wiki,
             wiki_len: 2,
             ..AppState::default()
         };
         assert_eq!(
-            decide(&wiki_state, plain(KeyCode::Char('/'))),
+            decide(&wiki, plain(KeyCode::Char('/'))),
             Outcome::SearchWiki
         );
-        // Nos outros painéis `/` não significa nada (ainda).
+        apply_outcome(&mut wiki, Outcome::SearchWiki);
+        assert!(wiki.wiki_search_open);
         assert_eq!(
-            decide(&findings_state(), plain(KeyCode::Char('/'))),
-            Outcome::Ignore
+            decide(&wiki, plain(KeyCode::Char('b'))),
+            Outcome::SearchChar('b')
         );
-    }
-
-    #[test]
-    fn search_mode_turns_keys_into_text_and_enter_confirms() {
-        let searching = AppState {
-            panel: Panel::Wiki,
-            wiki_search_open: true,
-            wiki_query: "se".to_string(),
-            ..AppState::default()
-        };
-        // Caracteres comuns (e maiúsculas com SHIFT) entram na agulha.
+        apply_outcome(&mut wiki, Outcome::SearchChar('b'));
+        assert_eq!(wiki.wiki_query, "b");
+        apply_outcome(&mut wiki, Outcome::SearchBackspace);
+        assert!(wiki.wiki_query.is_empty());
+        // `q` é texto durante a busca, não saída.
         assert_eq!(
-            decide(&searching, plain(KeyCode::Char('s'))),
-            Outcome::SearchChar('s')
-        );
-        let shift_s = KeyEvent {
-            modifiers: KeyModifiers::SHIFT,
-            ..KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE)
-        };
-        assert_eq!(decide(&searching, shift_s), Outcome::SearchChar('S'));
-        // Backspace apaga; Enter confirma e fecha a caixa (agulha fica no
-        // filtro). Esc cancela a busca (Esc = voltar, padrão de mercado).
-        assert_eq!(
-            decide(&searching, plain(KeyCode::Backspace)),
-            Outcome::SearchBackspace
-        );
-        assert_eq!(
-            decide(&searching, plain(KeyCode::Enter)),
-            Outcome::CloseSearch
-        );
-        assert_eq!(
-            decide(&searching, plain(KeyCode::Esc)),
-            Outcome::CloseSearch
-        );
-        // `q` na caixa de texto é TEXTO: quem digita uma palavra com q não pode
-        // ser expulso no meio da digitação. Sair da busca é Esc; do app, Ctrl+C.
-        assert_eq!(
-            decide(&searching, plain(KeyCode::Char('q'))),
+            decide(&wiki, plain(KeyCode::Char('q'))),
             Outcome::SearchChar('q')
         );
-        // Teclas de navegação NÃO vazam por baixo da busca: modal.
-        assert_eq!(decide(&searching, plain(KeyCode::Tab)), Outcome::Ignore);
-        assert_eq!(decide(&searching, plain(KeyCode::Down)), Outcome::Ignore);
-        // Ctrl+ combinações não viram texto.
-        let ctrl_s = KeyEvent {
-            modifiers: KeyModifiers::CONTROL,
-            ..KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
-        };
-        assert_eq!(decide(&searching, ctrl_s), Outcome::Ignore);
+        assert_eq!(decide(&wiki, plain(KeyCode::Enter)), Outcome::CloseSearch);
+        assert_eq!(decide(&wiki, plain(KeyCode::Esc)), Outcome::CloseSearch);
     }
 
     #[test]
-    fn page_view_is_modal_enter_backs_and_scroll_by_line_and_page() {
-        let open = AppState {
-            panel: Panel::Wiki,
-            wiki_len: 2,
+    fn page_reading_is_modal_and_scrolls() {
+        let mut state = AppState {
+            screen: Screen::Wiki,
+            wiki_len: 1,
             page_open: true,
             ..AppState::default()
         };
-        // Esc e Enter voltam à lista (Esc = voltar).
-        assert_eq!(decide(&open, plain(KeyCode::Esc)), Outcome::ClosePage);
-        assert_eq!(decide(&open, plain(KeyCode::Enter)), Outcome::ClosePage);
         assert_eq!(
-            decide(&open, plain(KeyCode::Char('j'))),
+            decide(&state, plain(KeyCode::Char('j'))),
             Outcome::ScrollPage(1)
         );
         assert_eq!(
-            decide(&open, plain(KeyCode::Char('k'))),
-            Outcome::ScrollPage(-1)
-        );
-        assert_eq!(
-            decide(&open, plain(KeyCode::PageDown)),
+            decide(&state, plain(KeyCode::PageDown)),
             Outcome::ScrollPage(SCROLL_PAGE_STEP)
         );
-        assert_eq!(
-            decide(&open, plain(KeyCode::PageUp)),
-            Outcome::ScrollPage(-SCROLL_PAGE_STEP)
-        );
-        assert_eq!(
-            decide(&open, plain(KeyCode::Char('g'))),
-            Outcome::ScrollPage(isize::MIN)
-        );
-        assert_eq!(
-            decide(&open, plain(KeyCode::Char('G'))),
-            Outcome::ScrollPage(isize::MAX)
-        );
-        // Modal: mover/Tab/ajuda não vazam por baixo do preview…
-        assert_eq!(decide(&open, plain(KeyCode::Tab)), Outcome::Ignore);
-        assert_eq!(decide(&open, plain(KeyCode::Char('?'))), Outcome::Ignore);
-        // …mas `q` sai do app e `r` relê o disco (mesmo contrato do detalhe).
-        assert_eq!(decide(&open, plain(KeyCode::Char('q'))), Outcome::Quit);
-        assert_eq!(decide(&open, plain(KeyCode::Char('r'))), Outcome::Reload);
+        assert_eq!(decide(&state, plain(KeyCode::Enter)), Outcome::ClosePage);
+        apply_outcome(&mut state, Outcome::ScrollPage(3));
+        assert_eq!(state.preview_scroll, 3);
+        apply_outcome(&mut state, Outcome::ClosePage);
+        assert!(!state.page_open);
     }
 
     #[test]
-    fn wiki_frame_renders_the_list_with_selection_and_age() {
-        let snapshot = snapshot_with_wiki_pages();
-        let screen = AppState {
-            panel: Panel::Wiki,
-            wiki_len: 2,
+    fn ctrl_c_quits_everywhere_and_help_is_modal() {
+        let state = AppState {
+            help_open: true,
             ..AppState::default()
         };
-        let text = render_full(&snapshot, &screen, 100, 30);
-        assert!(text.contains("painel 4/4"), "{text}");
-        assert!(text.contains("wiki — 2 páginas"), "{text}");
-        assert!(text.contains("TIPO"), "{text}");
-        assert!(text.contains("Contexto do projeto"), "{text}");
-        assert!(text.contains("Sessão 4821"), "{text}");
-        assert!(text.contains("há 3 min"), "{text}");
-        assert!(text.contains("➤"), "seleção visível: {text}");
+        let ctrl_c = KeyEvent {
+            modifiers: KeyModifiers::CONTROL,
+            ..KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
+        };
+        assert_eq!(decide(&state, ctrl_c), Outcome::Quit);
+        assert_eq!(decide(&state, plain(KeyCode::Char('?'))), Outcome::Help);
+        // Por baixo da ajuda não se navega.
+        assert_eq!(decide(&state, plain(KeyCode::Char('j'))), Outcome::Ignore);
     }
 
     #[test]
-    fn wiki_page_overlay_renders_the_markdown_in_full_screen() {
-        let snapshot = snapshot_with_wiki_pages();
-        let screen = AppState {
-            panel: Panel::Wiki,
-            wiki_len: 2,
-            page_open: true,
+    fn full_frame_shows_status_tabs_screen_and_footer_chips() {
+        let snapshot = snapshot_with_findings();
+        let state = AppState {
+            findings_len: snapshot.finding_rows.len(),
             ..AppState::default()
         };
-        let text = render_full(&snapshot, &screen, 100, 30);
-        // Preview em tela cheia: título da página + markdown rendido (sem
-        // `#`, sem `**`, sem code span cru).
+        let text = render_text(&state, &snapshot, 80, 24);
+        assert!(text.contains("pat Aa2x****"), "{text}");
+        assert!(text.contains("[1 Resumo]"), "aba ativa marcada: {text}");
+        assert!(text.contains("| Resumo |"), "{text}");
+        // PR-UX1: o Resumo abre com a faixa visual de risco (as barras
+        // substituem a seção de contagem em texto, que repetia o mesmo dado).
+        assert!(text.contains("| Risco |"), "faixa visual: {text}");
+        assert!(text.contains("critical"), "barras de severidade: {text}");
+        assert!(text.contains("Sair"), "rodapé com chips: {text}");
+        // Sem `--read-only`, o rodapé oferece as teclas de ação.
+        assert!(text.contains(" Scan"), "{text}");
+        assert!(text.contains("Triage"), "{text}");
+    }
+
+    #[test]
+    fn achados_screen_uses_the_whole_workspace_and_inspector_splits() {
+        let snapshot = snapshot_with_findings();
+        let mut state = AppState {
+            screen: Screen::Achados,
+            findings_len: snapshot.finding_rows.len(),
+            ..AppState::default()
+        };
+        let full = render_text(&state, &snapshot, 120, 40);
+        assert!(full.contains("| Achados — critical 1"), "{full}");
+        assert!(full.contains("Prototype pollution"), "{full}");
+        state.inspecting = true;
+        let split = render_text(&state, &snapshot, 120, 40);
         assert!(
-            text.contains("wiki: Contexto do projeto — Esc volta"),
+            split.contains("fingerprint"),
+            "inspetor com o registro: {split}"
+        );
+    }
+
+    #[test]
+    fn degraded_terminal_renders_a_single_list_with_a_warning() {
+        let snapshot = snapshot_with_findings();
+        let mut state = AppState {
+            findings_len: snapshot.finding_rows.len(),
+            degraded: true,
+            ..AppState::default()
+        };
+        state.screen = Screen::Achados;
+        let text = render_text(&state, &snapshot, 60, 18);
+        assert!(text.contains("lista única"), "{text}");
+        assert!(text.contains("aviso: terminal menor que"), "{text}");
+        assert!(text.contains("critical"), "{text}");
+    }
+
+    #[test]
+    fn read_only_mode_is_stated_in_the_chrome() {
+        let snapshot = snapshot_with_findings();
+        let state = AppState {
+            read_only: true,
+            ..AppState::default()
+        };
+        let text = render_text(&state, &snapshot, 100, 25);
+        assert!(text.contains("leitura"), "{text}");
+        assert!(
+            !text.contains(" Scan"),
+            "read-only não oferece tecla de ação no rodapé: {text}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_lists_the_new_keys_and_pendencies() {
+        let snapshot = snapshot_with_findings();
+        let state = AppState {
+            help_open: true,
+            ..AppState::default()
+        };
+        let text = render_text(&state, &snapshot, 100, 30);
+        assert!(text.contains("1–4 / Tab"), "{text}");
+        assert!(text.contains("inspetor"), "{text}");
+        assert!(text.contains("nada é inventado"), "{text}");
+    }
+
+    #[test]
+    fn severity_filter_cycles_present_values_and_wraps_back_to_all() {
+        let mut state = AppState {
+            screen: Screen::Achados,
+            findings_len: 2,
+            severity_values: vec!["critical".to_string(), "high".to_string()],
+            ..AppState::default()
+        };
+        apply_outcome(&mut state, Outcome::CycleSeverityFilter);
+        assert_eq!(state.severity_filter.as_deref(), Some("critical"));
+        assert_eq!(
+            findings_filter_label(&state).as_deref(),
+            Some("critical"),
+            "o título do bloco mostra o filtro"
+        );
+        apply_outcome(&mut state, Outcome::CycleSeverityFilter);
+        assert_eq!(state.severity_filter.as_deref(), Some("high"));
+        apply_outcome(&mut state, Outcome::CycleSeverityFilter);
+        assert_eq!(state.severity_filter, None, "fim do ciclo = todas");
+    }
+
+    #[test]
+    fn filters_only_exist_on_achados_and_esc_clears_them() {
+        let sessoes = AppState {
+            screen: Screen::Sessoes,
+            sessions_len: 1,
+            ..AppState::default()
+        };
+        assert_eq!(decide(&sessoes, plain(KeyCode::Char('f'))), Outcome::Ignore);
+        assert_eq!(decide(&sessoes, plain(KeyCode::Char('m'))), Outcome::Ignore);
+
+        let filtered = AppState {
+            screen: Screen::Achados,
+            findings_len: 2,
+            severity_filter: Some("high".to_string()),
+            tool_filter: Some("audit".to_string()),
+            ..AppState::default()
+        };
+        assert_eq!(
+            decide(&filters_state(), plain(KeyCode::Char('f'))),
+            Outcome::CycleSeverityFilter
+        );
+        assert_eq!(
+            decide(&filtered, plain(KeyCode::Esc)),
+            Outcome::ClearFindingsFilters
+        );
+        let mut cleared = filtered;
+        apply_outcome(&mut cleared, Outcome::ClearFindingsFilters);
+        assert!(!filters_active(&cleared));
+        assert_eq!(cleared.findings_selected, 0);
+    }
+
+    fn filters_state() -> AppState {
+        AppState {
+            screen: Screen::Achados,
+            findings_len: 2,
+            ..AppState::default()
+        }
+    }
+
+    #[test]
+    fn filtered_findings_and_label_are_pure_over_the_snapshot() {
+        let snapshot = snapshot_with_findings();
+        let mut state = AppState {
+            screen: Screen::Achados,
+            severity_filter: Some("high".to_string()),
+            ..AppState::default()
+        };
+        let visible = filtered_findings(&snapshot, &state);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].severity, "high");
+        state.tool_filter = Some("audit".to_string());
+        assert!(
+            filtered_findings(&snapshot, &state).is_empty(),
+            "high + audit não casa com nenhum achado do fixture"
+        );
+        assert_eq!(
+            findings_filter_label(&state).as_deref(),
+            Some("high · audit")
+        );
+    }
+
+    #[test]
+    fn resumo_sections_answer_risk_activity_and_gaps() {
+        let snapshot = snapshot_with_findings();
+        let sections = state::resumo_sections(&snapshot);
+        let titles: Vec<&str> = sections.iter().map(|(title, _)| title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Achados", "Primeiros achados", "Pendências"],
+            "sem sessões, a seção de atividade é omitida"
+        );
+        assert!(
+            sections[0].1[0].contains("critical 1 · high 1"),
+            "{:?}",
+            sections[0].1
+        );
+        assert!(
+            sections
+                .last()
+                .is_some_and(|(_, lines)| lines.iter().any(|line| line.contains('—'))),
+            "pendência honesta, nunca inventada"
+        );
+    }
+
+    #[test]
+    fn read_only_ignores_action_keys_and_keeps_navigation() {
+        let state = AppState {
+            read_only: true,
+            ..AppState::default()
+        };
+        for key in ['s', 't', 'd'] {
+            assert_eq!(
+                decide(&state, plain(KeyCode::Char(key))),
+                Outcome::Ignore,
+                "read-only precisa barrar {key} antes de qualquer modal"
+            );
+        }
+        // Navegação continua exatamente igual.
+        assert_eq!(decide(&state, plain(KeyCode::Tab)), Outcome::CycleScreen(1));
+        assert_eq!(decide(&state, plain(KeyCode::Char('?'))), Outcome::Help);
+
+        // Sem `--read-only`, a tecla vira PEDIDO — nunca execução.
+        let acting = AppState::default();
+        assert_eq!(
+            decide(&acting, plain(KeyCode::Char('s'))),
+            Outcome::RequestAction(Request::Scan)
+        );
+    }
+
+    #[test]
+    fn scan_goes_straight_to_a_plan_while_triage_asks_for_the_item() {
+        let mut state = AppState {
+            known_work_items: vec![4821, 4790],
+            ..AppState::default()
+        };
+        apply_outcome(&mut state, Outcome::RequestAction(Request::Scan));
+        assert!(
+            state.pending.is_some(),
+            "s já tem alvo: vai direto ao plano"
+        );
+        assert!(state.target.is_none());
+
+        apply_outcome(&mut state, Outcome::RequestAction(Request::Triage));
+        let sheet = state
+            .target
+            .as_ref()
+            .unwrap_or_else(|| panic!("t abre a folha de alvo"));
+        assert_eq!(sheet.selected(), Some(4821), "o mais recente vem primeiro");
+        apply_outcome(&mut state, Outcome::TargetConfirm);
+        assert!(state.target.is_none());
+        assert_eq!(
+            state.pending,
+            Some(StepAction::Triage { work_item: 4821 }),
+            "confirmar o id não executa: só prepara o plano"
+        );
+    }
+
+    #[test]
+    fn target_sheet_refuses_zero_and_esc_closes_it_before_everything() {
+        let mut state = AppState::default();
+        apply_outcome(&mut state, Outcome::RequestAction(Request::PrDraft));
+        assert!(state.target.is_some());
+        apply_outcome(&mut state, Outcome::TargetPush('0'));
+        apply_outcome(&mut state, Outcome::TargetConfirm);
+        assert!(state.target.is_some(), "id zero mantém a folha aberta");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("inválido"),
+            "{:?}",
+            state.notice
+        );
+        assert_eq!(decide(&state, plain(KeyCode::Esc)), Outcome::TargetCancel);
+        apply_outcome(&mut state, Outcome::TargetCancel);
+        assert!(state.target.is_none());
+    }
+
+    #[test]
+    fn confirmation_popup_lists_effects_and_navigation_cannot_execute() {
+        let snapshot = snapshot_with_findings();
+        let state = AppState {
+            confirm: Some(ConfirmState {
+                plan: sample_plan(StepAction::Scan),
+            }),
+            ..AppState::default()
+        };
+        let text = render_text(&state, &snapshot, 100, 30);
+        assert!(text.contains("executar scan"), "{text}");
+        assert!(text.contains(".kira/findings.json"), "{text}");
+        assert!(text.contains("nada foi executado ainda"), "{text}");
+
+        // Enter é o único caminho; Esc cancela; o resto não navega por baixo.
+        assert_eq!(
+            decide(&state, plain(KeyCode::Enter)),
+            Outcome::ConfirmExecute
+        );
+        assert_eq!(decide(&state, plain(KeyCode::Esc)), Outcome::ConfirmCancel);
+        assert_eq!(decide(&state, plain(KeyCode::Char('j'))), Outcome::Ignore);
+        assert_eq!(decide(&state, plain(KeyCode::Tab)), Outcome::Ignore);
+    }
+
+    #[test]
+    fn target_sheet_popup_shows_the_typed_id_and_the_known_list() {
+        let snapshot = snapshot_with_findings();
+        let mut state = AppState::default();
+        apply_outcome(&mut state, Outcome::RequestAction(Request::Triage));
+        apply_outcome(&mut state, Outcome::TargetPush('4'));
+        let text = render_text(&state, &snapshot, 100, 30);
+        assert!(text.contains("alvo do triage"), "{text}");
+        assert!(
+            text.contains("4821") || text.contains("work item"),
             "{text}"
         );
-        assert!(text.contains("▌ Contexto"), "{text}");
-        assert!(text.contains("• item um"), "{text}");
-        assert!(text.contains("decisão"), "{text}");
-        assert!(!text.contains("**"), "{text}");
-        // A lista NÃO aparece por baixo do preview (tela cheia de verdade).
-        assert!(!text.contains("Sessão 4821"), "{text}");
+        assert!(text.contains("▌"), "campo com cursor: {text}");
     }
 
     #[test]
-    fn wiki_search_footer_shows_the_query_with_cursor() {
-        let snapshot = snapshot_with_wiki_pages();
-        let screen = AppState {
-            panel: Panel::Wiki,
-            wiki_search_open: true,
-            wiki_query: "sess".to_string(),
-            wiki_len: 1,
+    fn reload_keeps_the_selected_finding_by_fingerprint() {
+        let before = snapshot_with_findings();
+        let mut state = AppState {
+            screen: Screen::Achados,
+            findings_len: before.finding_rows.len(),
+            findings_selected: 1, // Newtonsoft (high)
             ..AppState::default()
         };
-        let text = render_full(&snapshot, &screen, 100, 30);
-        // Rodapé vira caixa de texto com cursor ▌.
-        assert!(text.contains("busca wiki: sess▌"), "{text}");
-        // E a lista FILTRADA (só a página que casa) está visível.
-        assert!(text.contains("Sessão 4821"), "{text}");
-        assert!(
-            !text.contains("wiki — 2 páginas"),
-            "com filtro, só as casadas: {text}"
+        let key = selection_key(&before, &state);
+        assert_eq!(
+            key,
+            Some(state::SelectionKey::Finding("fedcba9876543210".to_string()))
         );
-        assert!(text.contains("wiki — 1 página"), "{text}");
+
+        // Depois: um critical NOVO entra no topo — a seleção não pode "andar"
+        // para outro achado só porque o índice 1 mudou de conteúdo.
+        let after = Snapshot {
+            finding_rows: rows_from(vec![
+                Finding {
+                    tool: "audit".to_string(),
+                    rule: "vulnerable".to_string(),
+                    package: "novo".to_string(),
+                    version: "1.0.0".to_string(),
+                    severity: "critical".to_string(),
+                    path: "node_modules".to_string(),
+                    message: "novo achado".to_string(),
+                    fingerprint: "aaaabbbbccccdddd".to_string(),
+                },
+                Finding {
+                    tool: "audit".to_string(),
+                    rule: "vulnerable".to_string(),
+                    package: "minimist".to_string(),
+                    version: "1.2.5".to_string(),
+                    severity: "critical".to_string(),
+                    path: "node_modules".to_string(),
+                    message: "Prototype pollution".to_string(),
+                    fingerprint: "0123456789abcdef".to_string(),
+                },
+                Finding {
+                    tool: "dotnet".to_string(),
+                    rule: "vulnerable".to_string(),
+                    package: "Newtonsoft.Json".to_string(),
+                    version: "12.0.3".to_string(),
+                    severity: "high".to_string(),
+                    path: "Kira.Backend".to_string(),
+                    message: "Advisory".to_string(),
+                    fingerprint: "fedcba9876543210".to_string(),
+                },
+            ]),
+            ..before.clone()
+        };
+        reanchor(&mut state, key, &after);
+        assert_eq!(
+            state.findings_selected, 2,
+            "segue o Newtonsoft, não o índice"
+        );
+        assert_eq!(
+            after.finding_rows[state.findings_selected].fingerprint,
+            "fedcba9876543210"
+        );
     }
 
     #[test]
-    fn wiki_search_filters_by_content_folded() {
-        // A função pura do filtro é a mesma que o widget recebe — e o
-        // render_frame FILTRA de verdade (agulha "token" acha só a 4821).
-        let snapshot = snapshot_with_wiki_pages();
-        let filtered = state::filter_pages(&snapshot.wiki_rows, "token");
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].slug, "bugs/4821");
-    }
-
-    #[test]
-    fn degraded_frame_keeps_everything_in_one_list_with_the_warning() {
-        let mut snapshot = snapshot_with_one_finding();
-        let sessions = snapshot_with_three_sessions();
-        snapshot.session_rows = sessions.session_rows;
-        snapshot.now_secs = sessions.now_secs;
-        let screen = AppState {
-            panel: Panel::Findings,
-            findings_len: 1,
-            sessions_len: 3,
+    fn exec_overlay_shows_streams_status_and_keys() {
+        let snapshot = snapshot_with_findings();
+        let mut exec = ExecState::new(StepAction::Scan, 0);
+        exec.apply(RunEvent::Line {
+            stream: action::Stream::Out,
+            text: "linha do scan".to_string(),
+        });
+        exec.status = action::ExecStatus::Exited { code: Some(0) };
+        let state = AppState {
+            exec: Some(exec),
+            exec_open: true,
             ..AppState::default()
         };
-        let text = render_full(&snapshot, &screen, 60, 20);
-        assert!(
-            text.contains("aviso: terminal 60×20 menor que 80×24"),
-            "aviso de degradação: {text}"
+        let text = render_text(&state, &snapshot, 100, 30);
+        assert!(text.contains("executar scan"), "{text}");
+        assert!(text.contains("stdout"), "{text}");
+        assert!(text.contains("linha do scan"), "{text}");
+        assert!(text.contains("concluído (exit 0)"), "{text}");
+        assert!(text.contains("j/k rolar"), "{text}");
+        // Esc fecha o overlay sem matar nada (só o `q` derruba o filho).
+        assert_eq!(
+            decide(&state, plain(KeyCode::Esc)),
+            Outcome::ToggleExecution
         );
-        assert!(
-            text.contains("src/lib.rs:42"),
-            "achado na lista única: {text}"
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('G'))),
+            Outcome::FollowExecution
         );
-        assert!(
-            text.contains("#3"),
-            "sessão na lista única (mesma informação degradada): {text}"
-        );
-        assert!(text.contains("painel achados"), "{text}");
-        assert!(text.contains("painel sessões"), "{text}");
+    }
+
+    #[test]
+    fn drain_without_a_runner_is_a_no_op() {
+        let mut state = AppState::default();
+        let mut runner = None;
+        let mut snapshot = snapshot_with_findings();
+        drain_execution(&mut state, &mut runner, &mut snapshot);
+        assert!(runner.is_none());
+        assert!(state.exec.is_none());
+    }
+
+    /// Critério 4 do PR-UX1 na TELA INTEIRA: com `KIRA_GLYPHS=ascii`, nenhum
+    /// painel, popup ou overlay pode emitir box-drawing, bloco ou seta.
+    ///
+    /// Roda pelo `render_frame_with` porque o modo de glifo é injetado — teste
+    /// que muta env é proibido aqui (edition 2024 torna `set_var` unsafe).
+    #[test]
+    fn ascii_mode_renders_the_whole_frame_without_special_glyph() {
+        use crate::tui::glyph::{Glyphs, Mode, has_special_glyphs};
+
+        let snapshot = snapshot_with_findings();
+        let glyphs = Glyphs::new(Mode::Ascii);
+        let render = |state: &AppState, width: u16, height: u16| -> String {
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal =
+                ratatui::Terminal::new(backend).unwrap_or_else(|err| panic!("backend: {err}"));
+            terminal
+                .draw(|frame| render_frame_with(frame, &snapshot, state, theme::mono(), glyphs))
+                .unwrap_or_else(|err| panic!("draw: {err}"));
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..height {
+                for x in 0..width {
+                    text.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
+                }
+                text.push('\n');
+            }
+            text
+        };
+
+        // As quatro telas.
+        for screen in [
+            Screen::Resumo,
+            Screen::Achados,
+            Screen::Sessoes,
+            Screen::Wiki,
+        ] {
+            let state = AppState {
+                screen,
+                findings_len: snapshot.finding_rows.len(),
+                ..AppState::default()
+            };
+            let text = render(&state, 80, 24);
+            assert!(!has_special_glyphs(&text), "{screen:?}: {text}");
+        }
+        // Overlay de ajuda.
+        let help = AppState {
+            help_open: true,
+            findings_len: snapshot.finding_rows.len(),
+            ..AppState::default()
+        };
+        let text = render(&help, 80, 24);
+        assert!(!has_special_glyphs(&text), "ajuda: {text}");
+        // Folha de alvo (popup com campo e lista de ids).
+        let target = AppState {
+            target: Some(TargetSheet::new(Request::Triage, vec![4821, 900])),
+            ..AppState::default()
+        };
+        let text = render(&target, 80, 24);
+        assert!(!has_special_glyphs(&text), "folha de alvo: {text}");
+        // Overlay `o` (saída da execução, com cabeçalho de stream).
+        let mut exec = ExecState::new(StepAction::Scan, 0);
+        exec.apply(RunEvent::Line {
+            stream: action::Stream::Out,
+            text: "linha do scan".to_string(),
+        });
+        let exec_state = AppState {
+            exec: Some(exec),
+            exec_open: true,
+            ..AppState::default()
+        };
+        let text = render(&exec_state, 80, 24);
+        assert!(!has_special_glyphs(&text), "overlay o: {text}");
     }
 }

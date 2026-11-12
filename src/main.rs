@@ -83,7 +83,7 @@ enum Command {
     },
     /// Save the Azure DevOps configuration and the PAT in the OS keyring
     #[command(
-        after_help = "Exemplos:\n  kira setup                # ensina o PAT, menu (colar / env / pular) e backend de IA\n  kira setup --yes          # não-interativo: usa AZURE_DEVOPS_PAT se existir, senão pula (e imprime o pulado)\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas\n  kira setup --skip pat     # pula um passo (repetível: pat, ia)\n  kira setup --reset        # remove o PAT do keyring"
+        after_help = "Exemplos:\n  kira setup                # ensina o PAT, menu (colar / env / pular) e backend de IA\n  kira setup --yes          # não-interativo: usa AZURE_DEVOPS_PAT se existir, senão pula (e imprime o pulado)\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # sem perguntas\n  kira setup --skip pat     # pula um passo (repetível: pat, ia)\n  kira setup --reset        # remove o PAT e a chave do Foundry do keyring; org/projeto/dev ficam"
     )]
     Setup {
         /// Azure DevOps organization name (skips the prompt)
@@ -92,7 +92,8 @@ enum Command {
         /// Azure DevOps project name (skips the prompt)
         #[arg(long)]
         project: Option<String>,
-        /// Remove the saved PAT from the keyring and exit
+        /// Remove o PAT e a chave do Foundry do keyring (e endpoint/deployment
+        /// do config.toml) e sai; idempotente
         #[arg(long)]
         reset: bool,
         /// PAT passed straight on the command line (pula a aula, o menu e o
@@ -115,6 +116,10 @@ enum Command {
         /// shown by `kira doctor` — never sent to any LLM prompt)
         #[arg(long)]
         name: Option<String>,
+        /// Força o wizard de texto (sem tela cheia) — para CI, terminal
+        /// restrito ou quem prefere linha a linha
+        #[arg(long)]
+        plain: bool,
     },
     /// List the recent sessions recorded for the current project
     History {
@@ -167,18 +172,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Open the read-only terminal dashboard (W6-PR1: header panel)
+    /// Open the terminal dashboard (ADR-0033: leitura por padrão, ação confirmada)
     ///
     /// Interactive ONLY with a TTY stdout; without a TTY (or with --snapshot)
     /// the SAME content is printed as plain text and the command exits 0 —
-    /// that is how the CI tests it. Read-only proven by the store hash e2e.
+    /// that is how the CI tests it. Actions run only after an explicit key and
+    /// confirmation; `--read-only` disables them (store hash e2e).
     #[command(
-        after_help = "Exemplos:\n  kira dashboard             # TUI interativa (q sair, r reler, ? ajuda)\n  kira dashboard --snapshot  # mesmo conteúdo em texto, para CI/pipes"
+        after_help = "Exemplos:\n  kira dashboard                 # TUI interativa (q sair, r reler, ? ajuda)\n  kira dashboard --snapshot      # mesmo conteúdo em texto, para CI/pipes\n  kira dashboard --read-only     # TUI sem ações: hash do store.db byte-idêntico"
     )]
     Dashboard {
         /// Print the text form and exit (never draws, never enters raw mode)
         #[arg(long)]
         snapshot: bool,
+        /// Disable every action key (scan/triage/pr draft); navigation only
+        #[arg(long)]
+        read_only: bool,
     },
     /// Generate the markdown PR draft from what KIRA already knows — no
     /// network and no LLM (W4: triage + findings + wiki, evidence cited)
@@ -346,8 +355,9 @@ async fn run(command: Command) -> Outcome {
             backend,
             skip,
             name,
+            plain,
         } => Outcome {
-            code: setup_command(org, project, reset, pat, yes, backend, skip, name).await,
+            code: setup_command(org, project, reset, pat, yes, backend, skip, name, plain).await,
             ok: true,
             records: false,
             summary: String::new(),
@@ -363,7 +373,10 @@ async fn run(command: Command) -> Outcome {
             explain,
             json,
         } => context_command(id, file, explain, json),
-        Command::Dashboard { snapshot } => dashboard_command(snapshot),
+        Command::Dashboard {
+            snapshot,
+            read_only,
+        } => dashboard_command(snapshot, read_only),
         Command::Pr { action } => pr_command(action),
     }
 }
@@ -525,15 +538,22 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             }
             ("context".to_string(), args, None)
         }
-        Command::Dashboard { snapshot } => (
-            "dashboard".to_string(),
+        Command::Dashboard {
+            snapshot,
+            read_only,
+        } => {
+            let mut args = String::new();
             if *snapshot {
-                "--snapshot".to_string()
-            } else {
-                String::new()
-            },
-            None,
-        ),
+                args.push_str("--snapshot");
+            }
+            if *read_only {
+                if !args.is_empty() {
+                    args.push(' ');
+                }
+                args.push_str("--read-only");
+            }
+            ("dashboard".to_string(), args, None)
+        }
         Command::Pr { action } => match action {
             PrAction::Draft {
                 id,
@@ -1049,15 +1069,16 @@ fn context_output(file: &Path, explain: bool, json: bool) -> Result<String, Erro
 }
 
 // ---------------------------------------------------------------------------
-// `kira dashboard` — casca TUI read-only (W6-PR1, ADR-0014)
+// `kira dashboard` — casca TUI (ADR-0014, ADR-0033)
 // ---------------------------------------------------------------------------
 
-/// `kira dashboard [--snapshot]` — o dashboard é o MESMO binário em modo
-/// interativo (nunca daemon): com stdout TTY abre a TUI (ratatui/crossterm);
-/// sem TTY ou com `--snapshot` imprime o mesmo conteúdo em texto e sai 0 — é
-/// assim que o CI testa. NUNCA grava sessão na trilha (o e2e prova isso com o
-/// hash do `store.db`) e nunca toca rede/LLM.
-fn dashboard_command(snapshot: bool) -> Outcome {
+/// `kira dashboard [--snapshot] [--read-only]` — o dashboard é o MESMO binário
+/// em modo interativo (nunca daemon): com stdout TTY abre a TUI
+/// (ratatui/crossterm); sem TTY ou com `--snapshot` imprime o mesmo conteúdo em
+/// texto e sai 0 — é assim que o CI testa. Navegar nunca executa; `--read-only`
+/// desliga toda ação (ADR-0033). NUNCA grava sessão na trilha por conta própria
+/// (o e2e prova isso com o hash do `store.db`) e nunca toca rede/LLM.
+fn dashboard_command(snapshot: bool, read_only: bool) -> Outcome {
     let model = kira::tui::state::load();
     if snapshot || !std::io::stdout().is_terminal() {
         // Fora de TTY o desenho é impossível (raw mode/alternate screen não
@@ -1073,7 +1094,8 @@ fn dashboard_command(snapshot: bool) -> Outcome {
             summary: text,
         }
     } else {
-        match kira::tui::app::run(model) {
+        let options = kira::tui::app::RunOptions { read_only };
+        match kira::tui::app::run(model, options) {
             Ok(()) => Outcome {
                 code: ExitCode::SUCCESS,
                 ok: true,
@@ -1427,6 +1449,7 @@ async fn setup_command(
     backend: Option<String>,
     skip: Vec<String>,
     name: Option<String>,
+    plain: bool,
 ) -> ExitCode {
     // Fail fast (before the user creates a token) when there is nowhere to
     // save it; on machines without a keyring the env var remains the path.
@@ -1441,25 +1464,55 @@ async fn setup_command(
     // IA aparecem; `--yes` força o modo não-interativo (usa a env do PAT se
     // existir, senão pula — e imprime o pulado).
     let interactive = std::io::stdin().is_terminal();
+    let options = setup::SetupOptions {
+        org,
+        project,
+        reset,
+        pat,
+        interactive,
+        name,
+        yes,
+        backend,
+        skip,
+        // O wizard de tela cheia entrega aqui o Foundry digitado no
+        // formulário inline (ADR-0035); em modo texto vem `None`.
+        foundry: None,
+        // Entrada de segredo com eco escondido onde existe mecanismo; no
+        // wizard o raw mode já desliga o eco nos três SOs.
+        hidden_input: true,
+    };
+
+    // Wizard só em TTY grande e SEM flag explícita: flags vencem sempre (quem
+    // passou `--pat` não quer um wizard) e `--reset` é ação única.
+    let explicit = options.reset
+        || options.org.is_some()
+        || options.project.is_some()
+        || options.pat.is_some()
+        || options.backend.is_some()
+        || !options.skip.is_empty()
+        || options.yes;
+    let stdout_tty = std::io::stdout().is_terminal();
+    let (width, height) = crossterm::terminal::size().unwrap_or((0, 0));
+    let options = if setup::wizard::mode(interactive && stdout_tty, width, height, plain, explicit)
+        == setup::wizard::Mode::Wizard
+    {
+        match setup::wizard::run(&options, &setup::env_lookup) {
+            Some(collected) => collected,
+            None => {
+                println!("setup cancelado — nada foi alterado");
+                return ExitCode::SUCCESS;
+            }
+        }
+    } else {
+        options
+    };
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut input = stdin.lock();
     let mut output = BufWriter::new(stdout.lock());
     setup::run(
-        &setup::SetupOptions {
-            org,
-            project,
-            reset,
-            pat,
-            interactive,
-            name,
-            yes,
-            backend,
-            skip,
-            // Entrada de segredo com eco do terminal escondido (melhor
-            // esforço via `stty`); o valor lido nunca é impresso.
-            hidden_input: true,
-        },
+        &options,
         store.as_ref(),
         credentials::config_path().as_deref(),
         &setup::env_lookup,

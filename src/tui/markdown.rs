@@ -149,17 +149,27 @@ fn is_rule(line: &str) -> bool {
 /// A função é PURA e total: qualquer entrada rende algo (nada de `Err`,
 /// nada de panic) — é o contrato "markdown inválido não panica" do gate.
 pub fn render(source: &str, width: usize) -> Vec<String> {
+    render_with(source, width, crate::tui::glyph::Glyphs::default())
+}
+
+/// [`render`] com o conjunto de glifos da sessão (`KIRA_GLYPHS=ascii`).
+///
+/// O texto markdown é o mesmo; muda só o desenho dos marcadores (`▌ ■ · • │ ──`
+/// viram `= - . * | --`). Um renderizador que ignora o modo de glifo entrega
+/// caixinha em console antigo no meio da leitura da wiki.
+pub fn render_with(source: &str, width: usize, glyphs: crate::tui::glyph::Glyphs) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut in_code = false;
+    let quote = glyphs.quote();
     for raw in source.lines() {
         if in_code {
             // Fim do bloco: a linha de fechamento some, o conteúdo fica com
-            // o prefixo `│ ` (a barra vertical é a "borda" do bloco, mesmo
-            // marcador da citação — densidade da persona, zero cor nova).
+            // o prefixo da citação (a barra é a "borda" do bloco — densidade
+            // da persona, zero cor nova).
             if raw.trim().starts_with("```") {
                 in_code = false;
             } else {
-                lines.extend(wrap_line(&format!("│ {raw}"), width));
+                lines.extend(wrap_line(&format!("{quote} {raw}"), width));
             }
             continue;
         }
@@ -172,16 +182,16 @@ pub fn render(source: &str, width: usize) -> Vec<String> {
         if let Some(quoted) = trimmed.strip_prefix('>') {
             let content = inline(quoted.trim_start());
             if content.is_empty() {
-                lines.push("│".to_string());
+                lines.push(quote.to_string());
             } else {
-                lines.extend(wrap_line(&format!("│ {content}"), width));
+                lines.extend(wrap_line(&format!("{quote} {content}"), width));
             }
             continue;
         }
         if is_rule(trimmed) {
-            // Régua: linha curta de travessão, largura fixa (determinismo —
-            // não depende da largura do terminal).
-            lines.push("────".to_string());
+            // Régua: linha curta, largura fixa (determinismo — não depende da
+            // largura do terminal).
+            lines.push(glyphs.rule().to_string());
             continue;
         }
         // Título: marcador por nível, NUNCA o `#` cru (a saída é texto lido).
@@ -191,12 +201,7 @@ pub fn render(source: &str, width: usize) -> Vec<String> {
             if text.is_empty() {
                 continue; // `#` solto não rende linha fantasma.
             }
-            let marker = match level {
-                1 => "▌",
-                2 => "■",
-                3 => "·",
-                _ => "·",
-            };
+            let marker = glyphs.heading(level);
             let title = inline(text);
             lines.extend(wrap_line(&format!("{marker} {title}"), width));
             continue;
@@ -204,7 +209,7 @@ pub fn render(source: &str, width: usize) -> Vec<String> {
         // Item de lista: `- x` ou `* x` → `• x` (fora de bloco de código).
         if let Some(item) = trimmed.strip_prefix("- ").or(trimmed.strip_prefix("* ")) {
             let content = inline(item);
-            lines.extend(wrap_line(&format!("• {content}"), width));
+            lines.extend(wrap_line(&format!("{} {content}", glyphs.bullet()), width));
             continue;
         }
         let rendered = inline(trimmed);

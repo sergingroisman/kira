@@ -17,11 +17,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 # Direct dependency: OS keyring storage for the PAT (src/credentials.rs).
-# Platform features kept minimal (Windows native + Linux secret-service via
-# pure-Rust zbus, no C dependency); elsewhere Entry::new fails at runtime and
-# the code falls back to the AZURE_DEVOPS_PAT env var with a clear message.
+# Platform features kept minimal: Windows Credential Manager, macOS Keychain
+# (apple-native) and Linux secret-service via pure-Rust zbus. Without the
+# apple store the macOS build compiled but failed at runtime, silently falling
+# back to the AZURE_DEVOPS_PAT env — the exact friction this PR removes.
 keyring = { version = "4", default-features = false, features = [
     "v1",
+    "apple-native-keyring-store",
     "windows-native-keyring-store",
     "zbus-secret-service-keyring-store",
 ] }
