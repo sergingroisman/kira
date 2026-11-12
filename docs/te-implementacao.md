@@ -512,7 +512,7 @@ não entra na fila agora.
 
 ## 14. ADR-0028 — cache de raciocínio e economia medida
 
-Draft já aceite na análise (PR #50, seção final). Vira arquivo
+Draft proposto na análise (PR #50, seção final) — não selado. Vira arquivo
 `docs/adr/ADR-0028-cache-raciocinio-e-economia-medida.md` na PR do plano de
 implementação, com:
 
@@ -528,13 +528,14 @@ implementação, com:
 
 ---
 
-## 15. Decisões abertas para o dono sela (resumo)
+## 15. Decisões abertas para o dono selar (resumo)
 
-**SELO DO DONO (12/Nov/2026): D1 selada como "não gravar" e D2–D12 seladas
-como propostas.** Os defaults abaixo são agora contrato; cada PR cita a
-decisão selada que consumir.
+**PROPOSTAS (12/Nov/2026), SEM SELO.** Nenhuma das D1–D12 foi selada pelo dono:
+os defaults abaixo são o que este documento propõe, e cada PR cita a proposta
+que consumiu. Selo é ato do dono, registrado depois da PR correspondente — não
+se auto-declara aqui.
 
-| # | PR | Decisão | Proposta default (selada) |
+| # | PR | Decisão | Proposta default (a confirmar) |
 |---|---|---|---|
 | D1 | 35 | Hit grava episódio? | **Não** (página não é log); hit fica no output + ledger |
 | D2 | 35 | Confiança no hit | Da página original, capada em `"média"` |
@@ -549,9 +550,10 @@ decisão selada que consumir.
 | D11 | 41 | Pergunta do setup | Teaching-only (não grava config) |
 | D12 | 42 | Watchdogs | 50% nota · 75% aviso+sugestão · 90% para+pendência |
 
-Seladas as propostas sem objeção, os PRs entram na fila com os defaults; o
-dono pode trocar qualquer valor aqui antes da PR correspondente — o plano
-fica honesto no git (cada PR cita a decisão selada).
+Sem objeção registrada, os PRs entram na fila com os defaults; o dono pode
+trocar qualquer valor aqui antes da PR correspondente, e o PR cita a proposta
+que consumiu. Se o dono quiser o selo explícito, ele vem por escrito (aqui ou
+na PR) — o plano fica honesto no git.
 
 ## 16. Pendências do dono (inalteradas)
 
