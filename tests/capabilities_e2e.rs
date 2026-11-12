@@ -97,13 +97,21 @@ impl Sandbox {
 
     /// Roda com env ZERADO (`env_clear`) e só o essencial reconstruído — a
     /// linha da matriz que prova "roda com env limpo" na forma mais forte.
-    fn run_env_clear(&self, args: &[&str]) -> (i32, String, String) {
+    fn run_without_credentials(&self, args: &[&str]) -> (i32, String, String) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
+        command.args(args).current_dir(&self.cwd);
+        // O contrato é "zero credencial e zero integração", NÃO "processo sem
+        // ambiente". `env_clear()` apaga `SystemRoot`, `PATHEXT`, `TEMP` no
+        // Windows e o `spawn` do npm falha por um motivo que não é o testado
+        // (foi exatamente o vermelho do e2e no windows-latest). Removemos só o
+        // domínio do produto e o do Azure.
+        for (key, _) in std::env::vars_os() {
+            let nome = key.to_string_lossy().to_ascii_uppercase();
+            if nome.starts_with("KIRA_") || nome.starts_with("AZURE_") {
+                command.env_remove(&key);
+            }
+        }
         command
-            .args(args)
-            .current_dir(&self.cwd)
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", &self.store)
             .env("KIRA_STORE_DIR", &self.store)
             .env("KIRA_CONFIG", self.store.join("config-absente.toml"))
@@ -250,10 +258,14 @@ fn matriz_de_capacidades_do_adr_0030_vira_tabela_de_casos() {
     }
 }
 
-/// Linhas locais da matriz na forma mais forte: env ZERADO (não apenas sem as
-/// variáveis do Azure) — zero credencial, zero integração, e os comandos rodam.
+/// Linhas locais da matriz na forma mais forte: sem NENHUMA variável do produto
+/// nem do Azure (zero credencial, zero integração) — e os comandos rodam.
+///
+/// Não usamos `env_clear()`: no Windows isso remove `SystemRoot`/`PATHEXT` e o
+/// spawn da ferramenta falha por motivo alheio ao contrato. O que precisa ser
+/// provado é a ausência de credencial, não de sistema operacional.
 #[test]
-fn comandos_locais_rodam_com_env_completamente_limpo() {
+fn comandos_locais_rodam_sem_credencial_nenhuma() {
     let sandbox = Sandbox::new("env-limpo");
     let fixture = sandbox.fixture();
     for args in [
@@ -263,7 +275,7 @@ fn comandos_locais_rodam_com_env_completamente_limpo() {
         vec!["pr", "draft", "4821", "--file", fixture.as_str()],
         vec!["dashboard", "--snapshot"],
     ] {
-        let (code, stdout, stderr) = sandbox.run_env_clear(&args);
+        let (code, stdout, stderr) = sandbox.run_without_credentials(&args);
         assert_eq!(
             code,
             0,
