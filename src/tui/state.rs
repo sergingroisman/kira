@@ -10,6 +10,7 @@
 //! (`Store::open_readonly_at`), findings/config/PAT são leituras, e nada aqui
 //! toca rede ou LLM (`src/tui` está fora da allowlist do ADR-0016).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::credentials;
@@ -49,6 +50,14 @@ pub struct Snapshot {
     /// Causa quando o painel de sessões está vazio mesmo com store legível
     /// (`store sem sessões`); ausente, a causa cai para `store_note`.
     pub sessions_note: Option<String>,
+    /// Páginas da wiki (W6-PR4): o índice `wiki_page` da store (read-only)
+    /// e o markdown de cada página lido de `.kira/wiki/`. Vazio = estado
+    /// vazio honesto (`empty_wiki_line`).
+    pub wiki_rows: Vec<WikiPage>,
+    /// Causa quando o índice da wiki está vazio mesmo com store legível
+    /// (`wiki vazia — rode kira wiki reindex`); ausente, a causa cai para
+    /// `store_note` (store ausente é a causa real, não uma inventada).
+    pub wiki_note: Option<String>,
     /// `now` capturado UMA vez por snapshot (unix, segundos): toda idade
     /// relativa da tela é função pura [`humanize_age`] sobre este valor —
     /// NUNCA `SystemTime::now()` dentro do widget (determinismo da spec W6).
@@ -123,12 +132,19 @@ fn load_store(snapshot: &mut Snapshot) {
             project.map_or(Ok(None), |project| {
                 store
                     .last_sessions(&project.id, SESSION_HISTORY_LIMIT)
-                    .map(|sessions| Some((project, sessions)))
+                    .and_then(|sessions| {
+                        // A MESMA conexão read-only alimenta o painel de
+                        // wiki (W6-PR4) — nenhuma segunda abertura, nenhum
+                        // write no disco.
+                        store
+                            .wiki_pages()
+                            .map(|wiki| Some((project, sessions, wiki)))
+                    })
             })
         })
     });
     match opened {
-        Ok(Some((project, sessions))) => {
+        Ok(Some((project, sessions, wiki))) => {
             if let Some(scan_session) = sessions
                 .iter()
                 .find(|session| session.command == "scan")
@@ -143,6 +159,7 @@ fn load_store(snapshot: &mut Snapshot) {
                 snapshot.sessions_note = Some("store sem sessões".to_string());
             }
             snapshot.project = Some(project);
+            apply_wiki(snapshot, Ok(wiki), &root);
         }
         Ok(None) => {
             snapshot.store_note = Some(format!(
@@ -638,6 +655,211 @@ pub fn format_age_secs(secs: i64) -> String {
     }
 }
 
+// ----------------------------------------------------------------------
+// Painel de wiki (W6-PR4)
+// ----------------------------------------------------------------------
+
+/// Limite de leitura do markdown de UMA página (256 KiB): uma página gigante
+/// (acidente de conteúdo) não pode encher a memória do dashboard nem travar o
+/// desenho — o corte é silencioso por design (o índice continua honesto).
+pub const WIKI_PAGE_MAX_BYTES: usize = 256 * 1024;
+
+/// Largura de quebra do markdown no modo texto (`--snapshot`/não-TTY): o TUI
+/// quebra pela largura real do painel; o texto fixa 100 colunas.
+const WIKI_TEXT_WIDTH: usize = 100;
+
+/// Uma página da wiki para o painel: o que o índice (`wiki_page`) sabe sobre
+/// a página + o markdown REAL lido de `.kira/wiki/` (a fonte de verdade é o
+/// disco — o `body` da store é derivado e pode estar velho depois de uma
+/// edição manual; o `updated_at` do índice dá a idade relativa da lista).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikiPage {
+    /// Slug da página (ex.: `contexto`, `bugs/4821`).
+    pub slug: String,
+    /// Tipo do índice (`decisao`, `padrao`, `bug`, `glossario`, ...).
+    pub kind: String,
+    pub title: String,
+    /// Caminho real do markdown no disco, como o índice gravou.
+    pub path: String,
+    /// `updated_at` cru (RFC 3339 UTC) — para o detalhe.
+    pub updated_at: String,
+    /// `updated_at` em unix (s) — `None` = stamp não-parseável (mostra `—`).
+    pub updated_unix: Option<i64>,
+    /// Markdown lido de `.kira/wiki/` com limite de
+    /// [`WIKI_PAGE_MAX_BYTES`]; vazio = página ilegível/ausente no disco.
+    pub content: String,
+}
+
+/// Aplica o resultado da consulta de `wiki_page` ao snapshot — função pura
+/// para o contrato fail-open ser unit-testável: índice vazio ⇒ lista vazia +
+/// causa acionável, NUNCA pânico nem dado inventado.
+fn apply_wiki(
+    snapshot: &mut Snapshot,
+    loaded: Result<Vec<store::WikiPageRow>, store::StoreError>,
+    root: &Path,
+) {
+    match loaded {
+        Ok(rows) => {
+            snapshot.wiki_rows = wiki_rows_from(&rows, root);
+            if rows.is_empty() {
+                // A causa honesta é o comando que conserta: o índice é
+                // derivado, então `kira wiki reindex` o reconstrói do disco.
+                snapshot.wiki_note = Some("wiki vazia — rode kira wiki reindex".to_string());
+            }
+        }
+        Err(err) => {
+            snapshot.wiki_note = Some(format!("índice da wiki ilegível ({err})"));
+            snapshot.wiki_rows = Vec::new();
+        }
+    }
+}
+
+/// Lê no máximo `max_bytes` de um arquivo; `None` = ausente/ilegível.
+///
+/// `String::from_utf8_lossy` em vez de `read_to_string`: um markdown com
+/// byte quebrado nunca impede o painel de abrir (fail-open, como todo o
+/// dashboard).
+fn read_capped(path: &Path, max_bytes: usize) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut buffer = Vec::new();
+    file.take(max_bytes as u64).read_to_end(&mut buffer).ok()?;
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// Markdown de UMA página: o caminho que o índice gravou primeiro; se o
+/// arquivo sumiu/se mudou (o índice é derivado, pode estar velho), tenta o
+/// caminho canônico `.kira/wiki/<slug>.md`. Vazio = nada no disco — o painel
+/// mostra a página com a nota de conteúdo ausente, nunca inventa texto.
+fn read_page_content(path: &str, root: &Path, slug: &str) -> String {
+    let stored = Path::new(path);
+    if let Some(content) = read_capped(stored, WIKI_PAGE_MAX_BYTES) {
+        return content;
+    }
+    let fallback = root.join(crate::wiki::WIKI_DIR).join(format!("{slug}.md"));
+    read_capped(&fallback, WIKI_PAGE_MAX_BYTES).unwrap_or_default()
+}
+
+/// Converte as linhas de `wiki_page` em páginas do painel. Função pura
+/// (a leitura de disco é a única parte I/O, e é read-only). A ordem é a do
+/// índice (slug), que já é determinística.
+pub fn wiki_rows_from(rows: &[store::WikiPageRow], root: &Path) -> Vec<WikiPage> {
+    rows.iter()
+        .map(|row| WikiPage {
+            slug: row.slug.trim().to_string(),
+            kind: row.kind.trim().to_string(),
+            title: row.title.trim().to_string(),
+            path: row.path.trim().to_string(),
+            updated_at: row.updated_at.trim().to_string(),
+            updated_unix: store::rfc3339_utc_to_unix_seconds(row.updated_at.trim()),
+            content: read_page_content(&row.path, root, &row.slug),
+        })
+        .collect()
+}
+
+/// Busca incremental do painel (`/`) — função PURA e testada: filtra por
+/// título E conteúdo, case-insensitive E sem acento-sensível (o dono digita
+/// "sessao" e acha "Sessão"). Agulha vazia = todas as páginas.
+pub fn filter_pages<'a>(pages: &'a [WikiPage], needle: &str) -> Vec<&'a WikiPage> {
+    let folded = fold_text(needle);
+    if folded.is_empty() {
+        return pages.iter().collect();
+    }
+    pages
+        .iter()
+        .filter(|page| {
+            fold_text(&page.title).contains(&folded) || fold_text(&page.content).contains(&folded)
+        })
+        .collect()
+}
+
+/// Normaliza um texto para comparação: minúsculas + tirar acento comum
+/// (pt-BR/latino). Sem dependência nova — a tabela cobre o alfabeto que a
+/// wiki realmente usa; qualquer outro char passa como está.
+pub fn fold_text(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| c.to_lowercase())
+        .map(deaccent)
+        .collect()
+}
+
+/// Um acento latino → letra base (só exibição de busca, nunca reescreve dado).
+fn deaccent(c: char) -> char {
+    match c {
+        'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' => 'u',
+        'ç' => 'c',
+        'ñ' => 'n',
+        'ý' | 'ÿ' => 'y',
+        _ => c,
+    }
+}
+
+/// Coluna ATUALIZAÇÃO da lista de páginas: idade relativa pura sobre o `now`
+/// do snapshot — `—` quando não há relógio ou o stamp não parseou.
+pub fn wiki_age_line(page: &WikiPage, now_secs: Option<i64>) -> String {
+    match (now_secs, page.updated_unix) {
+        (Some(now), Some(then)) => humanize_age(now, then),
+        _ => "—".to_string(),
+    }
+}
+
+/// Estado vazio honesto do painel de wiki: índice vazio com store legível ⇒
+/// `— (wiki vazia — rode kira wiki reindex)`; store ausente/ilegível ⇒ a
+/// causa concreta que o snapshot já carrega — nunca uma genérica inventada.
+pub fn empty_wiki_line(snapshot: &Snapshot) -> String {
+    let cause = snapshot
+        .wiki_note
+        .clone()
+        .or_else(|| snapshot.store_note.clone())
+        .unwrap_or_else(|| "wiki vazia — rode kira wiki reindex".to_string());
+    format!("wiki: — ({cause})")
+}
+
+/// Linhas de texto da LISTA de páginas (mesma lista da TUI no modo
+/// degradado + `--snapshot`). Fixas em colunas — sem scroll horizontal.
+pub fn wiki_lines(snapshot: &Snapshot) -> Vec<String> {
+    let pages = &snapshot.wiki_rows;
+    if pages.is_empty() {
+        return vec![empty_wiki_line(snapshot)];
+    }
+    let noun = if pages.len() == 1 {
+        "página"
+    } else {
+        "páginas"
+    };
+    let mut lines = vec![
+        format!("painel wiki — {} {noun}", pages.len()),
+        format!("{:<10} {:<30}{}", "TIPO", "TÍTULO", "ATUALIZAÇÃO"),
+    ];
+    for page in pages {
+        lines.push(format!(
+            "{:<10} {:<30}{}",
+            page.kind,
+            page.title,
+            wiki_age_line(page, snapshot.now_secs)
+        ));
+    }
+    lines
+}
+
+/// Preview renderizado de UMA página (o que `Enter` abre em tela cheia na
+/// TUI e o `--snapshot` imprime em texto): renderizador próprio, sem `#`
+/// nem `**` nem HTML executado — o dono lê um blog dentro do terminal.
+pub fn wiki_preview_lines(page: &WikiPage, width: usize) -> Vec<String> {
+    let mut lines = vec![format!("página: {} ({})", page.title, page.kind)];
+    let rendered = crate::tui::markdown::render(&page.content, width);
+    if rendered.is_empty() {
+        // Markdown ausente/ilegível no disco: a causa, nunca texto inventado.
+        lines.push("(conteúdo ausente em .kira/wiki/ — rode kira wiki reindex)".to_string());
+    } else {
+        lines.extend(rendered);
+    }
+    lines
+}
+
 /// Linha `— (causa)` de um dado ausente — o contrato de honestidade.
 fn dash_line(cause: &str) -> String {
     format!("— ({cause})")
@@ -745,7 +967,7 @@ pub fn header_lines(snapshot: &Snapshot) -> Vec<String> {
 
 /// Rodapé de 1 linha com as teclas — mesmo texto no TUI e no snapshot.
 pub fn footer_line() -> String {
-    "teclas: q sair · Tab/Shift+Tab painel · j/k ou ↑/↓ mover · g/G topo/fim · r reler disco · ? ajuda".to_string()
+    "teclas: q sair · Tab/Shift+Tab painel · j/k ou ↑/↓ mover · g/G topo/fim · / busca wiki · r reler disco · ? ajuda".to_string()
 }
 
 /// Relatório de texto do `kira dashboard --snapshot` (e do modo não-TTY).
@@ -772,6 +994,22 @@ pub fn text_report(snapshot: &Snapshot) -> String {
     if !sessions.is_empty() {
         text.push('\n');
         for line in sessions {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    // Painel de wiki (W6-PR4): lista + o preview renderizado de cada página
+    // (a MESMA saída do renderizador que o `Enter` abre na TUI).
+    let wiki = wiki_lines(snapshot);
+    if !wiki.is_empty() {
+        text.push('\n');
+        for line in wiki {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    for page in &snapshot.wiki_rows {
+        for line in wiki_preview_lines(page, WIKI_TEXT_WIDTH) {
             text.push_str(&line);
             text.push('\n');
         }
@@ -1315,5 +1553,171 @@ mod tests {
         assert!(report.contains("painel sessões — últimas 1"), "{report}");
         assert!(report.contains("#1"), "{report}");
         assert!(report.contains("scan fixture"), "{report}");
+    }
+
+    // ------------------------------------------------------------------
+    // Painel de wiki (W6-PR4)
+    // ------------------------------------------------------------------
+
+    /// Página de referência da wiki (o que `wiki_rows_from` devolve).
+    fn fixture_page(
+        slug: &str,
+        kind: &str,
+        title: &str,
+        updated_at: &str,
+        content: &str,
+    ) -> WikiPage {
+        WikiPage {
+            slug: slug.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            path: String::new(),
+            updated_at: updated_at.to_string(),
+            updated_unix: store::rfc3339_utc_to_unix_seconds(updated_at),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn filter_pages_matches_title_and_content_case_and_accent_insensitive() {
+        let pages = vec![
+            fixture_page(
+                "contexto",
+                "contexto",
+                "Contexto do projeto",
+                "2026-11-11T09:00:00Z",
+                "sessão expirada em produção",
+            ),
+            fixture_page(
+                "bugs/4821",
+                "bug",
+                "Sessão 4821",
+                "2026-11-10T09:00:00Z",
+                "token expirado",
+            ),
+        ];
+        // Agulha vazia = tudo.
+        assert_eq!(filter_pages(&pages, "").len(), 2);
+        // Título, case-insensitive.
+        assert_eq!(filter_pages(&pages, "CONTEXTO").len(), 1);
+        // Conteúdo, sem acento ("sessao" acha "Sessão" na página e no texto).
+        let hits = filter_pages(&pages, "sessao");
+        assert_eq!(hits.len(), 2, "título e conteúdo casam: {hits:?}");
+        // Sem casamento = lista vazia, nunca pânico.
+        assert!(filter_pages(&pages, "nada-disso-aqui").is_empty());
+    }
+
+    #[test]
+    fn empty_wiki_line_names_reindex_and_store_causes_fall_through() {
+        // Store legível, índice vazio: a causa é o comando que conserta.
+        let empty = Snapshot {
+            wiki_note: Some("wiki vazia — rode kira wiki reindex".to_string()),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            empty_wiki_line(&empty),
+            "wiki: — (wiki vazia — rode kira wiki reindex)"
+        );
+        // Store ausente: a causa concreta da store (nunca inventada aqui).
+        let absent = Snapshot {
+            store_note: Some(
+                "nenhuma trilha em store.db — rode `kira scan` ou `kira doctor`".to_string(),
+            ),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            empty_wiki_line(&absent),
+            "wiki: — (nenhuma trilha em store.db — rode `kira scan` ou `kira doctor`)"
+        );
+        // E `wiki_lines` devolve exatamente essa linha no estado vazio.
+        assert_eq!(
+            wiki_lines(&absent),
+            vec!["wiki: — (nenhuma trilha em store.db — rode `kira scan` ou `kira doctor`)"]
+        );
+    }
+
+    #[test]
+    fn wiki_lines_show_kind_title_and_relative_age() {
+        // now = 2026-11-11T09:00:00Z (1_794_387_600) + 3 dias ⇒ "há 3 dias"
+        // determinístico (o stamp é PARSEADO, o relógio é fixo do teste).
+        let now = 1_794_387_600 + 3 * 86_400;
+        let snapshot = Snapshot {
+            wiki_rows: vec![
+                fixture_page(
+                    "contexto",
+                    "contexto",
+                    "Contexto do projeto",
+                    "2026-11-11T09:00:00Z",
+                    "# Contexto\n\n**decisão** tomada",
+                ),
+                fixture_page(
+                    "bugs/4821",
+                    "bug",
+                    "Sessão 4821",
+                    "2026-11-10T09:00:00Z",
+                    "token expirado",
+                ),
+            ],
+            now_secs: Some(now),
+            ..Snapshot::default()
+        };
+        let lines = wiki_lines(&snapshot).join("\n");
+        assert!(lines.contains("painel wiki — 2 páginas"), "{lines}");
+        assert!(lines.contains("TIPO"), "{lines}");
+        assert!(lines.contains("TÍTULO"), "{lines}");
+        assert!(lines.contains("ATUALIZAÇÃO"), "{lines}");
+        assert!(lines.contains("Contexto do projeto"), "{lines}");
+        assert!(lines.contains("há 3 dias"), "{lines}");
+        // Stamp não-parseável: `—` honesto, nunca idade inventada.
+        let broken = fixture_page("x", "bug", "X", "stamp quebrado", "");
+        assert_eq!(wiki_age_line(&broken, Some(now)), "—");
+    }
+
+    #[test]
+    fn wiki_preview_renders_markdown_without_hash_or_bold_markers() {
+        let page = fixture_page(
+            "contexto",
+            "contexto",
+            "Contexto do projeto",
+            "2026-11-11T09:00:00Z",
+            "# Contexto\n\n- item um\n\n**negrito** e `código`",
+        );
+        let lines = wiki_preview_lines(&page, 80).join("\n");
+        assert!(
+            lines.contains("página: Contexto do projeto (contexto)"),
+            "{lines}"
+        );
+        assert!(lines.contains("▌ Contexto"), "{lines}");
+        assert!(lines.contains("• item um"), "{lines}");
+        assert!(lines.contains("negrito"), "{lines}");
+        assert!(lines.contains("código"), "{lines}");
+        assert!(!lines.contains('#'), "o `#` cru nunca sai: {lines}");
+        assert!(!lines.contains("**"), "{lines}");
+        assert!(!lines.contains('`'), "{lines}");
+        // Página ilegível no disco: causa, nunca texto inventado.
+        let ghost = fixture_page("ghost", "bug", "Fantasma", "2026-11-11T09:00:00Z", "");
+        let lines = wiki_preview_lines(&ghost, 80).join("\n");
+        assert!(lines.contains("conteúdo ausente"), "{lines}");
+    }
+
+    #[test]
+    fn text_report_carries_the_wiki_list_and_rendered_pages() {
+        let snapshot = Snapshot {
+            wiki_rows: vec![fixture_page(
+                "contexto",
+                "contexto",
+                "Contexto do projeto",
+                "2026-11-11T09:00:00Z",
+                "## Decisão\n\n- item",
+            )],
+            now_secs: Some(1_762_861_200),
+            ..Snapshot::default()
+        };
+        let report = text_report(&snapshot);
+        assert!(report.contains("painel wiki — 1 página"), "{report}");
+        assert!(report.contains("página: Contexto do projeto"), "{report}");
+        assert!(report.contains("■ Decisão"), "{report}");
+        assert!(report.contains("• item"), "{report}");
+        assert!(!report.contains("##"), "{report}");
     }
 }

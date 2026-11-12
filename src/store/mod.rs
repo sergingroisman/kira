@@ -507,6 +507,37 @@ impl Store {
         tx.commit().map_err(StoreError::Sql)?;
         Ok(deleted > 0)
     }
+
+    /// Lists every row of the derived wiki index, slug order (read query used
+    /// by `kira dashboard`, W6-PR4). The dashboard opens the store with
+    /// [`Store::open_readonly_at`], so this query physically cannot write.
+    pub fn wiki_pages(&self) -> Result<Vec<WikiPageRow>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT slug, kind, path, title, updated_at, content_hash, body \
+                 FROM wiki_page ORDER BY slug",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(WikiPageRow {
+                    slug: row.get(0)?,
+                    kind: row.get(1)?,
+                    path: row.get(2)?,
+                    title: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    content_hash: row.get(5)?,
+                    body: row.get(6)?,
+                })
+            })
+            .map_err(StoreError::Sql)?;
+        let mut pages = Vec::new();
+        for row in rows {
+            pages.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(pages)
+    }
 }
 
 /// One wiki page as stored in the derived index.

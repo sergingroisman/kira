@@ -226,7 +226,7 @@ próximo com `Cargo.toml`/`package.json`, senão o diretório atual).
   `kira note` grava exatamente o que você digitou.
 - Apagar `store.db` limpa toda a trilha.
 
-## Dashboard — `kira dashboard` (W6-PR3, read-only)
+## Dashboard — `kira dashboard` (W6-PR4, read-only)
 
 O dashboard é a mesma TUI do binário (ratatui/crossterm, ADR-0014) mostrando o
 estado vivo do projeto atual — nesta PR, o **painel de cabeçalho** (nome do
@@ -236,29 +236,55 @@ trilha), o **painel de achados** (`.kira/findings.json`): tabela ordenada
 critical→low com contagem por severidade no cabeçalho do bloco
 (`critical N · high N · medium N · low N`), colunas SEVERIDADE / FERRAMENTA /
 LOCAL (`path:linha`) / RESUMO (1ª linha da mensagem) e agregação por ferramenta
-— e o **painel de sessões** (trilha do store): as últimas 50 sessões do
+— o **painel de sessões** (trilha do store): as últimas 50 sessões do
 projeto (`#id`), com quando (idade relativa — `há 3 min` — calculada por
 função pura sobre o `now` capturado uma vez no snapshot, sem relógio por
 frame), comando, modelo, duração (`412ms`, `1m5s`, `1h05m`) e a 1ª linha do
 summary; sessão que falhou fica destacada, sucesso fica neutro. Store legível
-sem sessões mostra `sessões: — (store sem sessões)`.
-`Enter` abre o detalhe — do achado ou da sessão selecionada (painel lateral
-com o summary INTEIRO, ≤2000 chars já gravados pela store); `Esc` volta.
+sem sessões mostra `sessões: — (store sem sessões)` — e o **painel de wiki**
+(W6-PR4, abaixo). `Enter` abre o detalhe — do achado ou da sessão selecionada
+(painel lateral com o summary INTEIRO, ≤2000 chars já gravados pela store); no
+painel de wiki `Enter` abre a página em tela cheia; `Esc` volta em todos.
+
+### Painel de wiki (W6-PR4) — "ler um blog dentro do terminal"
+
+O coração do MVP para o dono: as páginas da wiki (ADR-0013) listadas por
+`tipo · título · atualização relativa` (idade por função pura sobre o `now` do
+snapshot), lidas do índice `wiki_page` da store em modo `SQLITE_OPEN_READ_ONLY`
+com o markdown REAL de cada arquivo em `.kira/wiki/` (limite de 256 KiB por
+página — a fonte de verdade é o disco, o índice é derivado).
+
+- **Markdown rendido por renderizador próprio** (`src/tui/markdown.rs`), SEM
+  dependência nova: títulos com marcador por nível (`#`→`▌`, `##`→`■`), listas
+  `-`/`*`→`•`, bloco de código e citação com barra `│` (sem cor de sintaxe),
+  code span desligado, negrito/itálico desligando os marcadores, links
+  `[txt](url)`→`txt (url)`, régua `---`→`────`. Nada de HTML executado (tags
+  viram texto), quebra de linha na largura real, determinístico.
+- **Busca incremental `/`**: filtra por título E conteúdo, case-insensitive e
+  sem acento-sensível (digitar `sessao` acha `Sessão`) — função pura
+  (`filter_pages`) unit-testada; o rodapé vira a caixa de texto com cursor e
+  `Esc` cancela.
+- **`Enter`** abre a página selecionada em tela cheia com scroll vertical
+  (`j`/`k`, `g`/`G`, `PgUp`/`PgDn`); **`Esc`** volta à lista.
+- Índice ausente/vazio ⇒ lista vazia com a causa honesta:
+  `wiki: — (wiki vazia — rode kira wiki reindex)`.
 
 - **Read-only provado**: o dashboard não escreve em nada — a store abre em modo
   `SQLITE_OPEN_READ_ONLY`, não toca rede nem LLM, e NÃO grava sessão na trilha.
   O e2e (`tests/dashboard_e2e.rs`) prova: hash do `store.db` antes/depois de
-  rodar com e sem `--snapshot` é byte-idêntico.
+  rodar com e sem `--snapshot` é byte-idêntico — inclusive com o painel de
+  wiki lendo `.kira/wiki/`.
 - **Honestidade**: dado ausente aparece como `—` com a causa
   (`achados: — (nunca rodou kira scan)`), nunca inventado ou estimado.
 - **Interativo só em TTY**: `kira dashboard` com stdout de terminal abre a TUI;
   sem TTY (pipe/CI) imprime o mesmo conteúdo em texto e sai 0.
 - **`--snapshot`**: sempre a forma de texto, para o CI e para redirecionamento —
-  nunca desenha na tela.
+  nunca desenha na tela (inclui a lista de páginas e o markdown rendido).
 - **Teclas** (setas E vim; nenhuma tecla escreve): `q` sair ·
-  `Tab`/`Shift+Tab` ciclar painel (cabeçalho → achados → sessões) · `j`/`k` ou
-  `↑`/`↓` mover · `g`/`G` topo/fim · `Enter` detalhe (achado ou sessão) ·
-  `Esc` volta · `r` reler o disco (sem rede, sem escrita) · `?` ajuda.
+  `Tab`/`Shift+Tab` ciclar painel (cabeçalho → achados → sessões → wiki) ·
+  `j`/`k` ou `↑`/`↓` mover · `g`/`G` topo/fim · `Enter` detalhe (achado ou
+  sessão) ou página da wiki · `Esc` volta · `/` busca na wiki ·
+  `r` reler o disco (sem rede, sem escrita) · `?` ajuda.
 - **Terminal pequeno**: abaixo de 80×24 o layout degrada para lista única com
   aviso claro.
 - **Cores**: `NO_COLOR` (ou `TERM=dumb`) ⇒ paleta mono com a mesma informação.

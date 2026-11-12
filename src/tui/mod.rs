@@ -14,6 +14,8 @@
 
 pub mod app;
 pub mod keymap;
+/// Renderizador markdown mínimo do painel de wiki (W6-PR4).
+pub mod markdown;
 pub mod state;
 pub mod theme;
 pub mod widgets;
