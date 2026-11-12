@@ -164,6 +164,7 @@ fn run_kira(
         .current_dir(&sandbox.cwd)
         .env("KIRA_STORE_DIR", &sandbox.store)
         .env_remove("AZURE_DEVOPS_PAT")
+        .env("KIRA_SECRET_STORE", "off")
         .env_remove("AZURE_DEVOPS_ORG")
         .env_remove("AZURE_DEVOPS_PROJECT")
         .env_remove("KIRA_MODEL")

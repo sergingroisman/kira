@@ -1324,6 +1324,7 @@ fn run_doctor(config: &Path, extra_envs: &[(&str, &str)]) -> String {
         .env("KIRA_CONFIG", config)
         .env("KIRA_STORE_DIR", &sandbox)
         .env_remove("AZURE_DEVOPS_PAT")
+        .env("KIRA_SECRET_STORE", "off")
         .env_remove("AZURE_DEVOPS_ORG")
         .env_remove("AZURE_DEVOPS_PROJECT");
     for (name, value) in extra_envs {
