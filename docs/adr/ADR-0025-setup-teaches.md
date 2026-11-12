@@ -1,4 +1,4 @@
-# ADR-0024 — O `kira setup` ensina: aula do PAT, menu com pular e validação na hora
+# ADR-0025 — O `kira setup` ensina: aula do PAT, menu com pular e validação na hora
 
 - **Status**: aceito (12/Nov/2026)
 - **Decisores**: Sérgio (dono)

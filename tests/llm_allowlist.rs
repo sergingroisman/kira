@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 const COMPOSITION_ROOT: &str = "main.rs";
 
 /// Modules allowed to reference the LLM layer. Anything else is a regression.
-/// `setup.rs` entra por ADR-0024: o passo de backend de IA VERIFICA o
+/// `setup.rs` entra por ADR-0025: o passo de backend de IA VERIFICA o
 /// pré-requisito (ollama list, copilot no PATH) e faz UMA chamada de teste
 /// barata do Foundry — é wiring/probe de configuração, nunca decisão com o
 /// modelo (não está em `MUST_JUSTIFY`).

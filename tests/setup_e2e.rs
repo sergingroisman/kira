@@ -1,4 +1,4 @@
-//! End-to-end tests of `kira setup` (ADR-0024: o wizard que ENSINA) and of
+//! End-to-end tests of `kira setup` (ADR-0025: o wizard que ENSINA) and of
 //! the `BoardProvider` seam.
 //!
 //! No real Azure DevOps, no OS keyring: a std `TcpListener` serves canned
@@ -1304,7 +1304,7 @@ async fn setup_reset_removes_the_pat_from_the_store() {
 
 /// Runs the REAL binary `kira doctor` with `KIRA_CONFIG` pointing at `config`.
 /// The Azure env vars are removed first (o doctor corta offline no PAT
-/// ausente, imprimindo a explicação curta — ADR-0024); `extra_envs` repõe as
+/// ausente, imprimindo a explicação curta — ADR-0025); `extra_envs` repõe as
 /// variáveis que o teste quiser (ex.: `AZURE_DEVOPS_PAT` para a máscara).
 fn run_doctor(config: &Path, extra_envs: &[(&str, &str)]) -> String {
     // Sandbox próprio: o doctor grava o resumo no store de sessões, e o

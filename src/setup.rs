@@ -1,4 +1,4 @@
-//! `kira setup` — o wizard que ENSINA (ADR-0024).
+//! `kira setup` — o wizard que ENSINA (ADR-0025).
 //!
 //! Princípio da spec: cada pergunta vem com **o que é**, **por que pedimos**,
 //! **como fazer** e **o que acontece se pular** — e nunca bloqueia: tudo tem
@@ -265,7 +265,7 @@ pub async fn run(
     }
 
     // ------------------------------------------------------------------
-    // Passo PAT: a aula vem sempre antes de qualquer pedido (ADR-0024).
+    // Passo PAT: a aula vem sempre antes de qualquer pedido (ADR-0025).
     // Com `--pat` o token já existe — zero aula, zero menu, zero prompt.
     // ------------------------------------------------------------------
     let pat_result = if let Some(pat) = options.pat.as_deref() {
@@ -821,7 +821,7 @@ fn ask_menu_choice(
 /// Melhor esforço para esconder o que o usuário digita: `stty -echo`/`echo`
 /// no Unix (o eco é do terminal, não do KIRA; o valor lido nunca é impresso
 /// de qualquer forma). Windows não tem mecanismo sem dependência nova — fica
-/// registrado na ADR-0024 como limitação. Nunca é fatal.
+/// registrado na ADR-0025 como limitação. Nunca é fatal.
 fn terminal_echo(enable: bool) {
     #[cfg(unix)]
     {

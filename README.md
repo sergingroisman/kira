@@ -22,7 +22,7 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira triage <id\|--file> --llm copilot` | Usa o **Copilot CLI** como LLM caro desta execução (spawn de `copilot -p`; exige `copilot auth login`) — ver [Backend LLM (ADR-0019)](#backend-llm-adr-0019). |
 | `kira triage <id\|--file> --llm foundry` | Usa o **Microsoft Foundry** (BYOK, HTTP OpenAI-compatible) no lugar do Ollama para esta execução — ver [Backend foundry](#backend-foundry-byok-microsoft-foundry) abaixo. |
 | `kira triage --eval <dir>` | **Gate M2 medido (ADR-0018)**: compara o triage com os rótulos do dono (`item.json` + `gold.json` por pasta) de forma **determinística, sem LLM juiz**; exit 0 = ≥70% (`PASSOU`), 1 = <70% ou erro. `--json` para automação; `--seed` copia 3 fixtures sintéticas num diretório vazio. Ver [seção do gate](#kira-triage---eval--o-gate-m2-medido-adr-0018). |
-| `kira setup [--org --project --name --pat --yes --backend --skip --reset]` | Wizard que **ensina** (ADR-0024): aula do PAT, menu (colar / env / pular), validação na hora e backend de IA com custo/dados; PAT vai para o keyring do OS (service `kira`). `--reset` remove o PAT. |
+| `kira setup [--org --project --name --pat --yes --backend --skip --reset]` | Wizard que **ensina** (ADR-0025): aula do PAT, menu (colar / env / pular), validação na hora e backend de IA com custo/dados; PAT vai para o keyring do OS (service `kira`). `--reset` remove o PAT. |
 | `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
 | `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
 | `kira note "<texto>"` / `kira note --remove N` | Fato do perfil do projeto (append-only, numerado). |
@@ -110,7 +110,7 @@ kira triage --eval ./gold --seed                    # primeira vez, 3 fixtures s
 cargo install --path .     # ou: cargo run -- <comando> direto do repo
 ```
 
-## Setup (o wizard que ensina — ADR-0024)
+## Setup (o wizard que ensina — ADR-0025)
 
 Cada passo do `kira setup` explica **o que é**, **por que pedimos**, **como
 fazer** e **o que acontece se pular** — nunca bloqueia, tudo tem caminho

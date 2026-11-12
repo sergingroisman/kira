@@ -89,7 +89,7 @@ pub fn format_unauthorized_check(organization: &str) -> String {
 }
 
 /// Explicação CURTA do PAT (a aula completa vive no `kira setup`; o doctor
-/// repete o resumo quando o PAT está ausente ou inválido — ADR-0024). Quando
+/// repete o resumo quando o PAT está ausente ou inválido — ADR-0025). Quando
 /// a org não é conhecida, usa `<sua-org>` no link.
 pub fn format_pat_lesson_short(organization: Option<&str>) -> String {
     let url = match organization {
@@ -212,7 +212,7 @@ pub async fn run() -> (bool, String) {
         let (line, ok) = format_resolved_check(name, resolved);
         emit(&mut out, &format!("   {line}"));
         if !ok {
-            // PAT ausente: repete a explicação curta (ADR-0024) — o usuário
+            // PAT ausente: repete a explicação curta (ADR-0025) — o usuário
             // que desistiu do token entende o que está faltando sem rodar o
             // wizard de novo.
             if *name == *"AZURE_DEVOPS_PAT" {
@@ -265,7 +265,7 @@ pub async fn run() -> (bool, String) {
         }
         Err(Error::AdoUnauthorized { organization: org }) => {
             emit(&mut out, &format!("   {}", format_unauthorized_check(&org)));
-            // PAT inválido: repete a explicação curta (ADR-0024).
+            // PAT inválido: repete a explicação curta (ADR-0025).
             emit(
                 &mut out,
                 &format!("   {}", format_pat_lesson_short(Some(&org))),
