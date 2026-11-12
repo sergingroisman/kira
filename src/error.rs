@@ -89,6 +89,25 @@ pub enum Error {
     )]
     Api(#[from] serde_json::Error),
 
+    /// A conferência de capacidades (ADR-0030) falhou ao ler o store local.
+    /// Fail-closed (decisão 6 do ADR-0030): sem prova do estado, o comando de
+    /// board não executa — o erro é do store, nunca uma tentativa de rede.
+    #[error(
+        "não foi possível conferir as capacidades no store local ({0}) — rode `kira doctor` para diagnosticar (o comando de board não executa sem essa prova, ADR-0030)"
+    )]
+    CapabilityStore(#[from] crate::store::StoreError),
+
+    /// A jornada exige uma integração (`Capability`, ADR-0030) que não está
+    /// conectada para este projeto: a mensagem é o contrato exato da matriz do
+    /// ADR-0030 e aponta o comando de conexão — nunca 401/404 cru, nunca rede.
+    #[error("esta jornada precisa de {capability} — rode: {command}")]
+    CapabilityMissing {
+        /// Nome da capacidade do contrato (`board.azure`, `scm.github`, ...).
+        capability: &'static str,
+        /// O comando que conecta (`kira connect azure`, ...).
+        command: &'static str,
+    },
+
     /// The local Ollama server is not reachable (nothing listening).
     #[error(
         "Ollama não está rodando — instale em https://ollama.com e execute 'ollama serve' (no Windows ele roda como serviço)"
@@ -456,6 +475,17 @@ mod tests {
             (
                 "Api",
                 Error::Api(serde_json::from_str::<i32>("não é json").expect_err("json inválido")),
+            ),
+            (
+                "CapabilityStore",
+                Error::CapabilityStore(crate::store::StoreError::NoStoreDir),
+            ),
+            (
+                "CapabilityMissing",
+                Error::CapabilityMissing {
+                    capability: "board.azure",
+                    command: "kira connect azure",
+                },
             ),
             ("LlmNotRunning", Error::LlmNotRunning),
             ("LlmTimeout", Error::LlmTimeout),
