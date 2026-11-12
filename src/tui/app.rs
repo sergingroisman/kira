@@ -114,7 +114,7 @@ pub struct AppState {
     /// Modo degradado ativo (terminal menor que 80×24)? `run` atualiza a cada
     /// frame; `Move` roteia para a lista única em vez do painel em foco.
     pub degraded: bool,
-    /// Detalhe de achado aberto (Enter abre, Enter volta — Esc agora sai).
+    /// Detalhe de achado aberto (Enter abre; Enter ou Esc voltam).
     pub detail_open: bool,
     /// Overlay de ajuda aberto (?).
     pub help_open: bool,
@@ -288,29 +288,47 @@ pub fn apply_outcome(screen: &mut AppState, outcome: Outcome) {
 /// DECISÃO PURA da tecla: estado de tela + `KeyEvent` → [`Outcome`].
 ///
 /// Toda a semântica de interação do loop mora aqui, sem terminal, sem I/O —
-/// o loop só executa o outcome. A SAÍDA (`q`, `Esc`, Ctrl+C) é a primeira
-/// checagem, ANTES de qualquer modal — contrato do dono: sair em qualquer
-/// estado, inclusive ajuda/detalhe/busca abertos. Setas E vim (persona §7)
+/// o loop só executa o outcome. SAIR (`Ctrl+C`, e `q` fora da busca) é a
+/// primeira checagem, antes de qualquer modal — sem SIGINT em raw mode, é o
+/// handler que obedece ao Ctrl+C. `Esc` é VOLTAR (fecha a camada aberta),
+/// padrão de mercado: ele nunca tira o usuário do app. Setas E vim (persona §7)
 /// chegam pelo `keymap`; Enter/TAB têm semântica dependente do estado (painel
 /// em foco, detalhe aberto) e por isso são decididos AQUI, não no keymap sem
 /// estado do W6-PR1. Nenhuma tecla escreve: não existe outcome de escrita.
 pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
-    // SAÍDA ANTES DE TUDO: `q`, `Esc` e Ctrl+C encerram o dashboard em
-    // QUALQUER estado (ajuda aberta, detalhe aberto, busca ativa, preview de
-    // página). Nenhum modal pode engolir a tecla de sair — por isso a
-    // checagem mora na primeira linha do decide().
+    // SAIR: Ctrl+C encerra em QUALQUER estado — em raw mode não existe
+    // SIGINT, então a tecla chega aqui como evento e ignorá-la prende o
+    // usuário. `q` também sai, EXCETO na busca (ali `q` é texto: quem digita
+    // uma palavra com q não pode ser expulso no meio da digitação).
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Outcome::Quit;
+    }
+    // VOLTAR: `Esc` fecha a camada aberta e, sem camada, não faz nada.
+    // Contrato do dono (teste em Windows): Esc é o "voltar" que todo dev
+    // aperta; a saída fica com q/Ctrl+C.
     match key.code {
-        KeyCode::Esc => return Outcome::Quit,
-        KeyCode::Char('q') => return Outcome::Quit,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return Outcome::Quit;
+        KeyCode::Esc => {
+            if state.wiki_search_open {
+                return Outcome::CloseSearch;
+            }
+            if state.page_open {
+                return Outcome::ClosePage;
+            }
+            if state.detail_open {
+                return Outcome::ToggleDetail;
+            }
+            if state.help_open {
+                return Outcome::Help;
+            }
+            return Outcome::Ignore;
         }
+        KeyCode::Char('q') if !state.wiki_search_open => return Outcome::Quit,
         _ => {}
     }
     // Busca aberta é modal: toda tecla vira texto no rodapé; Enter CONFIRMA e
     // fecha a caixa (o filtro é incremental, a agulha fica). Só caracteres
-    // sem CONTROL entram; SHIFT entra (maiúscula é busca). Esc NÃO cancela
-    // mais — agora sai do app (checagem acima).
+    // sem CONTROL entram; SHIFT entra (maiúscula é busca). Esc cancela a
+    // busca (voltou ao padrão de mercado: Esc é voltar).
     if state.wiki_search_open {
         return match key.code {
             KeyCode::Enter => Outcome::CloseSearch,
@@ -322,9 +340,9 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
         };
     }
     // Preview de página aberto é modal: Enter volta à lista, j/k/PgUp/PgDn
-    // rolam e `r` relê o disco (o mesmo serviço do modal de detalhe). Esc NÃO
-    // fecha mais — sai do app (checagem de saída acima). Mover/Tab por baixo
-    // do preview confundiria o foco.
+    // rolam e `r` relê o disco (o mesmo serviço do modal de detalhe). Esc
+    // fecha o preview (voltou a ser "voltar"). Mover/Tab por baixo do preview
+    // confundiria o foco.
     if state.page_open {
         return match key.code {
             KeyCode::Enter => Outcome::ClosePage,
@@ -348,8 +366,8 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
             _ => Outcome::Ignore,
         };
     }
-    // Detalhe aberto é modal: Enter fecha (o detalhe é toggle) e `r` relê o
-    // disco. Esc NÃO fecha mais — sai do app (checagem de saída acima).
+    // Detalhe aberto é modal: Enter fecha (toggle), `r` relê o disco e Esc
+    // também fecha (Esc = voltar).
     // Mover/Tab por baixo do detalhe confundiria o foco.
     if state.detail_open {
         return match key.code {
@@ -372,8 +390,8 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
                 _ => Outcome::Ignore,
             }
         }
-        // Esc NÃO chega aqui: a checagem de saída no topo do decide() já o
-        // converteu em Quit (contrato do dono — Esc sai em qualquer estado).
+        // Esc NÃO chega aqui: o bloco de VOLTAR no topo já tratou o Esc
+        // (fecha camada aberta ou Ignore), então este match não o vê.
         // Ctrl+L: redesenhar sem mudar nada (a tela de um terminal bagunçado
         // por outra aplicação volta sozinha).
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => Outcome::Redraw,
@@ -578,7 +596,7 @@ pub fn render_frame(frame: &mut Frame, snapshot: &Snapshot, screen: &AppState, p
     };
     let footer = if screen.wiki_search_open {
         format!(
-            "busca wiki: {}▌ (j/k mover · Enter confirma · q/Esc saem)",
+            "busca wiki: {}▌ (j/k mover · Enter confirma · Esc volta · Ctrl+C sai)",
             screen.wiki_query
         )
     } else {
@@ -781,7 +799,8 @@ fn help_paragraph(palette: &Palette, pendings: &[String]) -> Paragraph<'static> 
         "ajuda do kira dashboard (read-only — nenhuma tecla escreve)".to_string(),
         String::new(),
         "q                sair".to_string(),
-        "Esc              sair (em qualquer estado; Ctrl+C idem)".to_string(),
+        "Ctrl+C           sair (em qualquer estado, inclusive modal aberto)".to_string(),
+        "Esc              voltar (fecha ajuda/detalhe/página/busca)".to_string(),
         "Tab / Shift+Tab  ciclar painel (cabeçalho ↔ achados ↔ sessões ↔ wiki)".to_string(),
         "j / k ou ↑ / ↓   mover linha do painel em foco".to_string(),
         "g / G            topo / fim".to_string(),
@@ -891,10 +910,11 @@ mod tests {
     }
 
     #[test]
-    fn esc_quits_in_every_state_and_so_do_q_and_ctrl_c() {
-        // Contrato do dono (defeito real do smoke): q, Esc e Ctrl+C saem do
-        // app em QUALQUER estado — a checagem é a primeira do decide(),
-        // antes de ajuda/detalhe/busca/preview engolirem a tecla.
+    fn ctrl_c_quits_in_every_state_and_esc_goes_back() {
+        // Padrão de mercado (corrigido depois do teste do dono): Ctrl+C sai de
+        // QUALQUER estado (em raw mode não existe SIGINT — ignorar a tecla
+        // prende o usuário); Esc é VOLTAR e fecha a camada aberta; `q` sai
+        // fora da busca e é texto dentro dela.
         let normal = findings_state();
         let with_help = AppState {
             help_open: true,
@@ -918,24 +938,38 @@ mod tests {
             ..KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
         };
         for state in [&normal, &with_help, &with_detail, &searching, &with_page] {
-            assert_eq!(
-                decide(state, plain(KeyCode::Esc)),
-                Outcome::Quit,
-                "{state:?}"
-            );
-            assert_eq!(
-                decide(state, plain(KeyCode::Char('q'))),
-                Outcome::Quit,
-                "{state:?}"
-            );
             assert_eq!(decide(state, ctrl_c), Outcome::Quit, "{state:?}");
+            if !state.wiki_search_open {
+                assert_eq!(
+                    decide(state, plain(KeyCode::Char('q'))),
+                    Outcome::Quit,
+                    "q sai com overlay aberto: {state:?}"
+                );
+            }
         }
+        // Na busca, `q` é texto (ninguém pode ser expulso digitando).
+        assert_eq!(
+            decide(&searching, plain(KeyCode::Char('q'))),
+            Outcome::SearchChar('q')
+        );
+        // Esc volta, camada por camada; sem camada aberta não faz nada.
+        assert_eq!(decide(&normal, plain(KeyCode::Esc)), Outcome::Ignore);
+        assert_eq!(decide(&with_help, plain(KeyCode::Esc)), Outcome::Help);
+        assert_eq!(
+            decide(&with_detail, plain(KeyCode::Esc)),
+            Outcome::ToggleDetail
+        );
+        assert_eq!(
+            decide(&searching, plain(KeyCode::Esc)),
+            Outcome::CloseSearch
+        );
+        assert_eq!(decide(&with_page, plain(KeyCode::Esc)), Outcome::ClosePage);
     }
 
     #[test]
     fn enter_closes_the_modals_because_esc_now_quits() {
-        // Com Esc dedicado a SAIR, fechar overlay virou trabalho do Enter
-        // (detalhe/página são toggle) e da confirmação da busca.
+        // Overlay fecha com Enter (toggle) e TAMBÉM com Esc — as duas portas
+        // funcionam, porque Esc voltou a ser "voltar".
         let with_detail = AppState {
             detail_open: true,
             ..findings_state()
@@ -1278,8 +1312,12 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("Esc              sair"),
-            "o Esc documentado na ajuda (agora sai do app): {text}"
+            text.contains("Esc              voltar"),
+            "o Esc documentado na ajuda (agora volta): {text}"
+        );
+        assert!(
+            text.contains("Ctrl+C           sair"),
+            "Ctrl+C precisa estar documentado como saída: {text}"
         );
     }
 
@@ -1560,7 +1598,7 @@ mod tests {
         };
         assert_eq!(decide(&searching, shift_s), Outcome::SearchChar('S'));
         // Backspace apaga; Enter confirma e fecha a caixa (agulha fica no
-        // filtro). Esc NÃO cancela mais: sai do app (contrato do dono).
+        // filtro). Esc cancela a busca (Esc = voltar, padrão de mercado).
         assert_eq!(
             decide(&searching, plain(KeyCode::Backspace)),
             Outcome::SearchBackspace
@@ -1569,10 +1607,16 @@ mod tests {
             decide(&searching, plain(KeyCode::Enter)),
             Outcome::CloseSearch
         );
-        assert_eq!(decide(&searching, plain(KeyCode::Esc)), Outcome::Quit);
-        // E a própria busca não engole a tecla de sair: `q` na caixa de texto
-        // sai do app (a checagem vem antes do modal).
-        assert_eq!(decide(&searching, plain(KeyCode::Char('q'))), Outcome::Quit);
+        assert_eq!(
+            decide(&searching, plain(KeyCode::Esc)),
+            Outcome::CloseSearch
+        );
+        // `q` na caixa de texto é TEXTO: quem digita uma palavra com q não pode
+        // ser expulso no meio da digitação. Sair da busca é Esc; do app, Ctrl+C.
+        assert_eq!(
+            decide(&searching, plain(KeyCode::Char('q'))),
+            Outcome::SearchChar('q')
+        );
         // Teclas de navegação NÃO vazam por baixo da busca: modal.
         assert_eq!(decide(&searching, plain(KeyCode::Tab)), Outcome::Ignore);
         assert_eq!(decide(&searching, plain(KeyCode::Down)), Outcome::Ignore);
@@ -1592,8 +1636,8 @@ mod tests {
             page_open: true,
             ..AppState::default()
         };
-        // Esc agora SAI do app (contrato do dono); Enter volta à lista.
-        assert_eq!(decide(&open, plain(KeyCode::Esc)), Outcome::Quit);
+        // Esc e Enter voltam à lista (Esc = voltar).
+        assert_eq!(decide(&open, plain(KeyCode::Esc)), Outcome::ClosePage);
         assert_eq!(decide(&open, plain(KeyCode::Enter)), Outcome::ClosePage);
         assert_eq!(
             decide(&open, plain(KeyCode::Char('j'))),
