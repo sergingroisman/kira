@@ -4,6 +4,11 @@
 //! The function is pure and idempotent: `redact(redact(x)) == redact(x)`, so it
 //! is safe to apply at more than one layer without piling up markers.
 //!
+//! W7.1 (ADR-0024 R1): before masking, a closed set of invisible characters
+//! (zero-width and bidi controls) is stripped — a zero-width inside a secret's
+//! shape (`token\u{200B}=…`, `ghp\u{200B}_…`) used to break the masking regexes
+//! and cross the boundary unmasked, proven by the 12/Nov/2026 red team probe.
+//!
 //! Design: placeholders (`[REDACTED]`, `[EMAIL]`, `[CPF]`) instead of partial
 //! masks. A partial mask ("a***@b.com") still leaks length and shape, and a
 //! leaked token shape is what makes guessing worthwhile.
@@ -13,6 +18,45 @@ use std::sync::OnceLock;
 
 /// Marker for a masked credential.
 pub const MASKED: &str = "[REDACTED]";
+
+/// Conjunto fechado de caracteres invisíveis removidos antes do masking
+/// (ADR-0024, requisito R1). Cada grupo existe por um motivo:
+/// - `U+00AD` (soft hyphen): largura zero condicional — invisível no
+///   renderizador e no revisor;
+/// - `U+200B`/`U+200C`/`U+200D` (zero-width space, non-joiner, joiner):
+///   o bypass do probe de 12/Nov — entre a chave e o `=`, ou dentro de um
+///   shape conhecido, quebram o regex sem que ninguém veja nada;
+/// - `U+202A`–`U+202E` (bidi embedding/override): reordenam o texto
+///   renderizado — podem inverter o lado visível do `=` e escondem
+///   instrução/segredo do revisor humano;
+/// - `U+2060`–`U+2064` (word joiner e afins) e `U+FEFF` (BOM no meio do
+///   texto): mesma família de formato Cf, mesmo efeito de bypass.
+///
+/// Espaços de verdade (`U+00A0` e a família `White_Space`) NÃO entram:
+/// `\s` do regex já os casa (não há bypass) e removê-los destruiria texto
+/// legítimo. Normalização NFKC também fica de fora — mudaria identificadores
+/// reais de código (decisão registrada no "Rejeitado" da ADR-0024).
+const INVISIBLES: &[char] = &[
+    '\u{00AD}', // soft hyphen
+    '\u{200B}', // zero-width space
+    '\u{200C}', // zero-width non-joiner
+    '\u{200D}', // zero-width joiner
+    '\u{202A}', // bidi: LRE
+    '\u{202B}', // bidi: RLE
+    '\u{202C}', // bidi: PDF
+    '\u{202D}', // bidi: LRO
+    '\u{202E}', // bidi: RLO
+    '\u{2060}', // word joiner
+    '\u{2061}', // function application (invisível)
+    '\u{2062}', // invisible times
+    '\u{2063}', // invisible separator
+    '\u{2064}', // invisible plus
+    '\u{2066}', // bidi: LRI
+    '\u{2067}', // bidi: RLI
+    '\u{2068}', // bidi: FSI
+    '\u{2069}', // bidi: PDI
+    '\u{FEFF}', // BOM / zero-width no-break space
+];
 
 /// Regexes are compiled once, lazily; `regex` was already a transitive
 /// dependency (same version) and is the right layer for this per ADR-0016
@@ -59,6 +103,16 @@ fn patterns() -> &'static Patterns {
     })
 }
 
+/// Remove os caracteres invisíveis do conjunto fechado [`INVISIBLES`].
+///
+/// Uma passada por `char`: segura em boundary multibyte (emoji e acentos
+/// ficam intactos), preserva a ordem da entrada (determinismo do pack —
+/// mesma entrada, mesma saída) e é idempotente por construção — o que sai
+/// não volta e o que fica já não contém nada do conjunto.
+fn strip_invisibles(text: &str) -> String {
+    text.chars().filter(|c| !INVISIBLES.contains(c)).collect()
+}
+
 /// Masks credentials, e-mails and CPFs in `text`.
 ///
 /// Order matters: token shapes first (they can contain `=` and `:`), then
@@ -69,7 +123,10 @@ pub fn redact(text: &str) -> String {
         return String::new();
     }
     let p = patterns();
-    let mut out = text.to_string();
+    // ADR-0024 (R1): a normalização vem ANTES do masking — os regex só
+    // enxergam o texto visível, então zero-width dentro do shape não escapa
+    // mais. O texto visível não muda: só Cf/bidi sai.
+    let mut out = strip_invisibles(text);
 
     out = p
         .bearer
@@ -89,7 +146,10 @@ pub fn redact(text: &str) -> String {
     out
 }
 
-/// True when `text` contains something [`redact`] would mask.
+/// True when `text` contains something [`redact`] would mask or strip
+/// (ADR-0024 R1: caracteres invisíveis contam — um texto que só os tem não
+/// sai da fronteira intacto). A normalização acontece por herança, dentro
+/// do `redact`: a comparação é contra o texto já saneado.
 #[must_use]
 pub fn contains_secret(text: &str) -> bool {
     redact(text) != text
@@ -172,6 +232,87 @@ mod tests {
         let once = redact("token=AbC123XyZ789QqQ mail a@b.com cpf 123.456.789-01");
         let twice = redact(&once);
         assert_eq!(once, twice, "redact deve ser idempotente");
+    }
+
+    // ===== W7.1 (ADR-0024 R1): payload com caracteres invisíveis =====
+    // Payload novo só entra com fixture versionada (regra do W7) — as 5
+    // famílias vazantes do probe de 12/Nov/2026 viram arquivos aqui.
+
+    const FIX_ZWSP_TOKEN: &str = include_str!("../tests/fixtures/redact/zwsp_token.txt");
+    const FIX_ZWNJ_TOKEN: &str = include_str!("../tests/fixtures/redact/zwnj_token.txt");
+    const FIX_BIDI_OVERRIDE: &str = include_str!("../tests/fixtures/redact/bidi_override.txt");
+    const FIX_BOM: &str = include_str!("../tests/fixtures/redact/bom.txt");
+    const FIX_ZERO_WIDTH_BETWEEN: &str =
+        include_str!("../tests/fixtures/redact/zero_width_between_chars.txt");
+    const FIX_CLEAN_CONTROL: &str = include_str!("../tests/fixtures/redact/clean_control.txt");
+
+    /// Fixture vazante -> segredo que NÃO pode sobreviver na saída.
+    const LEAKING: &[(&str, &str)] = &[
+        (FIX_ZWSP_TOKEN, "AbC123XyZ789QqQ"),
+        (FIX_ZWNJ_TOKEN, "0123456789abcdefghij"),
+        (FIX_BIDI_OVERRIDE, "eyJhbGciOiJIUzI1NiIsInR5cCI6"),
+        (FIX_BOM, "AbC123XyZ789QqQ"),
+        (FIX_ZERO_WIDTH_BETWEEN, "AbC123XyZ789QqQ"),
+    ];
+
+    #[test]
+    fn masks_fixture_payloads_with_invisibles() {
+        for (input, secret) in LEAKING {
+            let out = redact(input);
+            assert!(!out.contains(secret), "segredo vazou: {out:?}");
+            assert!(out.contains(MASKED), "sem máscara: {out:?}");
+            // Contrato do R1: a saída NÃO contém mais nenhum invisível.
+            assert!(
+                !out.chars().any(|c| INVISIBLES.contains(&c)),
+                "invisível sobreviveu: {out:?}"
+            );
+            assert!(
+                contains_secret(input),
+                "contains_secret virou falso negativo: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_control_fixture_is_untouched() {
+        // Controle negativo: texto limpo e sem invisível sai idêntico.
+        assert_eq!(redact(FIX_CLEAN_CONTROL), FIX_CLEAN_CONTROL);
+        assert!(!contains_secret(FIX_CLEAN_CONTROL));
+    }
+
+    #[test]
+    fn is_idempotent_on_fixture_payloads() {
+        for (input, _) in LEAKING {
+            let once = redact(input);
+            assert_eq!(once, redact(&once), "não idempotente para {input:?}");
+        }
+    }
+
+    #[test]
+    fn empty_and_only_invisible_collapse_to_empty() {
+        assert_eq!(redact(""), "");
+        assert_eq!(redact("\u{200B}\u{FEFF}\u{202E}"), "");
+        assert!(!contains_secret(""));
+    }
+
+    #[test]
+    fn multibyte_visible_text_survives() {
+        // Sem invisíveis: nada muda — emoji, acento e travessão intactos.
+        let text = "ação 🚀 já feita — repositório https://x.org/p?q=1";
+        assert_eq!(redact(text), text);
+        // Com invisíveis: só eles saem; o multibyte visível permanece.
+        assert_eq!(redact("a\u{200B}ção \u{200D}🚀 já"), "ação 🚀 já");
+    }
+
+    #[test]
+    fn masks_probe_email_and_cpf_variants() {
+        // Vazamento parcial do probe: e-mail com zero-width no local-part
+        // antes saía "serjo\u{200B}[EMAIL]" — o prefixo vazava.
+        assert_eq!(redact("serjo\u{200B}ta@proton.me"), "[EMAIL]");
+        // CPF dividido por invisível era vazante completa no probe.
+        let cpf = redact("doc 123\u{200B}.456.789-01");
+        assert!(!cpf.contains("456.789-01"), "{cpf}");
+        assert!(cpf.contains("[CPF]"), "{cpf}");
     }
 
     #[test]
