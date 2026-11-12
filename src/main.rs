@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
-use kira::board::{self, BoardProvider};
+use kira::board::BoardProvider;
 use kira::capabilities::{self, Capability};
 use kira::credentials;
 use kira::doctor;
@@ -205,17 +205,21 @@ enum Command {
         action: PrAction,
     },
     /// Conecta uma integração opcional (capacidade, ADR-0030): é AQUI que a
-    /// credencial nasce (aula do ADR-0025 movida para o momento em que o dev
-    /// entende por que precisa dela). A implementação por provider (aula,
-    /// validação 200/401/403/sem rede, gravação no keyring) chega no MVP-3 —
-    /// hoje o comando aceita o argumento e responde claramente, sem fingir
-    /// que conectou
+    /// credencial nasce (aula do PAT, menu 1/2/3, entrada sem eco, validação
+    /// 200/401/403/sem rede, gravação no keyring e marcação da capacidade
+    /// conectada POR PROJETO). `github`/`gitlab` continuam "ainda não
+    /// implementado" (MVP posterior)
     #[command(
-        after_help = "Exemplos:\n  kira connect azure    # board Azure DevOps (implementação no MVP-3)\n  kira connect github   # scm.github — ainda não implementado\n  kira connect gitlab   # scm.gitlab — ainda não implementado"
+        after_help = "Exemplos:\n  kira connect azure         # board Azure DevOps (aula + menu no TTY)\n  kira connect azure --yes   # não-interativo: valida e conecta com AZURE_DEVOPS_PAT\n  kira connect github        # scm.github — ainda não implementado\n  kira connect gitlab        # scm.gitlab — ainda não implementado"
     )]
     Connect {
         /// Provider da integração: `azure` | `github` | `gitlab`
         provider: String,
+        /// Modo não-interativo: valida e conecta com AZURE_DEVOPS_PAT do
+        /// ambiente — nunca bloqueia esperando o menu; sem a env, erro
+        /// acionável
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -404,7 +408,7 @@ async fn run(command: Command) -> Outcome {
             read_only,
         } => dashboard_command(snapshot, read_only),
         Command::Pr { action } => pr_command(action),
-        Command::Connect { provider } => connect_command(&provider),
+        Command::Connect { provider, yes } => connect_command(&provider, yes).await,
     }
 }
 
@@ -442,27 +446,90 @@ fn gate_board() -> Result<(), Outcome> {
     }
 }
 
-/// `kira connect <provider>` (ADR-0030 #4): a credencial nasce aqui — mas a
-/// implementação (aula do PAT, validação, keyring, marcar a capacidade como
-/// conectada) é do MVP-3. Aceitar o argumento e responder claramente evita o
-/// "comando inexistente", que fingiria que o gating nunca vai abrir. Exit
-/// non-zero em TODOS os casos: nada foi conectado de verdade.
-fn connect_command(provider: &str) -> Outcome {
+/// `kira connect <provider>` (ADR-0030 #4): a credencial nasce aqui. `azure`
+/// é a implementação do MVP-3 (aula + menu + validação + keyring + capacidade
+/// por projeto); `github`/`gitlab` seguem aceitos mas "ainda não
+/// implementado" (contrato de teste do MVP-1 preservado), e provider
+/// desconhecido lista os válidos. Exit non-zero nos casos sem conexão real.
+async fn connect_command(provider: &str, yes: bool) -> Outcome {
     let message = match provider {
-        // Mensagem exata do MVP-1 (contrato de teste).
-        "azure" => "conecte com: kira connect azure (implementação no MVP-3)".to_string(),
-        // Mesmo padrão do azure: aceito, mas ainda não implementado.
         "github" | "gitlab" => format!(
             "conecte com: kira connect {provider} (ainda não implementado — fica para um MVP posterior)"
         ),
         other => format!("provider '{other}' desconhecido — use: kira connect azure|github|gitlab"),
     };
-    println!("{message}");
+    if provider != "azure" {
+        println!("{message}");
+        return Outcome {
+            code: ExitCode::FAILURE,
+            ok: false,
+            records: false,
+            summary: message,
+        };
+    }
+    connect_azure_command(yes).await
+}
+
+/// `kira connect azure` (MVP-3): no TTY imprime a aula e oferece o menu
+/// (1 colar / 2 env / 3 cancelar); fora de TTY (ou com `--yes`) usa SÓ a env
+/// `AZURE_DEVOPS_PAT` — nunca fica pendurado esperando input. Sucesso marca
+/// `board.azure` como conectada PARA O PROJETO ATUAL no store.
+async fn connect_azure_command(yes: bool) -> Outcome {
+    // A capacidade é POR PROJETO: sem raiz detectada não há onde marcar.
+    let Some(root) = store::detect_project_root() else {
+        let message =
+            "não foi possível determinar o projeto atual — rode dentro da raiz do repositório"
+                .to_string();
+        eprintln!("erro: {message}");
+        return Outcome::failure(message);
+    };
+    // Fail fast: sem onde guardar o segredo (ou sem store de capacidades) o
+    // connect para ANTES do dev criar um token novo.
+    let secret_store = match credentials::open_default_store() {
+        Ok(store) => store,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
+    let state_store = match Store::open_default() {
+        Ok(store) => store,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
+    // Interativo = stdin é TTY e o dev NÃO pediu --yes: `--yes` vence sempre,
+    // como no setup — nunca bloqueia quem está em pipe/CI.
+    let interactive = std::io::stdin().is_terminal() && !yes;
+    let env_lookup: &dyn Fn(&str) -> Option<String> = &setup::env_lookup;
+    let make_board: &setup::BoardFactory<'_> = &setup::default_board_factory;
+    let config_path = credentials::config_path();
+    let options = setup::ConnectAzureOptions {
+        interactive,
+        hidden_input: true,
+        secret_store: secret_store.as_ref(),
+        config_path: config_path.as_deref(),
+        env: env_lookup,
+        make_board,
+        project_root: &root,
+        state_store: &state_store,
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    let code = setup::connect_azure(&options, &mut input, &mut output).await;
     Outcome {
-        code: ExitCode::FAILURE,
-        ok: false,
+        code,
+        ok: code == ExitCode::SUCCESS,
         records: false,
-        summary: message,
+        summary: if code == ExitCode::SUCCESS {
+            "connect azure: board.azure conectada (PAT no keyring)"
+        } else {
+            "connect azure: conexão não concluída — veja a saída"
+        }
+        .to_string(),
     }
 }
 
@@ -562,7 +629,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             )
         }
         Command::Setup { .. } => ("setup".to_string(), String::new(), None),
-        Command::Connect { provider } => ("connect".to_string(), provider.clone(), None),
+        Command::Connect { provider, .. } => ("connect".to_string(), provider.clone(), None),
         Command::History { last } => (
             "history".to_string(),
             last.map_or_else(String::new, |n| format!("--last {n}")),
@@ -1242,15 +1309,12 @@ fn pr_command(action: PrAction) -> Outcome {
 }
 
 /// Resolves org/project/PAT (flags > env > keyring/config.toml) and builds the
-/// board provider selected by `KIRA_BOARD` (default `azure`).
+/// board provider selected by `KIRA_BOARD` (default `azure`) — pela MESMA
+/// fábrica do setup, que também respeita o override de endpoint de teste
+/// (`KIRA_ADO_URL`): o que o `connect` validar é o que o `triage` usa.
 fn resolve_board(project_override: Option<&str>) -> Result<Box<dyn BoardProvider>, Error> {
     let config = credentials::resolve_azure_config(project_override)?;
-    board::for_board(
-        &board::name_from_env(),
-        &config.pat,
-        &config.organization,
-        &config.project,
-    )
+    setup::default_board_factory(&config.pat, &config.organization, &config.project)
 }
 
 async fn inspect(id: i32, project_flag: Option<String>) -> Result<String, Error> {

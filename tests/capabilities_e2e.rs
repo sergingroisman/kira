@@ -6,7 +6,7 @@
 //! servidor (listener com prazo que captura qualquer conexão — se alguém
 //! conectar, o teste falha) + timeout curto no binário.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
@@ -222,9 +222,9 @@ fn matriz_de_capacidades_do_adr_0030_vira_tabela_de_casos() {
             false,
         ),
         (
-            "connect azure — mensagem exata do MVP-3",
+            "connect azure — fora de TTY sem env: erro acionável, nunca pendura",
             vec!["connect", "azure"],
-            "conecte com: kira connect azure (implementação no MVP-3)",
+            "precisa de AZURE_DEVOPS_PAT",
             false,
         ),
         (
@@ -369,17 +369,20 @@ fn triage_sem_capacidade_nao_toca_nenhum_servidor() {
     );
 }
 
-/// `kira connect <provider>`: aceita o argumento, responde a mensagem do
-/// MVP-3 (azure) / "ainda não implementado" (github/gitlab) e sai com exit
-/// != 0 — nada é conectado de verdade, nada é gravado como conectado.
+/// `kira connect <provider>`: fora de TTY e sem `AZURE_DEVOPS_PAT` o azure
+/// falha com erro acionável (nunca pendurado, nunca fingindo conectar);
+/// github/gitlab mantêm o contrato do MVP-1 ("ainda não implementado").
 #[test]
-fn connect_azure_responde_mensagem_do_mvp3_com_exit_nao_zero() {
-    let sandbox = Sandbox::new("connect");
+fn connect_fora_de_tty_sem_env_falha_acionavel_e_nada_conecta() {
+    let sandbox = Sandbox::new("connect-sem-env");
+    let (code, stdout, stderr) = sandbox.run(&["connect", "azure", "--yes"]);
+    assert_ne!(code, 0, "sem env nada conecta");
+    let saida = format!("{stdout}{stderr}");
+    assert!(
+        saida.contains("precisa de AZURE_DEVOPS_PAT"),
+        "erro acionável aponta a env: {saida}"
+    );
     for (provider, esperado) in [
-        (
-            "azure",
-            "conecte com: kira connect azure (implementação no MVP-3)",
-        ),
         (
             "github",
             "conecte com: kira connect github (ainda não implementado — fica para um MVP posterior)",
@@ -471,5 +474,211 @@ fn store_da_versao_anterior_migra_sem_perder_dados() {
     assert!(
         sessions >= 1,
         "a sessão registrada antes do rebaixamento deve sobreviver à migração"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MVP-3 — `kira connect azure` contra servidor ADO falso LOCAL (sem rede
+// real): os 4 estados de validação + o `triage <id>` que deixa de falhar por
+// capacidade. O seam do binário é `KIRA_ADO_URL` (endpoint de teste).
+// ---------------------------------------------------------------------------
+
+/// Resposta enlatada com dois projetos visíveis (o fake serve isto no 200).
+const PROJECTS_FAKE_BODY: &str = r#"{"count":2,"value":[{"id":"a","name":"Kira","state":"wellFormed","visibility":"private"},{"id":"b","name":"Outro","state":"wellFormed","visibility":"private"}]}"#;
+
+/// Servidor falso de Azure DevOps: responde UMA requisição com
+/// `status_line` + `body` e fecha (mesmo padrão do `tests/setup_e2e.rs`).
+fn spawn_fake_ado(
+    status_line: &'static str,
+    body: &'static str,
+) -> (String, std::thread::JoinHandle<Option<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|err| panic!("bind: {err}"));
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|err| panic!("endereço local: {err}"));
+    let handle = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return None;
+        };
+        let mut raw = vec![0u8; 4096];
+        let read = stream.read(&mut raw).unwrap_or(0);
+        raw.truncate(read);
+        let response = format!(
+            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        if stream.write_all(response.as_bytes()).is_err() {
+            return None;
+        }
+        let _ = stream.flush();
+        Some(String::from_utf8_lossy(&raw).into_owned())
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// Env comum dos testes de connect: PAT/org/projeto no ambiente e o ADO
+/// apontando para o servidor falso local.
+fn connect_envs(endpoint: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("AZURE_DEVOPS_PAT", "PAT-FALSO-DE-TESTE".to_string()),
+        ("AZURE_DEVOPS_ORG", "minha-org".to_string()),
+        ("AZURE_DEVOPS_PROJECT", "Kira".to_string()),
+        ("KIRA_ADO_URL", endpoint.to_string()),
+    ]
+}
+
+/// Estado gravado de `board.azure` no store.db do sandbox (None = sem linha).
+fn capability_state(sandbox: &Sandbox) -> Option<String> {
+    let db_path = sandbox.store.join("store.db");
+    let conn = rusqlite::Connection::open(&db_path)
+        .unwrap_or_else(|err| panic!("abrir {}: {err}", db_path.display()));
+    conn.query_row(
+        "SELECT state FROM capabilities WHERE capability = 'board.azure'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// 200 do servidor falso: exit 0, PAT mascarado, capacidade `conectada` no
+/// store, e o `triage 42` passa a TENTAR o board (falha por rede do servidor
+/// morto, NUNCA por CapabilityMissing).
+#[test]
+fn connect_azure_200_conecta_e_triage_passa_a_tentar_o_board() {
+    let sandbox = Sandbox::new("connect-200");
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 200 OK", PROJECTS_FAKE_BODY);
+    let envs = connect_envs(&endpoint);
+    let (code, stdout, stderr) = sandbox.run_with(&["connect", "azure", "--yes"], &envs, &[]);
+    assert_eq!(code, 0, "200 conecta: {stdout}{stderr}");
+    let saida = format!("{stdout}{stderr}");
+    assert!(
+        saida.contains("PAT ok — lê Work Items de minha-org/Kira"),
+        "mensagem exata do 200: {saida}"
+    );
+    assert!(
+        saida.contains("board.azure conectada"),
+        "confirma a capacidade: {saida}"
+    );
+    assert!(
+        saida.contains("kira triage <work-item-id>"),
+        "sucesso aponta o próximo passo: {saida}"
+    );
+    assert!(
+        saida.contains("PAT-****"),
+        "o PAT só aparece mascarado: {saida}"
+    );
+    assert!(
+        !saida.contains("PAT-FALSO-DE-TESTE"),
+        "o segredo NUNCA é ecoado: {saida}"
+    );
+    assert_eq!(
+        capability_state(&sandbox).as_deref(),
+        Some("conectada"),
+        "o connect marca a capacidade no store.db"
+    );
+
+    // O gate abre: o triage tenta o board de verdade (o servidor falso já
+    // fechou → falha de rede), nunca mais por capacidade.
+    let (code, _stdout, stderr) = sandbox.run_with(&["triage", "42"], &envs, &[]);
+    assert_ne!(code, 0, "triage falha no board morto: {stderr}");
+    assert!(
+        !stderr.contains(BOARD_AZURE_MISSING),
+        "depois do connect NÃO pode mais falhar por capacidade: {stderr}"
+    );
+    assert!(
+        stderr.contains("erro:"),
+        "a causa é o board (rede), reportada com erro: {stderr}"
+    );
+}
+
+/// 401 do servidor falso: mensagem EXATA com o link, exit ≠ 0 e a capacidade
+/// continua desconectada (o `triage 42` segue bloqueado pelo gate).
+#[test]
+fn connect_azure_401_mostra_a_mensagem_exata_e_nada_conecta() {
+    let sandbox = Sandbox::new("connect-401");
+    let (endpoint, _server) =
+        spawn_fake_ado("HTTP/1.1 401 Unauthorized", r#"{"message":"TF400813"}"#);
+    let envs = connect_envs(&endpoint);
+    let (code, stdout, stderr) = sandbox.run_with(&["connect", "azure", "--yes"], &envs, &[]);
+    assert_ne!(code, 0, "401 não conecta: {stdout}{stderr}");
+    let saida = format!("{stdout}{stderr}");
+    assert!(
+        saida.contains(
+            "PAT não autenticou (401). O token pode ter expirado ou foi copiado incompleto — crie outro em https://dev.azure.com/minha-org/_usersSettings/tokens"
+        ),
+        "mensagem exata da spec com o link: {saida}"
+    );
+    assert!(
+        !saida.contains("PAT-FALSO-DE-TESTE"),
+        "o segredo NUNCA é ecoado: {saida}"
+    );
+    assert_eq!(
+        capability_state(&sandbox),
+        None,
+        "401 não grava estado de capacidade"
+    );
+    let (code, _stdout, stderr) = sandbox.run(&["triage", "42"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(BOARD_AZURE_MISSING),
+        "capacidade continua desconectada: {stderr}"
+    );
+}
+
+/// 403 do servidor falso: mensagem EXATA do escopo, exit ≠ 0, nada conectado.
+#[test]
+fn connect_azure_403_mostra_a_mensagem_exata_e_nada_conecta() {
+    let sandbox = Sandbox::new("connect-403");
+    let (endpoint, _server) = spawn_fake_ado("HTTP/1.1 403 Forbidden", r#"{}"#);
+    let envs = connect_envs(&endpoint);
+    let (code, stdout, stderr) = sandbox.run_with(&["connect", "azure", "--yes"], &envs, &[]);
+    assert_ne!(code, 0, "403 não conecta: {stdout}{stderr}");
+    let saida = format!("{stdout}{stderr}");
+    assert!(
+        saida.contains(
+            "PAT autenticou, mas sem escopo Work Items (403). Edite o token e marque Work Items → Read"
+        ),
+        "mensagem exata da spec: {saida}"
+    );
+    assert_eq!(
+        capability_state(&sandbox),
+        None,
+        "403 não grava estado de capacidade"
+    );
+    let (code, _stdout, stderr) = sandbox.run(&["triage", "42"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(BOARD_AZURE_MISSING),
+        "capacidade continua desconectada: {stderr}"
+    );
+}
+
+/// Sem rede (porta recusada local): mensagem de "valide depois", o PAT fica
+/// no keyring (mesma conduta do `setup --pat` — é o que torna a mensagem
+/// verdadeira) mas a capacidade NÃO é marcada.
+#[test]
+fn connect_azure_sem_rede_nada_conecta_e_manda_validar_depois() {
+    let sandbox = Sandbox::new("connect-sem-rede");
+    // Endpoint recusado (conexão recusada = sem rede), mesmo truque do setup.
+    let envs = connect_envs("http://127.0.0.1:1");
+    let (code, stdout, stderr) = sandbox.run_with(&["connect", "azure", "--yes"], &envs, &[]);
+    assert_ne!(code, 0, "sem rede o connect não conclui: {stdout}{stderr}");
+    let saida = format!("{stdout}{stderr}");
+    assert!(
+        saida.contains(
+            "não foi possível validar agora (sem rede?). O token está na env AZURE_DEVOPS_PAT; rode kira doctor depois"
+        ),
+        "mensagem exata de rede com a origem env: {saida}"
+    );
+    assert_eq!(
+        capability_state(&sandbox),
+        None,
+        "sem rede a capacidade NÃO é marcada"
+    );
+    let (code, _stdout, stderr) = sandbox.run(&["triage", "42"]);
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(BOARD_AZURE_MISSING),
+        "sem rede nada conecta: {stderr}"
     );
 }
