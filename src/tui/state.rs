@@ -1052,8 +1052,60 @@ pub fn header_lines(snapshot: &Snapshot) -> Vec<String> {
 }
 
 /// Rodapé de 1 linha com as teclas — mesmo texto no TUI e no snapshot.
+/// `q sair` é SEMPRE o primeiro item (contrato do dono) e `? ajuda` o último.
 pub fn footer_line() -> String {
-    "teclas: q sair · Tab/Shift+Tab painel · j/k ou ↑/↓ mover · g/G topo/fim · / busca wiki · r reler disco · ? ajuda".to_string()
+    "teclas: q sair · Esc/Ctrl+C saem · Tab/Shift+Tab painel · j/k ou ↑/↓ mover · g/G topo/fim · / busca wiki · r reler disco · ? ajuda".to_string()
+}
+
+/// Dica do painel vazio para o rodapé (uma linha): quando o painel EM FOCO
+/// está vazio, o rodapé diz o que fazer — a MESMA causa honesta do estado
+/// vazio do painel (`wiki vazia — rode kira wiki reindex`), nunca inventada.
+/// `None` = painel tem conteúdo (ou é o cabeçalho, que nunca está vazio).
+pub fn empty_panel_hint(
+    snapshot: &Snapshot,
+    panel: crate::tui::app::Panel,
+    findings_len: usize,
+    sessions_len: usize,
+    wiki_len: usize,
+) -> Option<String> {
+    match panel {
+        crate::tui::app::Panel::Findings if findings_len == 0 => {
+            if snapshot.findings == Some(0) {
+                Some("0 achados no último scan".to_string())
+            } else {
+                Some(
+                    snapshot
+                        .findings_note
+                        .clone()
+                        .unwrap_or_else(|| "nunca rodou kira scan".to_string()),
+                )
+            }
+        }
+        crate::tui::app::Panel::Sessions if sessions_len == 0 => Some(
+            snapshot
+                .sessions_note
+                .clone()
+                .or_else(|| snapshot.store_note.clone())
+                .unwrap_or_else(|| "store sem sessões".to_string()),
+        ),
+        crate::tui::app::Panel::Wiki if wiki_len == 0 => {
+            if snapshot.wiki_rows.is_empty() {
+                // Índice vazio de verdade: a causa é o comando que conserta.
+                Some(
+                    snapshot
+                        .wiki_note
+                        .clone()
+                        .or_else(|| snapshot.store_note.clone())
+                        .unwrap_or_else(|| "wiki vazia — rode kira wiki reindex".to_string()),
+                )
+            } else {
+                // A wiki tem páginas; a lista FILTRADA é que casou com nada —
+                // a dica honesta é apagar a agulha.
+                Some("a busca não casou nada — Backspace apaga a agulha".to_string())
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Relatório de texto do `kira dashboard --snapshot` (e do modo não-TTY).
@@ -1343,6 +1395,80 @@ mod tests {
         assert!(report.contains("kira dashboard (read-only"), "{report}");
         assert!(report.contains("dev: Sérgio"), "{report}");
         assert!(report.contains("teclas: q sair"), "{report}");
+    }
+
+    #[test]
+    fn footer_keeps_q_sair_first_and_ajuda_last() {
+        // Contrato do dono: `q sair` é SEMPRE o primeiro item do rodapé —
+        // mesmo depois de Esc/Ctrl+C entrarem como saída também.
+        let footer = footer_line();
+        assert!(footer.starts_with("teclas: q sair · "), "{footer}");
+        assert!(footer.contains("Esc/Ctrl+C saem"), "{footer}");
+        assert!(footer.ends_with("? ajuda"), "{footer}");
+    }
+
+    #[test]
+    fn empty_panel_hint_names_the_actionable_cause_for_each_panel() {
+        // EXTRA do rodapé: a dica do painel vazio é a MESMA causa honesta do
+        // painel — nunca inventada.
+        let empty = Snapshot::default();
+        assert_eq!(
+            empty_panel_hint(&empty, crate::tui::app::Panel::Wiki, 0, 0, 0),
+            Some("wiki vazia — rode kira wiki reindex".to_string())
+        );
+        assert_eq!(
+            empty_panel_hint(&empty, crate::tui::app::Panel::Sessions, 0, 0, 0),
+            Some("store sem sessões".to_string())
+        );
+        assert_eq!(
+            empty_panel_hint(&empty, crate::tui::app::Panel::Findings, 0, 0, 0),
+            Some("nunca rodou kira scan".to_string())
+        );
+        // Arquivo presente e vazio: contagem zero explícita (sem `—` falso).
+        let zero = Snapshot {
+            findings: Some(0),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            empty_panel_hint(&zero, crate::tui::app::Panel::Findings, 0, 0, 0),
+            Some("0 achados no último scan".to_string())
+        );
+        // Cabeçalho nunca tem dica (não é lista); painel com conteúdo idem.
+        assert_eq!(
+            empty_panel_hint(&empty, crate::tui::app::Panel::Header, 0, 0, 0),
+            None
+        );
+        let full = full_snapshot();
+        assert_eq!(
+            empty_panel_hint(&full, crate::tui::app::Panel::Wiki, 2, 2, 2),
+            None
+        );
+        // Wiki COM páginas, mas a lista FILTRADA vazia: a dica é a agulha.
+        let with_pages = Snapshot {
+            wiki_rows: vec![fixture_page(
+                "contexto",
+                "contexto",
+                "Contexto do projeto",
+                "2026-11-11T09:00:00Z",
+                "conteúdo",
+            )],
+            ..full
+        };
+        assert_eq!(
+            empty_panel_hint(&with_pages, crate::tui::app::Panel::Wiki, 2, 2, 0),
+            Some("a busca não casou nada — Backspace apaga a agulha".to_string())
+        );
+        // Store ausente: a causa concreta da store (nunca genérica).
+        let absent = Snapshot {
+            store_note: Some(
+                "nenhuma trilha em store.db — rode `kira scan` ou `kira doctor`".to_string(),
+            ),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            empty_panel_hint(&absent, crate::tui::app::Panel::Wiki, 0, 0, 0),
+            Some("nenhuma trilha em store.db — rode `kira scan` ou `kira doctor`".to_string())
+        );
     }
 
     /// Achados de referência (severidades canônicas + uma fora do padrão) que
