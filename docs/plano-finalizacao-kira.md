@@ -225,7 +225,10 @@ Páginas a criar/completar em `.kira/wiki/` (todas indexáveis pós-F8):
 
 **Evidência (13/Nov)**: `kira wiki reindex` = **8 páginas**; `wiki search
 "rendezvous"` ancora `padroes`+`decisoes`; `wiki search "estaleiro"` ancora
-`glossario`+`decisoes`. Falta só a decisão de publicação abaixo.
+`glossario`+`decisoes`. Re-verificado com store LIMPO
+(`KIRA_STORE_DIR=…/kira-wiki-proof` apagado antes): reindex recontou 8 do zero
+(e os arquivos existem em `.kira/wiki/` com conteúdo). Falta só a decisão de
+publicação abaixo.
 
 **Questão de decisão (dono)**: `.kira/` é local por contrato — "wiki completa no
 GitHub" tem três saídas: (a) **GitHub Wiki** do repositório alimentada por
