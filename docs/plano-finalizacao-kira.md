@@ -218,10 +218,14 @@ Páginas a criar/completar em `.kira/wiki/` (todas indexáveis pós-F8):
 |---|---|---|
 | `contexto` | engenharia/resumo (índice p/ RAG) | ✅ feita |
 | `engenharia-kira` / `-agent-skills` / `-harness-toolkit` | wikis de engenharia + diferencial | ✅ feitas |
-| `getting-started` | jornada do zero com storytelling (setup→connect→ingest→trust→digest→publish→dashboard), tom persona | criar |
-| `decisoes` | pointer p/ ADRs + as 5 decisões que moldam o binário (local-first, fila=tabela, denylist, LLM-last, trust) | completar |
-| `padroes` | invariante byte a byte, erro acionável, redact-na-escrita, fail-open, um-PR-por-item | completar |
-| `glossario` | espelho do `nomenclatura.md` + termos de lore (turn/phase, draft_ttl) | completar |
+| `getting-started` | jornada do zero com storytelling (setup→connect→ingest→trust→digest→publish→dashboard), tom persona | ✅ feita |
+| `decisoes` | pointer p/ ADRs + as 5 decisões que moldam o binário + decisões da rodada (HF catálogo, 3 fases, estaleiro, dose de thread, container=agendador) | ✅ feita |
+| `padroes` | invariantes que o código prova (bytes, erro acionável, redact-na-escrita, fail-open/closed, author≠verifier, rendezvous, anti-padrões recusados) | ✅ feita |
+| `glossario` | espelho vivo do `nomenclatura.md` + termos de RAG/medição (packer, cache_key, gold, GGUF/quant, tick, egresso) | ✅ feita |
+
+**Evidência (13/Nov)**: `kira wiki reindex` = **8 páginas**; `wiki search
+"rendezvous"` ancora `padroes`+`decisoes`; `wiki search "estaleiro"` ancora
+`glossario`+`decisoes`. Falta só a decisão de publicação abaixo.
 
 **Questão de decisão (dono)**: `.kira/` é local por contrato — "wiki completa no
 GitHub" tem três saídas: (a) **GitHub Wiki** do repositório alimentada por
