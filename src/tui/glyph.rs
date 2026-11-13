@@ -209,6 +209,18 @@ impl Glyphs {
         }
     }
 
+    /// Glifos da chuva de fundo (cabeça, rabo) — ver `tui/rain.rs`.
+    ///
+    /// A cabeça é traço de casca (`│`), o rabo é ponto: em ASCII os dois
+    /// viram `|` e `.`, e o gate `has_special_glyphs` continua valendo para a
+    /// tela inteira, chuva incluída.
+    pub const fn rain(self) -> (&'static str, &'static str) {
+        match self.mode {
+            Mode::Unicode => ("│", "·"),
+            Mode::Ascii => ("|", "."),
+        }
+    }
+
     /// Barra de citação e borda de bloco de código.
     pub const fn quote(self) -> &'static str {
         match self.mode {
@@ -301,6 +313,8 @@ mod tests {
             ascii.rule(),
             ascii.bullet(),
             ascii.quote(),
+            ascii.rain().0,
+            ascii.rain().1,
         ];
         all.extend(ascii.spark_levels());
         all.extend([ascii.heading(1), ascii.heading(2), ascii.heading(3)]);

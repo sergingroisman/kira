@@ -203,6 +203,12 @@ pub struct AppState {
     pub exec_open: bool,
     /// Aviso de uma linha no rodapé (erro acionável, plano recusado).
     pub notice: Option<String>,
+    /// Chuva de fundo: estado de DESENHO (gotas), anda um passo por volta do
+    /// loop igual ao `tick`. Nunca vira dado, artefato ou config.
+    pub rain: crate::tui::rain::Rain,
+    /// `~` liga/desliga o fundo sutil. Default desligado, só em memória — o
+    /// plano da onda M não deixa efeito visual ir para `config.toml`.
+    pub rain_on: bool,
 }
 
 impl Default for AppState {
@@ -238,6 +244,8 @@ impl Default for AppState {
             exec: None,
             exec_open: false,
             notice: None,
+            rain: crate::tui::rain::Rain::default(),
+            rain_on: false,
         }
     }
 }
@@ -290,6 +298,9 @@ pub enum Outcome {
     ScrollPage(isize),
     /// Alternar o overlay de ajuda (?).
     Help,
+    /// Ligar/desligar a chuva de fundo (`~`): só desenho — nenhum spawn,
+    /// arquivo ou tecla de efeito; vale inclusive sob `--read-only`.
+    ToggleRain,
     /// Pedido de ação (`s`/`t`/`d`): abre folha de alvo ou vira plano.
     RequestAction(Request),
     /// Dígito digitado na folha de alvo.
@@ -551,6 +562,7 @@ pub fn apply_outcome(screen: &mut AppState, outcome: Outcome) {
             }
         }
         Outcome::Help => screen.help_open = !screen.help_open,
+        Outcome::ToggleRain => screen.rain_on = !screen.rain_on,
         Outcome::Ignore => {}
         Outcome::Quit | Outcome::Reload => {}
     }
@@ -823,6 +835,7 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
         KeyCode::Char('3') => Outcome::GoScreen(Screen::Sessoes),
         KeyCode::Char('4') => Outcome::GoScreen(Screen::Wiki),
         KeyCode::Char('5') => Outcome::GoScreen(Screen::Posts),
+        KeyCode::Char('~') => Outcome::ToggleRain,
         KeyCode::Char('l') if key.modifiers.contains(Mods::CONTROL) => Outcome::Redraw,
         _ => match keymap::map(key) {
             Some(Key::Quit) => Outcome::Quit,
@@ -904,6 +917,12 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
         wiki_len: snapshot.wiki_rows.len(),
         posts_len: snapshot.post_rows.len(),
         read_only: options.read_only,
+        // Semente da chuva por sessão: FNV sobre o `now` JÁ capturado pelo
+        // snapshot — nenhum relógio novo, e a sequência de frames continua
+        // reproduzível (o que o teste do módulo exige).
+        rain: crate::tui::rain::Rain::seeded(crate::store::fnv1a64(
+            format!("rain:{}", snapshot.now_secs.unwrap_or_default()).as_bytes(),
+        )),
         ..AppState::default()
     };
 
@@ -988,6 +1007,34 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
 
         // Um tick por volta do loop: o spinner anda, o resto da tela não muda.
         state_screen.tick = state_screen.tick.wrapping_add(1);
+
+        // Chuva: o modo é uma função pura do estado da tela, decidido aqui
+        // (o módulo não conhece `Snapshot`). Regras do plano da onda M:
+        // painel com dado ⇒ Off; painel vazio ⇒ Waiting (finíssima); `~` ⇒
+        // Ambient; degradado ⇒ Off. O avanço anda no mesmo compasso do poll
+        // de 150 ms que já existia — nenhum timer novo, custo de µs por volta.
+        let waiting = state::empty_panel_hint(
+            &snapshot,
+            state_screen.screen,
+            state_screen.findings_len,
+            state_screen.sessions_len,
+            state_screen.wiki_len,
+            state_screen.posts_len,
+        )
+        .is_some();
+        state_screen.rain.set_mode(if degraded {
+            crate::tui::rain::RainMode::Off
+        } else if state_screen.rain_on {
+            crate::tui::rain::RainMode::Ambient
+        } else if waiting {
+            crate::tui::rain::RainMode::Waiting
+        } else {
+            crate::tui::rain::RainMode::Off
+        });
+        state_screen.rain.advance(
+            layout::shell(Rect::new(0, 0, size.width, size.height)).workspace,
+            crate::tui::rain::TICK_MS,
+        );
 
         // Drena a execução em andamento (nunca bloqueia: `try_recv`).
         drain_execution(&mut state_screen, &mut runner, &mut snapshot);
@@ -1192,6 +1239,13 @@ pub fn render_frame_with(
             ws.inspector,
             &ordered_wiki,
         );
+        // A chuva pinta DEPOIS do painel, e o `render` só escreve célula em
+        // branco: "dado na tela ⇒ zero decoração" é código, não promessa.
+        // Off (o modo default de todo `AppState` de teste e do snapshot) não
+        // desenha nada — a prova de hash e os goldens seguem intocados.
+        screen
+            .rain
+            .render(&glyphs, palette, ws.primary, frame.buffer_mut());
     }
 
     // Rodapé: aviso (erro acionável) > busca aberta > chips de tecla.
@@ -1425,6 +1479,7 @@ fn help_paragraph(palette: &Palette, snapshot: &Snapshot, glyphs: Glyphs) -> Par
         "/                busca incremental na wiki (só na tela Wiki)".to_string(),
         "PgUp/PgDn        rolar a leitura em tela cheia".to_string(),
         "r                reler o disco (sem rede, sem escrita)".to_string(),
+        "~                chuva de fundo (só desenho; painel vazio já chove fino)".to_string(),
         "?                abrir/fechar esta ajuda".to_string(),
     ];
     if pendings.is_empty() {
@@ -1808,6 +1863,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tilde_toggles_the_rain_and_survives_read_only_because_it_is_drawing() {
+        let state = AppState::default();
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('~'))),
+            Outcome::ToggleRain
+        );
+        assert!(!state.rain_on, "o default é dado, nunca moda");
+        let mut on = state.clone();
+        apply_outcome(&mut on, Outcome::ToggleRain);
+        assert!(on.rain_on);
+        apply_outcome(&mut on, Outcome::ToggleRain);
+        assert!(!on.rain_on);
+        // Chuva é desenho — não AÇÃO. `--read-only` barra spawn/rede/LLM, mas
+        // a prova de hash do e2e continua porque nada aqui encosta no store.
+        let read_only = AppState {
+            read_only: true,
+            ..AppState::default()
+        };
+        assert_eq!(
+            decide(&read_only, plain(KeyCode::Char('~'))),
+            Outcome::ToggleRain
+        );
+    }
+
+    #[test]
+    fn a_panel_with_data_ships_zero_decoration_by_default() {
+        // A regra dura do plano mora no modo, não no render: com dado na
+        // tela o loop escolhe Off, e Off não desenha nada — nem se chamado.
+        let state = findings_state();
+        assert_eq!(state.rain.mode(), crate::tui::rain::RainMode::Off);
+        assert!(state.rain.drop_cells(Rect::new(0, 2, 100, 20)).is_empty());
+        assert!(!state.rain_on);
+    }
+
+    #[test]
+    fn waiting_rain_wets_only_the_blank_cells_never_the_hint() {
+        // Wiki vazia (o `empty_panel_hint` diz a causa) + Waiting avançado:
+        // comparando o frame molhado com o seco, TODA diferença tem de estar
+        // onde o seco é espaço — célula com texto é dado, e dado vence.
+        let snapshot = Snapshot::default();
+        let wet = AppState {
+            screen: Screen::Wiki,
+            rain: {
+                let mut rain = crate::tui::rain::Rain::seeded(7);
+                rain.set_mode(crate::tui::rain::RainMode::Waiting);
+                for _ in 0..20 {
+                    rain.advance(
+                        layout::shell(Rect::new(0, 0, 100, 24)).workspace,
+                        crate::tui::rain::TICK_MS,
+                    );
+                }
+                rain
+            },
+            ..AppState::default()
+        };
+        let dry = AppState {
+            screen: Screen::Wiki,
+            ..AppState::default()
+        };
+        let wet_rows = render_rows(&wet, &snapshot, 100, 24);
+        let dry_rows = render_rows(&dry, &snapshot, 100, 24);
+        assert_ne!(wet_rows, dry_rows, "Waiting tinha de desenhar alguma gota");
+        assert!(
+            dry_rows.iter().any(|row| row.contains("wiki")),
+            "a linha da causa vazia existe no frame seco"
+        );
+        // Cada diferença tem de nascer de uma célula SECA em espaço: dado
+        // (inclusive à direita do texto da dica) é intocado.
+        for (wet_line, dry_line) in wet_rows.iter().zip(&dry_rows) {
+            for (wet_char, dry_char) in wet_line.chars().zip(dry_line.chars()) {
+                if wet_char != dry_char {
+                    assert_eq!(dry_char, ' ', "decação por cima de dado");
+                }
+            }
+        }
+    }
+
+    /// Render determinístico com glifos Unicode injetados (a chuva tem
+    /// glifos próprios; env é estado global e teste não muta env).
+    fn render_rows(state: &AppState, snapshot: &Snapshot, width: u16, height: u16) -> Vec<String> {
+        let glyphs = Glyphs::new(crate::tui::glyph::Mode::Unicode);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap_or_else(|err| panic!("backend: {err}"));
+        terminal
+            .draw(|frame| render_frame_with(frame, snapshot, state, theme::mono(), glyphs))
+            .unwrap_or_else(|err| panic!("draw: {err}"));
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+
     /// M4: `Enter`/`i` na caixa de correio ABRIM a leitura (o carimbo
     /// `read_at` é do loop, nunca de `decide`), e só com post na lista.
     #[test]
@@ -1983,6 +2135,7 @@ mod tests {
                 KeyCode::Char('i'),
                 KeyCode::Char('r'),
                 KeyCode::Char('?'),
+                KeyCode::Char('~'),
                 KeyCode::Esc,
             ];
             for code in keys {
@@ -1992,6 +2145,7 @@ mod tests {
                         outcome,
                         Outcome::Reload
                             | Outcome::ToggleInspector
+                            | Outcome::ToggleRain
                             | Outcome::GoScreen(_)
                             | Outcome::CycleScreen(_)
                             | Outcome::Move(_)
@@ -2547,12 +2701,13 @@ mod tests {
             text
         };
 
-        // As quatro telas.
+        // As cinco telas (M4 entrou no gate junto).
         for screen in [
             Screen::Resumo,
             Screen::Achados,
             Screen::Sessoes,
             Screen::Wiki,
+            Screen::Posts,
         ] {
             let state = AppState {
                 screen,
@@ -2561,6 +2716,35 @@ mod tests {
             };
             let text = render(&state, 80, 24);
             assert!(!has_special_glyphs(&text), "{screen:?}: {text}");
+        }
+        // Chuva Ambient (`~`): gotas entram na tela inteira e o gate
+        // continua — em ASCII a chuva desenha `|` e `.` e nada mais, e cada
+        // célula nova nasce de um espaço. (O `.` da sparkline e o `|` da
+        // borda já existiam; o que prova a chuva é o delta seco × molhado.)
+        let mut raining = AppState {
+            rain_on: true,
+            findings_len: snapshot.finding_rows.len(),
+            ..AppState::default()
+        };
+        raining.rain.set_mode(crate::tui::rain::RainMode::Ambient);
+        for _ in 0..10 {
+            raining.rain.advance(
+                layout::shell(Rect::new(0, 0, 80, 24)).workspace,
+                crate::tui::rain::TICK_MS,
+            );
+        }
+        let dry = AppState {
+            findings_len: snapshot.finding_rows.len(),
+            ..AppState::default()
+        };
+        let wet_text = render(&raining, 80, 24);
+        let dry_text = render(&dry, 80, 24);
+        assert!(!has_special_glyphs(&wet_text), "chuva ascii: {wet_text}");
+        assert_ne!(wet_text, dry_text, "Ambient não desenhou nada");
+        for (wet_char, dry_char) in wet_text.chars().zip(dry_text.chars()) {
+            if wet_char != dry_char {
+                assert_eq!(dry_char, ' ', "chuva ascii cobriu dado");
+            }
         }
         // Overlay de ajuda.
         let help = AppState {

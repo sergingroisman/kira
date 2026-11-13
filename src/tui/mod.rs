@@ -29,6 +29,8 @@ pub mod keymap;
 pub mod layout;
 /// Renderizador markdown mínimo do painel de wiki (W6-PR4).
 pub mod markdown;
+/// Chuva de fundo: decoração pura, desenha só célula em branco (ADR-0036).
+pub mod rain;
 /// Spinner de execução (PR-UX2): puro sobre o tick, só com filho rodando.
 pub mod spinner;
 pub mod state;

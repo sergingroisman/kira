@@ -472,7 +472,17 @@ renderizador nativo e o scroll das mesmas teclas da wiki; painel vazio diz
   ciclar painel (resumo → achados → sessões → wiki → posts) ·
   `j`/`k` ou `↑`/`↓` mover · `g`/`G` topo/fim · `Enter` detalhe (achado ou
   sessão), página da wiki ou leitura do post · `Esc` volta · `/` busca na wiki ·
-  `r` reler o disco (sem rede, sem escrita) · `?` ajuda.
+  `r` reler o disco (sem rede, sem escrita) · `~` chuva de fundo (só desenho) ·
+  `?` ajuda.
+- **Chuva (`~`)** — fundo sutil, módulo puro (`src/tui/rain.rs`, conceito
+  `tui-rain`/MIT, nenhuma dependência nova): pinta **só célula em branco**,
+  depois de todos os painéis — dado na tela vence decoração sempre. Painel
+  vazio já chove finíssimo sem pedir; `~` liga o fundo no dashboard inteiro
+  (default desligado, só em memória — nada vai para `config.toml`). Fora do
+  `--snapshot` e do modo degradado — a prova de hash byte-idêntico continua
+  intacta porque o modo de texto nunca conhece o módulo. Em
+  `KIRA_GLYPHS=ascii` a chuva chove `|` e `.` e passa pelo gate de glifos da
+  tela inteira.
 - **Terminal pequeno**: abaixo de 80×24 o layout degrada para lista única com
   aviso claro.
 - **Cores**: `NO_COLOR` (ou `TERM=dumb`) ⇒ paleta mono com a mesma informação.

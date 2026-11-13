@@ -182,6 +182,7 @@ Os PRs de fechamento formam **stack** — merge na ordem, cada um com a base dec
 | `feat/m7-gitignore` | P5: subset gitwildmatch em `src/context/gitignore.rs`, uma política nos três caminhos; **fecha M7** | M7-P5 | branch empilhada — aguarda merge |
 | `docs/m8-jornada` | este: jornada do setup real de 5 etapas, JM na doc de jornadas, roadmap, README, ledger | M8 | branch empilhada — aguarda merge |
 | `feat/m4-mailbox` | M4: `Screen::Posts` no dashboard (5ª tela, preview nativo, `Enter`/`i` gravam `read_at` só na store, snapshot coberto) | M4 | branch empilhada — aguarda merge |
+| `feat/m8-rain-effect` | chuva de fundo: `src/tui/rain.rs` puro (conceito tui-rain, zero dependência), `~` opt-in, painel vazio chove fino, só célula em branco; snapshot/degradado fora | M8 extra | branch empilhada — aguarda merge |
 
 Achado registrado (issue própria, não corrigido na stack): `ollama list` spawna sem timeout
 e um daemon ocupado pode travar `kira setup --yes` — os e2es de binário rodam herméticos
