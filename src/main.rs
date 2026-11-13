@@ -1803,12 +1803,43 @@ async fn triage_command(
     };
     let base_url = ollama::base_url_from_env();
     let model = model_flag.unwrap_or_else(ollama::model_from_env);
+    // Budget diário (mandato/auditoria P0): checado ANTES da chamada. Store
+    // indisponível = fail-open com aviso VISÍVEL (regra dura da trilha), nunca
+    // bypass silencioso; teto atingido = erro acionável, exit ≠ 0. O mesmo
+    // store serve de LEDGER — `record_llm_call` acontece dentro do
+    // `triage_item`, que recebe a referência abaixo.
+    let budget_max = kira::credentials::max_llm_calls_per_day();
+    let budget_store = match kira::store::Store::open_default() {
+        Ok(store) => {
+            if let Err(err) = store.ensure_llm_budget(budget_max, "triage") {
+                print_error(&err);
+                return Outcome::failure(err.to_string());
+            }
+            Some(store)
+        }
+        Err(err) => {
+            eprintln!("aviso: budget de chamadas não verificado ({err}) — sigo sem enforcement");
+            None
+        }
+    };
     let result = match source {
         TriageSource::Id(id) => match resolve_board(None) {
-            Ok(board) => triage::triage_live_llm(kind, board.as_ref(), id, &base_url, &model).await,
+            Ok(board) => {
+                triage::triage_live_llm(
+                    kind,
+                    board.as_ref(),
+                    id,
+                    &base_url,
+                    &model,
+                    budget_store.as_ref(),
+                )
+                .await
+            }
             Err(err) => Err(err),
         },
-        TriageSource::File(path) => triage::triage_file_llm(kind, &base_url, &model, &path).await,
+        TriageSource::File(path) => {
+            triage::triage_file_llm(kind, &base_url, &model, &path, budget_store.as_ref()).await
+        }
     };
     match result {
         Ok(report) => {
@@ -1882,7 +1913,25 @@ async fn eval_command(
         }
         eprintln!("seeds sintéticas copiadas para {}", dir.display());
     }
-    match kira::eval::run(&dir, kind, &base_url, &model).await {
+    // P0 (auditoria F2): o `--eval` faz UMA chamada de LLM por item do gold —
+    // o mesmo teto do triage vale aqui, checado antes de cada item (o run
+    // aborta inteiro, nunca parcial). Store indisponível = aviso visível e
+    // execução sem teto, mesma conduta do triage vivo.
+    let budget_max = kira::credentials::max_llm_calls_per_day();
+    let budget_store = match kira::store::Store::open_default() {
+        Ok(store) => {
+            if let Err(err) = store.ensure_llm_budget(budget_max, "triage --eval") {
+                print_error(&err);
+                return Outcome::failure(err.to_string());
+            }
+            Some(store)
+        }
+        Err(err) => {
+            eprintln!("aviso: budget de chamadas não verificado ({err}) — sigo sem enforcement");
+            None
+        }
+    };
+    match kira::eval::run(&dir, kind, &base_url, &model, budget_store.as_ref()).await {
         Ok((itens, gate)) => {
             if json {
                 let report = kira::eval::report(&itens, &gate);

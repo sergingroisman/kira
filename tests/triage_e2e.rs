@@ -794,6 +794,53 @@ fn unknown_kira_llm_value_fails_with_the_valid_options() {
 }
 
 // ---------------------------------------------------------------------------
+// P0 (auditoria F2) — o teto diário de chamadas de LLM é enforcement real
+// ---------------------------------------------------------------------------
+
+/// Duas chamadas com teto 1: a primeira passa e entra no ledger; a segunda é
+/// recusada ANTES de qualquer conexão com o modelo, com o conserto na mensagem.
+/// Dano se regredir: o budget do mandato voltaria a ser promessa de doc.
+#[test]
+fn daily_llm_budget_blocks_the_second_call_with_an_actionable_error() {
+    let sandbox = Sandbox::new("budget");
+    let fixture = sandbox.fixture();
+    let envs = [
+        // O fake do sandbox atende UMA conexão: consumida pela 1ª chamada.
+        ("KIRA_OLLAMA_URL", sandbox.base_url.clone()),
+        ("KIRA_MAX_LLM_CALLS_PER_DAY", "1".to_string()),
+    ];
+
+    let (code, stdout, stderr) = sandbox.run_with(&["triage", "--file", &fixture], &envs, &[]);
+    assert_eq!(
+        code, 0,
+        "primeira chamada sob o teto deve passar: {stdout} / {stderr}"
+    );
+    assert!(stdout.starts_with("Causa raiz provável:"), "{stdout}");
+
+    // A chamada boa entrou no ledger: uma linha em `llm_calls` para hoje.
+    let store = kira::store::Store::open_at(&sandbox.store.join("store.db"))
+        .unwrap_or_else(|err| panic!("abrir store do sandbox: {err}"));
+    assert_eq!(
+        store
+            .llm_calls_today()
+            .unwrap_or_else(|err| panic!("ler ledger: {err}")),
+        1,
+        "o triage precisa registrar a chamada no contador"
+    );
+
+    let (code, stdout, stderr) = sandbox.run_with(&["triage", "--file", &fixture], &envs, &[]);
+    assert_ne!(code, 0, "teto atingido precisa falhar: {stdout}");
+    assert!(
+        stderr.contains("limite diário"),
+        "erro acionável no stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("max_llm_calls_per_day"),
+        "a mensagem precisa dizer o conserto: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // PR11b / ADR-0020 — backend foundry (`--llm foundry`, envs KIRA_FOUNDRY_*)
 // ---------------------------------------------------------------------------
 

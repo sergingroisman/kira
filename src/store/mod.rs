@@ -35,7 +35,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -75,6 +75,18 @@ pub enum StoreError {
     /// A write/read inside the store failed.
     #[error("falha de leitura/escrita no store: {0}")]
     Sql(#[from] rusqlite::Error),
+
+    /// The daily LLM-call budget of the mandate is exhausted: the cycle/command
+    /// must stop BEFORE the next call (auditoria P0). The message carries the
+    /// fix (wait for tomorrow or raise the configured cap).
+    #[error(
+        "limite diário de chamadas de LLM atingido ({today}/{max} hoje em `{command}`) — retome amanhã ou aumente max_llm_calls_per_day no config.toml (ou KIRA_MAX_LLM_CALLS_PER_DAY)"
+    )]
+    BudgetExhausted {
+        today: usize,
+        max: usize,
+        command: String,
+    },
 
     /// The project root (cwd) could not be canonicalized.
     #[error("não foi possível determinar o diretório do projeto a partir de '{path}': {source}")]
@@ -374,6 +386,54 @@ impl Store {
     /// Safe to call any number of times: the markdown files are the truth, so
     /// dropping and rebuilding the index can never lose knowledge. Returns how
     /// many pages were indexed.
+    /// LLM calls recorded today (UTC day) — the number of the mandate's budget
+    /// (auditoria P0): what `doctor`/dashboard show and what
+    /// [`Store::ensure_llm_budget`] consults BEFORE each call.
+    pub fn llm_calls_today(&self) -> Result<usize, StoreError> {
+        let cutoff = today_utc_cutoff();
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM llm_calls WHERE at >= ?1",
+                [cutoff],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
+            .map_err(StoreError::from)
+    }
+
+    /// Records one judgment call (triage/digest/eval). `tokens_est` is an
+    /// estimate (3 chars/token) — a ledger number, not billing.
+    pub fn record_llm_call(
+        &self,
+        backend: &str,
+        model: &str,
+        command: &str,
+        tokens_est: u64,
+    ) -> Result<(), StoreError> {
+        let tokens = i64::try_from(tokens_est).unwrap_or(i64::MAX);
+        self.conn.execute(
+            "INSERT INTO llm_calls (backend, model, command, tokens_est, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![backend, model, command, tokens, now_rfc3339_utc()],
+        )?;
+        Ok(())
+    }
+
+    /// Recusa a próxima chamada quando a contagem de hoje atingiu o teto
+    /// (mandato: budget checado ANTES de cada chamada). A mensagem diz o que
+    /// fazer — esperar amanhã ou subir o teto configurado.
+    pub fn ensure_llm_budget(&self, max: usize, command: &str) -> Result<(), StoreError> {
+        let today = self.llm_calls_today()?;
+        if today >= max {
+            return Err(StoreError::BudgetExhausted {
+                today,
+                max,
+                command: command.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn wiki_replace(&self, pages: &[WikiPageRow]) -> Result<usize, StoreError> {
         let tx = self.conn.unchecked_transaction().map_err(StoreError::Sql)?;
         tx.execute("DELETE FROM wiki_page", [])
@@ -829,6 +889,26 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
             .map_err(schema_error)?;
     }
 
+    // v9 — observabilidade (auditoria P0): o contador que transforma o budget
+    // do mandato (`max_llm_calls_per_day = 50`) em código. Uma linha por
+    // chamada de JULGAMENTO (triage/digest/eval); `at` em RFC 3339 UTC como
+    // todo o store, e "hoje" = dia UTC (comparação de string vale: zero-padded,
+    // mesmo fuso). Sem esta tabela o budget era contrato de doc, não enforcement.
+    if current < 9 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS llm_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backend TEXT NOT NULL,
+                model TEXT NOT NULL,
+                command TEXT NOT NULL,
+                tokens_est INTEGER NOT NULL DEFAULT 0,
+                at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_llm_calls_at ON llm_calls (at);",
+        )
+        .map_err(schema_error)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(schema_error)
 }
@@ -1197,6 +1277,12 @@ pub fn detect_project_root() -> Option<PathBuf> {
 /// Current time in RFC 3339 UTC (`...Z`) — no chrono dependency.
 ///
 /// Callers display it in local time via SQLite (`datetime(x, 'localtime')`).
+/// Início do dia UTC atual em RFC 3339; comparação de string com `at` é válida
+/// (zero-padded, mesmo fuso) — o corte do contador de chamadas (v9, P0).
+fn today_utc_cutoff() -> String {
+    format!("{}T00:00:00Z", &now_rfc3339_utc()[..10])
+}
+
 pub fn now_rfc3339_utc() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1750,6 +1836,65 @@ mod tests {
             .last_sessions(&project.id, usize::MAX)
             .unwrap_or_else(|err| panic!("last_sessions com usize::MAX: {err}"));
         assert_eq!(saturated.len(), 2, "LIMIT negativo viraria dump sem limite");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_calls_ledger_counts_today_and_refuses_over_the_cap() {
+        let (store, dir) = open_temp_store("llm-ledger");
+        assert_eq!(
+            store
+                .llm_calls_today()
+                .unwrap_or_else(|err| panic!("contar início: {err}")),
+            0,
+            "store novo não tem chamadas"
+        );
+
+        store
+            .record_llm_call("ollama", "qwen3.5:4b", "triage", 123)
+            .unwrap_or_else(|err| panic!("record triage: {err}"));
+        store
+            .record_llm_call("ollama", "qwen3.5:4b", "digest", 456)
+            .unwrap_or_else(|err| panic!("record digest: {err}"));
+        assert_eq!(
+            store
+                .llm_calls_today()
+                .unwrap_or_else(|err| panic!("contar hoje: {err}")),
+            2
+        );
+
+        // Teto atingido: erro acionável, com o comando e o conserto na mensagem.
+        let err = match store.ensure_llm_budget(2, "triage") {
+            Err(err) => err,
+            Ok(()) => panic!("teto de 2 com 2 chamadas deveria recusar"),
+        };
+        let message = err.to_string();
+        assert!(message.contains("triage"), "comando na mensagem: {message}");
+        assert!(
+            message.contains("max_llm_calls_per_day"),
+            "conserto na mensagem: {message}"
+        );
+        store
+            .ensure_llm_budget(3, "triage")
+            .unwrap_or_else(|err| panic!("teto 3 com 2 chamadas deveria passar: {err}"));
+
+        // Linha de outro dia (at < corte UTC) não conta para hoje — o corte
+        // separa ontem de hoje sem depender de fuso local.
+        store
+            .conn
+            .execute(
+                "INSERT INTO llm_calls (backend, model, command, tokens_est, at) \
+                 VALUES ('ollama', 'qwen3.5:4b', 'triage', 0, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap_or_else(|err| panic!("inserir linha antiga: {err}"));
+        assert_eq!(
+            store
+                .llm_calls_today()
+                .unwrap_or_else(|err| panic!("contar com linha antiga: {err}")),
+            2,
+            "linha de outro dia não entra na contagem de hoje"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
