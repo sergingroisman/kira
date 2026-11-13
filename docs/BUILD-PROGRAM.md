@@ -174,8 +174,11 @@
   **Aceite:** segundo run não repete post; `--lang` diferente não reaproveita cache; budget
   estourado para com nota; sem ollama ⇒ erro acionável com exit != 0.
 - [ ] **M4** caixa de correio no dashboard (modo leitura). Painel com `não lido`, Markdown
-  renderizado **nativo** (ADR-0036: nativo do ratatui primeiro; `tui-markdown` só com aprovação
-  do dono no PR), `read_at` grava.
+  renderizado **nativo** — o renderizador JÁ EXISTE: `src/tui/markdown.rs`
+  (`render(source, width) -> Vec<String>`, sem dependência, ADR-0013). **Não precisa de
+  `tui-markdown`.** Falta: variante `Screen::Posts` + `posts_selected` no `AppState`, snapshot com
+  a lista de posts (slug, kind, lang, estado, não lido), widget do painel, tecla de abrir (grava
+  `read_at` via `store.post_mark_read`), dica de painel vazio e teste de `--snapshot`.
   **Aceite:** `--snapshot` mostra o painel; hash do store muda só em `read_at`; tecla não escreve
   arquivo do dev.
 - [x] **M5** `kira emit` + linha de ingestão/posts no `doctor` *(código; docs da onda em M8)*.
