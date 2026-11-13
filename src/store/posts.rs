@@ -71,7 +71,7 @@ pub struct PostRow {
     pub attempts: i64,
     /// Quando o dev leu no dashboard (formato RFC3339). `None` = não lido.
     pub read_at: Option<String>,
-    /// Destino do `.md` publicado (`None` antes do `emit`).
+    /// Destino do `.md` publicado (`None` antes do `publish`).
     pub path: Option<String>,
     pub created_at: String,
 }

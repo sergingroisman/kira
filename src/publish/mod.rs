@@ -1,11 +1,11 @@
-//! `kira emit` — publica os rascunhos do `digest` no wiki (ADR-0038, M5).
+//! `kira publish` — publica os rascunhos do `digest` no wiki (ADR-0038, M5).
 //!
 //! O `digest` escreve em `.kira/digest/`; este comando é o único que escreve em
 //! `.kira/wiki/`, onde o dev lê. A regra que importa: **nunca sobrescrever o que o
 //! dev escreveu**. Como o wiki é markdown versionável, a única forma honesta de
 //! saber se um arquivo foi editado à mão é comparar o conteúdo com o que publicamos
 //! da última vez — por isso cada post publicado carrega `published_hash` no
-//! front-matter. Se o hash do arquivo atual não bate, o `emit` recusa e diz o que
+//! front-matter. Se o hash do arquivo atual não bate, o `publish` recusa e diz o que
 //! fazer (`--force` é decisão explícita do dono).
 //!
 //! O índice (`index.md`) é **derivado** do conjunto de posts: nunca é gerado por
@@ -18,11 +18,11 @@ use crate::post::plan::fnv1a64_hex;
 use crate::store::Store;
 use crate::store::posts::PostState;
 
-/// Prefixo do bloco de front-matter que o `emit` gerencia.
+/// Prefixo do bloco de front-matter que o `publish` gerencia.
 const FRONT_MATTER_OPEN: &str = "---\n";
 
 #[derive(Debug, thiserror::Error)]
-pub enum EmitError {
+pub enum PublishError {
     #[error("store indisponível: {0}")]
     Store(String),
     #[error("não consegui ler {path}: {source}")]
@@ -39,15 +39,15 @@ pub enum EmitError {
     },
 }
 
-/// Opções do `emit`.
+/// Opções do `publish`.
 #[derive(Debug, Clone)]
-pub struct EmitOptions {
+pub struct PublishOptions {
     pub root: PathBuf,
     /// Sobrescreve post editado à mão (decisão explícita do dono).
     pub force: bool,
 }
 
-impl EmitOptions {
+impl PublishOptions {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -58,7 +58,7 @@ impl EmitOptions {
 
 /// O que aconteceu em cada post.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EmitOutcome {
+pub enum PublishOutcome {
     Published,
     Unchanged,
     /// Recusado porque o arquivo em `.kira/wiki/` foi editado depois da publicação.
@@ -68,7 +68,7 @@ pub enum EmitOutcome {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct EmitReport {
+pub struct PublishReport {
     pub published: usize,
     pub unchanged: usize,
     pub edited: Vec<String>,
@@ -77,11 +77,11 @@ pub struct EmitReport {
     pub notes: Vec<String>,
 }
 
-impl EmitReport {
+impl PublishReport {
     pub fn summary(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "emit: {} publicado(s), {} sem mudança\n",
+            "publish: {} publicado(s), {} sem mudança\n",
             self.published, self.unchanged
         ));
         if !self.edited.is_empty() {
@@ -106,16 +106,16 @@ impl EmitReport {
 }
 
 /// Publica todo post entregue que tenha rascunho.
-pub fn run(options: &EmitOptions) -> Result<EmitReport, EmitError> {
+pub fn run(options: &PublishOptions) -> Result<PublishReport, PublishError> {
     let root = &options.root;
-    let store = Store::open_default().map_err(|err| EmitError::Store(err.to_string()))?;
-    let project_id =
-        crate::store::project_id_for_root(root).map_err(|err| EmitError::Store(err.to_string()))?;
+    let store = Store::open_default().map_err(|err| PublishError::Store(err.to_string()))?;
+    let project_id = crate::store::project_id_for_root(root)
+        .map_err(|err| PublishError::Store(err.to_string()))?;
     let posts = store
         .posts_of(&project_id)
-        .map_err(|err| EmitError::Store(err.to_string()))?;
+        .map_err(|err| PublishError::Store(err.to_string()))?;
 
-    let mut report = EmitReport::default();
+    let mut report = PublishReport::default();
     let mut index_rows: Vec<(String, String, String, String)> = Vec::new();
 
     for post in posts.iter().filter(|p| p.state == PostState::Delivered) {
@@ -138,35 +138,35 @@ pub fn run(options: &EmitOptions) -> Result<EmitReport, EmitError> {
         let published_hash = fnv1a64_hex(&body);
 
         let outcome = match &existing {
-            None => EmitOutcome::Published,
+            None => PublishOutcome::Published,
             Some(current) => {
                 let previous = front_matter_value(current, "published_hash");
                 if previous.as_deref() == Some(published_hash.as_str()) {
-                    EmitOutcome::Unchanged
+                    PublishOutcome::Unchanged
                 } else if previous.is_some() && !options.force {
                     // Publicamos este arquivo antes e o conteúdo mudou desde então:
                     // ou o dev editou, ou o digest gerou texto novo. O front-matter
                     // guarda o hash do corpo publicado, então dá para distinguir.
                     if body_hash_of(current).as_deref() == previous.as_deref() {
-                        EmitOutcome::Published
+                        PublishOutcome::Published
                     } else {
-                        EmitOutcome::Edited
+                        PublishOutcome::Edited
                     }
                 } else {
-                    EmitOutcome::Published
+                    PublishOutcome::Published
                 }
             }
         };
 
         match outcome {
-            EmitOutcome::Published => {
+            PublishOutcome::Published => {
                 let text = with_front_matter(post, &body, &published_hash);
                 write_text(&target, &text)?;
                 report.published += 1;
             }
-            EmitOutcome::Unchanged => report.unchanged += 1,
-            EmitOutcome::Edited => report.edited.push(post.slug.clone()),
-            EmitOutcome::NoDraft => {}
+            PublishOutcome::Unchanged => report.unchanged += 1,
+            PublishOutcome::Edited => report.edited.push(post.slug.clone()),
+            PublishOutcome::NoDraft => {}
         }
         index_rows.push((
             post.slug.clone(),
@@ -228,10 +228,12 @@ fn render_index(rows: &[(String, String, String, String)], root: &Path) -> Strin
     let mut out = String::new();
     out.push_str("# Posts\n\n");
     out.push_str(
-        "<!-- índice DERIVADO do conjunto de posts por `kira emit`. Não edite à mão. -->\n\n",
+        "<!-- índice DERIVADO do conjunto de posts por `kira publish`. Não edite à mão. -->\n\n",
     );
     if rows.is_empty() {
-        out.push_str("_nenhum post publicado ainda — rode `kira digest` e depois `kira emit`_\n");
+        out.push_str(
+            "_nenhum post publicado ainda — rode `kira digest` e depois `kira publish`_\n",
+        );
         return out;
     }
     let mut sorted: BTreeMap<&str, (&str, &str, &str)> = BTreeMap::new();
@@ -250,14 +252,14 @@ fn render_index(rows: &[(String, String, String, String)], root: &Path) -> Strin
     out
 }
 
-fn write_text(path: &Path, body: &str) -> Result<(), EmitError> {
+fn write_text(path: &Path, body: &str) -> Result<(), PublishError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| EmitError::Write {
+        std::fs::create_dir_all(parent).map_err(|source| PublishError::Write {
             path: parent.display().to_string(),
             source,
         })?;
     }
-    std::fs::write(path, body).map_err(|source| EmitError::Write {
+    std::fs::write(path, body).map_err(|source| PublishError::Write {
         path: path.display().to_string(),
         source,
     })
@@ -325,6 +327,6 @@ mod tests {
     fn empty_index_says_what_to_run() {
         let text = render_index(&[], Path::new("/repo"));
         assert!(text.contains("kira digest"), "{text}");
-        assert!(text.contains("kira emit"), "{text}");
+        assert!(text.contains("kira publish"), "{text}");
     }
 }

@@ -199,7 +199,7 @@ pub fn format_ingest_lines() -> Vec<String> {
     );
     if stale > 0 {
         line.push_str(&format!(
-            " · {stale} desatualizado(s) — o repositório mudou: rode `kira digest` e `kira emit`"
+            " · {stale} desatualizado(s) — o repositório mudou: rode `kira digest` e `kira publish`"
         ));
     }
     lines.push(line);

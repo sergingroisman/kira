@@ -409,7 +409,7 @@ fn render_briefing(
     if sealed > 0 {
         out.push_str("```\nkira digest --resume\n```\n");
     } else {
-        out.push_str("```\nkira emit\n```\n");
+        out.push_str("```\nkira publish\n```\n");
     }
     out
 }
@@ -445,8 +445,8 @@ mod tests {
         };
         let text = render_briefing(&options, &report, 0, 2, 0);
         assert!(
-            text.contains("kira emit"),
-            "fila vazia deve apontar o emit:\n{text}"
+            text.contains("kira publish"),
+            "fila vazia deve apontar o publish:\n{text}"
         );
         let pending = render_briefing(&options, &report, 1, 1, 0);
         assert!(

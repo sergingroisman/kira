@@ -1,4 +1,4 @@
-//! End-to-end de `kira emit` (ADR-0038, M5).
+//! End-to-end de `kira publish` (ADR-0038, M5).
 //!
 //! Contratos verificados no binário real, com Ollama falso em `127.0.0.1`:
 //! - publica cada rascunho em `.kira/wiki/<slug>.md` com front-matter e gera o
@@ -52,7 +52,7 @@ impl Sandbox {
             .unwrap_or(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!(
-            "kira-emit-e2e-{}-{tag}-{nanos}-{seq}",
+            "kira-publish-e2e-{}-{tag}-{nanos}-{seq}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&base);
@@ -92,7 +92,7 @@ impl Sandbox {
         )
     }
 
-    /// ingest → trust → digest: deixa os rascunhos prontos para o emit.
+    /// ingest → trust → digest: deixa os rascunhos prontos para o publish.
     fn prepare(&self) {
         for args in [
             &["ingest", "--skip-scan"][..],
@@ -124,10 +124,10 @@ impl Drop for Sandbox {
 }
 
 #[test]
-fn emit_publishes_the_posts_and_the_derived_index() {
+fn publish_writes_the_posts_and_the_derived_index() {
     let sandbox = Sandbox::new("publica");
     sandbox.prepare();
-    let (code, stdout, stderr) = sandbox.run(&["emit"]);
+    let (code, stdout, stderr) = sandbox.run(&["publish"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("2 publicado(s)"), "stdout: {stdout}");
 
@@ -159,15 +159,15 @@ fn emit_publishes_the_posts_and_the_derived_index() {
 }
 
 #[test]
-fn emitting_twice_is_idempotent() {
+fn publishing_twice_is_idempotent() {
     let sandbox = Sandbox::new("idem");
     sandbox.prepare();
-    let (code, _, stderr) = sandbox.run(&["emit"]);
-    assert_eq!(code, 0, "primeiro emit: {stderr}");
+    let (code, _, stderr) = sandbox.run(&["publish"]);
+    assert_eq!(code, 0, "primeiro publish: {stderr}");
     let before = sandbox.read(".kira/wiki/intro.md");
 
-    let (code, stdout, stderr) = sandbox.run(&["emit"]);
-    assert_eq!(code, 0, "segundo emit: {stderr}");
+    let (code, stdout, stderr) = sandbox.run(&["publish"]);
+    assert_eq!(code, 0, "segundo publish: {stderr}");
     assert!(stdout.contains("0 publicado(s)"), "stdout: {stdout}");
     assert!(stdout.contains("2 sem mudança"), "stdout: {stdout}");
     assert_eq!(
@@ -182,13 +182,13 @@ fn emitting_twice_is_idempotent() {
 fn a_post_edited_by_hand_is_refused_and_preserved() {
     let sandbox = Sandbox::new("editado");
     sandbox.prepare();
-    let (code, _, stderr) = sandbox.run(&["emit"]);
-    assert_eq!(code, 0, "emit inicial: {stderr}");
+    let (code, _, stderr) = sandbox.run(&["publish"]);
+    assert_eq!(code, 0, "publish inicial: {stderr}");
 
     let edited = "---\nslug: intro\npublished_hash: x\n---\n\n## Minha edição\nnão mexa\n";
     sandbox.write(".kira/wiki/intro.md", edited);
 
-    let (code, stdout, stderr) = sandbox.run(&["emit"]);
+    let (code, stdout, stderr) = sandbox.run(&["publish"]);
     assert_eq!(code, 0, "recusa não é erro do comando: {stderr}");
     assert!(
         stdout.contains("recusado(s) por edição manual"),
@@ -209,14 +209,14 @@ fn a_post_edited_by_hand_is_refused_and_preserved() {
 fn force_overwrites_a_hand_edited_post() {
     let sandbox = Sandbox::new("force");
     sandbox.prepare();
-    let (code, _, stderr) = sandbox.run(&["emit"]);
-    assert_eq!(code, 0, "emit inicial: {stderr}");
+    let (code, _, stderr) = sandbox.run(&["publish"]);
+    assert_eq!(code, 0, "publish inicial: {stderr}");
     sandbox.write(
         ".kira/wiki/intro.md",
         "---\nslug: intro\n---\n\ntexto do dev\n",
     );
 
-    let (code, stdout, stderr) = sandbox.run(&["emit", "--force"]);
+    let (code, stdout, stderr) = sandbox.run(&["publish", "--force"]);
     assert_eq!(code, 0, "force: {stderr}");
     assert!(stdout.contains("1 publicado(s)"), "stdout: {stdout}");
     let published = sandbox.read(".kira/wiki/intro.md");
