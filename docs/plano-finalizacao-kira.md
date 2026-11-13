@@ -98,6 +98,46 @@ cache errado. **"Arquivos de ouro"** = grounding ancorado (`path:linha`) +
 skill casado + guardrail HF-3 + verifier determinístico (`author ≠ verifier`) +
 front-matter: o especialista escreve, o código confere.
 
+### 3.1 Stack de modelos em 3 fases (decisão do dono, 13/Nov): 2060 6 GB → Ollama Cloud → Foundry no lançamento
+
+| Fase | Backend | Como entra no KIRA | Regra dura |
+|---|---|---|---|
+| **1. Local (hoje, default)** | Ollama localhost na **RTX 2060 6 GB** | já existe (`src/llm/ollama.rs`, `KIRA_OLLAMA_URL`/`KIRA_MODEL`) | default eterno; nada de cloud implícito |
+| **2. Ollama Cloud (testes)** | (a) `ollama signin` + tags `*:cloud` pelo server local — **zero código novo**; (b) API direta `https://ollama.com/api` com `Authorization: Bearer` — item **OC-1** abaixo | routing por kind; `--llm`/`KIRA_LLM` explícito no modo (b) | cloud = **caro**: nunca implícito, nunca fallback silencioso (mesma classe de ADR-0019/0020); código só sai da máquina com trust + escolha explícita; doctor avisa "egresso de dados neste run" quando tag `*:cloud` ou URL não-local |
+| **3. Foundry (lançamento/empresa)** | BYOK Microsoft Foundry (ADR-0020, já implementado: superfícies v1/legada, body modes) | endpoint/deployment no config; chave só env/keyring | política da empresa; learning desligado; caro explícito |
+
+**OC-1 — Ollama Cloud direto (PR pequeno, gates completos)**: se
+`KIRA_OLLAMA_URL` apontar para host não-local e houver `OLLAMA_API_KEY` (env)
+ou entrada no keyring, o backend Ollama acrescenta `Authorization: Bearer`;
+sem chave e URL não-local ⇒ erro acionável ("defina OLLAMA_API_KEY ou use
+localhost"), nunca request anônimo que falha confuso. Chave nunca em log/
+`Debug`/store (máscara no `doctor`). Teste com o fake server já existente
+(`spawn_fake_ollama`): asserts do header sem vazar o valor. Modo (a)
+(`signin`) não toca código: o server local autentica — mas o **aviso de
+egresso** no doctor/digest vale para os dois modos (cloud processa o prompt;
+não treina com ele, porém ele *sai* da máquina).
+
+**PR20 promovido (perfil de hardware, acaba com o chute de modelo)**: detectar
+VRAM via `nvidia-smi` resolvido no PATH (mesmo estilo `binresolve` das
+ferramentas de scan; ausente ⇒ perfil CPU) e recomendar tag por perfil:
+6 GB ⇒ `qwen3.5:4b` Q4_K_M com `KIRA_NUM_CTX=4096`; 8 GB ⇒ 7 B Q4 com ctx
+menor; CPU ⇒ 1–2 B. `kira doctor` imprime o perfil efetivo (VRAM, modelo,
+ctx) — é o PR20 do BUILD-PROGRAM subindo de prioridade por decisão do dono.
+
+**"Melhor output com o pior modelo" — a pilha de compensação (é isso que o
+KIRA é)**: modelo fraco não produz ouro sozinho; produz texto confiante. O que
+compensa, em ordem de cheap-first: (1) grounding ancorado (`path:linha`,
+facts determinísticos) — o modelo interpreta, não lembra; (2) skills com SOP
+por OS/stack (onda SK) — procedimento certo mesmo com modelo pequeno;
+(3) guardrail HF-3 + prompt delimitado — formato garantido por código;
+(4) verifier determinístico (`author ≠ verifier`) — o rascunho só publica se o
+código conferir; (5) compressão caveman do que sobe — mais sinal por token na
+janela curta da 2060; (6) **gate por modelo**: `kira triage --eval` roda por
+backend/tag — se a 4B local passar de 70% no gold, ela É o modelo de produção;
+kinds que reprovarem sobem na **matriz de escalonamento** (local → cloud
+`*:cloud` → Foundry) só sob flag explícita e budget, com o delta medido no
+`--eval`, nunca por vibe.
+
 ## 4. Ordem consolidada de execução (dependências reais)
 
 ```mermaid
