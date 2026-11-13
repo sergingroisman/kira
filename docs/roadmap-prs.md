@@ -164,6 +164,29 @@ Ordem: PR34 → PR35 → PR36/37 → PR38/39/40 → PR41 → PR42 (43 é W6).
 | PR42 | Watchdogs de budget 50/75/90% na spec W5 (doc-only) | fila |
 | PR43 | Painel de economia no dashboard (1 campo por PR; lê, nunca escreve — prova `dashboard_e2e`) | **W6** (pós-M2) |
 
+## Onda M — ingestão → digestão → emissão (ADR-0038, 12–13/Nov)
+
+Ledger vivo em [`BUILD-PROGRAM.md`](BUILD-PROGRAM.md) (M1–M8); aqui o fechamento por PR.
+Os PRs de fechamento formam **stack** — merge na ordem, cada um com a base declarada no corpo.
+
+| PR | Objetivo | Item | Status |
+|---|---|---|---|
+| #84 `feat/m1-ingest-v2` | `kira ingest` — denylist, detector de stack, inventário + digest determinístico | M1 | **mergeado** |
+| #85 `feat/m2-posts` | tabela `posts` + view `outbox` + claim/lease + `kira trust` (schema v6) | M2 | **mergeado** |
+| #86 `feat/m3-digest` | `kira digest` — Courier, Ollama primeiro, cache com `lang`, briefing | M3 | **mergeado** |
+| #87 `feat/m5-emit` | `kira emit` — publicação com gate por hash + linhas do doctor | M5 | **mergeado** |
+| `fix/m5-emit-gate` | fecha o aceite do M5: arquivo sem `published_hash` recusado sem `--force` (com caminho na mensagem), escrita pelo guard, testes do doctor, 5º e2e | M5 (lacuna) | branch empilhada — aguarda merge |
+| `fix/m7-bom-scan` | P1: `src/scan/decode.rs` (BOM UTF-8/UTF-16 LE/BE) + fixture real UTF-16 LE | M7-P1 | branch empilhada — aguarda merge |
+| `feat/m6-wizard-ingest-lang` | M6: etapa Ingestão no wizard + ingest no motor (`run_scan=false`) + `--lang`/`output_lang` (D4) + resumo com próximo passo dinâmico | M6 | branch empilhada — aguarda merge |
+| `feat/m-pack-digest-context` | item 4: `## Perfil`/`## Árvore` do digest no context pack (tetos 1 500 chars / 40 linhas; goldens intactos) | — | branch empilhada — aguarda merge |
+| `feat/m7-gitignore` | P5: subset gitwildmatch em `src/context/gitignore.rs`, uma política nos três caminhos; **fecha M7** | M7-P5 | branch empilhada — aguarda merge |
+| `docs/m8-jornada` | este: jornada do setup real de 5 etapas, JM na doc de jornadas, roadmap, README, ledger | M8 | branch empilhada — aguarda merge |
+| M4 caixa de correio | `Screen::Posts` no dashboard (preview nativo, `read_at`, snapshot) | M4 | aberto — próxima PR da fila |
+
+Achado registrado (issue própria, não corrigido na stack): `ollama list` spawna sem timeout
+e um daemon ocupado pode travar `kira setup --yes` — os e2es de binário rodam herméticos
+com `PATH=""` até a correção.
+
 ## Permanece REJEITADO
 
 Daemon Axum/SSE · DB além do SQLite `bundled` · embeddings/semantic search (pós-M2) ·
@@ -175,6 +198,6 @@ escrita autônoma antes do gate M2 + `--apply` explícito.
 | Item | O que é | Pré-condição |
 |---|---|---|
 | `kira git` / release tree | **Mini gestão de git dentro do Kira**: desenhar a árvore de release (branches, tags, merges, o que está em cada release), status/branch por projeto, agrupado por stack do `kira scan`. Só leitura + desenho (Ratatui/nome de árvore em texto) na v1 | pós-M2; precisa ADR própria (o que é `release` neste repo? tag? `CHANGELOG`?) |
-| Blog (devolvido do PR18) | `kira audit --weekly` gerando DRAFT no repo do blog | pós-W5, com aprovação humana explícita |
+| Blog (devolvido do PR18) | `kira audit --weekly` gerando DRAFT no repo do blog — nota: "PR18" aqui é a numeração antiga do plano; no ledger atual (BUILD-PROGRAM F2) PR18 é `kira approve` | pós-W5, com aprovação humana explícita |
 | Logs multi-provedor | depois do Datadog: `setup` já pergunta a fonte; novos provedores entram como backend do mesmo trait | pós-PR12 |
 | Embeddings/busca em Rust | retrieval local (usearch/candle) para contexto do triage | pós-M2 (está na lista de rejeitados-por-agora) |

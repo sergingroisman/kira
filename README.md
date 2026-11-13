@@ -22,13 +22,13 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira triage <id\|--file> --llm copilot` | Usa o **Copilot CLI** como LLM caro desta execução (spawn de `copilot -p`; exige `copilot auth login`) — ver [Backend LLM (ADR-0019)](#backend-llm-adr-0019). |
 | `kira triage <id\|--file> --llm foundry` | Usa o **Microsoft Foundry** (BYOK, HTTP OpenAI-compatible) no lugar do Ollama para esta execução — ver [Backend foundry](#backend-foundry-byok-microsoft-foundry) abaixo. |
 | `kira triage --eval <dir>` | **Gate M2 medido (ADR-0018)**: compara o triage com os rótulos do dono (`item.json` + `gold.json` por pasta) de forma **determinística, sem LLM juiz**; exit 0 = ≥70% (`PASSOU`), 1 = <70% ou erro. `--json` para automação; `--seed` copia 3 fixtures sintéticas num diretório vazio. Ver [seção do gate](#kira-triage---eval--o-gate-m2-medido-adr-0018). |
-| `kira setup [--org --project --name --pat --yes --backend --skip --reset]` | Setup **local-first** (ADR-0030): nome do dev → projeto (raiz detectada + confirmar) → backend de IA (4 opções, com **"4) nenhuma por agora"** como default quando o Ollama não está instalado) → resumo do que funciona. PAT NÃO é pedido — credencial nasce em `kira connect <provider>`; `--pat` segue como atalho explícito (valida na hora e vai para o keyring do OS, service `kira`). `--reset` apaga o que ele gravou de credencial (PAT, chave do Foundry) e o par público do Foundry, mantendo org/projeto/dev. |
+| `kira setup [--org --project --name --pat --yes --backend --skip --lang --reset]` | Setup **local-first** (ADR-0030): nome do dev → projeto (raiz detectada + confirmar + idioma de saída) → **ingestão (M6: ` kira ingest` roda aqui — preview read-only antes, efeito depois do Enter)** → backend de IA (4 opções, com **"4) nenhuma por agora"** como default quando o Ollama não está instalado) → resumo do que funciona. PAT NÃO é pedido — credencial nasce em `kira connect <provider>`; `--pat` segue como atalho explícito (valida na hora e vai para o keyring do OS, service `kira`). `--lang <bcp47>` escolhe o idioma do que o humano lê (posts, cards, PR — ADR-0038 D4; default `en`; `--skip pat|ia|ingest` pula passos). `--reset` apaga o que ele gravou de credencial (PAT, chave do Foundry) e o par público do Foundry, mantendo org/projeto/dev. |
 | `kira connect azure [--yes]` | Conecta o board (capacidade `board.azure`, ADR-0030): imprime a **aula do PAT** e oferece o menu `1) colar PAT  2) usar AZURE_DEVOPS_PAT do ambiente  3) cancelar` no TTY; entrada do segredo **sem eco**; valida na hora (200/401/403/sem rede — as 4 mensagens da spec) e, no 200, grava no keyring e marca `board.azure` **conectada para o projeto atual** (próximo passo: `kira triage <id>`). Falha/401/403/cancelar ⇒ nada gravado, exit ≠ 0. `--yes` (ou sem TTY): usa SÓ a env `AZURE_DEVOPS_PAT`, nunca bloqueia; sem a env, erro acionável. `kira connect github\|gitlab`: aceito, "ainda não implementado". |
 | `kira scan [--path <dir>]` | Scan **determinístico** das ferramentas padrão da stack (`dotnet list package --vulnerable --include-transitive --format json`; `pnpm audit --json` / `npm audit --json`). Sem IA. Grava `<root>/.kira/findings.json` com fingerprint FNV-1a e ordem estável. |
 | `kira ingest [--path <dir>] [--json] [--skip-scan]` | **Ingere** o projeto inteiro (ADR-0038): uma caminhada com **denylist** (nada de allowlist de extensão — stack nova entra de graça), índice FTS5 incremental, `scan` opcional e `.kira/digest.md` **determinístico** (árvore + perfil + até 12 arquivos-chave com `path` e linhas redigidas). Sem IA. Mesma árvore ⇒ mesmo digest, byte a byte; binário e arquivo acima de 1 MB aparecem como **nota**, nunca somem calados. `--skip-scan` = offline (usa o último `findings.json`). |
 | `kira trust [--path <dir>] [--revoke]` | **Aceite do repositório** (ADR-0038): grava `.kira/trust.json` com o hash do caminho canônico. O `ingest` é read-only e roda sempre; o `digest` — que envia código ao modelo — **recusa rodar sem o aceite**. `--revoke` apaga; mover o repositório pede aceite de novo (o hash é do caminho). `.kira/` nasce com `.gitignore` próprio. |
-| `kira digest [--path] [--model] [--lang] [--budget N] [--pause N] [--resume] [--json]` | **Digere** os fatos com o modelo **local** (ADR-0038, M3): enfileira em `posts` o que falta, retira com lease e grava rascunhos em `.kira/digest/<slug>.md` (`intro`, `c4-container`). **Exige `kira trust`** e um `kira ingest` anterior. `lang` entra no cache, então trocar idioma regenera; `--pause` para depois de N posts e `--resume` continua de onde parou; `--budget` (default 1 M tokens/run, 30 k por post) para com nota, nunca com erro. Sempre escreve `.kira/briefing.md` com o estado da fila e o próximo passo. |
-| `kira emit [--path] [--force] [--json]` | **Publica** os rascunhos do `digest` em `.kira/wiki/<slug>.md` (ADR-0038, M5), com front-matter (`slug, kind, lang, model, prompt_version, source_hash, published_hash, created_at`) e `index.md` **derivado**. Idempotente. Post editado à mão é **recusado** e preservado; `--force` é a única porta para sobrescrever. |
+| `kira digest [--path] [--model] [--lang] [--budget N] [--pause N] [--resume] [--json]` | **Digere** os fatos com o modelo **local** (ADR-0038, M3): enfileira em `posts` o que falta, retira com lease e grava rascunhos em `.kira/digest/<slug>.md` (`intro`, `c4-container`). **Exige `kira trust`** e um `kira ingest` anterior. `lang` vem da cadeia `--lang > KIRA_LANG > output_lang (escolhido no `kira setup`) > en` e entra no cache, então trocar idioma regenera; `--pause` para depois de N posts e `--resume` continua de onde parou; `--budget` (default 1 M tokens/run, 30 k por post) para com nota, nunca com erro. Sempre escreve `.kira/briefing.md` com o estado da fila e o próximo passo. |
+| `kira emit [--path] [--force] [--json]` | **Publica** os rascunhos do `digest` em `.kira/wiki/<slug>.md` (ADR-0038, M5), com front-matter (`slug, kind, lang, model, prompt_version, source_hash, published_hash, created_at`) e `index.md` **derivado**. Idempotente. Post editado à mão é **recusado** e preservado; arquivo wiki sem `published_hash` nosso (escrito do zero pelo dev) também é **recusado sem `--force`**, com o caminho na mensagem — `--force` é a única porta para sobrescrever. |
 | `kira history [--last N]` | Sessões recentes do projeto atual (N = 10 por padrão). |
 | `kira note "<texto>"` / `kira note --remove N` | Fato do perfil do projeto (append-only, numerado). |
 | `kira profile` | Root, nome, primeira vez visto e todos os fatos do projeto. |
@@ -154,14 +154,17 @@ instalação para antes de gravar qualquer arquivo.
 ## Setup (local-first — ADR-0030)
 
 Em TTY grande, `kira setup` abre um **wizard de tela cheia** (ADR-0034): trilha de
-etapas à esquerda (`Ambiente → Projeto → IA → Resumo`), painel à direita e
+etapas à esquerda (`Ambiente → Projeto → Ingestão → IA → Resumo`), painel à direita e
 rodapé de teclas. A etapa **Ambiente** só mostra o que foi detectado — SO,
 arquitetura, shell (`PowerShell`/`bash`/`zsh`), keyring, caminhos de config/store e
 quais ferramentas estão no PATH —, então você não responde o que a máquina já sabe.
 A etapa **Projeto** mostra a **raiz detectada** (mesma regra do store) e você só
-confirma. Flags explícitas (`--pat`, `--org`, `--project`, `--backend`, `--yes`,
-`--skip`, `--reset`) ou `--plain` mantêm o modo de texto linha a linha, que é o
-usado no CI.
+confirma. A etapa **Ingestão (M6)** mostra um *preview* read-only do que o
+`kira ingest` vai ingerir (arquivos, bytes, stacks — nada é gravado ali) e coleta
+`Enter = ingerir · n = pular · l = muda o idioma`; o efeito acontece no motor,
+depois do Enter final (ADR-0034). Flags explícitas (`--pat`, `--org`, `--project`,
+`--backend`, `--lang`, `--yes`, `--skip`, `--reset`) ou `--plain` mantêm o modo de
+texto linha a linha, que é o usado no CI.
 
 O KIRA funciona completo sem nenhuma integração externa — por isso o setup
 **não pede credencial** (ADR-0030): o PAT nasce em `kira connect <provider>`
@@ -180,6 +183,12 @@ env ou no keyring NÃO é usado pelo setup.
   chamada de teste barata reportando 401/403/404) e **`4) nenhuma por agora`**
   — o default quando o Ollama não está instalado. O caro nunca é default nem
   fallback silencioso.
+- **Idioma de saída (ADR-0038 D4)**: `--lang pt-BR` (ou `l` na etapa Ingestão)
+  escolhe o idioma do que o humano lê — posts, cards do board, título e corpo de
+  PR. O código validado vai para `config.toml` (`output_lang`) e o `kira digest`
+  o lê sem flag nova; `.kira/**` e prompts internos continuam **sempre** em
+  inglês. A cadeia é `flag > KIRA_LANG > config > en`, e `lang` entra no
+  `cache_key` (trocar idioma regenera, nunca serve cache velho).
 - **Atalho explícito `--pat`**: para quem já tem o token, `--org/--project/--pat`
   validam na hora com mensagem explícita (`PAT ok — lê Work Items de
   <org>/<projeto>`; 401 com o link; 403 sem escopo; "sem rede" salva e segue).
@@ -191,20 +200,24 @@ env ou no keyring NÃO é usado pelo setup.
 pronto:
   dev: <nome>
   ia:  <backend ou "nenhuma">
+  idioma: <en | código escolhido> (posts, cards e PR)
   store: <caminho>
+  ingestão: <N arquivo(s), ... digest .kira/digest.md>  (ou "pulada — ativar depois: kira ingest")
 
 funciona agora:  scan · wiki · context · pr draft · dashboard
 desativado:      judge de item do board · read (board) · publicar PR
 ativar depois:   kira connect azure   (leitura de work items)
                  kira setup --backend ollama
-próximo passo:   kira scan
+próximo passo:   kira connect azure   (ou kira triage <id>, com board.azure conectado)
 ```
 
 ```bash
-kira setup                # interativo: nome → projeto (raiz detectada) → IA → resumo
-kira setup --yes          # não-interativo: nunca bloqueia; sem Ollama escolhe "nenhuma" (e imprime o pulado)
+kira setup                # interativo: nome → projeto (raiz detectada) → ingestão → IA → resumo
+kira setup --yes          # não-interativo: nunca bloqueia; ingere; sem Ollama escolhe "nenhuma" (e imprime o pulado)
 kira setup --org minha-org --project MeuProjeto --pat <token>   # atalho: valida e salva sem perguntas
-kira setup --skip ia      # pula um passo (repetível: ia)
+kira setup --skip ia      # pula um passo (aceita: pat · ia · ingest)
+kira setup --skip ingest  # não ingere nada (reativar: kira ingest)
+kira setup --lang pt-BR   # idioma do que o humano lê (posts, cards, PR); .kira/** fica em inglês
 kira setup --name Sergin  # como o KIRA te chama (vai para config.toml, nunca para um LLM)
 kira setup --reset        # apaga PAT e chave do Foundry do keyring + endpoint/deployment do config.toml
 ```

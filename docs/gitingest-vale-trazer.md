@@ -5,6 +5,8 @@
   completo do repo (README, `src/gitingest/`, `src/server/`, `tests/`)
 - **ADR**: [ADR-0023](adr/ADR-0023-gitingest-reaproveitamento.md)
 - **Veredito**: 5 melhorias + 1 opcional; P1 corrige bug latente comprovado.
+- **Status final da onda M (13/Nov/2026)**: P1 ✅ (M7) · P2 cortado · P3/P4 absorvidos pelo M1 ·
+  P5 ✅ (M7) · P6 parcial (coberto em substância pelo ADR-0021).
 
 ## Por que o gitingest é rápido e preciso (a jornada, em 4 passos)
 
@@ -30,10 +32,10 @@ inteligência):
 |---|---|---|---|
 | P1 | **BOM-sniff antes de parsear JSON de ferramenta** (`EF BB BF`/`FF FE`/`FE FF`) | `src/scan/node.rs`, `src/scan/dotnet.rs` | **Bug real** — a captura `pnpm-audit-real.json` (redirect PowerShell) saiu UTF-16 LE com BOM; o `serde_json` quebraria. **Implementado 13/Nov/2026 (M7)**: `src/scan/decode.rs` cobre os 3 BOMs nos dois call sites, com fixture UTF-16 LE real |
 | P2 | ~~Sniff de binário (1 KB + decodificação)~~ | `src/context/repo.rs` | **Cortado (11/Nov)** — `read_text_file` já faz probe de NUL + `from_utf8` no arquivo inteiro; melhoria fantasma |
-| P3 | **Tabela `DEFAULT_IGNORE_PATTERNS`** (~150 padrões curados por linguagem) | `src/context/index.rs` + allowlist do grep | Alta — MIT, copiar tabela com atribuição, unificar numa única fonte |
-| P4 | **Orçamentos da caminhada**: profundidade máx. + total de bytes | `src/context/index.rs` (constantes fixas; env só com justificativa) | Média |
+| P3 | **Tabela `DEFAULT_IGNORE_PATTERNS`** (~150 padrões curados por linguagem) | `src/context/ignore.rs` (denylist única dos três caminhos) | **Absorvido pelo M1 (13/Nov)**: a tabela vive em `DEFAULT_IGNORE_PATTERNS` com atribuição ao gitingest no header, e o teste de política é um só para índice, grep e inventário |
+| P4 | **Orçamentos da caminhada**: profundidade máx. + total de bytes | `src/ingest/inventory.rs` (`Budget`: depth 20, teto de arquivos, cap por arquivo **com nota**) | **Absorvido pelo M1 (13/Nov)**: orçamento explícito com nota em todo corte (nunca skip silencioso); teto de *bytes totais* rejeitado de propósito — ver ADR-0038 |
 | P5 | **Honrar `.gitignore`** (subconjunto gitwildmatch em Rust puro, com negação e `.gitignore` aninhado) | `src/context/gitignore.rs` aplicado nos três caminhos (índice, grep, inventário) | Média — a fonte da precisão do gitingest. **Implementado 13/Nov/2026 (M7)**: `GitIgnoreStack` com cascata já na assinatura (onda IG-1 pluga `.kiraignore`/`.ignore` sem retrabalho); subset documentado (sem classes/escapes; sensível a caixa em todo SO); teste de política única prova os três caminhos com as mesmas regras |
-| P6 | **Estimativa de tokens no cabeçalho do pack** | `src/context/mod.rs` — chars/4 determinístico (tiktoken baixa BPE da rede = contra o CLI-first) | Opcional |
+| P6 | **Estimativa de tokens no cabeçalho do pack** | `src/context/mod.rs` — `context_summary`/`--json` já imprimem `X/Y chars (~Z tokens, 3 chars/token)`; conservadorismo maior que o chars/4 do gitingest | **Parcial — coberto em substância pelo ADR-0021** (estimativa determinística no resumo e no JSON; sem tiktoken, que é rede) |
 
 ## O que NÃO vale
 

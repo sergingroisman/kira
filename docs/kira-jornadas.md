@@ -11,7 +11,7 @@ dev mandar (`kira connect`).
 
 ```mermaid
 flowchart LR
-  FS[Repositório do dev] --> CORE[KIRA local<br/>scan · codex · lens · scribe · watch]
+  FS[Repositório do dev] --> CORE[KIRA local<br/>scan · codex · lens · scribe · watch · ingest]
   CORE --> STORE[(store.db + .kira/)]
   CORE -.->|opcional: IA local| OLL[Ollama]
   CORE -.->|capacidade board.azure| ADO[Azure DevOps]
@@ -34,6 +34,10 @@ flowchart LR
 | Publicar PR / issue | `scm.github`/`scm.gitlab` | — | `precisa de scm.github — kira connect github` |
 | J7 `verdict` (eval) | — | obrigatório | erro acionável, nunca medição parcial |
 | J10 `sentinel` | — | obrigatório | bloqueado pelo gate M2 |
+| JM1 `ingest` | — | — | roda (read-only, **sem** trust) |
+| JM2 `trust` | — | — | roda (grava `.kira/trust.json`; é aceite, não capacidade) |
+| JM3 `digest` | — | obrigatório (Ollama primeiro) | sem trust: **recusa** e diz o que fazer; sem IA: erro acionável |
+| JM4 `emit` | — | — | roda (publica rascunhos; gate por hash, `--force` única porta) |
 
 ## MVP — o que é "KIRA cru"
 
@@ -42,6 +46,7 @@ flowchart LR
 | # | Jornada | Por que é MVP |
 |---|---|---|
 | J1 | `scan` | é a percepção: sem isso o KIRA não tem o que dizer |
+| JM1/JM2 | `ingest` + `trust` | da onda M: conhecimento do projeto sem credencial; o `digest` que deles come (M3) precisa de IA, mas a matéria-prima é toda local |
 | J4 | `lens` | mostra o que iria ao modelo; é o "ver antes de pagar" |
 | J5 | `judge --file` | o julgamento local — o coração, provado offline |
 | J6 | `scribe` | entrega o artefato que o dev usa (PR em markdown) |
@@ -54,21 +59,26 @@ J7 `verdict` (precisa do gold set do dono), J10 `sentinel` (gate M2).
 
 ---
 
-## J0 — Onboarding (local-first, zero PAT)
+## J0 — Onboarding (local-first, zero PAT, projeto conhecido no fim)
 
 ```mermaid
 flowchart TD
   A[kira setup] --> B[nome do dev<br/>default do SO]
   B --> C[projeto: raiz detectada + confirmar]
-  C --> D[backend de IA<br/>1 ollama · 2 copilot · 3 foundry · 4 nenhuma por agora]
-  D --> E[resumo honesto]
+  C --> J[ingestão: preview read-only<br/>Enter ingere · n pula · l idioma]
+  J --> D[backend de IA<br/>1 ollama · 2 copilot · 3 foundry · 4 nenhuma por agora]
+  D --> E[resumo honesto<br/>dev · ia · idioma · store · ingestão]
   E --> F[funciona agora: scan · codex · lens · scribe · watch]
   E --> G[desativado: judge de item do board · read · publicar PR]
-  E --> H[próximo passo: kira scan]
+  E --> H[próximo passo: kira connect azure<br/>ou kira triage &lt;id&gt;, com board conectada]
   H --> I[kira doctor]
 ```
 
 - **Não pede PAT.** Credencial nasce em `kira connect <provider>`.
+- **Ingestão no setup (M6):** o `ingest` roda no motor, sem scan e sem rede — o mesmo
+  ` kira ingest` que o dev pode rodar depois; pular tem comando de retomada (`kira ingest`).
+- **Idioma (ADR-0038 D4):** `--lang`/`l` escolhe o idioma do que o humano lê; `.kira/**` e
+  prompts internos ficam sempre em inglês.
 - "Nenhuma IA por agora" é opção explícita e o default quando Ollama não existe.
 - O resumo separa **pronto** de **pulado** e sempre diz o comando de retomada.
 
@@ -86,13 +96,39 @@ flowchart TD
 `kira connect github` / `kira connect gitlab` seguem o mesmo desenho (token com escopo mínimo:
 ler issues, abrir PR; nunca push em branch protegida).
 
+## JM — Do repositório à wiki (ingest · trust · digest · emit, ADR-0038)
+
+```mermaid
+flowchart LR
+  I[kira ingest<br/>fatos, determinístico] --> S[(inventory.json<br/>digest.md · índice FTS5)]
+  S --> T[kira trust<br/>aceite do repositório]
+  T --> G[kira digest<br/>posts na fila SQL · Ollama]
+  G --> O[(outbox: rascunhos<br/>.kira/digest/)]
+  O --> E[kira emit<br/>gate por hash]
+  E --> W[.kira/wiki/&lt;slug&gt;.md]
+```
+
+Quatro contratos, um verbo cada (ADR-0038 D1):
+
+| Verbo | O que jura | O que **não** faz |
+|---|---|---|
+| `ingest` | uma caminhada, denylist + `.gitignore` honrado (M7-P5), sniff binário, teto com nota; `digest.md`/`inventory.json` byte-idênticos para o mesmo estado | não usa IA, não pede trust, não toca a rede (o scan é ferramenta, não aqui) |
+| `trust` | `.kira/trust.json` com o hash do caminho canônico; mudar de lugar o repo pede aceite de novo | não é capacidade de board; `--revoke` desfaz |
+| `digest` | exige trust; fila `posts` em SQL com lease; Ollama sempre primeiro; `lang` no `cache_key`; 1 M/run + 30 k/post com parada dura e nota | sem aceite: recusa com o comando; backend caro nunca implícito |
+| `emit` | publica em `.kira/wiki/<slug>.md` com front-matter e `index.md` derivado; idempotente; post editado à mão (ou wiki escrita do zero) é **recusado** sem `--force`, com o caminho na mensagem | nunca sobrescreve em silêncio; `--force` é a única porta |
+
+A caixa de correio do dashboard (M4) consome a fila em modo leitura; o `kira doctor`
+reporta ingestão, trust, fila e posts desatualizados.
+
 ---
 
 ## J1 — Percepção: `scan`
 
 Igual ao desenho anterior: stacks (node/dotnet), workspace pnpm dobrado no root, resolução de
-ferramenta no PATH (PATHEXT no Windows), parse tolerante (BOM/UTF-16), finding com fingerprint,
-saída determinística. **Zero rede, zero credencial.**
+ferramenta no PATH (PATHEXT no Windows), finding com fingerprint, saída determinística.
+**Zero rede, zero credencial.** O parse tolerante (BOM/UTF-16) é **implementado** (M7-P1,
+branch `fix/m7-bom-scan`): `src/scan/decode.rs` inspeciona o BOM do stdout cru antes de
+parsear — UTF-8, UTF-16 LE e BE — porque redirect do PowerShell escreve UTF-16.
 
 ## J3 — Conhecimento: `codex` (wiki)
 
@@ -101,8 +137,10 @@ Conhecimento, não log; redação antes de escrever; `forget` apaga do disco **e
 
 ## J4 — Contexto: `lens`
 
-Monta o pack (findings + wiki + trechos de código) com teto por fonte, `CHARS_PER_TOKEN=3`.
-`--explain` mostra por que cada item entrou; `--json` para avaliação. **Zero token.**
+Monta o pack (findings + **perfil/árvore do `.kira/digest.md`** + wiki + trechos de código)
+com a ordem de orçamento declarada e teto por fonte, `CHARS_PER_TOKEN=3`.
+`--explain` mostra por que cada item entrou (inclusive o corte do digest, quando ele não
+coube); `--json` para avaliação. **Zero token.**
 
 ## J5 — Julgamento: `judge`
 
@@ -145,7 +183,7 @@ Spec em `docs/kira-w5-loop.md`, bloqueada pelo gate M2. Sem o número, fica em m
 
 | Precisa de… | Jornadas |
 |---|---|
-| **nada** | J0, J1, J2, J3, J4, J6, J8 |
-| **backend de IA** | J5 (`--file`), J7, J10 |
+| **nada** | J0, J1, J2, J3, J4, J6, J8, JM1 `ingest`, JM2 `trust`, JM4 `emit` |
+| **backend de IA** | J5 (`--file`), J7, J10, JM3 `digest` (que também exige `trust`) |
 | **board.azure** | J5 (`<id>`), J9 |
 | **scm.github / scm.gitlab** | publicar PR/issue |

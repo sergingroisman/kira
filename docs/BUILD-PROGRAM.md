@@ -201,11 +201,14 @@
   dependência — PR `feat/m7-gitignore`).
   **Aceite:** fixture BOM parseia ✅; `.gitignore` aninhado com negação honrado no índice, no
   grep e no inventário (teste de política única) ✅; repo sem `.gitignore` inalterado ✅.
-- [ ] **M8** docs da onda M: `docs/ux-setup-jornada.md` (trilha real de 5 etapas),
-  `docs/kira-jornadas.md` (remover a promessa de "parse tolerante BOM/UTF-16" até M7;
-  registrar ingest/digest/emit/trust), `docs/gitingest-vale-trazer.md` (P1/P3/P4/P5),
-  `docs/roadmap-prs.md`.
-  **Aceite:** nenhum doc promete comportamento que o código não tem.
+- [x] **M8** docs da onda M: `docs/ux-setup-jornada.md` (trilha real de 5 etapas,
+  reescrita — a versão antiga ainda descrevia a etapa de PAT que o ADR-0030 removeu),
+  `docs/kira-jornadas.md` (JM ingest/trust/digest/emit; promessa BOM virou "implementado"
+  com âncora, pois o M7-P1 está no `fix/m7-bom-scan`), `docs/gitingest-vale-trazer.md`
+  (status final P1–P6), `docs/roadmap-prs.md` (seção Onda M com a stack e o achado do
+  `ollama list`), README (setup com `--lang`/Ingestão, emit com o gate novo).
+  **Aceite:** nenhum doc promete comportamento que o código não tem — M4 (caixa de
+  correio) continua de fora das docs até entrar no código.
 
 ### F3 — provedores e hardware
 - [ ] **PR20** tuning local: detecção de VRAM/backend, escolha de modelo por
