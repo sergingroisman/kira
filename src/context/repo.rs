@@ -33,36 +33,8 @@ const MAX_FILES_SCANNED: usize = 400;
 /// Bytes inspected for a NUL when deciding whether a file is binary.
 const BINARY_PROBE_BYTES: usize = 2_048;
 
-/// Directories never grepped: build output, dependencies, VCS metadata.
-/// Dot-directories (`.git`, `.kira`, `.venv`, `.next`) are covered by the
-/// leading-dot rule as well.
-const SKIPPED_DIRS: [&str; 14] = [
-    "target",
-    "node_modules",
-    "dist",
-    "build",
-    "out",
-    "bin",
-    "obj",
-    "vendor",
-    "venv",
-    "__pycache__",
-    "coverage",
-    "Pods",
-    "packages",
-    "TestResults",
-];
-
-/// Extensions worth sending: source, project files and prose, not binaries.
-const SOURCE_EXTENSIONS: [&str; 34] = [
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "cs", "csproj", "sln", "fs", "fsproj", "vb",
-    "py", "go", "java", "kt", "rb", "php", "swift", "c", "h", "cpp", "hpp", "sql", "sh", "ps1",
-    "toml", "yaml", "yml", "json", "md", "html", "css",
-];
-
-/// Extensionless files that still carry project context.
-const SOURCE_FILENAMES: [&str; 4] = ["Dockerfile", "Makefile", "Procfile", "README"];
-
+// A decisão de pular diretório/arquivo mora em `crate::context::ignore`
+// (ADR-0038). Aqui ficam só as constantes de leitura.
 /// One auditable excerpt: `path:line` plus the (redacted) text of that line.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CodeExcerpt {
@@ -233,7 +205,7 @@ pub fn grep(
         .into_iter()
         .filter_entry(|entry| {
             if entry.file_type().is_dir() {
-                !is_skipped_dir(entry.path())
+                !is_skipped_dir(entry.path(), entry.depth())
             } else {
                 true
             }
@@ -326,31 +298,33 @@ pub(crate) fn relative_path(root: &Path, path: &Path) -> Option<String> {
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
-/// True for directories that never carry useful context.
-pub(crate) fn is_skipped_dir(path: &Path) -> bool {
+/// `true` quando este diretório sai da caminhada.
+///
+/// `depth == 0` é a raiz: **nunca** sai, mesmo chamando `build`, `bin` ou começando
+/// com ponto. Era o bug que zerava o índice de um projeto com nome "reservado"
+/// (ADR-0038). A decisão do resto vem de [`crate::context::ignore`].
+pub(crate) fn is_skipped_dir(path: &Path, depth: usize) -> bool {
+    if depth == 0 {
+        return false;
+    }
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
-    if name.starts_with('.') {
-        return true;
-    }
-    SKIPPED_DIRS.contains(&name.as_str())
+    crate::context::ignore::is_ignored_dir(&name)
 }
 
-/// True when the extension (or the bare filename) is in the context allowlist.
+/// `true` quando o arquivo deve entrar no índice/contexto.
+///
+/// Decisão por **denylist** (ADR-0038): extensão desconhecida entra de graça, e
+/// `.dart`, `.vue`, `.proto`, `.mts` deixam de ser invisíveis sem mexer em lista
+/// nenhuma. Lockfiles continuam fora: são gerados e enormes.
 pub(crate) fn is_source_file(rel: &str) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     if name.ends_with(".lock") || name == "package-lock.json" {
         return false;
     }
-    if SOURCE_FILENAMES.contains(&name) {
-        return true;
-    }
-    match name.rsplit_once('.') {
-        Some((_, extension)) => SOURCE_EXTENSIONS.contains(&extension.to_lowercase().as_str()),
-        None => false,
-    }
+    !crate::context::ignore::is_ignored_file(name)
 }
 
 /// Reads a file as UTF-8 text, skipping oversized or binary ones. Any I/O error

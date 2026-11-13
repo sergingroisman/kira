@@ -240,13 +240,22 @@ mod tests {
 
     #[test]
     fn dotnet_and_swift_come_from_suffixes() {
-        let p = detect_from_names(&names(&["Minha.Solucao.sln", "App.csproj", "App.xcodeproj"]));
+        let p = detect_from_names(&names(&[
+            "Minha.Solucao.sln",
+            "App.csproj",
+            "App.xcodeproj",
+        ]));
         assert_eq!(p.all, vec![Stack::Dotnet, Stack::Swift]);
     }
 
     #[test]
     fn monorepo_with_many_markers_keeps_enum_order() {
-        let p = detect_from_names(&names(&["Cargo.toml", "package.json", "go.mod", "pnpm-workspace.yaml"]));
+        let p = detect_from_names(&names(&[
+            "Cargo.toml",
+            "package.json",
+            "go.mod",
+            "pnpm-workspace.yaml",
+        ]));
         assert_eq!(p.all, vec![Stack::Rust, Stack::Node, Stack::Go]);
         assert!(p.flavors.contains(&"pnpm-workspace".to_string()));
     }
@@ -270,7 +279,11 @@ mod tests {
         .expect("package.json");
         let p = detect(&dir);
         assert_eq!(p.all, vec![Stack::Node]);
-        assert!(p.flavors.contains(&"next".to_string()), "flavors: {:?}", p.flavors);
+        assert!(
+            p.flavors.contains(&"next".to_string()),
+            "flavors: {:?}",
+            p.flavors
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

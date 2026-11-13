@@ -104,7 +104,7 @@ fn reindex_limited(
         .into_iter()
         .filter_entry(|entry| {
             if entry.file_type().is_dir() {
-                !repo::is_skipped_dir(entry.path())
+                !repo::is_skipped_dir(entry.path(), entry.depth())
             } else {
                 true
             }
