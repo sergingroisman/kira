@@ -35,7 +35,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -777,7 +777,7 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     // v6 — `posts` (ADR-0038, M2): a fila que o `Courier` consome. A unidade é o
     // artigo, e a procedência (`source_hash`, `prompt_version`, `model`, `lang`)
     // mora na linha — é o que torna retomada e cache a mesma coisa.
-    // `postage_until` é o lease: vencido, a carta volta para a fila sozinha.
+    // `draft_ttl` é o lease: vencido, a carta volta para a fila sozinha.
     if current < 6 {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS posts (
@@ -790,7 +790,7 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
                 prompt_version TEXT NOT NULL,
                 model TEXT NOT NULL,
                 state TEXT NOT NULL,
-                postage_until INTEGER,
+                draft_ttl INTEGER,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 read_at TEXT,
                 path TEXT,
@@ -798,9 +798,24 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
                 UNIQUE (project_id, slug)
             );
             CREATE INDEX IF NOT EXISTS ix_posts_outbox
-                ON posts (project_id, state, postage_until);
+                ON posts (project_id, state, draft_ttl);
             CREATE VIEW IF NOT EXISTS outbox AS
                 SELECT * FROM posts WHERE state = 'sealed';",
+        )
+        .map_err(schema_error)?;
+    }
+
+    // v7 — renome da coluna do lease (ADR-0039): `postage_until` -> `draft_ttl`.
+    // `ALTER TABLE RENAME COLUMN` não é idempotente (ao contrário do
+    // `CREATE TABLE IF NOT EXISTS` que domina este arquivo), então a coluna é
+    // checada antes — mesmo padrão do `item_id` na v5. Bancos recém-criados
+    // (v6 com o nome novo) nunca têm a coluna antiga e pulam o bloco.
+    if current < 7 && column_exists(conn, "posts", "postage_until")? {
+        conn.execute_batch(
+            "ALTER TABLE posts RENAME COLUMN postage_until TO draft_ttl;
+             DROP INDEX IF EXISTS ix_posts_outbox;
+             CREATE INDEX IF NOT EXISTS ix_posts_outbox
+                 ON posts (project_id, state, draft_ttl);",
         )
         .map_err(schema_error)?;
     }
@@ -1259,6 +1274,7 @@ fn cap_summary(summary: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::posts::PostState;
 
     /// Unique temp directory per call (std only, as in the other e2e tests).
     fn temp_dir(name: &str) -> PathBuf {
@@ -1319,6 +1335,66 @@ mod tests {
             .unwrap_or_else(|err| panic!("last_sessions: {err}"));
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].summary, "sessão antiga");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migração v6 → v7 (ADR-0039): a coluna do lease `postage_until` vira
+    /// `draft_ttl` sem perder linha. O banco simulado é exatamente o estado que
+    /// a v6 deixava — inclusive o índice e a view, que o bloco v6 não recria
+    /// quando a tabela já existe.
+    #[test]
+    fn migration_from_v6_renames_postage_until_to_draft_ttl() {
+        let dir = temp_dir("migrate-v6-lease");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        let path = dir.join("store.db");
+        {
+            let conn =
+                rusqlite::Connection::open(&path).unwrap_or_else(|err| panic!("abrir v6: {err}"));
+            conn.execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, root_path TEXT NOT NULL, \
+                 name TEXT NOT NULL, first_seen_at TEXT NOT NULL);
+                 CREATE TABLE posts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, \
+                 slug TEXT NOT NULL, kind TEXT NOT NULL, lang TEXT NOT NULL, \
+                 source_hash TEXT NOT NULL, prompt_version TEXT NOT NULL, model TEXT NOT NULL, \
+                 state TEXT NOT NULL, postage_until INTEGER, \
+                 attempts INTEGER NOT NULL DEFAULT 0, read_at TEXT, path TEXT, \
+                 created_at TEXT NOT NULL, UNIQUE (project_id, slug));
+                 CREATE INDEX ix_posts_outbox ON posts (project_id, state, postage_until);
+                 CREATE VIEW outbox AS SELECT * FROM posts WHERE state = 'sealed';
+                 INSERT INTO posts (id, project_id, slug, kind, lang, source_hash, \
+                 prompt_version, model, state, postage_until, attempts, read_at, path, \
+                 created_at) VALUES ('id1', 'p1', 'intro', 'intro', 'pt-BR', 'h1', 'v1', \
+                 'ollama:qwen', 'picked', 1700, 1, NULL, NULL, '2026-11-12T00:00:00Z');
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap_or_else(|err| panic!("criar v6: {err}"));
+        }
+
+        let store = Store::open_at(&path).unwrap_or_else(|err| panic!("abrir v7: {err}"));
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or_else(|err| panic!("user_version: {err}"));
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "migração deveria subir para a versão atual"
+        );
+        assert!(
+            column_exists(&store.conn, "posts", "draft_ttl")
+                .unwrap_or_else(|err| panic!("table_info: {err}")),
+            "coluna nova deveria existir"
+        );
+        assert!(
+            !column_exists(&store.conn, "posts", "postage_until")
+                .unwrap_or_else(|err| panic!("table_info: {err}")),
+            "coluna antiga não deveria sobrar"
+        );
+        let rows = store
+            .posts_of("p1")
+            .unwrap_or_else(|err| panic!("posts_of: {err}"));
+        assert_eq!(rows.len(), 1, "linha antiga preservada");
+        assert_eq!(rows[0].draft_ttl, Some(1700), "valor do lease preservado");
+        assert_eq!(rows[0].state, PostState::Picked, "estado preservado");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
