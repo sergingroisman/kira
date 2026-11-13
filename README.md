@@ -448,6 +448,25 @@ página — a fonte de verdade é o disco, o índice é derivado).
 Atribuição: a casca é inspirada no statui (MIT, Mohamed Badry) — nenhum trecho
 foi copiado nesta PR; ver `third_party/statui/NOTICE.md`.
 
+### Design de referência (prints do Kombai)
+
+O dashboard admin e o frontend TUI futuros nascem destes designs do dono,
+produzidos na ferramenta de design dele (Kombai — **estaleiro, não componente**:
+o KIRA em execução não fala com ela; ver regra em `docs/nomenclatura.md` §4).
+Os arquivos vivem em `docs/assets/` — veja `docs/assets/LEIA-ME.md` para colocar
+os prints com estes nomes:
+
+| Print | O que mostra |
+|---|---|
+| ![Dashboard — achados, tendência, armazenamento e sessões](docs/assets/design-dashboard-achados.png) | **Dashboard**: resumo (último scan, achados por severidade, chamadas LLM hoje, orçamento `50 por dia`), tabela de achados com histórico sparkline, detalhe lateral do pacote, tendência de scans, armazenamento (MB e arquivos no índice) e duração das sessões |
+| ![Wiki com breadcrumbs e detalhe da página](docs/assets/design-wiki-breadcrumbs.png) | **Modo wiki com breadcrumbs**: navegação por trilha (`Documentos › Newtownsoft.Json deprecated`), página com Causa / Caminho de correção / Verificação / Achados / Arquitetura e contrato de contato (`Gostei` / `Meu contato`) |
+| ![Wiki thread única com comentários laterais](docs/assets/design-wiki-thread.png) | **Wiki thread única**: página revisada com trilha lateral de comentários/respostas por autor e data, votação (`Gostei` / `Não gostei`) e publicação de resposta confirmada |
+
+Regras que o design respeita (e o código já prova): leitura por padrão, ação
+só confirmada, dado ausente vira `—` (o painel de orçamento mostra `sem
+contador de chamadas` até o contador existir — auditoria F2), e `KIRA_GLYPHS=ascii`
+troca todo glifo sem perder informação.
+
 ## PR draft — `kira pr draft` (W4, local)
 
 Gera o **rascunho de PR em markdown** a partir do que o KIRA já sabe — SEM
