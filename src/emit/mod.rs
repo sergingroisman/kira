@@ -6,7 +6,8 @@
 //! saber se um arquivo foi editado à mão é comparar o conteúdo com o que publicamos
 //! da última vez — por isso cada post publicado carrega `published_hash` no
 //! front-matter. Se o hash do arquivo atual não bate, o `emit` recusa e diz o que
-//! fazer (`--force` é decisão explícita do dono).
+//! fazer (`--force` é decisão explícita do dono). Arquivo que existe SEM o nosso
+//! hash foi escrito do zero pelo dev: recusa igual, porta igual.
 //!
 //! O índice (`index.md`) é **derivado** do conjunto de posts: nunca é gerado por
 //! modelo, senão mente quando a lista muda.
@@ -14,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::guard::path::Guard;
 use crate::post::plan::fnv1a64_hex;
 use crate::store::Store;
 use crate::store::posts::PostState;
@@ -37,6 +39,10 @@ pub enum EmitError {
         #[source]
         source: std::io::Error,
     },
+    /// O guard de escrita recusou o destino (ADR-0011): travessia, deny-list ou
+    /// confinamento na raiz. A mensagem do guard já é acionável, passa inteira.
+    #[error(transparent)]
+    Guard(#[from] crate::guard::path::GuardError),
 }
 
 /// Opções do `emit`.
@@ -61,16 +67,17 @@ impl EmitOptions {
 pub enum EmitOutcome {
     Published,
     Unchanged,
-    /// Recusado porque o arquivo em `.kira/wiki/` foi editado depois da publicação.
+    /// Recusado: o arquivo em `.kira/wiki/` foi editado à mão depois da
+    /// publicação, ou foi escrito do zero pelo dev (sem o nosso `published_hash`).
     Edited,
-    /// Ainda não tem rascunho (o `digest` não rodou para ele).
-    NoDraft,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct EmitReport {
     pub published: usize,
     pub unchanged: usize,
+    /// Caminhos relativos (POSIX) dos arquivos recusados: o dev precisa do nome
+    /// do arquivo, não só do slug.
     pub edited: Vec<String>,
     pub missing_drafts: Vec<String>,
     pub index_path: String,
@@ -117,6 +124,9 @@ pub fn run(options: &EmitOptions) -> Result<EmitReport, EmitError> {
 
     let mut report = EmitReport::default();
     let mut index_rows: Vec<(String, String, String, String)> = Vec::new();
+    // Toda escrita do emit passa pelo guard (ADR-0011): confinamento na raiz e
+    // deny-list, decididos antes de tocar o disco.
+    let guard = Guard::new(root)?;
 
     for post in posts.iter().filter(|p| p.state == PostState::Delivered) {
         let draft = root
@@ -137,36 +147,16 @@ pub fn run(options: &EmitOptions) -> Result<EmitReport, EmitError> {
         let existing = std::fs::read_to_string(&target).ok();
         let published_hash = fnv1a64_hex(&body);
 
-        let outcome = match &existing {
-            None => EmitOutcome::Published,
-            Some(current) => {
-                let previous = front_matter_value(current, "published_hash");
-                if previous.as_deref() == Some(published_hash.as_str()) {
-                    EmitOutcome::Unchanged
-                } else if previous.is_some() && !options.force {
-                    // Publicamos este arquivo antes e o conteúdo mudou desde então:
-                    // ou o dev editou, ou o digest gerou texto novo. O front-matter
-                    // guarda o hash do corpo publicado, então dá para distinguir.
-                    if body_hash_of(current).as_deref() == previous.as_deref() {
-                        EmitOutcome::Published
-                    } else {
-                        EmitOutcome::Edited
-                    }
-                } else {
-                    EmitOutcome::Published
-                }
-            }
-        };
+        let outcome = decide_outcome(existing.as_deref(), &published_hash, options.force);
 
         match outcome {
             EmitOutcome::Published => {
                 let text = with_front_matter(post, &body, &published_hash);
-                write_text(&target, &text)?;
+                write_text(&guard, &target, &text)?;
                 report.published += 1;
             }
             EmitOutcome::Unchanged => report.unchanged += 1,
-            EmitOutcome::Edited => report.edited.push(post.slug.clone()),
-            EmitOutcome::NoDraft => {}
+            EmitOutcome::Edited => report.edited.push(relative(root, &target)),
         }
         index_rows.push((
             post.slug.clone(),
@@ -178,9 +168,38 @@ pub fn run(options: &EmitOptions) -> Result<EmitReport, EmitError> {
 
     let index_path = root.join(".kira").join("wiki").join("index.md");
     let index = render_index(&index_rows, root);
-    write_text(&index_path, &index)?;
+    write_text(&guard, &index_path, &index)?;
     report.index_path = relative(root, &index_path);
     Ok(report)
+}
+
+/// Decisão pura sobre um arquivo que já existe (ou não) no wiki. Três portas:
+/// - `--force` ⇒ publica (decisão explícita do dono);
+/// - o corpo no disco bate com o que publicamos ⇒ seguro republicar (só o
+///   rascunho mudou) ou nada a fazer (rascunho idêntico);
+/// - qualquer divergência de texto do dev ⇒ recusa, nomeando o arquivo.
+///
+/// O caso que o gate antigo deixava passar: arquivo SEM o nosso
+/// `published_hash` foi escrito do zero pelo dev — sem `--force`, é recusa.
+fn decide_outcome(existing: Option<&str>, published_hash: &str, force: bool) -> EmitOutcome {
+    let Some(current) = existing else {
+        return EmitOutcome::Published;
+    };
+    let previous = front_matter_value(current, "published_hash");
+    if previous.as_deref() == Some(published_hash) {
+        return EmitOutcome::Unchanged;
+    }
+    if force {
+        return EmitOutcome::Published;
+    }
+    if previous.is_none() {
+        return EmitOutcome::Edited;
+    }
+    if body_hash_of(current).as_deref() == previous.as_deref() {
+        EmitOutcome::Published
+    } else {
+        EmitOutcome::Edited
+    }
 }
 
 fn with_front_matter(
@@ -250,15 +269,26 @@ fn render_index(rows: &[(String, String, String, String)], root: &Path) -> Strin
     out
 }
 
-fn write_text(path: &Path, body: &str) -> Result<(), EmitError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| EmitError::Write {
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
-    std::fs::write(path, body).map_err(|source| EmitError::Write {
-        path: path.display().to_string(),
+fn write_text(guard: &Guard, path: &Path, body: &str) -> Result<(), EmitError> {
+    // O guard decide antes de tocar o disco: travessia e deny-list são recusados
+    // mesmo sem o pai existir. Se a única reclamação for o pai ausente, o
+    // diretório de artefato é criado e a checagem se repete — o destino final
+    // escrito é sempre o canônico devolvido pelo guard.
+    let destination = match guard.check_write(path) {
+        Ok(destination) => destination,
+        Err(crate::guard::path::GuardError::UnresolvableParent { .. }) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| EmitError::Write {
+                    path: parent.display().to_string(),
+                    source,
+                })?;
+            }
+            guard.check_write(path)?
+        }
+        Err(err) => return Err(err.into()),
+    };
+    std::fs::write(&destination, body).map_err(|source| EmitError::Write {
+        path: destination.display().to_string(),
         source,
     })
 }
@@ -272,6 +302,54 @@ fn relative(root: &Path, path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_without_our_hash_is_never_overwritten_without_force() {
+        // Regression do aceite M5: arquivo escrito do zero pelo dev (sem
+        // front-matter, ou sem `published_hash`) era sobrescrito calado.
+        // `--force` é a única porta.
+        assert_eq!(
+            decide_outcome(Some("# escrito pelo dev\n"), "abc", false),
+            EmitOutcome::Edited
+        );
+        assert_eq!(
+            decide_outcome(
+                Some("---\nslug: intro\n---\n\ntexto do dev\n"),
+                "abc",
+                false
+            ),
+            EmitOutcome::Edited
+        );
+        assert_eq!(
+            decide_outcome(Some("---\nslug: intro\n---\n\ntexto do dev\n"), "abc", true),
+            EmitOutcome::Published
+        );
+    }
+
+    #[test]
+    fn our_untouched_publication_is_republished_when_only_the_draft_changed() {
+        let old_body = "corpo publicado\n";
+        let old_hash = fnv1a64_hex(old_body);
+        let file = format!("---\npublished_hash: {old_hash}\n---\n\n{old_body}");
+        // Rascunho novo por cima de corpo intacto: republica.
+        assert_eq!(
+            decide_outcome(Some(&file), "hash-do-rascunho-novo", false),
+            EmitOutcome::Published
+        );
+        // Rascunho idêntico ao publicado: nada a fazer.
+        assert_eq!(
+            decide_outcome(Some(&file), &old_hash, false),
+            EmitOutcome::Unchanged
+        );
+        // Corpo mexido à mão: recusa, mesmo com front-matter nosso.
+        let edited = format!("---\npublished_hash: {old_hash}\n---\n\ncorpo mexido\n");
+        assert_eq!(
+            decide_outcome(Some(&edited), "novo", false),
+            EmitOutcome::Edited
+        );
+        // Arquivo ausente é só publicar.
+        assert_eq!(decide_outcome(None, "abc", false), EmitOutcome::Published);
+    }
 
     #[test]
     fn front_matter_round_trips_through_the_parser() {

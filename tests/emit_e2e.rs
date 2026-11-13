@@ -5,6 +5,8 @@
 //!   `index.md` DERIVADO;
 //! - rodar de novo sem mudança é idempotente (`0 publicado`);
 //! - post editado à mão é **recusado** e o conteúdo do dev é preservado;
+//! - arquivo escrito do zero pelo dev (sem o nosso `published_hash`) também é
+//!   recusado sem `--force` — o gate que o aceite M5 exigia;
 //! - `--force` é a única porta para sobrescrever.
 
 use std::io::{Read, Write};
@@ -195,12 +197,48 @@ fn a_post_edited_by_hand_is_refused_and_preserved() {
         "a recusa precisa aparecer: {stdout}"
     );
     assert!(
-        stdout.contains("intro"),
-        "o arquivo recusado precisa ser nomeado: {stdout}"
+        stdout.contains(".kira/wiki/intro.md"),
+        "a recusa precisa nomear o ARQUIVO, não só o slug: {stdout}"
     );
     assert_eq!(
         sandbox.read(".kira/wiki/intro.md"),
         edited,
+        "o texto do dev foi sobrescrito sem --force"
+    );
+}
+
+/// O caso que o gate antigo deixava passar: arquivo SEM o nosso
+/// `published_hash` (dev escreveu do zero) não pode ser sobrescrito sem `--force`.
+#[test]
+fn a_wiki_file_without_our_hash_is_refused_without_force() {
+    let sandbox = Sandbox::new("sem-hash");
+    sandbox.prepare();
+    let (code, _, stderr) = sandbox.run(&["emit"]);
+    assert_eq!(code, 0, "emit inicial: {stderr}");
+
+    sandbox.write(".kira/wiki/intro.md", "# escrito do zero pelo dev\n");
+
+    let (code, stdout, stderr) = sandbox.run(&["emit"]);
+    assert_eq!(code, 0, "recusa não é erro do comando: {stderr}");
+    assert!(
+        stdout.contains("recusado(s) por edição manual"),
+        "a recusa precisa aparecer: {stdout}"
+    );
+    assert!(
+        stdout.contains(".kira/wiki/intro.md"),
+        "a recusa precisa nomear o arquivo: {stdout}"
+    );
+    assert!(
+        stdout.contains("0 publicado(s)"),
+        "nada pode ser republicado: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 sem mudança"),
+        "o outro post segue íntegro: {stdout}"
+    );
+    assert_eq!(
+        sandbox.read(".kira/wiki/intro.md"),
+        "# escrito do zero pelo dev\n",
         "o texto do dev foi sobrescrito sem --force"
     );
 }

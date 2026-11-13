@@ -139,17 +139,7 @@ pub fn format_ingest_lines() -> Vec<String> {
         "não aceito (rode `kira trust`)"
     };
     let mut lines = Vec::new();
-    match (&digest, files) {
-        (Some(_), Some(count)) => lines.push(format!(
-            "ingestão: {count} arquivo(s) ingerido(s), digest ok, repositório {trust}"
-        )),
-        (Some(_), None) => lines.push(format!(
-            "ingestão: digest ok (inventário ausente — rode `kira ingest`), repositório {trust}"
-        )),
-        _ => lines.push(format!(
-            "ingestão: nenhuma (rode `kira ingest`), repositório {trust}"
-        )),
-    }
+    lines.push(ingest_status_line(digest.is_some(), files, trust));
 
     let Some(digest) = digest else {
         return lines;
@@ -194,6 +184,36 @@ pub fn format_ingest_lines() -> Vec<String> {
         })
         .count();
     let unread = store.posts_unread(&project_id).unwrap_or(0);
+    lines.push(posts_status_line(pending, delivered, unread, dead, stale));
+    lines
+}
+
+/// Linha pura do estado de ingestão — o teste cobre as três variantes sem
+/// disco: dado ausente vira frase com a causa e o comando que resolve, nunca
+/// número inventado.
+#[must_use]
+pub fn ingest_status_line(digest: bool, files: Option<usize>, trust: &str) -> String {
+    match (digest, files) {
+        (true, Some(count)) => {
+            format!("ingestão: {count} arquivo(s) ingerido(s), digest ok, repositório {trust}")
+        }
+        (true, None) => format!(
+            "ingestão: digest ok (inventário ausente — rode `kira ingest`), repositório {trust}"
+        ),
+        _ => format!("ingestão: nenhuma (rode `kira ingest`), repositório {trust}"),
+    }
+}
+
+/// Linha pura da fila de posts; o aviso de desatualização só aparece quando
+/// existe post mais velho que o repositório.
+#[must_use]
+pub fn posts_status_line(
+    pending: usize,
+    delivered: usize,
+    unread: usize,
+    dead: usize,
+    stale: usize,
+) -> String {
     let mut line = format!(
         "posts: {pending} pendente(s) · {delivered} entregue(s) · {unread} não lido(s) · {dead} extraviada(s)"
     );
@@ -202,8 +222,7 @@ pub fn format_ingest_lines() -> Vec<String> {
             " · {stale} desatualizado(s) — o repositório mudou: rode `kira digest` e `kira emit`"
         ));
     }
-    lines.push(line);
-    lines
+    line
 }
 
 /// Linha de capacidades do `kira doctor` (ADR-0030): o que está conectado
@@ -631,6 +650,41 @@ mod tests {
     fn dev_check_shows_the_saved_name_or_a_dash() {
         assert_eq!(format_dev_check(Some("Sergin")), "dev: Sergin");
         assert_eq!(format_dev_check(None), "dev: —");
+    }
+
+    #[test]
+    fn ingest_line_reports_files_digest_and_trust_together() {
+        assert_eq!(
+            ingest_status_line(true, Some(181), "aceito"),
+            "ingestão: 181 arquivo(s) ingerido(s), digest ok, repositório aceito"
+        );
+    }
+
+    #[test]
+    fn ingest_line_names_the_missing_piece_instead_of_inventing() {
+        // Cada variante diz O QUE falta e QUAL comando resolve — o contrato
+        // "dado ausente com causa, nunca inventado" do M5.
+        assert_eq!(
+            ingest_status_line(true, None, "não aceito (rode `kira trust`)"),
+            "ingestão: digest ok (inventário ausente — rode `kira ingest`), \
+             repositório não aceito (rode `kira trust`)"
+        );
+        assert_eq!(
+            ingest_status_line(false, None, "aceito"),
+            "ingestão: nenhuma (rode `kira ingest`), repositório aceito"
+        );
+    }
+
+    #[test]
+    fn posts_line_counts_states_and_only_warns_when_stale() {
+        assert_eq!(
+            posts_status_line(1, 2, 3, 0, 0),
+            "posts: 1 pendente(s) · 2 entregue(s) · 3 não lido(s) · 0 extraviada(s)"
+        );
+        let stale = posts_status_line(0, 2, 0, 0, 1);
+        assert!(stale.contains("1 desatualizado(s)"), "{stale}");
+        assert!(stale.contains("kira digest"), "{stale}");
+        assert!(stale.contains("kira emit"), "{stale}");
     }
 
     #[test]
