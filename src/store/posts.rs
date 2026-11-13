@@ -2,7 +2,7 @@
 //!
 //! A unidade de trabalho **é** o artigo: uma linha em `posts` guarda identidade
 //! (`slug`), procedência (`source_hash`, `prompt_version`, `model`, `lang`), estado e
-//! o lease (`postage_until`, o "selo"). A view `outbox` é só a leitura dos pendentes.
+//! o lease (`draft_ttl`, o "selo"). A view `outbox` é só a leitura dos pendentes.
 //!
 //! Por que tabela e não broker: o Kira já embarca SQLite `bundled`, e o que a fila
 //! precisa (retomar, dormir, não duplicar trabalho) é `SELECT`/`UPDATE` com lease.
@@ -23,7 +23,7 @@ use super::{Store, StoreError, now_rfc3339_utc};
 pub enum PostState {
     /// Selada, esperando retirada (aparece na view `outbox`).
     Sealed,
-    /// Retirada por um `Courier` até `postage_until`.
+    /// Retirada por um `Courier` até `draft_ttl`.
     Picked,
     /// Entregue: o `.md` existe no destino.
     Delivered,
@@ -67,7 +67,7 @@ pub struct PostRow {
     pub model: String,
     pub state: PostState,
     /// Epoch em que o lease vence (`None` = livre).
-    pub postage_until: Option<i64>,
+    pub draft_ttl: Option<i64>,
     pub attempts: i64,
     /// Quando o dev leu no dashboard (formato RFC3339). `None` = não lido.
     pub read_at: Option<String>,
@@ -135,7 +135,7 @@ impl Store {
                 self.conn
                     .execute(
                         "INSERT INTO posts (id, project_id, slug, kind, lang, source_hash, \
-                         prompt_version, model, state, postage_until, attempts, read_at, path, \
+                         prompt_version, model, state, draft_ttl, attempts, read_at, path, \
                          created_at) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'sealed', NULL, 0, NULL, NULL, ?9)",
                         params![
@@ -164,7 +164,7 @@ impl Store {
                 self.conn
                     .execute(
                         "UPDATE posts SET source_hash = ?2, prompt_version = ?3, model = ?4, \
-                         lang = ?5, kind = ?6, state = 'sealed', postage_until = NULL, \
+                         lang = ?5, kind = ?6, state = 'sealed', draft_ttl = NULL, \
                          attempts = 0, path = NULL WHERE id = ?1",
                         params![
                             id,
@@ -195,13 +195,13 @@ impl Store {
         let claimed: Option<String> = self
             .conn
             .query_row(
-                "UPDATE posts SET state = 'picked', postage_until = ?2, attempts = attempts + 1 \
+                "UPDATE posts SET state = 'picked', draft_ttl = ?2, attempts = attempts + 1 \
                  WHERE id = ( \
                      SELECT id FROM posts \
                      WHERE project_id = ?1 \
                        AND ( state = 'sealed' \
-                             OR (state = 'picked' AND postage_until IS NOT NULL \
-                                 AND postage_until < ?3) ) \
+                             OR (state = 'picked' AND draft_ttl IS NOT NULL \
+                                 AND draft_ttl < ?3) ) \
                      ORDER BY created_at, slug LIMIT 1 \
                  ) \
                  RETURNING id",
@@ -221,7 +221,7 @@ impl Store {
     pub fn post_deliver(&self, id: &str, path: &str) -> Result<(), StoreError> {
         self.conn
             .execute(
-                "UPDATE posts SET state = 'delivered', postage_until = NULL, path = ?2, \
+                "UPDATE posts SET state = 'delivered', draft_ttl = NULL, path = ?2, \
                  read_at = NULL WHERE id = ?1",
                 params![id, path],
             )
@@ -248,7 +248,7 @@ impl Store {
         };
         self.conn
             .execute(
-                "UPDATE posts SET state = ?2, postage_until = NULL WHERE id = ?1",
+                "UPDATE posts SET state = ?2, draft_ttl = NULL WHERE id = ?1",
                 params![id, next.as_str()],
             )
             .map_err(StoreError::Sql)?;
@@ -259,7 +259,7 @@ impl Store {
     pub fn post_release_all(&self) -> Result<usize, StoreError> {
         self.conn
             .execute(
-                "UPDATE posts SET state = 'sealed', postage_until = NULL WHERE state = 'picked'",
+                "UPDATE posts SET state = 'sealed', draft_ttl = NULL WHERE state = 'picked'",
                 [],
             )
             .map_err(StoreError::Sql)
@@ -282,7 +282,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, project_id, slug, kind, lang, source_hash, prompt_version, model, \
-                 state, postage_until, attempts, read_at, path, created_at \
+                 state, draft_ttl, attempts, read_at, path, created_at \
                  FROM posts WHERE project_id = ?1 ORDER BY created_at DESC, slug",
             )
             .map_err(StoreError::Sql)?;
@@ -314,7 +314,7 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, project_id, slug, kind, lang, source_hash, prompt_version, model, \
-                 state, postage_until, attempts, read_at, path, created_at \
+                 state, draft_ttl, attempts, read_at, path, created_at \
                  FROM posts WHERE id = ?1",
                 params![id],
                 map_row,
@@ -336,7 +336,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostRow> {
         prompt_version: row.get(6)?,
         model: row.get(7)?,
         state: PostState::from_stored(&state),
-        postage_until: row.get(9)?,
+        draft_ttl: row.get(9)?,
         attempts: row.get(10)?,
         read_at: row.get(11)?,
         path: row.get(12)?,
@@ -449,7 +449,7 @@ mod tests {
             .unwrap()
             .expect("claim");
         assert_eq!(claimed.state, PostState::Picked);
-        assert_eq!(claimed.postage_until, Some(1060));
+        assert_eq!(claimed.draft_ttl, Some(1060));
         // Antes de vencer: ninguém pega.
         assert!(store.post_claim(&project, 1059, 60).unwrap().is_none());
         // Depois de vencer: a mesma carta volta, com a tentativa contada.
