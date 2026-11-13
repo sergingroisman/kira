@@ -1,6 +1,6 @@
 //! End-to-end de `kira ingest` (ADR-0038, M1).
 //!
-//! O contrato no limite do CLI é: mesma árvore ⇒ mesmo `.kira/digest.md` **byte a
+//! O contrato no limite do CLI é: mesma árvore ⇒ mesmo `.kira/facts.md` **byte a
 //! byte**, sem rede (`--skip-scan`), com segredo mascarado no corpo dos arquivos-chave
 //! e com o que a denylist decide sendo respeitado de verdade (monorepo entra,
 //! `node_modules` não). Tudo offline: store em tempdir, repositório de fixture.
@@ -68,9 +68,9 @@ impl Sandbox {
         )
     }
 
-    fn digest(&self) -> String {
-        fs::read_to_string(self.cwd.join(".kira/digest.md"))
-            .unwrap_or_else(|err| panic!("ler digest: {err}"))
+    fn facts(&self) -> String {
+        fs::read_to_string(self.cwd.join(".kira/facts.md"))
+            .unwrap_or_else(|err| panic!("ler facts: {err}"))
     }
 }
 
@@ -95,7 +95,7 @@ fn seed(sandbox: &Sandbox) {
 }
 
 #[test]
-fn two_ingests_produce_a_byte_identical_digest() {
+fn two_ingests_produce_a_byte_identical_facts() {
     let sandbox = Sandbox::new("identico");
     seed(&sandbox);
 
@@ -105,15 +105,15 @@ fn two_ingests_produce_a_byte_identical_digest() {
         stdout.contains("ingerido: 4 arquivo(s)"),
         "stdout: {stdout}"
     );
-    let first = sandbox.digest();
+    let first = sandbox.facts();
 
     let (code, _, stderr) = sandbox.run(&["ingest", "--skip-scan"]);
     assert_eq!(code, 0, "segunda execução falhou: {stderr}");
-    let second = sandbox.digest();
+    let second = sandbox.facts();
 
-    assert_eq!(first, second, "o digest não é determinístico");
+    assert_eq!(first, second, "os facts não são determinísticos");
     // Sem relógio no artefato: nada de hora/data no cabeçalho.
-    assert!(!first.contains("T00:"), "digest não pode ter timestamp");
+    assert!(!first.contains("T00:"), "facts não pode ter timestamp");
 }
 
 #[test]
@@ -123,25 +123,25 @@ fn monorepo_source_is_ingested_and_noise_is_not() {
     let (code, _, stderr) = sandbox.run(&["ingest", "--skip-scan"]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
-    let digest = sandbox.digest();
-    assert!(digest.contains("packages/"), "monorepo ausente:\n{digest}");
+    let facts = sandbox.facts();
+    assert!(facts.contains("packages/"), "monorepo ausente:\n{facts}");
     assert!(
-        digest.contains("lib.rs"),
-        "arquivo do monorepo ausente:\n{digest}"
+        facts.contains("lib.rs"),
+        "arquivo do monorepo ausente:\n{facts}"
     );
     assert!(
-        !digest.contains("node_modules"),
-        "node_modules entrou:\n{digest}"
+        !facts.contains("node_modules"),
+        "node_modules entrou:\n{facts}"
     );
-    assert!(!digest.contains("target/"), "target entrou:\n{digest}");
+    assert!(!facts.contains("target/"), "target entrou:\n{facts}");
     assert!(
-        digest.contains("stacks: rust"),
-        "stack não detectada:\n{digest}"
+        facts.contains("stacks: rust"),
+        "stack não detectada:\n{facts}"
     );
 }
 
 #[test]
-fn secrets_in_key_files_are_masked_in_the_digest() {
+fn secrets_in_key_files_are_masked_in_the_facts() {
     let sandbox = Sandbox::new("segredo");
     seed(&sandbox);
     sandbox.write(
@@ -151,10 +151,10 @@ fn secrets_in_key_files_are_masked_in_the_digest() {
     let (code, _, stderr) = sandbox.run(&["ingest", "--skip-scan"]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
-    let digest = sandbox.digest();
+    let facts = sandbox.facts();
     assert!(
-        !digest.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
-        "token vazou para o digest:\n{digest}"
+        !facts.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+        "token vazou para os facts:\n{facts}"
     );
 }
 
@@ -169,10 +169,10 @@ fn json_report_is_parseable_and_carries_the_same_numbers() {
     assert_eq!(report["files_ingested"], 4, "report: {stdout}");
     assert_eq!(report["findings_total"], serde_json::Value::Null);
     assert!(
-        report["digest_path"]
+        report["facts_path"]
             .as_str()
-            .is_some_and(|path| path.ends_with(".kira/digest.md")),
-        "digest_path: {stdout}"
+            .is_some_and(|path| path.ends_with(".kira/facts.md")),
+        "facts_path: {stdout}"
     );
 }
 
@@ -185,14 +185,14 @@ fn project_root_named_build_is_ingested() {
     let (code, stdout, stderr) = sandbox.run(&["ingest", "--skip-scan"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     // A raiz `build/` precisa ser ingerida: era esse nome "reservado" na RAIZ que
-    // zerava índice e digest antes do ADR-0038.
-    let digest = sandbox.digest();
+    // zerava índice e facts antes do ADR-0038.
+    let facts = sandbox.facts();
     assert!(
-        digest.contains("Cargo.toml"),
-        "a raiz precisa ser ingerida:\n{digest}"
+        facts.contains("Cargo.toml"),
+        "a raiz precisa ser ingerida:\n{facts}"
     );
     assert!(
-        digest.contains("src/main.rs"),
-        "o código da raiz precisa entrar:\n{digest}"
+        facts.contains("src/main.rs"),
+        "o código da raiz precisa entrar:\n{facts}"
     );
 }

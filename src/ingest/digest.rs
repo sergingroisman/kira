@@ -1,6 +1,6 @@
 //! Renderização do digest: função **pura**, sem I/O e sem relógio (ADR-0038).
 //!
-//! O `.kira/digest.md` é o artefato determinístico do KIRA: mesma árvore, mesmos
+//! O `.kira/facts.md` é o artefato determinístico do KIRA: mesma árvore, mesmos
 //! bytes. Por isso este módulo não toca disco e não olha `SystemTime` — quem lê
 //! arquivo é o chamador, que passa as linhas já recortadas e já redigidas.
 //!

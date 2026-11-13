@@ -1,6 +1,6 @@
 //! Plano do `digest`: quais posts existem para um projeto (ADR-0038, M3).
 //!
-//! Função **pura**: recebe o digest já renderizado (`.kira/digest.md`) e devolve a
+//! Função **pura**: recebe os fatos já renderizados (`.kira/facts.md`) e devolve a
 //! lista de posts que deveriam existir. Sem I/O, sem relógio, sem modelo — o que
 //! torna o plano testável e o `cache_key` reprodutível.
 //!

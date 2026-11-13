@@ -155,7 +155,7 @@ enum Command {
     },
     /// Ingest the project: walks everything the denylist does not exclude, refreshes
     /// the FTS5 index, runs `scan` (optional) and writes a deterministic
-    /// .kira/digest.md — no AI, no network required (ADR-0038)
+    /// .kira/facts.md — no AI, no network required (ADR-0038)
     #[command(
         after_help = "Exemplos:\n  kira ingest\n  kira ingest --path ./repo --json\n  kira ingest --skip-scan"
     )]
@@ -1208,7 +1208,7 @@ fn scan_command(path: Option<&Path>) -> Outcome {
 
 /// `kira ingest` — fatos do projeto, sem LLM (ADR-0038, M1).
 ///
-/// Determinístico: mesma árvore ⇒ mesmo `.kira/digest.md`. Rede só se `--skip-scan`
+/// Determinístico: mesma árvore ⇒ mesmo `.kira/facts.md`. Rede só se `--skip-scan`
 /// não for passado, e mesmo assim a falha do scan vira nota, nunca erro.
 fn ingest_command(path: Option<&Path>, json: bool, skip_scan: bool) -> Outcome {
     let root = path.map_or_else(
