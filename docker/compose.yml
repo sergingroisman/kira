@@ -1,0 +1,39 @@
+# KIRA + Ollama locais: o organismo e o seu cérebro de bolso.
+#
+#   docker compose up -d          # sobe ollama + kira (cron batendo)
+#   docker compose logs -f kira   # tail do tick.log (o pulso)
+#   docker compose exec ollama ollama pull qwen3.5:4b   # baixa o modelo uma vez
+#   docker compose exec kira kira trust --path /repo    # ACEITE (sem isso, nada de digest)
+#   docker compose exec kira kira wiki search "..."     # o RAG, de dentro da casa
+#
+# O repo do dono entra montado em /repo: o KIRA lê tudo e só escreve em
+# /repo/.kira (jail + trust continuam valendo DENTRO do container).
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    # localhost do host continua funcionando: publique a porta se quiser usar
+    # o mesmo Ollama fora do container.
+    ports:
+      - "11434:11434"
+
+  kira:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      KIRA_PROJECT: /repo
+      KIRA_OLLAMA_URL: http://ollama:11434
+      KIRA_TICK_MINUTES: "30"
+      KIRA_POSTS_PER_TICK: "1"
+      # KIRA_MODEL: qwen3.5:4b   # troque quando puxar outro GGUF (hf.co/...)
+    volumes:
+      - ..:/repo
+      - kira-config:/root/.config/kira
+    depends_on:
+      - ollama
+
+volumes:
+  ollama-models:
+  kira-config:
