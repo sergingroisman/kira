@@ -58,7 +58,7 @@ gold (dono) · cleanup (aprovação do inventário §7) · PNGs do README (dono)
 
 | Item | Escopo | Aceite | Tam. |
 |---|---|---|---|
-| **HF-1** | `ADR-0040` (docs-only): HF como catálogo; por que NÃO candle/llama-cpp no binário; consentimento p/ download; disco checado | ADR aceito pelo dono; nenhuma linha de código | S |
+| **HF-1** ✅ **implementado (13/Nov, PR #102)**: `ADR-0040-hugging-face-catalogo-gguf.md` (catálogo via Ollama; alternativas candle/llama-cpp/hf-hub rejeitadas; consentimento + disco no pull; gate de admissão, piso Q4_K_M, Q2_K proibido) + linha no índice de ADRs (e registro retroativo da linha 0039 que faltava) | ADR aceito pelo dono; nenhuma linha de código | S |
 | **HF-2** | `kira model list` (parse do `ollama list`, sem rede fora do localhost) + `kira model pull <hf-repo>` (flag `--yes` ou prompt interativo com tamanho GB + destino; checa disco; log de auditoria no store; fail-closed) | e2e com shim de `ollama`: pull sem `--yes` e sem TTY = erro acionável; list nunca vaza segredo | M |
 | **HF-3** | Guardrail de saída no `digest` (`src/post/mod.rs`): front-matter obrigatório, teto 30 k (já existe), scan de segredo no corpo reusando `redact`, recusa com nota acionável | unit + e2e: post sem front-matter vira `failed` com nota; post com token fake é mascarado antes de gravar | M |
 | **HF-4** | `scripts/install.sh` / `install.ps1` com a proteção da casa: nunca `curl|sh`; Ollama ausente ⇒ instrução manual e saída limpa; `--with-model <repo>` opt-in com consentimento+disco; SHA256SUMS verificado antes de tocar o sistema (fail-closed, como `release.yml`); smoke `kira doctor` | teste de shell em CI Linux: install sem Ollama sai 0 com instrução; com `--with-model` sem disco ⇒ recusa | M |
