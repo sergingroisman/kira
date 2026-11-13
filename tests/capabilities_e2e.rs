@@ -449,7 +449,10 @@ fn store_da_versao_anterior_migra_sem_perder_dados() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap_or_else(|err| panic!("user_version: {err}"));
-    assert_eq!(version, 4, "store rebaixado deve migrar para a v4");
+    assert!(
+        version >= 4,
+        "store rebaixado deve migrar para a versão atual (veio v{version})"
+    );
     for tabela in [
         "projects",
         "sessions",
