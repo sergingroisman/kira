@@ -113,6 +113,99 @@ pub fn format_unauthorized_check(organization: &str) -> String {
     )
 }
 
+/// Linhas da onda M (ADR-0038): o que foi ingerido e o estado da fila de posts.
+///
+/// Fail-open: qualquer dado ausente vira uma frase com a causa e o comando que
+/// resolve — nunca número inventado. "Desatualizado" tem definição precisa: o
+/// `source_hash` da linha em `posts` não bate mais com o digest atual, ou seja, o
+/// repositório mudou depois que o post foi gerado.
+#[must_use]
+pub fn format_ingest_lines() -> Vec<String> {
+    let Some(root) = crate::store::detect_project_root() else {
+        return vec![
+            "ingestão: sem projeto detectado — rode dentro da raiz do repositório".to_string(),
+        ];
+    };
+    let kira = root.join(".kira");
+    let digest_path = kira.join("digest.md");
+    let digest = std::fs::read_to_string(&digest_path).ok();
+    let files = std::fs::read_to_string(kira.join("ingest").join("inventory.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<crate::ingest::inventory::Inventory>(&text).ok())
+        .map(|inv| inv.files.len());
+    let trust = if crate::trust::is_trusted(&root) {
+        "aceito"
+    } else {
+        "não aceito (rode `kira trust`)"
+    };
+    let mut lines = Vec::new();
+    match (&digest, files) {
+        (Some(_), Some(count)) => lines.push(format!(
+            "ingestão: {count} arquivo(s) ingerido(s), digest ok, repositório {trust}"
+        )),
+        (Some(_), None) => lines.push(format!(
+            "ingestão: digest ok (inventário ausente — rode `kira ingest`), repositório {trust}"
+        )),
+        _ => lines.push(format!(
+            "ingestão: nenhuma (rode `kira ingest`), repositório {trust}"
+        )),
+    }
+
+    let Some(digest) = digest else {
+        return lines;
+    };
+    let Ok(store) = crate::store::Store::open_default() else {
+        lines.push("posts: store indisponível".to_string());
+        return lines;
+    };
+    let Ok(project_id) = crate::store::project_id_for_root(&root) else {
+        lines.push("posts: projeto não registrado".to_string());
+        return lines;
+    };
+    let Ok(posts) = store.posts_of(&project_id) else {
+        lines.push("posts: ilegível".to_string());
+        return lines;
+    };
+    if posts.is_empty() {
+        lines.push("posts: nenhum (rode `kira digest`)".to_string());
+        return lines;
+    }
+    let planned = crate::post::plan::plan(&digest);
+    let pending = posts
+        .iter()
+        .filter(|p| p.state == crate::store::posts::PostState::Sealed)
+        .count();
+    let delivered = posts
+        .iter()
+        .filter(|p| p.state == crate::store::posts::PostState::Delivered)
+        .count();
+    let dead = posts
+        .iter()
+        .filter(|p| p.state == crate::store::posts::PostState::Dead)
+        .count();
+    let stale = posts
+        .iter()
+        .filter(|p| p.state == crate::store::posts::PostState::Delivered)
+        .filter(|p| {
+            planned
+                .iter()
+                .find(|planned| planned.slug == p.slug)
+                .is_some_and(|planned| planned.source_hash != p.source_hash)
+        })
+        .count();
+    let unread = store.posts_unread(&project_id).unwrap_or(0);
+    let mut line = format!(
+        "posts: {pending} pendente(s) · {delivered} entregue(s) · {unread} não lido(s) · {dead} extraviada(s)"
+    );
+    if stale > 0 {
+        line.push_str(&format!(
+            " · {stale} desatualizado(s) — o repositório mudou: rode `kira digest` e `kira emit`"
+        ));
+    }
+    lines.push(line);
+    lines
+}
+
 /// Linha de capacidades do `kira doctor` (ADR-0030): o que está conectado
 /// para o projeto atual, ou o aviso de modo local quando nada está.
 pub fn format_capabilities_line(connected: &[&str]) -> String {
@@ -285,6 +378,12 @@ pub async fn run() -> (bool, String) {
         &mut out,
         &format_capabilities_line(&connected_capabilities()).to_string(),
     );
+
+    // Onda M (ADR-0038): ingestão e fila de posts. Fail-open — sem projeto ou sem
+    // store, a linha diz que não há dado em vez de inventar número.
+    for line in format_ingest_lines() {
+        emit(&mut out, &line);
+    }
 
     if !missing.is_empty() {
         emit(&mut out, "2. Conexão com a organização");
