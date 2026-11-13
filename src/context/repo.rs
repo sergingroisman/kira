@@ -173,6 +173,9 @@ pub fn grep(
     if terms.is_empty() || max_excerpts == 0 {
         return out;
     }
+    // P5: as regras dos `.gitignore` do projeto valem para o grep como valem
+    // para o índice e para o inventário — um só stack, descoberto aqui.
+    let stack = super::gitignore::GitIgnoreStack::discover(root);
     let mut hits: Vec<Hit> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut skipped: BTreeSet<String> = BTreeSet::new();
@@ -188,7 +191,9 @@ pub fn grep(
             Some(rel) => rel,
             None => continue,
         };
-        if skipped.contains(&rel) || !seen.insert(rel.clone()) {
+        // Um finding que cita arquivo explicitamente ignorado pelo projeto não
+        // abre exceção: a política é a mesma da caminhada.
+        if skipped.contains(&rel) || stack.ignores(&rel) || !seen.insert(rel.clone()) {
             continue;
         }
         let Some(content) = read_text_file(&root.join(&rel)) else {
@@ -205,7 +210,12 @@ pub fn grep(
         .into_iter()
         .filter_entry(|entry| {
             if entry.file_type().is_dir() {
-                !is_skipped_dir(entry.path(), entry.depth())
+                !is_skipped_dir(
+                    entry.path(),
+                    entry.depth(),
+                    relative_path(root, entry.path()).as_deref(),
+                    Some(&stack),
+                )
             } else {
                 true
             }
@@ -230,7 +240,10 @@ pub fn grep(
         // would send the same knowledge twice and burn the budget. W2-fix
         // PR-F3: the wiki lives inside the dot-directory `.kira/wiki/`, which
         // the leading-dot rule already skips — no special case left here.
-        if skipped.contains(&rel) || !is_source_file(&rel) || !seen.insert(rel.clone()) {
+        if skipped.contains(&rel)
+            || !is_source_file(&rel, Some(&stack))
+            || !seen.insert(rel.clone())
+        {
             continue;
         }
         let Some(content) = read_text_file(entry.path()) else {
@@ -303,7 +316,12 @@ pub(crate) fn relative_path(root: &Path, path: &Path) -> Option<String> {
 /// `depth == 0` é a raiz: **nunca** sai, mesmo chamando `build`, `bin` ou começando
 /// com ponto. Era o bug que zerava o índice de um projeto com nome "reservado"
 /// (ADR-0038). A decisão do resto vem de [`crate::context::ignore`].
-pub(crate) fn is_skipped_dir(path: &Path, depth: usize) -> bool {
+pub(crate) fn is_skipped_dir(
+    path: &Path,
+    depth: usize,
+    rel: Option<&str>,
+    stack: Option<&super::gitignore::GitIgnoreStack>,
+) -> bool {
     if depth == 0 {
         return false;
     }
@@ -311,7 +329,11 @@ pub(crate) fn is_skipped_dir(path: &Path, depth: usize) -> bool {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
-    crate::context::ignore::is_ignored_dir(&name)
+    // P5: com stack de `.gitignore` montado, o veredito sai do par nome+caminho.
+    match rel {
+        Some(rel) => crate::context::ignore::skip_dir(&name, rel, stack),
+        None => crate::context::ignore::is_ignored_dir(&name),
+    }
 }
 
 /// `true` quando o arquivo deve entrar no índice/contexto.
@@ -319,8 +341,11 @@ pub(crate) fn is_skipped_dir(path: &Path, depth: usize) -> bool {
 /// Decisão por **denylist** (ADR-0038): extensão desconhecida entra de graça, e
 /// `.dart`, `.vue`, `.proto`, `.mts` deixam de ser invisíveis sem mexer em lista
 /// nenhuma. Lockfiles continuam fora: são gerados e enormes.
-pub(crate) fn is_source_file(rel: &str) -> bool {
+pub(crate) fn is_source_file(rel: &str, stack: Option<&super::gitignore::GitIgnoreStack>) -> bool {
     let name = rel.rsplit('/').next().unwrap_or(rel);
+    if let Some(ignored) = stack.and_then(|stack| stack.match_path(rel, false)) {
+        return !ignored;
+    }
     if name.ends_with(".lock") || name == "package-lock.json" {
         return false;
     }

@@ -195,11 +195,12 @@
   **Aceite:** `setup_e2e` com `--yes` (digest criado) e `--skip ingest` (nada criado). ✅
   Prova extra em `tests/setup_ingest_e2e.rs` (binário real, hermético): `--yes` cria
   `digest.md` sem rede nem trust; `--lang pt-BR` chega ao post via config.
-- [ ] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
-  com UTF-8/UTF-16 LE/BE nos call sites de `node.rs`/`dotnet.rs` + fixture) e **P5 `.gitignore`**
-  (`src/context/gitignore.rs`, subset gitwildmatch, aninhado, sem dependência).
-  **Aceite:** fixture BOM parseia; `.gitignore` aninhado com negação honrado no índice e no grep;
-  repo sem `.gitignore` inalterado.
+- [x] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
+  com UTF-8/UTF-16 LE/BE nos call sites de `node.rs`/`dotnet.rs` + fixture — PR `fix/m7-bom-scan`)
+  e **P5 `.gitignore`** (`src/context/gitignore.rs`, subset gitwildmatch, aninhado, sem
+  dependência — PR `feat/m7-gitignore`).
+  **Aceite:** fixture BOM parseia ✅; `.gitignore` aninhado com negação honrado no índice, no
+  grep e no inventário (teste de política única) ✅; repo sem `.gitignore` inalterado ✅.
 - [ ] **M8** docs da onda M: `docs/ux-setup-jornada.md` (trilha real de 5 etapas),
   `docs/kira-jornadas.md` (remover a promessa de "parse tolerante BOM/UTF-16" até M7;
   registrar ingest/digest/emit/trust), `docs/gitingest-vale-trazer.md` (P1/P3/P4/P5),

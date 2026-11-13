@@ -217,6 +217,31 @@ pub(crate) const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     ".kira",
 ];
 
+use super::gitignore::GitIgnoreStack;
+
+/// Veredito de **diretório** (depth > 0) com o `.gitignore` no jogo (P5):
+/// quando o stack tem opinião sobre o caminho relativo, a opinião dele é a
+/// última palavra — negação reinclui o que a denylist poda (`!coverage/`) e
+/// regra extra exclui o que a denylist deixa passar (`secrets/`). Sem opinião,
+/// decide a denylist default. A raiz da caminhada nunca passa por aqui.
+#[must_use]
+pub fn skip_dir(name: &str, rel: &str, stack: Option<&GitIgnoreStack>) -> bool {
+    match stack.and_then(|stack| stack.match_path(rel, true)) {
+        Some(ignored) => ignored,
+        None => is_ignored_dir(name),
+    }
+}
+
+/// Veredito de **arquivo**, mesma mecânica — fonte única de política para os
+/// três caminhos (índice, grep e inventário); o teste de tabela prova os três.
+#[must_use]
+pub fn skip_file(name: &str, rel: &str, stack: Option<&GitIgnoreStack>) -> bool {
+    match stack.and_then(|stack| stack.match_path(rel, false)) {
+        Some(ignored) => ignored,
+        None => is_ignored_file(name),
+    }
+}
+
 /// `true` quando o **nome** do diretório está na denylist ou obedece a regra do ponto.
 ///
 /// O chamador deve aplicar isto somente a `depth > 0`: a raiz da caminhada é sempre

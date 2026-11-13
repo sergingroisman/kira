@@ -109,6 +109,11 @@ pub fn walk(root: &Path, budget: Budget) -> Inventory {
     let mut depth_capped = 0usize;
     let mut file_capped = false;
 
+    // P5: o `.gitignore` do projeto é lido como REGRA (o arquivo em si continua
+    // fora do conteúdo ingerido — a denylist o mantém). Mesmo stack, mesmo
+    // veredito do índice e do grep: uma política, três caminhos.
+    let stack = crate::context::gitignore::GitIgnoreStack::discover(root);
+
     let walker = WalkDir::new(root)
         .max_depth(budget.max_depth)
         .sort_by_file_name()
@@ -119,7 +124,13 @@ pub fn walk(root: &Path, budget: Budget) -> Inventory {
                 return true;
             }
             let name = entry.file_name().to_string_lossy();
-            !ignore::is_ignored_dir(&name)
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            !ignore::skip_dir(&name, &rel, Some(&stack))
         });
 
     for entry in walker {
@@ -135,8 +146,12 @@ pub fn walk(root: &Path, budget: Budget) -> Inventory {
         if !entry.file_type().is_file() {
             continue;
         }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let path = rel.to_string_lossy().replace('\\', "/");
         let name = entry.file_name().to_string_lossy();
-        if ignore::is_ignored_file(&name) {
+        if ignore::skip_file(&name, &path, Some(&stack)) {
             continue;
         }
         if files.len() >= budget.max_files {
@@ -146,10 +161,6 @@ pub fn walk(root: &Path, budget: Budget) -> Inventory {
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let path = rel.to_string_lossy().replace('\\', "/");
         // Binário: amostra inicial com NUL. Não entra no inventário e vira nota.
         if let Some(sample) = read_probe(entry.path())
             && ignore::looks_binary(&sample)

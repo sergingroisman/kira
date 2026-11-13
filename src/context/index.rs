@@ -99,12 +99,20 @@ fn reindex_limited(
 
     // 1. Collect the candidate paths first, then sort: the same tree always
     //    indexes in the same order, independent of filesystem reply order.
+    //    P5: the project's own `.gitignore` rules join the decision — same
+    //    stack, same verdict as the grep and the inventory (one policy).
+    let stack = super::gitignore::GitIgnoreStack::discover(root);
     let walker = WalkDir::new(root)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
             if entry.file_type().is_dir() {
-                !repo::is_skipped_dir(entry.path(), entry.depth())
+                !repo::is_skipped_dir(
+                    entry.path(),
+                    entry.depth(),
+                    repo::relative_path(root, entry.path()).as_deref(),
+                    Some(&stack),
+                )
             } else {
                 true
             }
@@ -120,7 +128,7 @@ fn reindex_limited(
         let Some(rel) = repo::relative_path(root, entry.path()) else {
             continue;
         };
-        if repo::is_source_file(&rel) {
+        if repo::is_source_file(&rel, Some(&stack)) {
             candidates.push(rel);
         }
     }

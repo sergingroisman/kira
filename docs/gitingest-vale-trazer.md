@@ -32,7 +32,7 @@ inteligência):
 | P2 | ~~Sniff de binário (1 KB + decodificação)~~ | `src/context/repo.rs` | **Cortado (11/Nov)** — `read_text_file` já faz probe de NUL + `from_utf8` no arquivo inteiro; melhoria fantasma |
 | P3 | **Tabela `DEFAULT_IGNORE_PATTERNS`** (~150 padrões curados por linguagem) | `src/context/index.rs` + allowlist do grep | Alta — MIT, copiar tabela com atribuição, unificar numa única fonte |
 | P4 | **Orçamentos da caminhada**: profundidade máx. + total de bytes | `src/context/index.rs` (constantes fixas; env só com justificativa) | Média |
-| P5 | **Honrar `.gitignore`** (subconjunto gitwildmatch em Rust puro, com negação e `.gitignore` aninhado) | `src/context/index.rs`, `src/context/repo.rs` | Média — a fonte da precisão do gitingest |
+| P5 | **Honrar `.gitignore`** (subconjunto gitwildmatch em Rust puro, com negação e `.gitignore` aninhado) | `src/context/gitignore.rs` aplicado nos três caminhos (índice, grep, inventário) | Média — a fonte da precisão do gitingest. **Implementado 13/Nov/2026 (M7)**: `GitIgnoreStack` com cascata já na assinatura (onda IG-1 pluga `.kiraignore`/`.ignore` sem retrabalho); subset documentado (sem classes/escapes; sensível a caixa em todo SO); teste de política única prova os três caminhos com as mesmas regras |
 | P6 | **Estimativa de tokens no cabeçalho do pack** | `src/context/mod.rs` — chars/4 determinístico (tiktoken baixa BPE da rede = contra o CLI-first) | Opcional |
 
 ## O que NÃO vale
@@ -55,7 +55,8 @@ comunidades chegaram no mesmo contrato por dor real.
 ## Ordem de execução sugerida
 
 1. ~~**P1**~~ — **implementado em 13/Nov/2026 (M7)**: `src/scan/decode.rs` + fixture `scan_pnpm_audit_utf16le.json` (a captura real reencodada UTF-16 LE com BOM).
-2. **P3 → P4 → P5** (todos tocam `src/context/`; nessa ordem para não
-   rebasear) — fila depois do W2-FIX, um PR por item.
+2. ~~**P3 → P4 → P5**~~ — P3/P4 foram absorvidos pelo M1 (denylist única +
+   orçamentos `Budget`); **P5 implementado 13/Nov/2026 (M7)**:
+   `src/context/gitignore.rs`, negação e aninhamento honrados nos três caminhos.
 3. ~~**P2**~~ — cortado em 11/Nov/2026: `read_text_file` (probe de NUL +
    `from_utf8` no arquivo inteiro) já cobre o caso; melhoria fantasma.
