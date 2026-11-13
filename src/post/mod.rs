@@ -221,7 +221,7 @@ pub async fn run<B: LlmBackend>(
                     .saturating_add(estimate_tokens(&prompt, &text));
                 let draft = root
                     .join(".kira")
-                    .join("digest")
+                    .join("drafts")
                     .join(format!("{}.md", claimed.slug));
                 if let Err(source) = write_draft(&draft, &claimed.slug, &options.lang, &text) {
                     let state = store.post_fail(&claimed.id).unwrap_or(PostState::Sealed);
