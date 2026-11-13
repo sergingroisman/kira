@@ -1,4 +1,4 @@
-# BUILD PROGRAM — KIRA autônomo (executado pelo Hermes/Orchestrator)
+# BUILD PROGRAM — KIRA autônomo (executado pelo Hermes)
 
 > Criado 10/Nov/2026 por decisão do dono: "enquanto eu estudo, o Hermes faz tudo
 > sozinho; só termina quando o KIRA estiver pronto e completo, com o dashboard
@@ -11,7 +11,7 @@
 ## Decisões do dono (10/Nov/2026 — aprovadas, valem sobre qualquer opinião minha)
 
 1. **Ordem das fases** F0→F5 como está; **dashboard depois do loop** (F4 > F2). ✅
-2. **Wiki nasce commitada** em `docs/wiki/`; ciclo autônomo só grava em
+2. **Wiki é local** em `.kira/wiki/` (ADR-0039; antes: `docs/wiki/`, W2-FIX); ciclo autônomo só grava em
    `.kira/wiki-staging/` e depende de `kira wiki promote` (ADR-0013).
 3. **Modelo local**: ≤4B q4_K_M, `KIRA_NUM_CTX=4096` (RTX 2060 6 GB e M1 8 GB). ✅
 4. **Agendamento** só com o KIRA vivo (sem serviço do Windows no MVP). ✅
@@ -32,7 +32,7 @@
    `output.lang`, escolhido no `kira setup` (`--lang` no não-interativo), com override por projeto.
    `lang` entra no `cache_key`.
 13. **Domínio `post`** (tabela `posts`): a unidade de trabalho é o artigo. Lore de carta/selo/
-   carteiro vive na doc e na UI — `outbox`, `Courier`, `Postage`, `DeadLetter`, `Postmaster`.
+   carteiro vive na doc e na UI — `outbox`, `phase`, `draft_ttl`, `failed`, `turn` (ADR-0039).
    `letters` descartado.
 14. **O orquestrador Hermes fica no DeepSeek de propósito** (paga 2× com o OpenCode Go no crew).
    Registrado aqui para que nenhuma sessão futura "otimize" isso de novo.
@@ -81,13 +81,13 @@
       `cargo test` falha se alguém adicionar LLM em `scan`/`store`/`tui`.
 
 ### F1 — contexto e medição (W2 + W2.5 wiki + W2-bis)
-- [x] **PR28** `kira wiki` em **`docs/wiki/` (commitada)**: páginas
+- [x] **PR28** `kira wiki` em **`.kira/wiki/` (local; na época `docs/wiki/`): páginas
       contexto/decisoes/padroes/glossario/bugs, escrita via `redact` + `guard/path`;
       ciclo autônomo só grava em `.kira/wiki-staging/`.
 - [x] **PR29** índice FTS5 (`wiki_page`, `wiki_fts`) + `kira wiki reindex` (derivado,
       descartável; sem FTS5 cai para substring).
 - [x] **PR30** captura episódica pós-`triage` + decay 30 dias + `kira wiki forget`.
-      `docs/wiki/bugs/<id>.md` com causa raiz prevista + arquivos + confiança +
+      `.kira/wiki/bugs/<id>.md` com causa raiz prevista + arquivos + confiança +
       brief do scan, sem perguntar nada; episódio repetido não duplica; >30 dias
       colapsa em `## Histórico colapsado`; `forget` apaga markdown + índice
       (página ausente = exit 0). Ciclo autônomo usa `EpisodeTarget::Staging`.
@@ -158,8 +158,8 @@
   (detector por marcador: `go.mod`, `pubspec.yaml`, `*.sln`, `build.gradle.kts`, `app.json`,
   `Package.swift`, `terraform/`) · `src/ingest/{mod,inventory,digest}.rs` (`render` puro) ·
   `Command::Ingest { path, json, skip_scan }` · grava `.kira/ingest/{inventory.json,tree.txt}`
-  e `.kira/digest.md`.
-  **Aceite:** dois `ingest` seguidos ⇒ `digest.md` byte-idêntico; `packages/core/src/lib.rs`
+  e `.kira/facts.md`.
+  **Aceite:** dois `ingest` seguidos ⇒ `facts.md` byte-idêntico; `packages/core/src/lib.rs`
   indexado; raiz chamada `build` ingerida; arquivo acima do cap sai com nota "truncado"; repositório
   Go e Flutter detectados no perfil; gates verdes.
 - [x] **M2** `posts` + `outbox` + trust. Migração v6 (tabela `posts`: `id, slug, kind, lang,
@@ -181,7 +181,7 @@
   `read_at` via `store.post_mark_read`), dica de painel vazio e teste de `--snapshot`.
   **Aceite:** `--snapshot` mostra o painel; hash do store muda só em `read_at`; tecla não escreve
   arquivo do dev.
-- [x] **M5** `kira emit` + linha de ingestão/posts no `doctor` *(código; docs da onda em M8)*.
+- [x] **M5** `kira publish` (antes `kira emit`) + linha de ingestão/posts no `doctor` *(código; docs da onda em M8)*.
   Publica `.kira/wiki/<slug>.md` (front-matter + índice derivado) com gate por
   `source_hash`/`published_hash`; `doctor` reporta ingestão, trust, fila e posts desatualizados.
   **Aceite:** publicar duas vezes é idempotente; `doctor` lista post velho quando o repo muda;

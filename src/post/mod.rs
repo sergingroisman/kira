@@ -1,4 +1,4 @@
-//! `kira digest` — o `Courier` que gera os posts (ADR-0038, M3).
+//! `kira digest` — um turno (`turn`) com fases `claim → generate → deliver` (ADR-0038, M3).
 //!
 //! Lê os fatos do `ingest`, enfileira o que falta em `posts`, retira com lease e
 //! chama o modelo local para cada carta. Tudo o que é estado fica no SQLite: parar
@@ -56,7 +56,7 @@ pub enum DigestError {
     },
 }
 
-/// Opções de uma rodada do `Courier`.
+/// Opções de uma rodada do turno.
 #[derive(Debug, Clone)]
 pub struct DigestOptions {
     pub root: PathBuf,
@@ -126,7 +126,7 @@ impl DigestReport {
     }
 }
 
-/// Executa uma rodada do `Courier`.
+/// Executa uma rodada do turno.
 pub async fn run<B: LlmBackend>(
     options: &DigestOptions,
     backend: &B,
@@ -172,7 +172,7 @@ pub async fn run<B: LlmBackend>(
     // 2. Evidências: o digest inteiro é o perfil; os arquivos-chave já estão nele.
     let evidence = read_key_files(root, &digest);
 
-    // 3. Courier: retira, gera, entrega.
+    // 3. Fases do turno: retira (claim), gera (generate), entrega (deliver).
     let now = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

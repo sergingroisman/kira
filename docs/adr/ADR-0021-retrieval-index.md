@@ -4,7 +4,7 @@
   do dono**. Um veto vira ADR que supersede este, não edição silenciosa.
 - **Contexto**: viés alfabético do grep de 400 arquivos + ranking por "linha
   contém termo"; dono exige retrieval confiável e barato
-- **Decisores**: Orchestrator (recomendação) · Sérgio (veto/aval)
+- **Decisores**: Hermes (recomendação) · Sérgio (veto/aval)
 
 ## Contexto
 

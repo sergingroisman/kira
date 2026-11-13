@@ -1,7 +1,7 @@
 # ADR-0016 — CLI-first, LLM-last: nada de LLM onde um comando resolve
 
 - **Status**: aceito (decisão explícita do dono, 10/Nov/2026)
-- **Decisores**: Sérgio (dono) · Orchestrator (Hermes)
+- **Decisores**: Sérgio (dono) · Hermes
 
 ## Contexto
 

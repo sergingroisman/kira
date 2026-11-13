@@ -48,7 +48,7 @@
 | **0035** | **Foundry configurável pelo `kira setup` (formulário inline, chave no keyring)** | **implementado** — aguarda aceite do dono | `ADR-0035-foundry-no-setup.md` |
 | **0036** | **Camada visual do TUI: nativo do ratatui primeiro, dependência depois** | **implementado** — aguarda aceite do dono | `ADR-0036-tui-visual-nativo-sem-dependencia.md` |
 | **0037** | **Resumo em cartões: chip vem da trilha, spinner só com filho vivo** | **proposto** — aguarda aval do dono | `ADR-0037-resumo-em-cartoes.md` |
-| **0038** | **Ingestão, digestão e emissão: do repositório ao post** (denylist multi-stack, `post`/`outbox`/`Courier`, idioma por instalação, Ollama primeiro) | **proposto** — decisões do dono 12–13/Nov, aguarda selo | `ADR-0038-ingestao-digestao-emissao.md` |
+| **0038** | **Ingestão, digestão e emissão: do repositório ao post** (denylist multi-stack, `post`/`outbox`/`turn`/`phase`, idioma por instalação, Ollama primeiro) | **proposto** — decisões do dono 12–13/Nov, aguarda selo | `ADR-0038-ingestao-digestao-emissao.md` |
 
 ## O que **não** é ADR aqui
 

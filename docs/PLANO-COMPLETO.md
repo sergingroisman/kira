@@ -47,9 +47,9 @@ chama Azure. `loop` não fala com LLM direto, fala com `triage`.
 
 ## 3. A wiki (o pedido novo) — ADR-0013
 
-- **Onde**: `<projeto>/docs/wiki/*.md` — **commitada** (decisão do dono). Páginas:
+- **Onde**: `<projeto>/.kira/wiki/*.md` — local (ADR-0039; a decisão original de wiki commitada foi revertida no W2-FIX). Páginas:
   `contexto.md`, `decisoes.md`, `padroes.md`, `glossario.md`, `bugs/<item-id>.md`.
-- **Escrita ≠ autonomia**: comando invocado por você grava direto em `docs/wiki/`;
+- **Escrita ≠ autonomia**: comando invocado por você grava direto em `.kira/wiki/`;
   o ciclo autônomo grava só em `.kira/wiki-staging/` e depende de `kira wiki promote`
   (humano). Autonomia nunca escreve no seu repo, mesmo com a wiki versionada.
 - **Verdade x índice**: markdown manda; `wiki_page` + `wiki_fts` no `store.db` são

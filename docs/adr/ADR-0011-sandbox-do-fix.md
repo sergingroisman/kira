@@ -2,7 +2,7 @@
 
 - **Status**: aceito (decisão do dono, 10/Nov/2026)
 - **Contexto**: estudo dos projetos do Akita (ai-jail, ai-memory, ai-usagebar)
-- **Decisores**: Sérgio (dono) · Orchestrator (Hermes)
+- **Decisores**: Sérgio (dono) · Hermes
 
 ## Contexto
 

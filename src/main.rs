@@ -1288,7 +1288,7 @@ fn trust_command(path: Option<&Path>, revoke: bool) -> Outcome {
     }
 }
 
-/// `kira digest` — o `Courier` local (ADR-0038, M3).
+/// `kira digest` — o turno local (ADR-0038, M3).
 ///
 /// O backend é construído **aqui** (composition root) e o módulo de decisão recebe
 /// a referência: `post` não escolhe provider, só decide com o modelo.

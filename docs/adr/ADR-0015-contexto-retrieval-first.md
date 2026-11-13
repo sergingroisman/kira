@@ -1,10 +1,10 @@
 # ADR-0015 — Contexto para o LLM: retrieval-first determinístico, sem LangGraph
 
-- **Status**: aceito provisoriamente (10/Nov/2026) — recomendação do Orchestrator,
+- **Status**: aceito provisoriamente (10/Nov/2026) — recomendação do Hermes,
   **sujeita a veto do dono**. Um veto vira ADR que supersede este, não edição
   silenciosa.
 - **Contexto**: dúvida técnica do dono sobre grep/leitura de arquivos e LangGraph
-- **Decisores**: Orchestrator (recomendação) · Sérgio (veto/aval)
+- **Decisores**: Hermes (recomendação) · Sérgio (veto/aval)
 
 ## Contexto
 
@@ -31,7 +31,7 @@ O fluxo do context packer (PR5 + PR31):
 
 1. o KIRA deriva termos do work item (título, descrição, nomes citados) e os
    nomes de arquivo presentes em `findings.json`;
-2. busca determinística em duas fontes: **FTS5 da wiki** (`docs/wiki/`, ADR-0013) e
+2. busca determinística em duas fontes: **FTS5 da wiki** (`.kira/wiki/`, ADR-0013) e
    **grep nos arquivos do stack detectado** (`walkdir` + `regex`, ambos já no
    `Cargo.lock` como transitivos);
 3. monta trechos com **`caminho:linha`** — auditáveis, nunca blob anônimo;
@@ -88,5 +88,5 @@ e reprodutível — o mesmo requisito de determinismo do gate M1.
   `caminho:linha` e redigido por `redact` antes de entrar no prompt.
 - Orçamento (`KIRA_NUM_CTX` × 3 caracteres): o que não cabe vira nota, nunca erro.
 - `kira triage` imprime `contexto: …` no stderr — o usuário vê o que o modelo viu.
-- O arquivo do work item (`--file`) e `docs/wiki/` nunca são greppados: o primeiro
+- O arquivo do work item (`--file`) e `.kira/wiki/` nunca são greppados: o primeiro
   já está inteiro no prompt, a segunda já vem do FTS5.

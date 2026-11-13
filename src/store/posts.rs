@@ -1,4 +1,4 @@
-//! `posts` — a fila que o `Courier` consome (ADR-0038, M2).
+//! `posts` — a fila que o turno (`turn`) consome (ADR-0038, M2).
 //!
 //! A unidade de trabalho **é** o artigo: uma linha em `posts` guarda identidade
 //! (`slug`), procedência (`source_hash`, `prompt_version`, `model`, `lang`), estado e
@@ -23,7 +23,7 @@ use super::{Store, StoreError, now_rfc3339_utc};
 pub enum PostState {
     /// Selada, esperando retirada (aparece na view `outbox`).
     Sealed,
-    /// Retirada por um `Courier` até `draft_ttl`.
+    /// Retirada por um claim até `draft_ttl`.
     Picked,
     /// Entregue: o `.md` existe no destino.
     Delivered,
@@ -255,7 +255,7 @@ impl Store {
         Ok(next)
     }
 
-    /// Devolve à fila tudo que está `picked` — é o `--pause` do `Courier`.
+    /// Devolve à fila tudo que está `picked` — é o `--pause` do turno.
     pub fn post_release_all(&self) -> Result<usize, StoreError> {
         self.conn
             .execute(

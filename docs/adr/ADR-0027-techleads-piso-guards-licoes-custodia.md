@@ -1,6 +1,6 @@
 # ADR-0027 — Emprestado do Tech Leads Club: piso de guardas com veredito, lições que provam que valem e custódia de prompt
 
-- **Status**: proposto (12/Nov/2026) — Orchestrator (recomendação) · Sérgio (veto/aval).
+- **Status**: proposto (12/Nov/2026) — Hermes (recomendação) · Sérgio (veto/aval).
   Um veto vira ADR que supersede este, não edição silenciosa.
 - **Fonte**: análise de `tech-leads-club/agent-skills` @ `e74dc8a` (MIT no código,
   **CC-BY-4.0** no conteúdo dos SKILL.md — copiar com atribuição) e

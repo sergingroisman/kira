@@ -1,6 +1,6 @@
 # ADR-0023 — Melhorias emprestadas do gitingest: sniff de BOM/binário, tabela de ignorados e orçamentos da caminhada
 
-- **Status**: proposto (11/Nov/2026) — Orchestrator (recomendação) · Sérgio (veto/aval).
+- **Status**: proposto (11/Nov/2026) — Hermes (recomendação) · Sérgio (veto/aval).
   Um veto vira ADR que supersede este, não edição silenciosa.
 - **Fonte**: análise do repo `coderamp-labs/gitingest` (Python, **MIT**) — licença
   compatível com este repo (MIT). O `ai-jail` continua proibido (GPL); conceito

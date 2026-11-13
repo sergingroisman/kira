@@ -29,7 +29,7 @@ item independente.
 | Mudar decisão de ADR | qualquer coisa que contrarie `docs/adr/` |
 | Gastar dinheiro | provedor pago, Copilot, API key |
 | Rotular dado de verdade | os 20 bugs do `triage_gold` |
-| Sobrescrever wiki existente | apagar página de `docs/wiki/` |
+| Sobrescrever wiki existente | apagar página de `.kira/wiki/` |
 
 ## Formato do pedido (o que eu envio no Slack)
 
