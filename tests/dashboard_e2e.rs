@@ -79,6 +79,80 @@ impl Sandbox {
         }
     }
 
+    /// Caixa de correio (M4): posts reais via `post_enqueue` + `post_deliver`
+    /// na MESMA store que o binário abre, e o corpo escrito como o `kira
+    /// digest` escreve (comentário de cabeçalho incluso — o painel sabe que
+    /// metadado não é prosa). Um post fica `sealed` de propósito: a lista
+    /// mostra os três estados que a fila conhece. A store é fechada (drop)
+    /// para o WAL checkpointar e o hash ficar estável.
+    fn seed_posts_fixture(&self) {
+        let store_db = kira::store::Store::open_in_dir(&self.store).expect("abrir store fixture");
+        let project = store_db
+            .ensure_project(&self.cwd)
+            .expect("criar projeto fixture");
+        let drafts = [
+            (
+                "uuid-intro",
+                "intro",
+                "intro",
+                "# Visão geral\n\nO projeto resolve X.\n",
+            ),
+            (
+                "uuid-c4",
+                "c4-container",
+                "c4-container",
+                "```mermaid\ngraph TD; A --> B;\n```\n",
+            ),
+        ];
+        for (id, slug, kind, body) in drafts {
+            let new = kira::store::posts::NewPost {
+                id: id.to_string(),
+                slug: slug.to_string(),
+                kind: kind.to_string(),
+                lang: "en".to_string(),
+                source_hash: format!("hash-{slug}"),
+                prompt_version: "v1".to_string(),
+                model: "ollama:fake".to_string(),
+            };
+            store_db
+                .post_enqueue(&project.id, &new)
+                .expect("enqueue do post fixture");
+            store_db
+                .post_deliver(id, &format!(".kira/digest/{slug}.md"))
+                .expect("entrega do post fixture");
+            let draft = self
+                .cwd
+                .join(".kira")
+                .join("digest")
+                .join(format!("{slug}.md"));
+            if let Some(parent) = draft.parent() {
+                std::fs::create_dir_all(parent).expect("criar .kira/digest");
+            }
+            std::fs::write(
+                &draft,
+                format!(
+                    "<!-- gerado por `kira digest` (ADR-0038). slug: {slug} · lang: en -->\n\n{body}"
+                ),
+            )
+            .expect("escrever rascunho fixture");
+        }
+        // Um terceiro SEM entrega: a fila também desenha quem ainda espera.
+        store_db
+            .post_enqueue(
+                &project.id,
+                &kira::store::posts::NewPost {
+                    id: "uuid-glossario".to_string(),
+                    slug: "glossario".to_string(),
+                    kind: "intro".to_string(),
+                    lang: "pt-BR".to_string(),
+                    source_hash: "hash-glossario".to_string(),
+                    prompt_version: "v1".to_string(),
+                    model: "ollama:fake".to_string(),
+                },
+            )
+            .expect("enqueue do post da fila");
+    }
+
     /// Store fixture (W6-PR3): 3 sessões reais na trilha via `Store::record`
     /// (scan ok, triage ok com modelo, doctor que falhou) — o painel de
     /// sessões lê o MESMO banco que os comandos gravam. Fecha a store antes
@@ -603,6 +677,78 @@ fn snapshot_with_wiki_fixture_shows_rendered_pages_and_keeps_the_store_readonly(
     assert_eq!(
         before, after,
         "dashboard --snapshot com painel de wiki mutou o store.db — violação do contrato read-only"
+    );
+}
+
+/// M4: a caixa de correio no `--snapshot` — lista com estado traduzido,
+/// marcador de não lido NA célula, contagem de não lidos, e o renderizador
+/// nativo no corpo dos entregues (metadado do rascunho fora da prosa). A
+/// prova de read-only continua valendo: `--snapshot` NUNCA grava `read_at`.
+#[test]
+fn snapshot_with_posts_fixture_shows_the_mailbox_and_keeps_the_store_readonly() {
+    let sandbox = Sandbox::new("posts");
+    sandbox.seed_store_with_scan(true);
+    sandbox.seed_posts_fixture();
+    let before = sandbox.store_hash();
+    assert!(!before.is_empty(), "store fixture precisa existir");
+
+    let (code, out, err) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "saída: {out}{err}");
+
+    // Cabeçalho com a contagem REAL e o número que bate com o critério do
+    // `posts_unread` do doctor (entregue E read_at IS NULL).
+    assert!(out.contains("painel posts — 3 artigos"), "{out}");
+    assert!(out.contains("(2 não lido)"), "{out}");
+    assert!(out.contains("ESTADO"), "{out}");
+    assert!(out.contains("SLUG"), "{out}");
+    assert!(
+        out.contains("entregue [não lido]"),
+        "marcador na célula: {out}"
+    );
+    assert!(out.contains("na fila"), "{out}");
+    assert!(out.contains("glossario"), "{out}");
+    // Os entregues ganham preview renderizado (o corpo é arquivo, não banco).
+    assert!(out.contains("post: intro — entregue [não lido]"), "{out}");
+    assert!(
+        out.contains("O projeto resolve X"),
+        "prosa renderizada: {out}"
+    );
+    assert!(out.contains("graph TD"), "corpo do c4 renderizado: {out}");
+    // O metadado do rascunho não vira prosa; o post da fila não tem preview.
+    assert!(
+        !out.contains("gerado por"),
+        "cabeçalho do draft fora: {out}"
+    );
+    assert!(
+        !out.contains("post: glossario"),
+        "sealed não tem corpo: {out}"
+    );
+    // A leitura do snapshot NÃO marca nada — o `read_at` é só da tecla.
+    let after = sandbox.store_hash();
+    assert_eq!(
+        before, after,
+        "dashboard --snapshot com posts mutou o store.db — violação do contrato read-only"
+    );
+}
+
+/// Painel vazio com a causa honesta e o comando (nunca inventado), no mesmo
+/// espírito do painel de wiki ausente.
+#[test]
+fn posts_panel_names_the_digest_cause_when_the_mailbox_is_empty() {
+    let sandbox = Sandbox::new("posts-empty");
+    sandbox.seed_store_with_scan(true);
+    let before = sandbox.store_hash();
+    let (code, out, err) = run_kira(&sandbox, &[], &["dashboard", "--snapshot"]);
+    assert_eq!(code, 0, "saída: {out}{err}");
+    assert!(out.contains("posts: —"), "estado vazio com traço: {out}");
+    assert!(
+        out.contains("kira digest"),
+        "e o comando que resolve: {out}"
+    );
+    assert_eq!(
+        before,
+        sandbox.store_hash(),
+        "nem a leitura vazia toca o disco"
     );
 }
 

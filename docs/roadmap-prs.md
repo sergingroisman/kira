@@ -181,7 +181,7 @@ Os PRs de fechamento formam **stack** — merge na ordem, cada um com a base dec
 | `feat/m-pack-digest-context` | item 4: `## Perfil`/`## Árvore` do digest no context pack (tetos 1 500 chars / 40 linhas; goldens intactos) | — | branch empilhada — aguarda merge |
 | `feat/m7-gitignore` | P5: subset gitwildmatch em `src/context/gitignore.rs`, uma política nos três caminhos; **fecha M7** | M7-P5 | branch empilhada — aguarda merge |
 | `docs/m8-jornada` | este: jornada do setup real de 5 etapas, JM na doc de jornadas, roadmap, README, ledger | M8 | branch empilhada — aguarda merge |
-| M4 caixa de correio | `Screen::Posts` no dashboard (preview nativo, `read_at`, snapshot) | M4 | aberto — próxima PR da fila |
+| `feat/m4-mailbox` | M4: `Screen::Posts` no dashboard (5ª tela, preview nativo, `Enter`/`i` gravam `read_at` só na store, snapshot coberto) | M4 | branch empilhada — aguarda merge |
 
 Achado registrado (issue própria, não corrigido na stack): `ollama list` spawna sem timeout
 e um daemon ocupado pode travar `kira setup --yes` — os e2es de binário rodam herméticos

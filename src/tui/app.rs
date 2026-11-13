@@ -45,11 +45,12 @@ use crate::tui::theme::{self, Palette};
 use crate::tui::widgets::cards::{self, Live};
 use crate::tui::widgets::findings::{DetailWidget, FindingsWidget};
 use crate::tui::widgets::footer;
+use crate::tui::widgets::posts::{PostsPageWidget, PostsWidget};
 use crate::tui::widgets::sessions::SessionsWidget;
 use crate::tui::widgets::wiki::{WikiPageWidget, WikiWidget};
 
-/// Quantidade de fontes no ciclo de `Tab`/`1–4`.
-pub const SCREEN_COUNT: usize = 4;
+/// Quantidade de fontes no ciclo de `Tab`/`1–5`.
+pub const SCREEN_COUNT: usize = 5;
 
 /// Passo de PgUp/PgDn no preview/lista (linhas por "página" de scroll).
 pub const SCROLL_PAGE_STEP: isize = 10;
@@ -87,7 +88,7 @@ impl Drop for ScreenGuard {
     }
 }
 
-/// Fonte de dados em foco (as quatro telas do dashboard).
+/// Fonte de dados em foco (as cinco telas do dashboard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     /// Home: risco, atividade recente e pendências.
@@ -98,6 +99,8 @@ pub enum Screen {
     Sessoes,
     /// Páginas da wiki.
     Wiki,
+    /// Caixa de correio (M4): a fila `posts` e a leitura dos entregues.
+    Posts,
 }
 
 impl Screen {
@@ -108,6 +111,7 @@ impl Screen {
             Screen::Achados => 1,
             Screen::Sessoes => 2,
             Screen::Wiki => 3,
+            Screen::Posts => 4,
         }
     }
 
@@ -117,13 +121,16 @@ impl Screen {
             1 => Screen::Achados,
             2 => Screen::Sessoes,
             3 => Screen::Wiki,
+            4 => Screen::Posts,
             _ => Screen::Resumo,
         }
     }
 
-    /// A tela tem registro que abre inspetor?
+    /// A tela tem registro que abre inspetor 50–50? Nos Posts a leitura é em
+    /// tela cheia (como a página da wiki no `Enter`): o inspetor não tem o
+    /// que desenhar, então `i` vira a própria leitura via `OpenPost`.
     pub fn has_inspector(self) -> bool {
-        !matches!(self, Screen::Resumo)
+        !matches!(self, Screen::Resumo | Screen::Posts)
     }
 }
 
@@ -158,6 +165,8 @@ pub struct AppState {
     pub sessions_selected: usize,
     /// Seleção da lista de wiki (sobre a lista FILTRADA).
     pub wiki_selected: usize,
+    /// Seleção da caixa de correio (M4) — própria, nunca compartilhada.
+    pub posts_selected: usize,
     /// Scroll da lista ÚNICA do modo degradado.
     pub degraded_selected: usize,
     /// Modo degradado ativo (terminal menor que 80×24).
@@ -168,6 +177,7 @@ pub struct AppState {
     pub findings_len: usize,
     pub sessions_len: usize,
     pub wiki_len: usize,
+    pub posts_len: usize,
     /// Busca incremental da wiki aberta (`/`).
     pub wiki_search_open: bool,
     /// Agulha da busca (aplicada por `state::filter_pages`).
@@ -208,12 +218,14 @@ impl Default for AppState {
             tool_values: Vec::new(),
             sessions_selected: 0,
             wiki_selected: 0,
+            posts_selected: 0,
             degraded_selected: 0,
             degraded: false,
             help_open: false,
             findings_len: 0,
             sessions_len: 0,
             wiki_len: 0,
+            posts_len: 0,
             wiki_search_open: false,
             wiki_query: String::new(),
             page_open: false,
@@ -232,7 +244,10 @@ impl Default for AppState {
 
 /// O que o loop executa depois de [`decide`].
 ///
-/// Não existe variante de escrita/rede/LLM: navegar nunca executa (ADR-0033).
+/// Não existe variante de execução/rede/LLM: navegar nunca spawna (ADR-0033).
+/// A ÚNICA escrita que o painel faz é o carimbo `posts.read_at` que
+/// [`Outcome::OpenPost`] dispara no loop (aceite do M4 no BUILD-PROGRAM), em
+/// conexão própria, idempotente e desligada sob `--read-only`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Sair do dashboard.
@@ -265,6 +280,10 @@ pub enum Outcome {
     CloseSearch,
     /// Abrir a página selecionada da wiki em tela cheia.
     OpenPage,
+    /// Abrir a leitura do post selecionado (M4) — `Enter`/`i` na caixa de
+    /// correio. O loop abre a tela E grava `read_at` (a única escrita do
+    /// dashboard); sob `--read-only` só abre, não grava.
+    OpenPost,
     /// Fechar a leitura em tela cheia.
     ClosePage,
     /// Rolar a leitura (j/k por linha, PgUp/PgDn por página).
@@ -316,6 +335,7 @@ pub fn max_selected_for(
     findings_len: usize,
     sessions_len: usize,
     wiki_len: usize,
+    posts_len: usize,
     degraded_total_lines: usize,
     degraded: bool,
 ) -> usize {
@@ -326,6 +346,7 @@ pub fn max_selected_for(
         Screen::Achados => findings_len.max(1) - 1,
         Screen::Sessoes => sessions_len.max(1) - 1,
         Screen::Wiki => wiki_len.max(1) - 1,
+        Screen::Posts => posts_len.max(1) - 1,
         Screen::Resumo => 0,
     }
 }
@@ -336,6 +357,7 @@ fn screen_has_rows(screen: &AppState) -> bool {
         Screen::Achados => screen.findings_len > 0,
         Screen::Sessoes => screen.sessions_len > 0,
         Screen::Wiki => screen.wiki_len > 0,
+        Screen::Posts => screen.posts_len > 0,
         Screen::Resumo => false,
     }
 }
@@ -416,6 +438,9 @@ pub fn apply_outcome(screen: &mut AppState, outcome: Outcome) {
                         screen.sessions_selected = apply_move(screen.sessions_selected, offset)
                     }
                     Screen::Wiki => screen.wiki_selected = apply_move(screen.wiki_selected, offset),
+                    Screen::Posts => {
+                        screen.posts_selected = apply_move(screen.posts_selected, offset)
+                    }
                     // O Resumo não é lista: ↑/↓ não inventam seleção.
                     Screen::Resumo => {}
                 }
@@ -452,6 +477,12 @@ pub fn apply_outcome(screen: &mut AppState, outcome: Outcome) {
             screen.page_open = true;
             screen.preview_scroll = 0;
             screen.wiki_search_open = false;
+        }
+        // A leitura do post é a MESMA camada modal da página da wiki: quem
+        // grava `read_at` é o loop (I/O fora da função pura), aqui só a tela.
+        Outcome::OpenPost => {
+            screen.page_open = true;
+            screen.preview_scroll = 0;
         }
         Outcome::ClosePage => screen.page_open = false,
         Outcome::ScrollPage(offset) => {
@@ -617,6 +648,10 @@ fn selection_key(snapshot: &Snapshot, state_screen: &AppState) -> Option<state::
                 .get(state_screen.wiki_selected)
                 .map(|page| state::SelectionKey::Wiki(page.slug.clone()))
         }
+        Screen::Posts => snapshot
+            .post_rows
+            .get(state_screen.posts_selected)
+            .map(|post| state::SelectionKey::Post(post.id.clone())),
         Screen::Resumo => None,
     }
 }
@@ -648,6 +683,11 @@ fn reanchor(state_screen: &mut AppState, key: Option<state::SelectionKey>, snaps
                 .position(|page| page.slug == slug)
             {
                 state_screen.wiki_selected = index;
+            }
+        }
+        state::SelectionKey::Post(id) => {
+            if let Some(index) = snapshot.post_rows.iter().position(|row| row.id == id) {
+                state_screen.posts_selected = index;
             }
         }
     }
@@ -773,12 +813,16 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
             Screen::Sessoes if state.sessions_len > 0 => Outcome::ToggleInspector,
             // Wiki: Enter abre a leitura integral (o `i` abre o preview ao lado).
             Screen::Wiki if state.wiki_len > 0 => Outcome::OpenPage,
+            // Correio: a tecla de abrir (M4) — leitura em tela cheia e o
+            // carimbo `read_at`, único e do ledger do dashboard, ficam no loop.
+            Screen::Posts if state.posts_len > 0 => Outcome::OpenPost,
             _ => Outcome::Ignore,
         },
         KeyCode::Char('1') => Outcome::GoScreen(Screen::Resumo),
         KeyCode::Char('2') => Outcome::GoScreen(Screen::Achados),
         KeyCode::Char('3') => Outcome::GoScreen(Screen::Sessoes),
         KeyCode::Char('4') => Outcome::GoScreen(Screen::Wiki),
+        KeyCode::Char('5') => Outcome::GoScreen(Screen::Posts),
         KeyCode::Char('l') if key.modifiers.contains(Mods::CONTROL) => Outcome::Redraw,
         _ => match keymap::map(key) {
             Some(Key::Quit) => Outcome::Quit,
@@ -790,6 +834,15 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
             Some(Key::Bottom) => Outcome::Move(isize::MAX),
             Some(Key::Reload) => Outcome::Reload,
             Some(Key::Help) => Outcome::Help,
+            // Nos Posts o `i` é a própria leitura (mesma tecla, mesmo
+            // resultado do `Enter` — o inspetor 50–50 não tem o que desenhar).
+            Some(Key::Inspect) if state.screen == Screen::Posts => {
+                if state.posts_len > 0 {
+                    Outcome::OpenPost
+                } else {
+                    Outcome::Ignore
+                }
+            }
             Some(Key::Inspect) => Outcome::ToggleInspector,
             Some(Key::SearchWiki) if state.screen == Screen::Wiki => Outcome::SearchWiki,
             Some(Key::SearchWiki) => Outcome::Ignore,
@@ -849,6 +902,7 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
         findings_len: snapshot.finding_rows.len(),
         sessions_len: snapshot.session_rows.len(),
         wiki_len: snapshot.wiki_rows.len(),
+        posts_len: snapshot.post_rows.len(),
         read_only: options.read_only,
         ..AppState::default()
     };
@@ -874,6 +928,7 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
         let filtered_wiki: Vec<&WikiPage> =
             state::filter_pages(&snapshot.wiki_rows, &state_screen.wiki_query);
         state_screen.wiki_len = filtered_wiki.len();
+        state_screen.posts_len = snapshot.post_rows.len();
         // Ids que a folha de alvo pode oferecer, do snapshot (sem rede).
         state_screen.known_work_items = action::known_work_items(&snapshot);
 
@@ -890,6 +945,7 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
             state_screen.findings_len,
             state_screen.sessions_len,
             state_screen.wiki_len,
+            state_screen.posts_len,
             degraded_total_lines,
             degraded,
         ));
@@ -898,6 +954,7 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
             state_screen.findings_len,
             state_screen.sessions_len,
             state_screen.wiki_len,
+            state_screen.posts_len,
             degraded_total_lines,
             degraded,
         ));
@@ -906,6 +963,16 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
             state_screen.findings_len,
             state_screen.sessions_len,
             state_screen.wiki_len,
+            state_screen.posts_len,
+            degraded_total_lines,
+            degraded,
+        ));
+        state_screen.posts_selected = state_screen.posts_selected.min(max_selected_for(
+            Screen::Posts,
+            state_screen.findings_len,
+            state_screen.sessions_len,
+            state_screen.wiki_len,
+            state_screen.posts_len,
             degraded_total_lines,
             degraded,
         ));
@@ -914,6 +981,7 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
             state_screen.findings_len,
             state_screen.sessions_len,
             state_screen.wiki_len,
+            state_screen.posts_len,
             degraded_total_lines,
             degraded,
         ));
@@ -987,6 +1055,33 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
                             }
                         }
                     }
+                    // M4: a ÚNICA escrita do dashboard. `Enter`/`i` abrem a
+                    // leitura (navegação — o apply em `OpenPost` só liga a
+                    // camada modal) e carimbam `read_at` quando o post está
+                    // entregue e o modo leitura está desligado. A gravação é
+                    // idempotente por SQL; falha vira aviso acionável no
+                    // rodapé e a leitura abre do mesmo jeito (fail-open).
+                    Outcome::OpenPost => {
+                        let target = snapshot.post_rows.get(state_screen.posts_selected).cloned();
+                        if let Some(post) = target {
+                            if !state_screen.read_only
+                                && post.state == "delivered"
+                                && post.read_at.is_none()
+                            {
+                                match state::mark_post_read(&post.id) {
+                                    Ok(()) => {
+                                        if let Some(row) =
+                                            snapshot.post_rows.get_mut(state_screen.posts_selected)
+                                        {
+                                            row.read_at = Some(crate::store::now_rfc3339_utc());
+                                        }
+                                    }
+                                    Err(cause) => state_screen.notice = Some(cause),
+                                }
+                            }
+                            apply_outcome(&mut state_screen, Outcome::OpenPost);
+                        }
+                    }
                     outcome => apply_outcome(&mut state_screen, outcome),
                 }
             }
@@ -1013,6 +1108,7 @@ pub fn degraded_lines(snapshot: &Snapshot, screen: Screen) -> Vec<String> {
         Screen::Achados => lines.extend(state::findings_lines(snapshot)),
         Screen::Sessoes => lines.extend(state::sessions_lines(snapshot)),
         Screen::Wiki => lines.extend(state::wiki_lines(snapshot)),
+        Screen::Posts => lines.extend(state::posts_lines(snapshot)),
     }
     lines
 }
@@ -1153,14 +1249,31 @@ pub fn render_frame_with(
         );
     }
 
-    // Leitura da wiki em tela cheia cobre tudo (modal): `Enter` abriu.
-    if screen.page_open
-        && let Some(page) = ordered_wiki.get(screen.wiki_selected)
-    {
-        frame.render_widget(
-            WikiPageWidget::new(page, screen.preview_scroll, palette).with_glyphs(glyphs),
-            area,
-        );
+    // Leitura em tela cheia cobre tudo (modal): o `Enter` da wiki abre a
+    // página; o `Enter`/`i` dos Posts abre o rascunho entregue (M4) — a mesma
+    // camada, dados diferentes, `Esc` fecha as duas.
+    if screen.page_open {
+        match screen.screen {
+            Screen::Wiki => {
+                if let Some(page) = ordered_wiki.get(screen.wiki_selected) {
+                    frame.render_widget(
+                        WikiPageWidget::new(page, screen.preview_scroll, palette)
+                            .with_glyphs(glyphs),
+                        area,
+                    );
+                }
+            }
+            Screen::Posts => {
+                if let Some(post) = snapshot.post_rows.get(screen.posts_selected) {
+                    frame.render_widget(
+                        PostsPageWidget::new(post, screen.preview_scroll, palette)
+                            .with_glyphs(glyphs),
+                        area,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
     if screen.help_open {
         // `Clear` antes: a ajuda é modal e cobre a tela inteira — sem limpar, o
@@ -1266,6 +1379,23 @@ fn render_screen(
                 );
             }
         }
+        Screen::Posts => {
+            // A leitura não cabe aqui: `Enter`/`i` abrem a página modal em
+            // `render_frame_with`. O inspetor 50–50 está desligado na tela
+            // (`has_inspector` false) — nada de área morta na tela do dono.
+            frame.render_widget(
+                PostsWidget::new(
+                    &snapshot.post_rows,
+                    snapshot.now_secs,
+                    screen.posts_selected,
+                    true,
+                    state::empty_posts_line(snapshot),
+                    palette,
+                )
+                .with_glyphs(glyphs),
+                primary,
+            );
+        }
     }
 }
 
@@ -1285,10 +1415,10 @@ fn help_paragraph(palette: &Palette, snapshot: &Snapshot, glyphs: Glyphs) -> Par
         "q                sair".to_string(),
         "Ctrl+C           sair (em qualquer estado)".to_string(),
         "Esc              voltar (fecha ajuda/leitura/inspetor/busca)".to_string(),
-        "1–4 / Tab        trocar de tela (Resumo · Achados · Sessões · Wiki)".to_string(),
+        "1–5 / Tab        trocar de tela (Resumo · Achados · Sessões · Wiki · Posts)".to_string(),
         format!("j / k ou {arrows}   mover a seleção da tela"),
         "g / G            topo / fim".to_string(),
-        "Enter            abrir inspetor (achado/sessão) ou ler a página".to_string(),
+        "Enter            abrir inspetor (achado/sessão), ler a página ou abrir o post".to_string(),
         "i                abrir/fechar o inspetor 50–50".to_string(),
         "s / t / d        pedir scan / triage / rascunho de PR (Enter confirma)".to_string(),
         "o                abrir/fechar a saída da execução".to_string(),
@@ -1668,16 +1798,102 @@ mod tests {
             Outcome::GoScreen(Screen::Wiki)
         );
         assert_eq!(
+            decide(&state, plain(KeyCode::Char('5'))),
+            Outcome::GoScreen(Screen::Posts),
+            "M4 entrou no ciclo de dígitos"
+        );
+        assert_eq!(
             decide(&state, plain(KeyCode::Char('1'))),
             Outcome::GoScreen(Screen::Resumo)
         );
     }
 
+    /// M4: `Enter`/`i` na caixa de correio ABRIM a leitura (o carimbo
+    /// `read_at` é do loop, nunca de `decide`), e só com post na lista.
     #[test]
-    fn tab_cycles_the_four_screens_with_wrap() {
+    fn posts_open_key_returns_the_read_outcome_only_with_rows() {
+        let empty = AppState {
+            screen: Screen::Posts,
+            ..AppState::default()
+        };
+        assert_eq!(decide(&empty, plain(KeyCode::Enter)), Outcome::Ignore);
+        let with_posts = AppState {
+            screen: Screen::Posts,
+            posts_len: 2,
+            ..AppState::default()
+        };
+        assert_eq!(
+            decide(&with_posts, plain(KeyCode::Enter)),
+            Outcome::OpenPost
+        );
+        // `i` é a mesma leitura na tela inteira (o inspetor 50–50 não existe
+        // em Posts — `has_inspector` false), e fora dela continua inspetor.
+        assert_eq!(
+            decide(&with_posts, plain(KeyCode::Char('i'))),
+            Outcome::OpenPost
+        );
+        assert_eq!(
+            decide(&findings_state(), plain(KeyCode::Char('i'))),
+            Outcome::ToggleInspector
+        );
+        // A leitura abre também em `--read-only`: o que o modo desliga é a
+        // GRAVAÇÃO, que mora no loop — navegar nunca foi ação.
+        let glasses = AppState {
+            screen: Screen::Posts,
+            posts_len: 1,
+            read_only: true,
+            ..AppState::default()
+        };
+        assert_eq!(
+            decide(&glasses, plain(KeyCode::Enter)),
+            Outcome::OpenPost,
+            "leitura não é escrita"
+        );
+        let mut state = with_posts;
+        apply_outcome(&mut state, Outcome::OpenPost);
+        assert!(state.page_open, "a camada modal de leitura ligou");
+        assert_eq!(state.preview_scroll, 0, "abre do topo");
+        // Esc fecha a leitura ANTES de qualquer outra camada (cascata).
+        assert_eq!(decide(&state, plain(KeyCode::Esc)), Outcome::ClosePage);
+        // E rolagem dentro da leitura é a mesma camada da wiki.
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('j'))),
+            Outcome::ScrollPage(1)
+        );
+    }
+
+    /// O clamp e o movimento da caixa de correio são próprios, como os de
+    /// cada tela — nada de seleção compartilhada entre painéis.
+    #[test]
+    fn posts_selection_is_scoped_and_clamped() {
+        let mut state = AppState {
+            findings_len: 5,
+            sessions_len: 5,
+            wiki_len: 5,
+            posts_len: 3,
+            ..AppState::default()
+        };
+        state.screen = Screen::Posts;
+        apply_outcome(&mut state, Outcome::Move(2));
+        assert_eq!(state.posts_selected, 2);
+        assert_eq!(state.findings_selected, 0, "não atravessa a tela vizinha");
+        assert_eq!(
+            max_selected_for(Screen::Posts, 5, 5, 5, 3, 0, false),
+            2,
+            "clamp pela quantidade REAL de posts"
+        );
+    }
+
+    #[test]
+    fn tab_cycles_the_five_screens_with_wrap() {
         assert_eq!(next_screen(Screen::Resumo, 1), Screen::Achados);
-        assert_eq!(next_screen(Screen::Wiki, 1), Screen::Resumo);
-        assert_eq!(next_screen(Screen::Resumo, -1), Screen::Wiki);
+        assert_eq!(
+            next_screen(Screen::Wiki, 1),
+            Screen::Posts,
+            "M4 entrou no ciclo"
+        );
+        assert_eq!(next_screen(Screen::Posts, 1), Screen::Resumo);
+        assert_eq!(next_screen(Screen::Resumo, -1), Screen::Posts);
         let mut state = AppState::default();
         apply_outcome(&mut state, Outcome::CycleScreen(1));
         assert_eq!(state.screen, Screen::Achados);
@@ -1745,44 +1961,55 @@ mod tests {
 
     #[test]
     fn navigation_never_returns_an_execution_outcome() {
-        // Contrato do ADR-0033: nenhuma tecla de navegação vira ação.
-        let state = findings_state();
-        let keys = [
-            KeyCode::Tab,
-            KeyCode::BackTab,
-            KeyCode::Char('j'),
-            KeyCode::Char('k'),
-            KeyCode::Char('g'),
-            KeyCode::Char('G'),
-            KeyCode::Enter,
-            KeyCode::Char('i'),
-            KeyCode::Char('r'),
-            KeyCode::Char('?'),
-            KeyCode::Esc,
-        ];
-        for code in keys {
-            let outcome = decide(&state, plain(code));
-            assert!(
-                matches!(
-                    outcome,
-                    Outcome::Reload
-                        | Outcome::ToggleInspector
-                        | Outcome::GoScreen(_)
-                        | Outcome::CycleScreen(_)
-                        | Outcome::Move(_)
-                        | Outcome::SearchWiki
-                        | Outcome::SearchChar(_)
-                        | Outcome::SearchBackspace
-                        | Outcome::CloseSearch
-                        | Outcome::OpenPage
-                        | Outcome::ClosePage
-                        | Outcome::ScrollPage(_)
-                        | Outcome::Help
-                        | Outcome::Redraw
-                        | Outcome::Ignore
-                ),
-                "navegação produziu efeito inesperado: {code:?} -> {outcome:?}"
-            );
+        // Contrato do ADR-0033: nenhuma tecla de navegação vira ação (spawn,
+        // rede ou LLM). A caixa de correio (M4) também roda aqui: `OpenPost`
+        // não é execução — é leitura; o único efeito de escrita que dispara
+        // (carimbo `read_at` no ledger do próprio dashboard) é o que o aceite
+        // do dono exige, e mesmo assim fica desligado sob `--read-only`.
+        let mailbox = AppState {
+            screen: Screen::Posts,
+            posts_len: 2,
+            ..AppState::default()
+        };
+        for state in [findings_state(), mailbox] {
+            let keys = [
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::Char('j'),
+                KeyCode::Char('k'),
+                KeyCode::Char('g'),
+                KeyCode::Char('G'),
+                KeyCode::Enter,
+                KeyCode::Char('i'),
+                KeyCode::Char('r'),
+                KeyCode::Char('?'),
+                KeyCode::Esc,
+            ];
+            for code in keys {
+                let outcome = decide(&state, plain(code));
+                assert!(
+                    matches!(
+                        outcome,
+                        Outcome::Reload
+                            | Outcome::ToggleInspector
+                            | Outcome::GoScreen(_)
+                            | Outcome::CycleScreen(_)
+                            | Outcome::Move(_)
+                            | Outcome::SearchWiki
+                            | Outcome::SearchChar(_)
+                            | Outcome::SearchBackspace
+                            | Outcome::CloseSearch
+                            | Outcome::OpenPage
+                            | Outcome::OpenPost
+                            | Outcome::ClosePage
+                            | Outcome::ScrollPage(_)
+                            | Outcome::Help
+                            | Outcome::Redraw
+                            | Outcome::Ignore
+                    ),
+                    "navegação produziu efeito inesperado: {code:?} -> {outcome:?}"
+                );
+            }
         }
     }
 
@@ -1963,7 +2190,7 @@ mod tests {
             ..AppState::default()
         };
         let text = render_text(&state, &snapshot, 100, 30);
-        assert!(text.contains("1–4 / Tab"), "{text}");
+        assert!(text.contains("1–5 / Tab"), "{text}");
         assert!(text.contains("inspetor"), "{text}");
         assert!(text.contains("nada é inventado"), "{text}");
     }

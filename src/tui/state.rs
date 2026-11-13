@@ -58,6 +58,14 @@ pub struct Snapshot {
     /// (`wiki vazia — rode kira wiki reindex`); ausente, a causa cai para
     /// `store_note` (store ausente é a causa real, não uma inventada).
     pub wiki_note: Option<String>,
+    /// Caixa de correio (M4, ADR-0038): a tabela `posts` lida pela MESMA
+    /// conexão read-only + o corpo de cada rascunho lido de
+    /// `.kira/digest/<slug>.md`. Vazio = estado vazio honesto
+    /// (`empty_posts_line`).
+    pub post_rows: Vec<PostEntry>,
+    /// Causa quando a fila está vazia/ilegível com store legível; ausente,
+    /// cai para `store_note`.
+    pub posts_note: Option<String>,
     /// `now` capturado UMA vez por snapshot (unix, segundos): toda idade
     /// relativa da tela é função pura [`humanize_age`] sobre este valor —
     /// NUNCA `SystemTime::now()` dentro do widget (determinismo da spec W6).
@@ -150,20 +158,24 @@ fn load_store(snapshot: &mut Snapshot) {
                     .last_sessions(&project.id, SESSION_HISTORY_LIMIT)
                     .and_then(|sessions| {
                         // A MESMA conexão read-only alimenta o painel de
-                        // wiki (W6-PR4) e a contagem do índice de retrieval —
-                        // nenhuma segunda abertura, nenhum write no disco.
+                        // wiki (W6-PR4), a contagem do índice de retrieval e
+                        // a caixa de correio (M4) — nenhuma segunda abertura,
+                        // nenhum write no disco.
                         store.wiki_pages().map(|wiki| {
                             // `ok()` de propósito: índice ausente é dado
                             // ausente (`—` com causa), nunca erro do painel.
                             let index_files = store.repo_file_count(&project.id).ok();
-                            Some((project, sessions, wiki, index_files))
+                            // posts: a falha fica Result e vira nota por
+                            // fonte (fail-open), não derruba o painel inteiro.
+                            let posts = store.posts_of(&project.id);
+                            Some((project, sessions, wiki, index_files, posts))
                         })
                     })
             })
         })
     });
     match opened {
-        Ok(Some((project, sessions, wiki, index_files))) => {
+        Ok(Some((project, sessions, wiki, index_files, posts))) => {
             if let Some(scan_session) = sessions
                 .iter()
                 .find(|session| session.command == "scan")
@@ -193,6 +205,7 @@ fn load_store(snapshot: &mut Snapshot) {
             }
             snapshot.project = Some(project);
             apply_wiki(snapshot, Ok(wiki), &root);
+            apply_posts(snapshot, posts, &root);
         }
         Ok(None) => {
             snapshot.store_note = Some(format!(
@@ -1025,6 +1038,226 @@ pub fn wiki_rows_from(rows: &[store::WikiPageRow], root: &Path) -> Vec<WikiPage>
         .collect()
 }
 
+/// Um artigo da caixa de correio (M4): a linha da tabela `posts` (proveniência
+/// e estado) + o corpo lido do rascunho em `.kira/digest/<slug>.md` — a fonte
+/// da verdade é o arquivo, o store nunca guarda o texto. A lore (fila, selo,
+/// entrega) vive aqui na UI; os identificadores ficam em inglês (ADR-0038 D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostEntry {
+    /// Id do post (uuid gravado no enqueue) — chave do `read_at`.
+    pub id: String,
+    pub slug: String,
+    pub kind: String,
+    pub lang: String,
+    /// Estado CRUDO da tabela (`sealed|picked|delivered|dead`); a UI traduz
+    /// por [`post_state_label`].
+    pub state: String,
+    /// RFC3339 quando o dev abriu o post; `None` = **não lido** (o marcador
+    /// do painel, ADR-0038 D5).
+    pub read_at: Option<String>,
+    /// Destino publicado em `.kira/wiki/` (`None` antes do `kira emit`).
+    pub path: Option<String>,
+    /// RFC3339 da criação — a idade relativa da lista.
+    pub created_at: String,
+    /// `created_at` em unix (s); `None` = stamp não-parseável (mostra `—`).
+    pub created_unix: Option<i64>,
+    /// Markdown do rascunho com o teto de [`WIKI_PAGE_MAX_BYTES`]; vazio =
+    /// arquivo ausente/ilegível — o preview diz a causa, nunca inventa texto.
+    pub body: String,
+}
+
+/// Tradução da lore para a humana (o identificador interno stays English):
+/// as quatro palavras do ciclo `sealed → picked → delivered | dead`.
+#[must_use]
+pub fn post_state_label(state: &str) -> &'static str {
+    match state {
+        "sealed" => "na fila",
+        "picked" => "em rota",
+        "delivered" => "entregue",
+        "dead" => "perdida",
+        _other => "desconhecido",
+    }
+    // `other` nunca vem do store (a enum normaliza); o rótulo existencial é
+    // o contrato do painel para dado que não deveria existir.
+}
+
+/// Linhas da tabela `posts` + corpo do arquivo. Pura por fonte: o `Result` da
+/// consulta entra já resolvido (a mesma conexão read-only do wiki) e vira
+/// nota por fonte quando falha — fail-open, como tudo aqui.
+fn apply_posts(
+    snapshot: &mut Snapshot,
+    loaded: Result<Vec<store::posts::PostRow>, store::StoreError>,
+    root: &Path,
+) {
+    match loaded {
+        Ok(rows) => {
+            snapshot.post_rows = post_rows_from(&rows, root);
+            if rows.is_empty() {
+                // A causa honesta é o caminho inteiro: posts nascem do digest
+                // e só viram página com o emit.
+                snapshot.posts_note =
+                    Some("nenhum post — rode kira digest (e kira emit para publicar)".to_string());
+            }
+        }
+        Err(err) => {
+            snapshot.posts_note = Some(format!("fila de posts ilegível ({err})"));
+            snapshot.post_rows.clear();
+        }
+    }
+}
+
+/// Converte linhas da tabela em entradas do painel; ordem da consulta
+/// (`created_at DESC, slug`), determinística por construção. O corpo vem do
+/// arquivo `.kira/digest/<slug>.md` — presente só após a entrega.
+pub fn post_rows_from(rows: &[store::posts::PostRow], root: &Path) -> Vec<PostEntry> {
+    rows.iter()
+        .map(|row| {
+            let draft = root
+                .join(".kira")
+                .join("digest")
+                .join(format!("{}.md", row.slug.trim()));
+            PostEntry {
+                id: row.id.clone(),
+                slug: row.slug.trim().to_string(),
+                kind: row.kind.trim().to_string(),
+                lang: row.lang.trim().to_string(),
+                state: row.state.as_str().to_string(),
+                read_at: row.read_at.clone(),
+                path: row.path.clone(),
+                created_at: row.created_at.trim().to_string(),
+                created_unix: store::rfc3339_utc_to_unix_seconds(row.created_at.trim()),
+                body: read_capped(&draft, WIKI_PAGE_MAX_BYTES).unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+/// `posts: — (nenhum post — rode kira digest …)`; store ausente ⇒ a causa
+/// concreta que o snapshot já carrega (nunca uma genérica inventada).
+#[must_use]
+pub fn empty_posts_line(snapshot: &Snapshot) -> String {
+    let cause = snapshot
+        .posts_note
+        .clone()
+        .or_else(|| snapshot.store_note.clone())
+        .unwrap_or_else(|| "nenhum post — rode kira digest".to_string());
+    format!("posts: — ({cause})")
+}
+
+/// Uma linha de estado do painel: o rótulo traduzido + o marcador de não-lido
+/// na própria célula (estado visível sem depender de cor, a regra dos chips).
+#[must_use]
+pub fn post_state_cell(post: &PostEntry) -> String {
+    let label = post_state_label(&post.state);
+    if post.state == "delivered" && post.read_at.is_none() {
+        format!("{label} [não lido]")
+    } else {
+        label.to_string()
+    }
+}
+
+/// Lista da caixa de correio em texto (`--snapshot` + modo degradado):
+/// colunas fixas, mesma ordem da TUI.
+#[must_use]
+pub fn posts_lines(snapshot: &Snapshot) -> Vec<String> {
+    let posts = &snapshot.post_rows;
+    if posts.is_empty() {
+        return vec![empty_posts_line(snapshot)];
+    }
+    let noun = if posts.len() == 1 {
+        "artigo"
+    } else {
+        "artigos"
+    };
+    let unread = posts
+        .iter()
+        .filter(|post| post.state == "delivered" && post.read_at.is_none())
+        .count();
+    let mut lines = vec![format!(
+        "painel posts — {} {noun} ({} não lido)",
+        posts.len(),
+        unread
+    )];
+    lines.push(format!(
+        "{:<20} {:<26} {:<16} {:<6} {}",
+        "ESTADO", "SLUG", "TIPO", "IDIOMA", "CRIADO"
+    ));
+    for post in posts {
+        lines.push(format!(
+            "{:<20} {:<26} {:<16} {:<6} {}",
+            post_state_cell(post),
+            post.slug,
+            post.kind,
+            post.lang,
+            post_age_line(post.created_unix, snapshot.now_secs),
+        ));
+    }
+    lines
+}
+
+/// Idade relativa de um timestamp do painel (a mesma função do wiki, agora
+/// também para posts — extraída para não duplicar regra de `—`).
+fn post_age_line(unix: Option<i64>, now_secs: Option<i64>) -> String {
+    match (unix, now_secs) {
+        (Some(then), Some(now)) => humanize_age(now, then),
+        _ => "—".to_string(),
+    }
+}
+
+/// Preview de UM post — o que `Enter` abre na TUI e o `--snapshot` imprime
+/// para cada entregue. O cabeçalho-comentário do rascunho (`<!-- gerado por
+/// kira digest … -->`) sai da visualização: é metadado de arquivo, não prosa;
+/// o resto sai pelo renderizador nativo (sem `#`, sem HTML executado).
+#[must_use]
+pub fn post_preview_lines(post: &PostEntry, width: usize) -> Vec<String> {
+    let mut lines = vec![format!(
+        "post: {} — {} ({}, {})",
+        post.slug,
+        post_state_cell(post),
+        post.kind,
+        post.lang
+    )];
+    let prose: Vec<&str> = post
+        .body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("<!--"))
+        .collect();
+    let rendered = crate::tui::markdown::render(&prose.join("\n"), width);
+    if rendered.is_empty() {
+        lines.push(if post.state == "delivered" {
+            "(rascunho ausente em .kira/digest/ — rode kira digest de novo)".to_string()
+        } else {
+            "(sem corpo: o post ainda não foi digerido)".to_string()
+        });
+    } else {
+        lines.extend(rendered);
+    }
+    lines
+}
+
+/// A ÚNICA escrita que o dashboard faz (M4, aceite do dono): grava `read_at`
+/// quando o dev abre um post entregue. Erro sai como texto acionável para o
+/// rodapé — a leitura abre igualmente (falha de trilha nunca esconde dado).
+pub fn mark_post_read(id: &str) -> Result<(), String> {
+    let db = store::db_path().ok_or_else(|| {
+        "sem diretório para o store — defina HOME (ou USERPROFILE) ou KIRA_STORE_DIR".to_string()
+    })?;
+    stamp_read_at(&db, id)
+}
+
+/// Costura do `mark_post_read`: o caminho EXATO da store, sem env e sem cwd
+/// — o que o deixa testável sem mutar variável de ambiente (regra do repo:
+/// `set_var` é proibido em teste). Conexão RW mínima aberta e fechada aqui
+/// (sem WAL, sem migração — ver `Store::open_readwrite_no_migrate_at`); o SQL
+/// é idempotente (`WHERE read_at IS NULL`), então reabrir não muda mais nada.
+fn stamp_read_at(db: &Path, id: &str) -> Result<(), String> {
+    let opened = Store::open_readwrite_no_migrate_at(db)
+        .map_err(|err| format!("não foi possível abrir o store para marcar leitura ({err})"))?;
+    opened
+        .post_mark_read(id)
+        .map_err(|err| format!("não foi possível marcar o post como lido ({err})"))
+}
+
 /// Busca incremental do painel (`/`) — função PURA e testada: filtra por
 /// título E conteúdo, case-insensitive E sem acento-sensível (o dono digita
 /// "sessao" e acha "Sessão"). Agulha vazia = todas as páginas.
@@ -1051,6 +1284,8 @@ pub enum SelectionKey {
     Session(i64),
     /// Slug da página da wiki.
     Wiki(String),
+    /// Id do post (uuid estável entre recargas da fila).
+    Post(String),
 }
 
 /// Ordem canônica dos tipos de página da wiki (ADR-0013).
@@ -1465,6 +1700,7 @@ pub fn empty_panel_hint(
     findings_len: usize,
     sessions_len: usize,
     wiki_len: usize,
+    posts_len: usize,
 ) -> Option<String> {
     match screen {
         crate::tui::app::Screen::Achados if findings_len == 0 => {
@@ -1502,6 +1738,13 @@ pub fn empty_panel_hint(
                 Some("a busca não casou nada — Backspace apaga a agulha".to_string())
             }
         }
+        crate::tui::app::Screen::Posts if posts_len == 0 => Some(
+            snapshot
+                .posts_note
+                .clone()
+                .or_else(|| snapshot.store_note.clone())
+                .unwrap_or_else(|| "nenhum post — rode kira digest".to_string()),
+        ),
         _ => None,
     }
 }
@@ -1564,6 +1807,26 @@ pub fn text_report(snapshot: &Snapshot) -> String {
     }
     for page in &snapshot.wiki_rows {
         for line in wiki_preview_lines(page, WIKI_TEXT_WIDTH) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    // Painel posts (M4): a caixa de correio em texto — lista com o marcador
+    // de não lido na célula e o preview renderizado dos ENTREGUES (o mesmo
+    // texto que o `Enter` abre na TUI; fila/rota/perdida não têm corpo).
+    let posts = posts_lines(snapshot);
+    if !posts.is_empty() {
+        text.push('\n');
+        for line in posts {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    for post in &snapshot.post_rows {
+        if post.state != "delivered" {
+            continue;
+        }
+        for line in post_preview_lines(post, WIKI_TEXT_WIDTH) {
             text.push_str(&line);
             text.push('\n');
         }
@@ -1820,15 +2083,15 @@ mod tests {
         // painel — nunca inventada.
         let empty = Snapshot::default();
         assert_eq!(
-            empty_panel_hint(&empty, crate::tui::app::Screen::Wiki, 0, 0, 0),
+            empty_panel_hint(&empty, crate::tui::app::Screen::Wiki, 0, 0, 0, 0),
             Some("wiki vazia — rode kira wiki reindex".to_string())
         );
         assert_eq!(
-            empty_panel_hint(&empty, crate::tui::app::Screen::Sessoes, 0, 0, 0),
+            empty_panel_hint(&empty, crate::tui::app::Screen::Sessoes, 0, 0, 0, 0),
             Some("store sem sessões".to_string())
         );
         assert_eq!(
-            empty_panel_hint(&empty, crate::tui::app::Screen::Achados, 0, 0, 0),
+            empty_panel_hint(&empty, crate::tui::app::Screen::Achados, 0, 0, 0, 0),
             Some("nunca rodou kira scan".to_string())
         );
         // Arquivo presente e vazio: contagem zero explícita (sem `—` falso).
@@ -1837,17 +2100,17 @@ mod tests {
             ..Snapshot::default()
         };
         assert_eq!(
-            empty_panel_hint(&zero, crate::tui::app::Screen::Achados, 0, 0, 0),
+            empty_panel_hint(&zero, crate::tui::app::Screen::Achados, 0, 0, 0, 0),
             Some("0 achados no último scan".to_string())
         );
         // Cabeçalho nunca tem dica (não é lista); painel com conteúdo idem.
         assert_eq!(
-            empty_panel_hint(&empty, crate::tui::app::Screen::Resumo, 0, 0, 0),
+            empty_panel_hint(&empty, crate::tui::app::Screen::Resumo, 0, 0, 0, 0),
             None
         );
         let full = full_snapshot();
         assert_eq!(
-            empty_panel_hint(&full, crate::tui::app::Screen::Wiki, 2, 2, 2),
+            empty_panel_hint(&full, crate::tui::app::Screen::Wiki, 2, 2, 2, 2),
             None
         );
         // Wiki COM páginas, mas a lista FILTRADA vazia: a dica é a agulha.
@@ -1862,7 +2125,7 @@ mod tests {
             ..full
         };
         assert_eq!(
-            empty_panel_hint(&with_pages, crate::tui::app::Screen::Wiki, 2, 2, 0),
+            empty_panel_hint(&with_pages, crate::tui::app::Screen::Wiki, 2, 2, 0, 0),
             Some("a busca não casou nada — Backspace apaga a agulha".to_string())
         );
         // Store ausente: a causa concreta da store (nunca genérica).
@@ -1873,7 +2136,7 @@ mod tests {
             ..Snapshot::default()
         };
         assert_eq!(
-            empty_panel_hint(&absent, crate::tui::app::Screen::Wiki, 0, 0, 0),
+            empty_panel_hint(&absent, crate::tui::app::Screen::Wiki, 0, 0, 0, 0),
             Some("nenhuma trilha em store.db — rode `kira scan` ou `kira doctor`".to_string())
         );
     }
@@ -2127,6 +2390,200 @@ mod tests {
         // Ficam as 50 MAIS recentes (ids 55..=6), nunca as antigas.
         assert_eq!(rows[0].id, 55);
         assert_eq!(rows[SESSIONS_LIMIT - 1].id, 6);
+    }
+
+    /// M4: o painel desenha estado traduzido + marcador de não lido NA CÉLULA,
+    /// e o contador da linha-título bate com o `posts_unread` do doctor
+    /// (mesmo critério: entregue E `read_at IS NULL`).
+    #[test]
+    fn posts_lines_mark_unread_in_the_cell_and_count_them() {
+        let post = |slug: &str, state: &str, read_at: Option<&str>| PostEntry {
+            id: format!("uuid-{slug}"),
+            slug: slug.to_string(),
+            kind: "intro".to_string(),
+            lang: "pt-BR".to_string(),
+            state: state.to_string(),
+            read_at: read_at.map(str::to_string),
+            path: None,
+            created_at: "2026-11-10T08:00:00Z".to_string(),
+            created_unix: Some(1_762_771_200),
+            body: String::new(),
+        };
+        let snapshot = Snapshot {
+            now_secs: Some(1_762_857_600),
+            post_rows: vec![
+                post("intro", "delivered", None),
+                post("c4-container", "delivered", Some("2026-11-11T08:00:00Z")),
+                post("glossario", "sealed", None),
+            ],
+            ..Snapshot::default()
+        };
+        let lines = posts_lines(&snapshot);
+        assert!(lines[0].contains("3 artigos"), "{lines:?}");
+        assert!(lines[0].contains("(1 não lido)"), "{lines:?}");
+        let body = lines.join("\n");
+        assert!(body.contains("entregue [não lido]"), "{body}");
+        assert!(body.contains("na fila"), "{body}");
+        assert!(
+            !body.contains("selado"),
+            "lore interna não vaza para a humana: {body}"
+        );
+    }
+
+    #[test]
+    fn posts_lines_empty_prefers_the_real_cause() {
+        let with_note = Snapshot {
+            posts_note: Some("fila de posts ilegível (x)".to_string()),
+            store_note: Some("alguma outra causa".to_string()),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            empty_posts_line(&with_note),
+            "posts: — (fila de posts ilegível (x))"
+        );
+        let store_only = Snapshot {
+            store_note: Some("nenhuma trilha em /x".to_string()),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            empty_posts_line(&store_only),
+            "posts: — (nenhuma trilha em /x)"
+        );
+        let bare = Snapshot::default();
+        assert!(
+            empty_posts_line(&bare).contains("kira digest"),
+            "{}",
+            empty_posts_line(&bare)
+        );
+    }
+
+    #[test]
+    fn post_preview_splits_the_missing_draft_from_the_undigested_post() {
+        let delivered_without_body = PostEntry {
+            id: "a".into(),
+            slug: "intro".into(),
+            kind: "intro".into(),
+            lang: "en".into(),
+            state: "delivered".into(),
+            read_at: None,
+            path: None,
+            created_at: "x".into(),
+            created_unix: None,
+            body: String::new(),
+        };
+        let lines = post_preview_lines(&delivered_without_body, 40);
+        assert!(
+            lines.iter().any(|l| l.contains(".kira/digest/")),
+            "{lines:?}"
+        );
+        let sealed = PostEntry {
+            state: "sealed".into(),
+            ..delivered_without_body
+        };
+        let lines = post_preview_lines(&sealed, 40);
+        assert!(
+            lines.iter().any(|l| l.contains("ainda não foi digerido")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn post_preview_strips_the_draft_header_and_renders_the_prose() {
+        let post = PostEntry {
+            id: "b".into(),
+            slug: "intro".into(),
+            kind: "intro".into(),
+            lang: "pt-BR".into(),
+            state: "delivered".into(),
+            read_at: Some("2026-11-11T08:00:00Z".into()),
+            path: Some(".kira/wiki/intro.md".into()),
+            created_at: "x".into(),
+            created_unix: None,
+            body: "<!-- gerado por `kira digest`. slug: intro -->\n\n# Visão geral\n\nO projeto faz **isto**.\n".into(),
+        };
+        let lines = post_preview_lines(&post, 40);
+        assert!(lines[0].contains("post: intro"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Visão geral")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("gerado por")),
+            "metadado não é prosa: {lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains('#')), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("entregue") && !l.contains("não lido")),
+            "lido não marca: {lines:?}"
+        );
+    }
+
+    /// O custo real da única escrita do dashboard: idempotente por SQL, com
+    /// a store EXATA do teste (sem env — a costura `stamp_read_at` recebe o
+    /// caminho). Reabrir um post lido não muda mais nada.
+    #[test]
+    fn stamp_read_at_writes_once_and_survives_being_called_twice() {
+        let dir = std::env::temp_dir().join(format!("kira-mark-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("mkdir: {err}"));
+        let db = dir.join("store.db");
+        let project_id = {
+            let store = Store::open_in_dir(&dir).unwrap_or_else(|err| panic!("store: {err}"));
+            let project = store
+                .ensure_project(&dir)
+                .unwrap_or_else(|err| panic!("projeto: {err}"));
+            let new = crate::store::posts::NewPost {
+                id: "uuid-intro".to_string(),
+                slug: "intro".to_string(),
+                kind: "intro".to_string(),
+                lang: "en".to_string(),
+                source_hash: "hash".to_string(),
+                prompt_version: "v1".to_string(),
+                model: "ollama:teste".to_string(),
+            };
+            store
+                .post_enqueue(&project.id, &new)
+                .unwrap_or_else(|err| panic!("enqueue: {err}"));
+            store
+                .post_deliver("uuid-intro", ".kira/digest/intro.md")
+                .unwrap_or_else(|err| panic!("deliver: {err}"));
+            assert!(
+                store
+                    .posts_of(&project.id)
+                    .unwrap_or_else(|err| panic!("posts_of: {err}"))
+                    .remove(0)
+                    .read_at
+                    .is_none(),
+                "entregue volta a não lido (post_deliver)"
+            );
+            project.id
+        }; // a conexão RW do seed morre aqui — o WAL é checkpointado no drop
+
+        stamp_read_at(&db, "uuid-intro").unwrap_or_else(|err| panic!("marcação: {err}"));
+        let check = Store::open_readonly_at(&db).unwrap_or_else(|err| panic!("ro: {err}"));
+        let rows = check
+            .posts_of(&project_id)
+            .unwrap_or_else(|err| panic!("rows: {err}"));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].read_at.is_some(), "read_at gravado");
+        let first = rows[0].read_at.clone();
+        drop(check);
+
+        // Idempotência: segunda chamada não reescreve o stamp.
+        stamp_read_at(&db, "uuid-intro").unwrap_or_else(|err| panic!("re-marcação: {err}"));
+        let check = Store::open_readonly_at(&db).unwrap_or_else(|err| panic!("ro 2: {err}"));
+        let rows = check
+            .posts_of(&project_id)
+            .unwrap_or_else(|err| panic!("rows 2: {err}"));
+        assert_eq!(rows[0].read_at, first, "reabrir não muda o stamp");
+        drop(check);
+
+        // Id inexistente: no-op honesto (UPDATE casa 0 linhas), sem pânico.
+        stamp_read_at(&db, "uuid-fantasma").unwrap_or_else(|err| panic!("fantasma: {err}"));
+        // Store inexistente: erro ACIONÁVEL, nunca panic — o rodapé mostra.
+        let absent = dir.join("nao-existe.db");
+        let error = stamp_read_at(&absent, "uuid-intro").unwrap_err();
+        assert!(error.contains("abrir o store"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

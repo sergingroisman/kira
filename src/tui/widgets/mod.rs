@@ -11,6 +11,8 @@ pub mod footer;
 pub mod gauge;
 /// Primitiva de painel: borda dupla + título `| x |`.
 pub mod panel;
+/// Caixa de correio: lista de posts + leitura do rascunho entregue (M4).
+pub mod posts;
 /// Scrollbar vertical das listas (posição do viewport).
 pub mod scrollbar;
 /// Régua de seção com título (`═| Seção |════`).

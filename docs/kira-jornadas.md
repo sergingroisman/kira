@@ -162,8 +162,12 @@ em caso de falha; exit 0/1. Sem LLM juiz.
 
 ## J8 — Vigilância: `watch` (dashboard)
 
-4 painéis read-only, provado por hash do store. Agora ganha **um campo de capacidades** (o que está
-conectado / desativado) — é o que evita o dev achar que "não funciona".
+5 painéis (Resumo · Achados · Sessões · Wiki · **Posts**), read-only, provado por hash do
+store. A caixa de correio (M4) lista a fila `posts` com o marcador `[não lido]` na célula e abre
+o rascunho entregue em tela cheia com o renderizador nativo; a única escrita possível — o
+carimbo `read_at` ao abrir — mora na store do próprio dashboard, é idempotente e some com
+`--read-only`. O painel também mostra **o que está conectado / desativado** — é o que evita o
+dev achar que "não funciona".
 
 ## J9 — Inspeção viva: `read` (inspect)
 

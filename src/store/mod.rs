@@ -130,6 +130,24 @@ impl Store {
         Ok(Store { conn })
     }
 
+    /// Opens the DB at `path` for the ONE dashboard write M4 allows: stamping
+    /// `posts.read_at` when the dev opens a delivered article. Deliberately
+    /// minimal — `SQLITE_OPEN_READ_WRITE` without `CREATE`, **no WAL pragma and
+    /// no migration**: the dashboard must not reshape the store file, only the
+    /// row the owner's spec calls for. ADR-0033 keeps forbidding navigation to
+    /// execute, spawn, touch the network or edit the dev's files; `read_at` is
+    /// the dashboard's own ledger column (ADR-0038: "read_at = não lido"), and
+    /// BUILD-PROGRAM M4 requires it. Every other write stays out.
+    pub fn open_readwrite_no_migrate_at(path: &Path) -> Result<Store, StoreError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(
+            |source| StoreError::Open {
+                path: path.display().to_string(),
+                source,
+            },
+        )?;
+        Ok(Store { conn })
+    }
+
     /// Opens (or creates) `store.db` inside `dir`, creating `dir` first.
     pub fn open_in_dir(dir: &Path) -> Result<Store, StoreError> {
         let path = dir.join(DB_FILE);

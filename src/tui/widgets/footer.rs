@@ -72,7 +72,7 @@ const EXECUTION: Key = Key {
 /// `actions` = a tela pode pedir ação (`!read_only`); `execution` = existe
 /// execução em andamento/última para abrir com `o`.
 pub fn keys_for(screen: usize, actions: bool, execution: bool) -> Vec<Key> {
-    // 0 Resumo · 1 Achados · 2 Sessões · 3 Wiki
+    // 0 Resumo · 1 Achados · 2 Sessões · 3 Wiki · 4 Posts
     let mut keys = Vec::with_capacity(10);
     keys.push(QUIT);
     if actions {
@@ -104,6 +104,15 @@ pub fn keys_for(screen: usize, actions: bool, execution: bool) -> Vec<Key> {
             keys.push(Key {
                 key: "/",
                 desc: "Busca",
+            });
+        }
+        4 => {
+            // Caixa de correio (M4): a tecla de abrir é o `Enter` (ou `i`) e
+            // grava `read_at` — a única escrita do painel, fora das ações s/t/d.
+            keys.push(MOVE);
+            keys.push(Key {
+                key: "Enter",
+                desc: "Ler",
             });
         }
         // O Resumo não é lista: nem `j/k` nem `i` valem aqui.

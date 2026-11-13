@@ -389,7 +389,7 @@ próximo com `Cargo.toml`/`package.json`, senão o diretório atual).
   `kira note` grava exatamente o que você digitou.
 - Apagar `store.db` limpa toda a trilha.
 
-## Dashboard — `kira dashboard` (W6-PR4, read-only)
+## Dashboard — `kira dashboard` (W6 + M4, read-only)
 
 O dashboard é a mesma TUI do binário (ratatui/crossterm, ADR-0014) mostrando o
 estado vivo do projeto atual — nesta PR, o **painel de cabeçalho** (nome do
@@ -404,8 +404,9 @@ projeto (`#id`), com quando (idade relativa — `há 3 min` — calculada por
 função pura sobre o `now` capturado uma vez no snapshot, sem relógio por
 frame), comando, modelo, duração (`412ms`, `1m5s`, `1h05m`) e a 1ª linha do
 summary; sessão que falhou fica destacada, sucesso fica neutro. Store legível
-sem sessões mostra `sessões: — (store sem sessões)` — e o **painel de wiki**
-(W6-PR4, abaixo). `Enter` abre o detalhe — do achado ou da sessão selecionada
+sem sessões mostra `sessões: — (store sem sessões)` — o **painel de wiki**
+(W6-PR4, abaixo) e o **painel de posts** (M4, caixa de correio, abaixo).
+`Enter` abre o detalhe — do achado ou da sessão selecionada
 (painel lateral com o summary INTEIRO, ≤2000 chars já gravados pela store); no
 painel de wiki `Enter` abre a página em tela cheia; `Esc` volta em todos.
 
@@ -432,11 +433,28 @@ página — a fonte de verdade é o disco, o índice é derivado).
 - Índice ausente/vazio ⇒ lista vazia com a causa honesta:
   `wiki: — (wiki vazia — rode kira wiki reindex)`.
 
-- **Read-only provado**: o dashboard não escreve em nada — a store abre em modo
-  `SQLITE_OPEN_READ_ONLY`, não toca rede nem LLM, e NÃO grava sessão na trilha.
-  O e2e (`tests/dashboard_e2e.rs`) prova: hash do `store.db` antes/depois de
-  rodar com e sem `--snapshot` é byte-idêntico — inclusive com o painel de
-  wiki lendo `.kira/wiki/`.
+### Caixa de correio (M4) — `painel posts`
+
+A fila do `kira digest` em modo leitura: a tabela `posts` lida pela MESMA
+conexão `SQLITE_OPEN_READ_ONLY` dos outros painéis (estado traduzido — `na
+fila`, `em rota`, `entregue`, `perdida` — com `[não lido]` escrito NA célula,
+sem depender de cor), e o corpo de cada post direto do arquivo
+`.kira/digest/<slug>.md` (a fonte de verdade; o banco nunca guarda o texto).
+`Enter` (ou `i`) no post entregue abre a leitura em tela cheia com o
+renderizador nativo e o scroll das mesmas teclas da wiki; painel vazio diz
+`posts: — (nenhum post — rode kira digest)`.
+
+- **A única escrita do dashboard**: abrir um post entregue grava `read_at`
+  (aceite explícito do M4) — SQL idempotente (`WHERE read_at IS NULL`), em
+  conexão própria sem WAL e sem migração, que não toca arquivo nenhum do dev.
+  `--read-only` desliga o carimbo (a leitura continua); `--snapshot` nunca
+  escreve. O e2e compara o hash do `store.db` com a caixa cheia e vazia.
+
+- **Read-only provado**: fora o carimbo acima, o dashboard não escreve em
+  nada — não toca rede nem LLM, e NÃO grava sessão na trilha. O e2e
+  (`tests/dashboard_e2e.rs`) prova: hash do `store.db` antes/depois de rodar
+  com e sem `--snapshot` é byte-idêntico — inclusive com o painel de wiki
+  lendo `.kira/wiki/` e o de posts lendo `.kira/digest/`.
 - **Honestidade**: dado ausente aparece como `—` com a causa
   (`achados: — (nunca rodou kira scan)`), nunca inventado ou estimado.
 - **Disciplina de linha**: cada campo do cabeçalho ocupa exatamente UMA linha
@@ -449,10 +467,11 @@ página — a fonte de verdade é o disco, o índice é derivado).
   sem TTY (pipe/CI) imprime o mesmo conteúdo em texto e sai 0.
 - **`--snapshot`**: sempre a forma de texto, para o CI e para redirecionamento —
   nunca desenha na tela (inclui a lista de páginas e o markdown rendido).
-- **Teclas** (setas E vim; nenhuma tecla escreve): `q` sair ·
-  `Tab`/`Shift+Tab` ciclar painel (cabeçalho → achados → sessões → wiki) ·
+- **Teclas** (setas E vim; nenhuma tecla executa ação — a exceção declarada é
+  o carimbo `read_at` ao abrir um post): `q` sair · `1`–`5`/`Tab`/`Shift+Tab`
+  ciclar painel (resumo → achados → sessões → wiki → posts) ·
   `j`/`k` ou `↑`/`↓` mover · `g`/`G` topo/fim · `Enter` detalhe (achado ou
-  sessão) ou página da wiki · `Esc` volta · `/` busca na wiki ·
+  sessão), página da wiki ou leitura do post · `Esc` volta · `/` busca na wiki ·
   `r` reler o disco (sem rede, sem escrita) · `?` ajuda.
 - **Terminal pequeno**: abaixo de 80×24 o layout degrada para lista única com
   aviso claro.

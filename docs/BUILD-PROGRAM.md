@@ -173,14 +173,21 @@
   `.kira/briefing.md`, `cache_key = (input_hash, prompt_version, model, lang)`.
   **Aceite:** segundo run não repete post; `--lang` diferente não reaproveita cache; budget
   estourado para com nota; sem ollama ⇒ erro acionável com exit != 0.
-- [ ] **M4** caixa de correio no dashboard (modo leitura). Painel com `não lido`, Markdown
-  renderizado **nativo** — o renderizador JÁ EXISTE: `src/tui/markdown.rs`
-  (`render(source, width) -> Vec<String>`, sem dependência, ADR-0013). **Não precisa de
-  `tui-markdown`.** Falta: variante `Screen::Posts` + `posts_selected` no `AppState`, snapshot com
-  a lista de posts (slug, kind, lang, estado, não lido), widget do painel, tecla de abrir (grava
-  `read_at` via `store.post_mark_read`), dica de painel vazio e teste de `--snapshot`.
-  **Aceite:** `--snapshot` mostra o painel; hash do store muda só em `read_at`; tecla não escreve
-  arquivo do dev.
+- [x] **M4** caixa de correio no dashboard (modo leitura). Painel com `não lido`, Markdown
+  renderizado **nativo** — o renderizador JÁ EXISTIA: `src/tui/markdown.rs`
+  (`render(source, width) -> Vec<String>`, sem dependência, ADR-0013). Sem `tui-markdown`,
+  como o registro anterior mandava. Entregue: variante `Screen::Posts` (5ª tela, tecla `5`,
+  ciclo do Tab, abas do chrome), `Snapshot.post_rows` lido pela MESMA conexão read-only
+  (corpo do rascunho vem de `.kira/digest/<slug>.md`, nunca do banco), widget próprio
+  (`tui/widgets/posts.rs`) com estado traduzido e `[não lido]` NA célula, leitura em tela
+  cheia com o renderizador nativo + scroll clampado, e a ÚNICA escrita: `Enter`/`i` num
+  post entregue grava `read_at` via `store.post_mark_read` em conexão RW mínima (sem WAL,
+  sem migração), idempotente, desligada em `--read-only`. O conflito aparente com o
+  ADR-0033 está declarado no código e no PR: navegar continua sem spawn/rede/arquivo do
+  dev; `read_at` é o ledger do próprio dashboard (aceite do M4 acima de conveniência).
+  **Aceite:** `--snapshot` mostra o painel ✅ (e2e); hash do store muda só em `read_at` ✅
+  (e2e de snapshot inalterado + unit idempotência); tecla não escreve arquivo do dev ✅
+  (update SQL único; custo zero em disco).
 - [x] **M5** `kira emit` + linha de ingestão/posts no `doctor` *(código; docs da onda em M8)*.
   Publica `.kira/wiki/<slug>.md` (front-matter + índice derivado) com gate por
   `source_hash`/`published_hash`; `doctor` reporta ingestão, trust, fila e posts desatualizados.
