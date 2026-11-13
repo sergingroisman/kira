@@ -10,6 +10,7 @@ use kira::board::BoardProvider;
 use kira::capabilities::{self, Capability};
 use kira::credentials;
 use kira::doctor;
+use kira::emit;
 use kira::error::Error;
 use kira::format;
 use kira::ingest;
@@ -205,6 +206,20 @@ enum Command {
         /// Release posts left claimed by a previous run before starting
         #[arg(long)]
         resume: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Emit the digested drafts into the project wiki (.kira/wiki), gated by the
+    /// source hash: a post edited by hand is never overwritten without --force
+    #[command(after_help = "Exemplos:\n  kira emit\n  kira emit --force")]
+    Emit {
+        /// Project folder (defaults to the project root detected like in the store)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Overwrite posts edited by hand in .kira/wiki
+        #[arg(long)]
+        force: bool,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -466,6 +481,7 @@ async fn run(command: Command) -> Outcome {
             skip_scan,
         } => ingest_command(path.as_deref(), json, skip_scan),
         Command::Trust { path, revoke } => trust_command(path.as_deref(), revoke),
+        Command::Emit { path, force, json } => emit_command(path.as_deref(), force, json),
         Command::Digest {
             path,
             model,
@@ -817,6 +833,19 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 args.push_str(" --json");
             }
             ("digest".to_string(), args.trim().to_string(), model.clone())
+        }
+        Command::Emit { path, force, json } => {
+            let mut args = String::new();
+            if let Some(path) = path {
+                args.push_str(&format!("--path {}", path.display()));
+            }
+            if *force {
+                args.push_str(" --force");
+            }
+            if *json {
+                args.push_str(" --json");
+            }
+            ("emit".to_string(), args.trim().to_string(), None)
         }
         Command::Wiki { action, path } => {
             let args = match action {
@@ -1329,6 +1358,51 @@ fn report_json(report: &kira::post::DigestReport) -> serde_json::Value {
         "briefing_path": report.briefing_path,
         "notes": report.notes,
     })
+}
+
+/// `kira emit` — publica os rascunhos no wiki, gate por hash (ADR-0038, M5).
+///
+/// A decisão de sobrescrever é do dono: `--force` explícito. Sem ele, post editado
+/// à mão é recusado com o nome do arquivo na frente.
+fn emit_command(path: Option<&Path>, force: bool, json: bool) -> Outcome {
+    let root = path.map_or_else(
+        || store::detect_project_root().unwrap_or_else(|| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
+    let mut options = emit::EmitOptions::at(root);
+    options.force = force;
+    match emit::run(&options) {
+        Ok(report) => {
+            if json {
+                let value = serde_json::json!({
+                    "published": report.published,
+                    "unchanged": report.unchanged,
+                    "edited": report.edited,
+                    "missing_drafts": report.missing_drafts,
+                    "index_path": report.index_path,
+                    "notes": report.notes,
+                });
+                match serde_json::to_string_pretty(&value) {
+                    Ok(text) => {
+                        println!("{text}");
+                        Outcome::success(text)
+                    }
+                    Err(err) => {
+                        print_error(&err);
+                        Outcome::failure(err.to_string())
+                    }
+                }
+            } else {
+                let text = report.summary();
+                print!("{text}");
+                Outcome::success(text)
+            }
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
 }
 
 /// `kira wiki <action>` — reads and appends to the project wiki (ADR-0013).
