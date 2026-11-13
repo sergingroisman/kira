@@ -76,7 +76,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        # windows-latest desligado TEMPORARIAMENTE (13/Nov/2026): o dono está
+        # testando manualmente no Windows e o job vinha estourando o timeout de
+        # 30 min por margem apertada (29m27s verde às 01:10, 30m03s falha às
+        # 03:22 — antes dos renames de ADR-0039). Reativar quando resolver.
+        os: [macos-latest]
     steps:
       - uses: actions/checkout@v4
 
