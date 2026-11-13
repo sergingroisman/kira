@@ -78,7 +78,7 @@ descartável**. Sem servidor, sem MCP, sem embeddings até o M2. Ver `ADR-0013`.
 
 | PR | Objetivo | Aceite |
 |---|---|---|
-| **PR28** | `kira wiki` + páginas `contexto/decisoes/padroes/glossario/bugs/*` em **`docs/wiki/` (commitada)**, toda escrita passando por `redact` e pelo `guard/path` | Nenhum segredo no disco; página criada/atualizada por comando; fail-open se o store quebrar; ciclo autônomo só grava em `.kira/wiki-staging/` |
+| **PR28** | `kira wiki` + páginas `contexto/decisoes/padroes/glossario/bugs/*` em **`.kira/wiki/`** (na época do PR28: `docs/wiki/`, depois movida no W2-FIX), toda escrita passando por `redact` e pelo `guard/path` | Nenhum segredo no disco; página criada/atualizada por comando; fail-open se o store quebrar; ciclo autônomo só grava em `.kira/wiki-staging/` |
 | **PR29** | Índice FTS5 (`wiki_page`, `wiki_fts`) + `kira wiki reindex` reconstruindo do zero | Apagar o índice e reindexar devolve o mesmo resultado de busca; sem FTS5 cai para substring sem erro fatal |
 | **PR30** | Captura episódica pós-`triage` + decay de 30 dias + `kira wiki forget` | Episódio gravado sem interação; página antiga colapsada em resumo; forget apaga página e índice |
 | **PR31** | Retrieval para o context packer (liga no PR5) | Prompt recebe top-k páginas com caminho e idade; respeita `KIRA_NUM_CTX` |

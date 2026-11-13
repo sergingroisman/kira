@@ -2,7 +2,7 @@
 
 - **Status**: aceito (decisão do dono, 10/Nov/2026: "cópia descarada do statui")
 - **Fonte**: https://github.com/Mohamed-Badry/statui · Rust + Ratatui · **MIT** · v0.3.0
-- **Decisores**: Sérgio (dono) · Orchestrator (Hermes)
+- **Decisores**: Sérgio (dono) · Hermes
 
 ## Contexto
 

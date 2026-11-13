@@ -1,6 +1,8 @@
 # ADR-0013 — Wiki do KIRA: markdown como fonte de verdade, SQLite como índice
 
-- **Status**: proposto (aguardando leitura do dono)
+- **Status**: proposto (aguardando leitura do dono) · **Nota (ADR-0039, 13/Nov/2026)**: o destino
+  vigente da wiki é `.kira/wiki/` (local) — as menções a `docs/wiki/` abaixo são o estado
+  histórico desta decisão, revertida pelo W2-FIX. Ver `docs/nomenclatura.md`.
 - **Origem**: estudo do `akitaonrails/ai-memory` (`docs/ARCHITECTURE.md`)
 - **Rejeitado de propósito**: servidor, MCP, web UI, embeddings
 

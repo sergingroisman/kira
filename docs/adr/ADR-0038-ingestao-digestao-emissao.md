@@ -27,10 +27,11 @@ orçamento em *bytes do diretório* mede a coisa errada, e custo de caminhada n�
 ## Decisão
 
 1. **Três verbos, três contratos.** `kira ingest` (fatos, determinístico, sem LLM, segundos),
-   `kira digest` (julgamento com IA, cacheado, retomável), `kira emit` (publica o `.md` no
+   `kira digest` (julgamento com IA, cacheado, retomável), `kira publish` (publica o `.md` no
    wiki, atrás de gate). Só o `ingest` entra no `kira setup`.
 2. **Domínio `post`.** A unidade de trabalho **é** o artigo: tabela `posts`, view `outbox`
-   para os pendentes, worker `Courier`, lease `Postage`, falha `DeadLetter`, loop `Postmaster`.
+   para os pendentes, fase `phase` (verbos técnicos: `claim → generate → deliver`), lease
+   `draft_ttl`, falha `failed`, loop `turn` (ADR-0039 aposenta a lore de correio).
    Identificadores em inglês; a lore (carta, selo, carteiro) vive na doc e na UI. `letters`
    foi descartado: dois nomes para o mesmo objeto é o começo de um deles divergir.
 3. **Ingestão completa em qualquer stack:** *denylist* de padrões (não allowlist de extensões),
@@ -56,10 +57,10 @@ orçamento em *bytes do diretório* mede a coisa errada, e custo de caminhada n�
 8. **Trust do repositório.** O `ingest` é read-only e roda sempre; o `digest` — que envia
    código ao modelo — só roda com o repositório aceito pelo dev (`.kira/trust.json` com hash
    do caminho). Sem trust, nada é enviado.
-9. **Determinismo onde há determinismo.** `digest.md` e `inventory.json` são byte-idênticos
+9. **Determinismo onde há determinismo.** `facts.md` e `inventory.json` são byte-idênticos
    para o mesmo estado: sem timestamp, caminhos relativos POSIX, tudo ordenado, redação na
    escrita (ADR-0021), `digest::render` puro (sem I/O). O que passa por LLM fica em
-   `.kira/digest/` e é identificado por `model` + `prompt_version` + `input_hash`.
+   `.kira/drafts/` e é identificado por `model` + `prompt_version` + `input_hash`.
 
 ## Consequências
 

@@ -1,6 +1,6 @@
 # ADR-0024 — Guardrails v2: injeção invisível (zero-width/bidi) e bloco delimitado no prompt de triage — melhorias do awesome-web-security
 
-- **Status**: proposto (12/Nov/2026) — Orchestrator (recomendação) · Sérgio
+- **Status**: proposto (12/Nov/2026) — Hermes (recomendação) · Sérgio
   (veto/aval). Um veto vira ADR que supersede este, não edição silenciosa.
 - **Fonte**: análise de `qazbnm456/awesome-web-security` (licença **CC0**) —
   o artigo sobre caracteres de largura zero, a prática de `diff-sentry` no

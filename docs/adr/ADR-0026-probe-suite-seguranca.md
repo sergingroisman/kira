@@ -1,6 +1,6 @@
 # ADR-0026 — Teste de segurança do próprio KIRA: probe suite no `cargo test` (red team estático)
 
-- **Status**: proposto (12/Nov/2026) — Orchestrator (recomendação) · Sérgio
+- **Status**: proposto (12/Nov/2026) — Hermes (recomendação) · Sérgio
   (veto/aval).
 - **Fonte**: prática de `diff-sentry` (CI de `qazbnm456/awesome-web-security`),
   os artigos "Where the LLM Stops: Deterministic Scoring in an AI-Assisted
