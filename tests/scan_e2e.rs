@@ -103,6 +103,38 @@ impl Sandbox {
         self.write_shim(tool, &windows_script, &unix_script)
     }
 
+    /// Fake tool that proves OVERLAP: writes its own marker and waits for the
+    /// other tool's marker (up to ~20 s) before printing the JSON. If the two
+    /// stacks ran sequentially, the first tool would never see the second's
+    /// marker and would exit 1 — a load-immune proof of concurrency (wall-time
+    /// assertions flake on busy machines; rendezvous does not).
+    fn install_rendezvous_tool(
+        &self,
+        tool: &str,
+        output_content: &str,
+        file_name: &str,
+        other_tool: &str,
+    ) -> PathBuf {
+        let output_file = self.base.join(file_name);
+        std::fs::write(&output_file, output_content)
+            .unwrap_or_else(|err| panic!("escrever output {output_file:?}: {err}"));
+        let mine = self.shims.join(format!("marker-{tool}"));
+        let other = self.shims.join(format!("marker-{other_tool}"));
+        let win = format!(
+            "@echo off\r\ntype nul > \"{}\"\r\nset /a n=0\r\n:wait\r\nif exist \"{}\" goto run\r\nping -n 2 127.0.0.1 >nul\r\nset /a n+=1\r\nif %n% GEQ 20 exit /b 1\r\ngoto wait\r\n:run\r\ntype \"{}\"\r\n",
+            mine.display(),
+            other.display(),
+            output_file.display()
+        );
+        let unix = format!(
+            "#!/bin/sh\n: > \"{}\"\nn=0\nwhile [ ! -f \"{}\" ]; do\n  sleep 1\n  n=$((n+1))\n  [ \"$n\" -ge 20 ] && exit 1\ndone\ncat \"{}\"\n",
+            mine.display(),
+            other.display(),
+            output_file.display()
+        );
+        self.write_shim(tool, &win, &unix)
+    }
+
     /// Writes the shim file (`.cmd` on Windows, shebang script elsewhere) and
     /// makes it executable; returns its full path for the env override.
     fn write_shim(&self, tool: &str, windows_script: &str, unix_script: &str) -> PathBuf {
@@ -482,4 +514,42 @@ fn pnpm_workspace_scans_once_at_the_root_and_never_runs_npm() {
     let second = std::fs::read_to_string(&findings_path)
         .unwrap_or_else(|err| panic!("ler findings de novo: {err}"));
     assert_eq!(first, second, "gate de determinismo do M1");
+}
+
+/// npm audit sem achados, no formato real capturado (fixture).
+const NPM_NONE_OUTPUT: &str = include_str!("fixtures/scan/scan_npm_audit_none.json");
+
+/// P1 (auditoria): com 2 stacks, os audits rodam EM PARALELO — cada shim só
+/// responde depois de ver o marker do OUTRO (rendezvous): se o scan voltasse a
+/// ser sequencial, o primeiro shim esperaria até o timeout e sairia 1, falhando
+/// o scan. Prova imune a carga de máquina; e o gate de bytes do M1 continua:
+/// a segunda execução produz o mesmo `findings.json`.
+#[test]
+fn two_stacks_scan_concurrently_and_stay_byte_identical() {
+    let sandbox = Sandbox::new("scan-paralelo");
+    sandbox.prepare_dotnet_project();
+    sandbox.prepare_npm_project();
+    let dotnet_shim =
+        sandbox.install_rendezvous_tool("dotnet", DOTNET_NONE_OUTPUT, "dotnet_slow.json", "npm");
+    let npm_shim =
+        sandbox.install_rendezvous_tool("npm", NPM_NONE_OUTPUT, "npm_slow.json", "dotnet");
+    let envs: Vec<(&str, &Path)> = vec![
+        ("KIRA_SCAN_DOTNET_BIN", &dotnet_shim),
+        ("KIRA_SCAN_NPM_BIN", &npm_shim),
+    ];
+
+    let (code, out, err) = run_kira(&sandbox, None, &envs, &["scan"]);
+    assert_eq!(
+        code, 0,
+        "os dois shims se encontraram (stacks em paralelo): {out}{err}"
+    );
+
+    let findings_path = sandbox.cwd.join(".kira").join("findings.json");
+    let first =
+        std::fs::read_to_string(&findings_path).unwrap_or_else(|err| panic!("ler findings: {err}"));
+    let (code, _, _) = run_kira(&sandbox, None, &envs, &["scan"]);
+    assert_eq!(code, 0);
+    let second = std::fs::read_to_string(&findings_path)
+        .unwrap_or_else(|err| panic!("ler findings de novo: {err}"));
+    assert_eq!(first, second, "paralelismo não pode mudar um byte do M1");
 }
