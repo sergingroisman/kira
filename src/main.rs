@@ -183,7 +183,7 @@ enum Command {
     },
     /// Digest the ingested facts into posts with the LOCAL model (ADR-0038): enqueues
     /// what is missing in `posts`, claims with a lease and writes drafts under
-    /// .kira/digest/. Requires `kira trust` and a previous `kira ingest`
+    /// .kira/drafts/. Requires `kira trust` and a previous `kira ingest`
     #[command(
         after_help = "Exemplos:\n  kira digest --lang pt-BR\n  kira digest --pause 1\n  kira digest --resume --budget 200000"
     )]

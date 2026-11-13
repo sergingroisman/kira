@@ -1,6 +1,6 @@
 //! `kira publish` — publica os rascunhos do `digest` no wiki (ADR-0038, M5).
 //!
-//! O `digest` escreve em `.kira/digest/`; este comando é o único que escreve em
+//! O `digest` escreve em `.kira/drafts/`; este comando é o único que escreve em
 //! `.kira/wiki/`, onde o dev lê. A regra que importa: **nunca sobrescrever o que o
 //! dev escreveu**. Como o wiki é markdown versionável, a única forma honesta de
 //! saber se um arquivo foi editado à mão é comparar o conteúdo com o que publicamos
@@ -121,7 +121,7 @@ pub fn run(options: &PublishOptions) -> Result<PublishReport, PublishError> {
     for post in posts.iter().filter(|p| p.state == PostState::Delivered) {
         let draft = root
             .join(".kira")
-            .join("digest")
+            .join("drafts")
             .join(format!("{}.md", post.slug));
         let body = match std::fs::read_to_string(&draft) {
             Ok(body) => body,

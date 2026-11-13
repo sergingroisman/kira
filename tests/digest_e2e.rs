@@ -2,7 +2,7 @@
 //!
 //! Contratos verificados no binário real:
 //! - sem `kira trust` o comando **recusa** e diz o que fazer;
-//! - com trust + ingest, gera os posts e grava rascunho em `.kira/digest/`;
+//! - com trust + ingest, gera os posts e grava rascunho em `.kira/drafts/`;
 //! - rodar de novo não refaz nada (cache por procedência);
 //! - trocar `--lang` **regenera** (o idioma entra no `cache_key`);
 //! - `--budget 0` para com nota e exit 0, nunca erro;
@@ -144,13 +144,13 @@ fn digest_generates_the_two_posts_and_writes_the_briefing() {
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("2 post(s) novo(s)"), "stdout: {stdout}");
 
-    let intro = sandbox.read(".kira/digest/intro.md");
+    let intro = sandbox.read(".kira/drafts/intro.md");
     assert!(intro.contains("What this is"), "rascunho do intro: {intro}");
     assert!(
         intro.contains("lang: pt-BR"),
         "idioma não ficou registrado: {intro}"
     );
-    let c4 = sandbox.read(".kira/digest/c4-container.md");
+    let c4 = sandbox.read(".kira/drafts/c4-container.md");
     assert!(!c4.is_empty(), "rascunho do c4 ausente");
 
     let briefing = sandbox.read(".kira/briefing.md");
@@ -192,7 +192,7 @@ fn changing_the_language_regenerates_instead_of_serving_stale_cache() {
         "idioma novo precisa regenerar: {stdout}"
     );
     assert!(
-        sandbox.read(".kira/digest/intro.md").contains("lang: en"),
+        sandbox.read(".kira/drafts/intro.md").contains("lang: en"),
         "o rascunho precisa estar no idioma novo"
     );
 }
@@ -225,8 +225,8 @@ fn pause_after_one_post_leaves_the_rest_in_the_queue() {
     let (code, stdout, stderr) = sandbox.run(&["digest", "--lang", "pt-BR", "--pause", "1"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("pausado"), "stdout: {stdout}");
-    let first = sandbox.read(".kira/digest/intro.md");
-    let second = sandbox.read(".kira/digest/c4-container.md");
+    let first = sandbox.read(".kira/drafts/intro.md");
+    let second = sandbox.read(".kira/drafts/c4-container.md");
     // A ordem é determinística (created_at, slug): `c4-container` vem antes de
     // `intro`. O contrato do --pause é "um só", não "qual deles".
     assert!(
@@ -243,5 +243,5 @@ fn pause_after_one_post_leaves_the_rest_in_the_queue() {
         stdout.contains("1 post(s) novo(s)"),
         "o resume entrega só o que faltava: {stdout}"
     );
-    assert!(!sandbox.read(".kira/digest/c4-container.md").is_empty());
+    assert!(!sandbox.read(".kira/drafts/c4-container.md").is_empty());
 }
