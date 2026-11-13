@@ -35,6 +35,10 @@ pub const STAGING_DIR: &str = ".kira/wiki-staging";
 /// Fixed pages of the wiki (ADR-0013) plus the `bugs/` collection.
 const FIXED_PAGES: [&str; 4] = ["contexto", "decisoes", "padroes", "glossario"];
 
+/// `index.md` é DERIVADO (o `publish` o regenera a cada emissão): nunca é página
+/// de leitura, busca ou índice — listá-lo seria indexar o próprio índice.
+const INDEX_PAGE: &str = "index";
+
 /// Collection whose pages are `bugs/<slug>.md`.
 const COLLECTION: &str = "bugs";
 
@@ -162,7 +166,13 @@ impl Wiki {
         }
     }
 
-    /// Pages that exist, ordered (`contexto`, `decisoes`, ..., then `bugs/*`).
+    /// Pages that exist, ordered (`contexto`, `decisoes`, ..., then other
+    /// top-level pages sorted, then `bugs/*`).
+    ///
+    /// Top-level pages beyond the fixed four enter here: posts published by
+    /// `kira publish` and hand-written pages are knowledge too, and keeping
+    /// them out of `list()` kept them out of the FTS5 index — i.e. out of the
+    /// RAG (audit F8). `index.md` is derived and never listed.
     pub fn list(&self) -> Result<Vec<String>, WikiError> {
         let base = self.root.join(WIKI_DIR);
         if !base.is_dir() {
@@ -174,6 +184,30 @@ impl Wiki {
                 pages.push(page.to_string());
             }
         }
+        let mut extra: Vec<String> = Vec::new();
+        let entries = fs::read_dir(&base).map_err(|source| WikiError::Io {
+            action: "listar",
+            path: base.display().to_string(),
+            source,
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(raw_stem) = path.file_stem() else {
+                continue;
+            };
+            let stem_owned = raw_stem.to_string_lossy();
+            let stem: &str = &stem_owned;
+            if path.is_file()
+                && path.extension().is_some_and(|ext| ext == "md")
+                && stem != INDEX_PAGE
+                && !FIXED_PAGES.contains(&stem)
+                && stem.chars().all(is_slug_char)
+            {
+                extra.push(stem.to_string());
+            }
+        }
+        extra.sort();
+        pages.extend(extra);
         let bugs = base.join(COLLECTION);
         if bugs.is_dir() {
             let mut found: Vec<String> = Vec::new();
@@ -262,6 +296,13 @@ impl Wiki {
                 });
             }
             return Ok(PathBuf::from(COLLECTION).join(format!("{slug}.md")));
+        }
+
+        // Página de topo fora das fixas (post do `publish` ou página manual):
+        // mesmo slug dos bugs, sem `/`, e nunca o `index.md` derivado. Sem isso
+        // o `show`/`search` recusava o que o próprio `publish` gravou (F8).
+        if !trimmed.contains('/') && trimmed != INDEX_PAGE && trimmed.chars().all(is_slug_char) {
+            return Ok(PathBuf::from(format!("{trimmed}.md")));
         }
 
         Err(WikiError::UnknownPage {
@@ -676,6 +717,53 @@ mod tests {
         assert_eq!(hits[0].slug, "bugs/4821-sessao-expirada");
         assert_eq!(hits[0].kind, "bug");
         assert_eq!(hits[0].title, "Sessão expirada", "título vem do heading");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn top_level_pages_enter_list_and_index_but_index_md_stays_out() {
+        let dir = temp_project("top-level");
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        let store = open_store(&dir);
+        let base = dir.join(WIKI_DIR);
+        fs::create_dir_all(&base).unwrap_or_else(|err| panic!("criar wiki: {err}"));
+        // Um post como o `publish` grava, e o index.md derivado ao lado.
+        fs::write(base.join("intro.md"), "# Intro\nstack: Rust local-first")
+            .unwrap_or_else(|err| panic!("intro: {err}"));
+        fs::write(base.join("index.md"), "# Índice\n derivado, não é página")
+            .unwrap_or_else(|err| panic!("index: {err}"));
+        wiki.write("contexto", "# Contexto\nnota fixa")
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let pages = wiki.list().unwrap_or_else(|err| panic!("list: {err}"));
+        assert_eq!(
+            pages,
+            vec!["contexto".to_string(), "intro".to_string()],
+            "fixas primeiro e topo extra ordenado; index.md fora: {pages:?}"
+        );
+
+        let indexed = wiki
+            .reindex(&store)
+            .unwrap_or_else(|err| panic!("reindex: {err}"));
+        assert_eq!(indexed, 2, "index.md não é indexável");
+
+        let hits = wiki
+            .search(&store, "stack", 5)
+            .unwrap_or_else(|err| panic!("search: {err}"));
+        assert_eq!(hits.len(), 1, "post publicado entra no RAG: {hits:?}");
+        assert_eq!(hits[0].slug, "intro");
+        assert_eq!(hits[0].kind, "page");
+
+        assert!(
+            wiki.read("intro")
+                .unwrap_or_else(|err| panic!("read: {err}"))
+                .is_some(),
+            "show resolve o post"
+        );
+        assert!(
+            wiki.page_path("index").is_err(),
+            "index.md nunca é página de leitura"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
