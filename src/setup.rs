@@ -4,11 +4,12 @@
 //! context, pr draft e dashboard rodam com zero credencial. Por isso o setup
 //! pergunta primeiro o que é LOCAL e nunca pede credencial:
 //!
-//! nome do dev → projeto (raiz detectada + confirmar) → backend de IA (4
-//! opções, com **4) nenhuma por agora** como default quando o Ollama não está
-//! instalado) → resumo no formato `pronto: / funciona agora: / desativado: /
-//! ativar depois: / próximo passo:  kira scan` — nunca "configuração
-//! concluída".
+//! nome do dev → projeto (raiz detectada + confirmar) → ingestão (índice +
+//! digest, SEM scan — ADR-0038 D1: só o `ingest` entra no setup) → backend de
+//! IA (4 opções, com **4) nenhuma por agora** como default quando o Ollama
+//! não está instalado) → resumo no formato `pronto: / funciona agora: /
+//! desativado: / ativar depois: / próximo passo:  kira connect azure` (ou
+//! `kira triage <id>` com o board conectado) — nunca "configuração concluída".
 //!
 //! PAT não é assunto do setup (ADR-0030 #3/#4): credencial nasce em
 //! `kira connect <provider>` (MVP-3), onde a aula (`pat_lesson_lines`) será
@@ -30,7 +31,7 @@
 
 use std::future::Future;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 
@@ -41,8 +42,8 @@ pub mod wizard;
 use crate::board::{self, BoardProvider};
 use crate::capabilities::{self, Capability, CapabilityState};
 use crate::credentials::{
-    self, CONFIG_KEY_DEV_NAME, CONFIG_KEY_ORG, CONFIG_KEY_PROJECT, CRED_KEY_PAT, CredStore,
-    ORG_ENV, PAT_ENV, PROJECT_ENV,
+    self, CONFIG_KEY_DEV_NAME, CONFIG_KEY_ORG, CONFIG_KEY_OUTPUT_LANG, CONFIG_KEY_PROJECT,
+    CRED_KEY_PAT, CredStore, ORG_ENV, PAT_ENV, PROJECT_ENV,
 };
 use crate::doctor;
 use crate::error::Error;
@@ -88,8 +89,17 @@ pub struct SetupOptions {
     /// backend de IA (o caro nunca é default nem fallback silencioso).
     pub backend: Option<String>,
     /// `--skip <passo>` (repetível): pula um passo — `pat` (no-op, o passo
-    /// deixou de existir) ou `ia`.
+    /// deixou de existir), `ia` ou `ingest` (M6).
     pub skip: Vec<String>,
+    /// Etapa Ingestão (M6, ADR-0038 D1): `Some(true)` ingere (índice +
+    /// digest, sem scan — rede fica fora do setup), `Some(false)` pula com
+    /// nota. `None` = o chamador não decidiu: só o binário real e o wizard
+    /// decidem; os testes de processo antigos seguem sem ingestão nenhuma.
+    pub ingest: Option<bool>,
+    /// `--lang <código>` (ADR-0038 D4): idioma do que o humano lê (posts,
+    /// cards, PR). Vem da flag ou do wizard; `None` usa o `output_lang` salvo
+    /// em `config.toml`, senão `en`. O valor validado vai ao config.
+    pub lang: Option<String>,
     /// Raiz do projeto detectada, injetada pelo binário real
     /// (`store::detect_project_root`); testes fixam o valor. `None` faz o
     /// motor detectar pelo cwd.
@@ -230,15 +240,15 @@ pub async fn run(
     let config_pairs = read_config(config_path, output);
 
     // Valores explícitos inválidos falham de cara, sem adivinhar: --skip só
-    // aceita 'pat'/'ia' ('pat' segue aceito por compatibilidade — virou no-op
-    // porque o passo deixou de existir) e --backend só os nomes conhecidos
-    // (nada de fallback silencioso).
+    // aceita 'pat'/'ia'/'ingest' ('pat' segue aceito por compatibilidade —
+    // virou no-op porque o passo deixou de existir) e --backend só os nomes
+    // conhecidos (nada de fallback silencioso).
     for skipped_step in &options.skip {
         let step = skipped_step.trim().to_ascii_lowercase();
-        if step != "pat" && step != "ia" {
+        if step != "pat" && step != "ia" && step != "ingest" {
             let _ = writeln!(
                 output,
-                "erro: --skip aceita 'pat' ou 'ia' (recebi '{skipped_step}')."
+                "erro: --skip aceita 'pat', 'ia' ou 'ingest' (recebi '{skipped_step}')."
             );
             return ExitCode::FAILURE;
         }
@@ -253,6 +263,29 @@ pub async fn run(
             return ExitCode::FAILURE;
         }
     }
+
+    // ------------------------------------------------------------------
+    // Idioma de saída (ADR-0038 D4): flag/wizard > `output_lang` salvo >
+    // `en`. Explícito inválido falha de cara — a mesma regra de --skip/
+    // --backend: nada de guardar lixo para o `kira digest` descobrir depois.
+    // ------------------------------------------------------------------
+    let saved_lang = config_pairs
+        .as_ref()
+        .and_then(|pairs| value_of(pairs, CONFIG_KEY_OUTPUT_LANG))
+        .and_then(|value| validate_lang(&value));
+    let lang = match options.lang.as_deref() {
+        Some(raw) => match validate_lang(raw) {
+            Some(value) => value,
+            None => {
+                let _ = writeln!(
+                    output,
+                    "erro: --lang inválido '{raw}' — use um código como en ou pt-BR (2 a 20 letras, dígitos ou hífens)."
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        None => saved_lang.unwrap_or_else(|| "en".to_string()),
+    };
 
     // ------------------------------------------------------------------
     // Passo 1 — nome do dev: `--name` > nome já salvo em `config.toml` >
@@ -385,6 +418,7 @@ pub async fn run(
     // `kira doctor` e o `kira connect` (MVP-3) já têm o contexto.
     let mut config_updates: Vec<(&str, &str)> = Vec::new();
     config_updates.push((CONFIG_KEY_DEV_NAME, dev_name.as_str()));
+    config_updates.push((CONFIG_KEY_OUTPUT_LANG, lang.as_str()));
     if let Some(organization) = organization.as_deref() {
         config_updates.push((CONFIG_KEY_ORG, organization));
     }
@@ -421,6 +455,53 @@ pub async fn run(
         detected_root
     };
     let _ = writeln!(output, "projeto: {project_root}");
+
+    // ------------------------------------------------------------------
+    // Passo 2b — ingestão (M6, ADR-0038 D1): só o `ingest` entra no setup,
+    // e SEM scan — o contrato do M1 é explícito (`run_scan: false` no
+    // setup; rede fica fora do caminho local-first). O wizard COLETA a
+    // escolha; este é o único lugar que executa (ADR-0034). Falha de
+    // ingestão é nota, nunca erro do setup.
+    // ------------------------------------------------------------------
+    let mut ingest_line: Option<IngestLine> = None;
+    match options.ingest {
+        None => {}
+        Some(false) => {
+            let _ = writeln!(output, "ingestão pulada — ativar depois: kira ingest");
+            ingest_line = Some(IngestLine::Skipped);
+        }
+        Some(true) => {
+            let root = PathBuf::from(project_root.as_str());
+            let mut ingest_options = crate::ingest::IngestOptions::at(root.clone());
+            ingest_options.run_scan = false;
+            match crate::ingest::run(&ingest_options) {
+                Ok(report) => {
+                    crate::ingest::ensure_local_marker(&root);
+                    let _ = writeln!(
+                        output,
+                        "ingerido: {} arquivo(s), índice {} linha(s), digest {}",
+                        report.files_ingested, report.lines_indexed, report.digest_path
+                    );
+                    for note in &report.notes {
+                        let _ = writeln!(output, "nota: {note}");
+                    }
+                    ingest_line = Some(IngestLine::Done(IngestSummary {
+                        files: report.files_ingested,
+                        findings: report.findings_total,
+                        digest_path: report.digest_path,
+                    }));
+                }
+                Err(cause) => {
+                    let cause = cause.to_string();
+                    let _ = writeln!(
+                        output,
+                        "aviso: ingestão não rodou ({cause}) — nada foi perdido; rode kira ingest depois."
+                    );
+                    ingest_line = Some(IngestLine::Failed(cause));
+                }
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Passo 3 — backend de IA: 4 opções, com "nenhuma por agora" como default
@@ -595,13 +676,39 @@ pub async fn run(
     let store_line = store::db_path()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "indisponível (sem HOME)".to_string());
+    let board_connected = board_azure_connected(Path::new(project_root.as_str()));
     let _ = writeln!(output);
     let _ = writeln!(
         output,
         "{}",
-        format_summary(&dev_name, ia_summary.as_deref(), &store_line)
+        format_summary(&SummaryInput {
+            dev: &dev_name,
+            ia: ia_summary.as_deref(),
+            store_path: &store_line,
+            lang: &lang,
+            ingest: ingest_line,
+            board_connected,
+        })
     );
     ExitCode::SUCCESS
+}
+
+/// `board.azure` conectada para ESTA raiz? A mesma fonte do gating (store por
+/// projeto, `kira connect` que marca); qualquer falha de leitura = não
+/// conectada — o resumo é diagnóstico, nunca promessa.
+fn board_azure_connected(root: &Path) -> bool {
+    let Ok(store) = store::Store::open_default() else {
+        return false;
+    };
+    let Ok(project_id) = store::project_id_for_root(root) else {
+        return false;
+    };
+    store
+        .capability_state_raw(&project_id, Capability::BoardAzure.name())
+        .ok()
+        .flatten()
+        .and_then(|value| CapabilityState::from_stored(&value))
+        == Some(CapabilityState::Conectada)
 }
 
 /// Primeiro valor não vazio entre as fontes (flag > env > config), SEM
@@ -1134,30 +1241,115 @@ pub fn resume_command(step: &str) -> &'static str {
         // A credencial agora nasce em `connect` (ADR-0030 #4), não em setup.
         "pat" => "kira connect azure",
         "ia" => "kira setup --backend ollama",
+        // M6: a ingestão pulada se reativa com um comando, não com o setup.
+        "ingest" => "kira ingest",
         _ => "kira setup",
     }
 }
 
-/// Resumo final (formato exato do MVP-2, ADR-0030): `pronto:` com dev/ia/
-/// store, os blocos "funciona agora" (toda a jornada local, zero credencial),
-/// "desativado" (o que espera uma capacidade) e "ativar depois" (com a linha
-/// do backend de IA só quando ficou sem IA), e o próximo comando — nunca
-/// termina com "configuração concluída".
-pub fn format_summary(dev: &str, ia: Option<&str>, store_path: &str) -> String {
+/// Números da ingestão que o resumo ecoa (M6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestSummary {
+    pub files: usize,
+    /// `None` = sem `findings.json` — o setup NÃO roda scan (contrato do M1:
+    /// rede fora do caminho local-first). A linha diz isso com a causa.
+    pub findings: Option<usize>,
+    pub digest_path: String,
+}
+
+/// O que a linha de ingestão do resumo diz — as três saídas possíveis do
+/// passo, todas com o comando que resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestLine {
+    Skipped,
+    Failed(String),
+    Done(IngestSummary),
+}
+
+/// Entrada do resumo final (M6): as respostas do setup + o resultado da
+/// ingestão + a capacidade que decide o próximo passo.
+pub struct SummaryInput<'a> {
+    pub dev: &'a str,
+    pub ia: Option<&'a str>,
+    pub store_path: &'a str,
+    pub lang: &'a str,
+    pub ingest: Option<IngestLine>,
+    pub board_connected: bool,
+}
+
+/// Linha de ingestão pura (testável): dado ausente com causa e comando,
+/// nunca número inventado.
+#[must_use]
+pub fn ingest_line_text(line: &IngestLine) -> String {
+    match line {
+        IngestLine::Skipped => "ingestão: pulada — ativar depois: kira ingest".to_string(),
+        IngestLine::Failed(cause) => {
+            format!("ingestão: não rodou ({cause}) — ativar depois: kira ingest")
+        }
+        IngestLine::Done(summary) => {
+            let findings = match summary.findings {
+                Some(count) => format!("{count} achado(s)"),
+                None => "sem scan (rode kira scan)".to_string(),
+            };
+            format!(
+                "ingestão: {} arquivo(s), {findings}, digest {}",
+                summary.files, summary.digest_path
+            )
+        }
+    }
+}
+
+/// Valida um código de idioma no formato prático do bcp47 (`en`, `pt-BR`,
+/// `zh-Hans`): 2 a 20 caracteres de letras/dígitos ASCII e hífens, sem hífen
+/// nas pontas. É o que entra em `config.toml` e no `cache_key` do digest —
+/// por isso a recusa é dura em flag explícita e suave em default.
+#[must_use]
+pub fn validate_lang(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.len() < 2 || value.len() > 20 {
+        return None;
+    }
+    if value.starts_with('-') || value.ends_with('-') {
+        return None;
+    }
+    if value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+/// Resumo final (formato do MVP-2 + M6): `pronto:` com dev/ia/idioma/store/
+/// ingestão, os blocos "funciona agora" (toda a jornada local, zero
+/// credencial), "desativado" (o que espera uma capacidade) e "ativar depois"
+/// (com a linha do backend de IA só quando ficou sem IA). O próximo passo
+/// saiu do `kira scan` hardcoded: com ingestão no setup, o scan já não é o
+/// caminho — é `kira connect azure`, ou `kira triage <id>` quando o board
+/// já está conectado. Nunca termina com "configuração concluída".
+#[must_use]
+pub fn format_summary(input: &SummaryInput<'_>) -> String {
     let mut text = String::new();
     text.push_str("pronto:\n");
-    text.push_str(&format!("  dev: {dev}\n"));
-    let ia_line = ia.unwrap_or("nenhuma");
+    text.push_str(&format!("  dev: {}\n", input.dev));
+    let ia_line = input.ia.unwrap_or("nenhuma");
     text.push_str(&format!("  ia:  {ia_line}\n"));
-    text.push_str(&format!("  store: {store_path}\n"));
+    text.push_str(&format!("  idioma: {} (posts, cards e PR)\n", input.lang));
+    text.push_str(&format!("  store: {}\n", input.store_path));
+    if let Some(line) = &input.ingest {
+        text.push_str(&format!("  {}\n", ingest_line_text(line)));
+    }
     text.push('\n');
     text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard\n");
     text.push_str("desativado:      judge de item do board · read (board) · publicar PR\n");
     text.push_str("ativar depois:   kira connect azure   (leitura de work items)\n");
-    if ia.is_none() {
+    if input.ia.is_none() {
         text.push_str(&format!("                 {}\n", resume_command("ia")));
     }
-    text.push_str("próximo passo:   kira scan");
+    if input.board_connected {
+        text.push_str("próximo passo:   kira triage <id>");
+    } else {
+        text.push_str("próximo passo:   kira connect azure");
+    }
     text
 }
 
@@ -1736,14 +1928,26 @@ mod tests {
     // ------------------------------------------------------------------
     #[test]
     fn summary_has_ready_works_disabled_and_next_command_sections() {
-        let text = format_summary(
-            "Sergin",
-            Some("ollama (qwen3.5:4b)"),
-            "/home/x/.config/kira/store.db",
-        );
+        let text = format_summary(&SummaryInput {
+            dev: "Sergin",
+            ia: Some("ollama (qwen3.5:4b)"),
+            store_path: "/home/x/.config/kira/store.db",
+            lang: "en",
+            ingest: Some(IngestLine::Done(IngestSummary {
+                files: 181,
+                findings: Some(39),
+                digest_path: ".kira/digest.md".to_string(),
+            })),
+            board_connected: false,
+        });
         assert!(text.starts_with("pronto:\n  dev: Sergin\n"), "{text}");
         assert!(text.contains("  ia:  ollama (qwen3.5:4b)"));
+        assert!(text.contains("  idioma: en (posts, cards e PR)"), "{text}");
         assert!(text.contains("  store: /home/x/.config/kira/store.db"));
+        assert!(
+            text.contains("  ingestão: 181 arquivo(s), 39 achado(s), digest .kira/digest.md"),
+            "{text}"
+        );
         assert!(text.contains("funciona agora:  scan · wiki · context · pr draft · dashboard"));
         assert!(
             text.contains("desativado:      judge de item do board · read (board) · publicar PR"),
@@ -1752,7 +1956,12 @@ mod tests {
         assert!(text.contains("ativar depois:   kira connect azure   (leitura de work items)"));
         // Com IA escolhida, a linha do backend não aparece em "ativar depois".
         assert!(!text.contains("kira setup --backend ollama"), "{text}");
-        assert!(text.contains("próximo passo:   kira scan"));
+        // M6: o próximo passo saiu do `kira scan` hardcoded.
+        assert!(
+            text.contains("próximo passo:   kira connect azure"),
+            "{text}"
+        );
+        assert!(!text.contains("kira scan\n"), "{text}");
         assert!(
             !text.contains("configuração concluída"),
             "nunca termina com 'configuração concluída': {text}"
@@ -1763,13 +1972,63 @@ mod tests {
 
     #[test]
     fn summary_without_ia_marks_none_and_the_activation_command() {
-        let text = format_summary("dev", None, "store.db");
+        let text = format_summary(&SummaryInput {
+            dev: "dev",
+            ia: None,
+            store_path: "store.db",
+            lang: "pt-BR",
+            ingest: None,
+            board_connected: true,
+        });
         assert!(text.contains("  ia:  nenhuma"), "{text}");
         assert!(
             text.contains("                 kira setup --backend ollama"),
             "sem IA, o ativar depois traz o comando: {text}"
         );
+        // Board conectado: o próximo passo é o triage, não o connect.
+        assert!(text.contains("próximo passo:   kira triage <id>"), "{text}");
+        // Sem decisão de ingestão (motor de teste), a linha não aparece.
+        assert!(!text.contains("ingestão:"), "{text}");
         assert!(!text.contains("PAT"), "{text}");
+    }
+
+    #[test]
+    fn ingest_line_texts_always_name_the_command_that_fixes_it() {
+        assert_eq!(
+            ingest_line_text(&IngestLine::Skipped),
+            "ingestão: pulada — ativar depois: kira ingest"
+        );
+        let failed = ingest_line_text(&IngestLine::Failed("raiz inexistente".to_string()));
+        assert!(failed.contains("não rodou (raiz inexistente)"), "{failed}");
+        assert!(failed.contains("kira ingest"), "{failed}");
+        // Sem findings, a linha diz a causa em vez de inventar zero.
+        let done = ingest_line_text(&IngestLine::Done(IngestSummary {
+            files: 2,
+            findings: None,
+            digest_path: ".kira/digest.md".to_string(),
+        }));
+        assert_eq!(
+            done,
+            "ingestão: 2 arquivo(s), sem scan (rode kira scan), digest .kira/digest.md"
+        );
+    }
+
+    #[test]
+    fn validate_lang_accepts_codes_and_rejects_everything_loose() {
+        assert_eq!(validate_lang("en"), Some("en".to_string()));
+        assert_eq!(validate_lang(" pt-BR "), Some("pt-BR".to_string()));
+        assert_eq!(validate_lang("zh-Hans"), Some("zh-Hans".to_string()));
+        assert_eq!(validate_lang("e"), None, "um caractere não é código");
+        assert_eq!(validate_lang(""), None);
+        assert_eq!(validate_lang("pt BR"), None, "espaço não entra no config");
+        assert_eq!(validate_lang("-pt"), None);
+        assert_eq!(validate_lang("pt-"), None);
+        assert_eq!(
+            validate_lang("pt-BR-brasil-extra-longo-demais"),
+            None,
+            "> 20"
+        );
+        assert_eq!(validate_lang("pt_BR"), None, "só hífen, não underscore");
     }
 
     #[test]
@@ -1777,6 +2036,8 @@ mod tests {
         // A credencial agora nasce em `connect` (MVP-3), não no setup.
         assert_eq!(resume_command("pat"), "kira connect azure");
         assert_eq!(resume_command("ia"), "kira setup --backend ollama");
+        // M6: a ingestão pulada se reativa com o comando próprio.
+        assert_eq!(resume_command("ingest"), "kira ingest");
         // Passo desconhecido cai no comando neutro (nada de fantasma).
         assert_eq!(resume_command("fonte"), "kira setup");
     }

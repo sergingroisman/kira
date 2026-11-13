@@ -266,6 +266,51 @@ async fn run_setup(
     project_root: Option<String>,
     ia: &IaStub,
 ) -> (ExitCode, String) {
+    run_setup_full(
+        stdin_text,
+        org_flag,
+        project_flag,
+        env_values,
+        endpoint,
+        config_path,
+        store,
+        pat_flag,
+        interactive,
+        name_flag,
+        yes,
+        backend,
+        skip,
+        project_root,
+        ia,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Variante com as decisões da M6 (ingestão/idioma). Os testes antigos passam
+/// pelo `run_setup` acima, que deixa os dois `None` — motor sem decisão,
+/// comportamento idêntico ao de antes para eles.
+#[allow(clippy::too_many_arguments)]
+async fn run_setup_full(
+    stdin_text: &str,
+    org_flag: Option<String>,
+    project_flag: Option<String>,
+    env_values: &[(&str, &str)],
+    endpoint: Option<String>,
+    config_path: Option<&Path>,
+    store: &dyn CredStore,
+    pat_flag: Option<String>,
+    interactive: bool,
+    name_flag: Option<String>,
+    yes: bool,
+    backend: Option<String>,
+    skip: &[&str],
+    project_root: Option<String>,
+    ia: &IaStub,
+    ingest: Option<bool>,
+    lang: Option<String>,
+) -> (ExitCode, String) {
     let make_board =
         move |pat: &str, org: &str, project: &str| -> Result<Box<dyn BoardProvider>, Error> {
             match &endpoint {
@@ -290,6 +335,8 @@ async fn run_setup(
         pat: pat_flag,
         interactive,
         name: name_flag,
+        lang,
+        ingest,
         yes,
         backend,
         skip: skip.iter().map(|item| (*item).to_string()).collect(),
@@ -380,7 +427,8 @@ async fn setup_interactive_local_first_asks_name_project_and_ia_without_pat() {
         out.contains("ativar depois:   kira connect azure   (leitura de work items)"),
         "{out}"
     );
-    assert!(out.contains("próximo passo:   kira scan"), "{out}");
+    // M6: o scan saiu do próximo passo (a ingestão do setup não usa rede).
+    assert!(out.contains("próximo passo:   kira connect azure"), "{out}");
     // O setup local-first NUNCA fala de PAT (nem pergunta, nem ensina).
     assert!(
         !out.contains("PAT"),
@@ -660,8 +708,8 @@ async fn setup_yes_clean_env_prints_the_three_blocks_and_never_mentions_pat() {
         out.contains("                 kira setup --backend ollama"),
         "sem IA, o ativar depois traz o backend: {out}"
     );
-    // Bloco 3 — próximo passo.
-    assert!(out.contains("próximo passo:   kira scan"), "{out}");
+    // Bloco 3 — próximo passo (M6: sem scan no caminho, o board é o passo).
+    assert!(out.contains("próximo passo:   kira connect azure"), "{out}");
     // O pulado é impresso com a causa (nunca silencioso).
     assert!(out.contains("ollama não encontrado nesta máquina"), "{out}");
     assert!(out.contains("ia: nenhuma por agora"), "{out}");
@@ -1506,7 +1554,7 @@ async fn setup_network_failure_saves_the_pat_and_continues() {
         "o PAT completo nunca pode aparecer na saída: {out}"
     );
     // O fluxo NÃO morre na falha de rede: o resumo local-first aparece.
-    assert!(out.contains("próximo passo:   kira scan"), "{out}");
+    assert!(out.contains("próximo passo:   kira connect azure"), "{out}");
     let _ = std::fs::remove_file(&config);
 }
 
@@ -1703,8 +1751,178 @@ async fn setup_unknown_skip_step_fails_with_actionable_error() {
 
     assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
     assert!(
-        out.contains("--skip aceita 'pat' ou 'ia'"),
+        out.contains("--skip aceita 'pat', 'ia' ou 'ingest'"),
         "erro acionável: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+// ---------------------------------------------------------------------------
+// M6 — ingestão e idioma no setup (briefing de 13/Nov + ADR-0038 D1/D4).
+// O motor executa; a ingestão é nota quando falha, nunca erro do setup.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn setup_skip_ingest_reports_the_skipped_step() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("skip-ingest");
+    let ia = IaStub::without_ollama();
+    let root = fake_root("skip-ingest");
+
+    let (code, out) = run_setup_full(
+        "",
+        None,
+        None,
+        &[("USER", "joao")],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &["ingest"],
+        Some(root),
+        &ia,
+        Some(false),
+        None,
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    assert!(
+        out.contains("ingestão pulada — ativar depois: kira ingest"),
+        "{out}"
+    );
+    assert!(
+        out.contains("ingestão: pulada — ativar depois: kira ingest"),
+        "o resumo ecoa o pulado: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_ingest_failure_is_a_note_not_a_crash() {
+    // Raiz inexistente: a ingestão falha ANTES de tocar qualquer store, o
+    // aviso diz a causa, o setup continua verde e o resumo aponta o comando.
+    let store = credentials::InMemory::new();
+    let config = temp_config("ingest-falha");
+    let ia = IaStub::without_ollama();
+    let root = fake_root("ingest-falha");
+
+    let (code, out) = run_setup_full(
+        "",
+        None,
+        None,
+        &[("USER", "joao")],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &[],
+        Some(root),
+        &ia,
+        Some(true),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        code,
+        ExitCode::SUCCESS,
+        "ingestão não derruba o setup: {out}"
+    );
+    assert!(out.contains("aviso: ingestão não rodou"), "{out}");
+    assert!(
+        out.contains("ingestão: não rodou"),
+        "o resumo ecoa a causa: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_lang_flag_saves_output_lang_and_the_summary_echoes_it() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("lang-ok");
+    let ia = IaStub::without_ollama();
+
+    let (code, out) = run_setup_full(
+        "",
+        None,
+        None,
+        &[("USER", "joao")],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &[],
+        Some(fake_root("lang-ok")),
+        &ia,
+        None,
+        Some("pt-BR".to_string()),
+    )
+    .await;
+
+    assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
+    let pairs = credentials::read_config_file(&config).unwrap_or_default();
+    assert!(
+        pairs
+            .iter()
+            .any(|(k, v)| k == "output_lang" && v == "pt-BR"),
+        "{pairs:?}"
+    );
+    assert!(
+        out.contains("idioma: pt-BR (posts, cards e PR)"),
+        "o resumo mostra o idioma: {out}"
+    );
+    let _ = std::fs::remove_file(&config);
+}
+
+#[tokio::test]
+async fn setup_invalid_lang_flag_fails_fast_without_writing() {
+    let store = credentials::InMemory::new();
+    let config = temp_config("lang-ruim");
+    let ia = IaStub::without_ollama();
+
+    let (code, out) = run_setup_full(
+        "",
+        None,
+        None,
+        &[],
+        None,
+        Some(&config),
+        &store,
+        None,
+        false,
+        None,
+        true,
+        None,
+        &[],
+        Some(fake_root("lang-ruim")),
+        &ia,
+        None,
+        Some("pt BR".to_string()),
+    )
+    .await;
+
+    assert_eq!(
+        code,
+        ExitCode::FAILURE,
+        "explícito inválido falha de cara: {out}"
+    );
+    assert!(out.contains("--lang inválido 'pt BR'"), "{out}");
+    assert!(
+        !config.exists(),
+        "nada é gravado antes da validação explícita"
     );
     let _ = std::fs::remove_file(&config);
 }

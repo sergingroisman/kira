@@ -49,6 +49,11 @@ pub const CONFIG_KEY_DEV_NAME: &str = "dev_name";
 pub const CONFIG_KEY_FOUNDRY_ENDPOINT: &str = "foundry_endpoint";
 /// Deployment/modelo do Foundry (público) em `config.toml`.
 pub const CONFIG_KEY_FOUNDRY_DEPLOYMENT: &str = "foundry_deployment";
+/// Idioma do que o humano lê (posts, cards, PR) — ADR-0038 decisão 4. É dado,
+/// não código: `.kira/**` e prompts seguem em inglês; `output_lang` escolhido
+/// no `kira setup` (flag `--lang` no não-interativo) entra no `cache_key` do
+/// digest via `kira digest`. Público, nunca segredo.
+pub const CONFIG_KEY_OUTPUT_LANG: &str = "output_lang";
 
 /// Where a resolved value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

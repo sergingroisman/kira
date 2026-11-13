@@ -186,11 +186,15 @@
   `source_hash`/`published_hash`; `doctor` reporta ingestão, trust, fila e posts desatualizados.
   **Aceite:** publicar duas vezes é idempotente; `doctor` lista post velho quando o repo muda;
   nunca sobrescreve wiki escrito pelo dev sem `--force`.
-- [ ] **M6** etapa Ingestão no wizard (`src/setup/wizard.rs` + `src/setup.rs`). `Step` vira
+- [x] **M6** etapa Ingestão no wizard (`src/setup/wizard.rs` + `src/setup.rs`). `Step` vira
   `Ambiente, Projeto, Ingestao, Ia, Resumo`; a etapa só MOSTRA preview read-only e coleta
   `Enter = ingerir / n = pular`; efeito todo em `setup::run` (ADR-0034). `--skip` aceita
   `pat|ia|ingest`; resumo troca o próximo passo de `kira scan` para `kira connect azure`.
-  **Aceite:** `setup_e2e` com `--yes` (digest criado) e `--skip ingest` (nada criado).
+  Inclui a decisão 12 do dono: `--lang`/`output_lang` escolhido no setup e lido pelo digest
+  (cadeia `flag > env > config > en`).
+  **Aceite:** `setup_e2e` com `--yes` (digest criado) e `--skip ingest` (nada criado). ✅
+  Prova extra em `tests/setup_ingest_e2e.rs` (binário real, hermético): `--yes` cria
+  `digest.md` sem rede nem trust; `--lang pt-BR` chega ao post via config.
 - [ ] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
   com UTF-8/UTF-16 LE/BE nos call sites de `node.rs`/`dotnet.rs` + fixture) e **P5 `.gitignore`**
   (`src/context/gitignore.rs`, subset gitwildmatch, aninhado, sem dependência).

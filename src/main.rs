@@ -87,7 +87,7 @@ enum Command {
     },
     /// Configure the local-first setup: dev name → project root → IA backend
     #[command(
-        after_help = "Exemplos:\n  kira setup                # nome → projeto (raiz detectada) → backend de IA → resumo\n  kira setup --yes          # não-interativo: nunca bloqueia; sem Ollama escolhe \"nenhuma\" (e imprime o pulado)\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # atalho: valida e salva sem perguntas\n  kira setup --skip ia      # pula um passo (repetível: ia; 'pat' segue aceito como no-op)\n  kira setup --reset        # remove o PAT e a chave do Foundry do keyring; org/projeto/dev ficam\n\n  # A credencial do board nasce em `kira connect azure` (MVP-3), não aqui."
+        after_help = "Exemplos:\n  kira setup                # nome → projeto → ingestão → backend de IA → resumo\n  kira setup --yes          # não-interativo: nunca bloqueia; ingere, e sem Ollama escolhe \"nenhuma\" (imprime o pulado)\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # atalho: valida e salva sem perguntas\n  kira setup --skip ia      # pula um passo (repetível: ia, ingest; 'pat' segue aceito como no-op)\n  kira setup --lang pt-BR   # idioma dos posts/cards/PR (ADR-0038 D4); salvo como output_lang\n  kira setup --reset        # remove o PAT e a chave do Foundry do keyring; org/projeto/dev ficam\n\n  # A credencial do board nasce em `kira connect azure` (MVP-3), não aqui."
     )]
     Setup {
         /// Azure DevOps organization (atalho para quem já tem — nunca é
@@ -117,14 +117,19 @@ enum Command {
         /// entra por escolha explícita
         #[arg(long, value_parser = ["ollama", "copilot", "foundry", "nenhuma"])]
         backend: Option<String>,
-        /// Pula um passo (repetível): `ia` (`pat` segue aceito como no-op —
-        /// o passo deixou de existir no fluxo local-first)
+        /// Pula um passo (repetível): `ia`, `ingest` (`pat` segue aceito como
+        /// no-op — o passo deixou de existir no fluxo local-first)
         #[arg(long)]
         skip: Vec<String>,
         /// How the dev wants to be called (saved as `dev_name` in config.toml;
         /// shown by `kira doctor` — never sent to any LLM prompt)
         #[arg(long)]
         name: Option<String>,
+        /// Idioma do que o humano lê (posts, cards e PR): ex. `en`, `pt-BR`.
+        /// Salvo como `output_lang` em config.toml; `kira digest` lê na ordem
+        /// flag > KIRA_LANG > config > en (ADR-0038 D4)
+        #[arg(long)]
+        lang: Option<String>,
         /// Força o wizard de texto (sem tela cheia) — para CI, terminal
         /// restrito ou quem prefere linha a linha
         #[arg(long)]
@@ -464,9 +469,13 @@ async fn run(command: Command) -> Outcome {
             backend,
             skip,
             name,
+            lang,
             plain,
         } => Outcome {
-            code: setup_command(org, project, reset, pat, yes, backend, skip, name, plain).await,
+            code: setup_command(
+                org, project, reset, pat, yes, backend, skip, name, lang, plain,
+            )
+            .await,
             ok: true,
             records: false,
             summary: String::new(),
@@ -1288,6 +1297,17 @@ fn trust_command(path: Option<&Path>, revoke: bool) -> Outcome {
     }
 }
 
+/// Idioma salvo pelo `kira setup` (ADR-0038 D4). Qualquer falha de leitura =
+/// `None` — o digest cai no default `en`, nunca trava por config.
+fn output_lang_from_config() -> Option<String> {
+    credentials::read_config()
+        .ok()?
+        .into_iter()
+        .find(|(name, _)| name == credentials::CONFIG_KEY_OUTPUT_LANG)
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// `kira digest` — o `Courier` local (ADR-0038, M3).
 ///
 /// O backend é construído **aqui** (composition root) e o módulo de decisão recebe
@@ -1307,8 +1327,10 @@ async fn digest_command(
         Path::to_path_buf,
     );
     let model_tag = model.unwrap_or_else(ollama::model_from_env);
+    // ADR-0038 D4: flag > env > `output_lang` salvo pelo setup > en.
     let lang = lang
         .or_else(|| std::env::var("KIRA_LANG").ok())
+        .or_else(output_lang_from_config)
         .unwrap_or_else(|| "en".to_string());
     let mut options = kira::post::DigestOptions::at(root);
     options.model = format!("ollama:{model_tag}");
@@ -2013,6 +2035,7 @@ async fn setup_command(
     backend: Option<String>,
     skip: Vec<String>,
     name: Option<String>,
+    lang: Option<String>,
     plain: bool,
 ) -> ExitCode {
     // Fail fast (before the user creates a token) when there is nowhere to
@@ -2028,6 +2051,11 @@ async fn setup_command(
     // de IA aparece; `--yes` força o modo não-interativo (nunca bloqueia;
     // sem Ollama escolhe "nenhuma" e imprime o pulado).
     let interactive = std::io::stdin().is_terminal();
+    // M6: o binário SEMPRE decide a ingestão (o wizard refaz a coleta na
+    // etapa própria); `--skip ingest` é o "não" explícito. O motor executa.
+    let skip_ingest = skip
+        .iter()
+        .any(|item| item.trim().eq_ignore_ascii_case("ingest"));
     let options = setup::SetupOptions {
         org,
         project,
@@ -2035,6 +2063,8 @@ async fn setup_command(
         pat,
         interactive,
         name,
+        lang,
+        ingest: Some(!skip_ingest),
         yes,
         backend,
         skip,
@@ -2056,6 +2086,7 @@ async fn setup_command(
         || options.project.is_some()
         || options.pat.is_some()
         || options.backend.is_some()
+        || options.lang.is_some()
         || !options.skip.is_empty()
         || options.yes;
     let stdout_tty = std::io::stdout().is_terminal();
