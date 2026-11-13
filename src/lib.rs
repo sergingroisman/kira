@@ -27,6 +27,7 @@ pub mod shellline;
 pub mod stack;
 pub mod store;
 pub mod triage;
+pub mod trust;
 pub mod tui;
 pub mod wiki;
 pub mod work_item;

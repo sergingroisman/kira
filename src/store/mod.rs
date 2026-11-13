@@ -26,6 +26,8 @@ use thiserror::Error;
 
 use crate::credentials;
 
+pub mod posts;
+
 /// Name of the single central DB file inside the store directory.
 pub const DB_FILE: &str = "store.db";
 
@@ -33,7 +35,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -770,6 +772,37 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     if current < 5 && !column_exists(conn, "sessions", "item_id")? {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN item_id INTEGER;")
             .map_err(schema_error)?;
+    }
+
+    // v6 — `posts` (ADR-0038, M2): a fila que o `Courier` consome. A unidade é o
+    // artigo, e a procedência (`source_hash`, `prompt_version`, `model`, `lang`)
+    // mora na linha — é o que torna retomada e cache a mesma coisa.
+    // `postage_until` é o lease: vencido, a carta volta para a fila sozinha.
+    if current < 6 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS posts (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                lang TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                model TEXT NOT NULL,
+                state TEXT NOT NULL,
+                postage_until INTEGER,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                read_at TEXT,
+                path TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE (project_id, slug)
+            );
+            CREATE INDEX IF NOT EXISTS ix_posts_outbox
+                ON posts (project_id, state, postage_until);
+            CREATE VIEW IF NOT EXISTS outbox AS
+                SELECT * FROM posts WHERE state = 'sealed';",
+        )
+        .map_err(schema_error)?;
     }
 
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))

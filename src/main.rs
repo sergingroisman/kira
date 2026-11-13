@@ -18,6 +18,7 @@ use kira::scan;
 use kira::setup;
 use kira::store::{self, Store, StoreError};
 use kira::triage;
+use kira::trust;
 use kira::wiki::{WIKI_DIR, Wiki, WikiError, episode};
 
 /// Hard cap for the summary line shown by `kira history`.
@@ -167,6 +168,17 @@ enum Command {
         /// Do not run the stack scanners (offline mode: digest uses the last findings.json)
         #[arg(long)]
         skip_scan: bool,
+    },
+    /// Trust this repository (or revoke it): the gate before `kira digest` sends any
+    /// code to a model. Without trust, nothing leaves the machine (ADR-0038)
+    #[command(after_help = "Exemplos:\n  kira trust\n  kira trust --revoke")]
+    Trust {
+        /// Project folder (defaults to the project root detected like in the store)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Revoke the trust instead of granting it
+        #[arg(long)]
+        revoke: bool,
     },
     /// Read and grow the local project wiki at .kira/wiki (knowledge, not chat logs)
     #[command(
@@ -424,6 +436,7 @@ async fn run(command: Command) -> Outcome {
             json,
             skip_scan,
         } => ingest_command(path.as_deref(), json, skip_scan),
+        Command::Trust { path, revoke } => trust_command(path.as_deref(), revoke),
         Command::Wiki { action, path } => wiki_command(action, path.as_deref()),
         Command::Context {
             id,
@@ -723,6 +736,16 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 args.push_str(" --skip-scan");
             }
             ("ingest".to_string(), args.trim().to_string(), None)
+        }
+        Command::Trust { path, revoke } => {
+            let mut args = String::new();
+            if let Some(path) = path {
+                args.push_str(&format!("--path {}", path.display()));
+            }
+            if *revoke {
+                args.push_str(" --revoke");
+            }
+            ("trust".to_string(), args.trim().to_string(), None)
         }
         Command::Wiki { action, path } => {
             let args = match action {
@@ -1113,6 +1136,50 @@ fn ingest_command(path: Option<&Path>, json: bool, skip_scan: bool) -> Outcome {
                 print!("{text}");
                 Outcome::success(text)
             }
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira trust` — aceite do repositório (ADR-0038, M2).
+///
+/// O `ingest` é read-only e não pede aceite; o `digest`, que envia código ao modelo,
+/// recusa rodar sem ele. Revogar é tão fácil quanto aceitar, e nenhum dos dois apaga
+/// artefato já gravado.
+fn trust_command(path: Option<&Path>, revoke: bool) -> Outcome {
+    let root = path.map_or_else(
+        || store::detect_project_root().unwrap_or_else(|| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
+    if revoke {
+        return match trust::revoke(&root) {
+            Ok(true) => {
+                let text = format!("confiança revogada: {}\n", root.display());
+                print!("{text}");
+                Outcome::success(text)
+            }
+            Ok(false) => {
+                let text = format!("nada a revogar em {}\n", root.display());
+                print!("{text}");
+                Outcome::success(text)
+            }
+            Err(err) => {
+                print_error(&err);
+                Outcome::failure(err.to_string())
+            }
+        };
+    }
+    match trust::accept(&root) {
+        Ok(record) => {
+            let text = format!(
+                "repositório aceito: {}\n  hash: {}\n",
+                record.root, record.hash
+            );
+            print!("{text}");
+            Outcome::success(text)
         }
         Err(err) => {
             print_error(&err);
