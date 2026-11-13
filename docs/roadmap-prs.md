@@ -13,11 +13,11 @@
 2. **Nunca merge da branch `dev`.** Histórias desconectadas (POC v1 Bun/Ink/TS). Só
    conceito, lido por `git show origin/dev:<path>`. Só sobrevive o que respeita o
    contrato da main: binário único, read-only, Ollama local, SQLite `bundled`.
-3. **Delta escreve o código; Orchestrator sela** (`cargo fmt --check` ·
+3. **Delta escreve o código; Hermes sela** (`cargo fmt --check` ·
    `cargo clippy --all-targets -- -D warnings` · `cargo test` · `cargo build` ·
    CI 3 SOs · push). Nenhum PR entra em `main` sem o selo.
 4. **Orquestrador não escreve nos arquivos do PR aberto da Delta.** Código = Delta;
-   docs/ledger/gates = Orchestrator. Colisão de worktree é o único risco real aqui.
+   docs/ledger/gates = Hermes. Colisão de worktree é o único risco real aqui.
 
 ## Decisões de processo (dono, 11/Nov/2026)
 
