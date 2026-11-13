@@ -12,6 +12,7 @@ use kira::credentials;
 use kira::doctor;
 use kira::error::Error;
 use kira::format;
+use kira::ingest;
 use kira::llm::ollama;
 use kira::scan;
 use kira::setup;
@@ -149,6 +150,23 @@ enum Command {
         /// Project folder (defaults to the project root detected like in the store)
         #[arg(long)]
         path: Option<PathBuf>,
+    },
+    /// Ingest the project: walks everything the denylist does not exclude, refreshes
+    /// the FTS5 index, runs `scan` (optional) and writes a deterministic
+    /// .kira/digest.md — no AI, no network required (ADR-0038)
+    #[command(
+        after_help = "Exemplos:\n  kira ingest\n  kira ingest --path ./repo --json\n  kira ingest --skip-scan"
+    )]
+    Ingest {
+        /// Project folder (defaults to the project root detected like in the store)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Print the report as JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+        /// Do not run the stack scanners (offline mode: digest uses the last findings.json)
+        #[arg(long)]
+        skip_scan: bool,
     },
     /// Read and grow the local project wiki at .kira/wiki (knowledge, not chat logs)
     #[command(
@@ -401,6 +419,11 @@ async fn run(command: Command) -> Outcome {
         Command::Note { text, remove } => store_command(note_output(text, remove)),
         Command::Profile => store_command(profile_output()),
         Command::Scan { path } => scan_command(path.as_deref()),
+        Command::Ingest {
+            path,
+            json,
+            skip_scan,
+        } => ingest_command(path.as_deref(), json, skip_scan),
         Command::Wiki { action, path } => wiki_command(action, path.as_deref()),
         Command::Context {
             id,
@@ -684,6 +707,23 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 .unwrap_or_default(),
             None,
         ),
+        Command::Ingest {
+            path,
+            json,
+            skip_scan,
+        } => {
+            let mut args = String::new();
+            if let Some(path) = path {
+                args.push_str(&format!("--path {}", path.display()));
+            }
+            if *json {
+                args.push_str(" --json");
+            }
+            if *skip_scan {
+                args.push_str(" --skip-scan");
+            }
+            ("ingest".to_string(), args.trim().to_string(), None)
+        }
         Command::Wiki { action, path } => {
             let args = match action {
                 WikiAction::List => "list".to_string(),
@@ -1035,6 +1075,44 @@ fn scan_command(path: Option<&Path>) -> Outcome {
         Ok(text) => {
             print!("{text}");
             Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira ingest` — fatos do projeto, sem LLM (ADR-0038, M1).
+///
+/// Determinístico: mesma árvore ⇒ mesmo `.kira/digest.md`. Rede só se `--skip-scan`
+/// não for passado, e mesmo assim a falha do scan vira nota, nunca erro.
+fn ingest_command(path: Option<&Path>, json: bool, skip_scan: bool) -> Outcome {
+    let root = path.map_or_else(
+        || store::detect_project_root().unwrap_or_else(|| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
+    let mut options = ingest::IngestOptions::at(root);
+    options.run_scan = !skip_scan;
+    match ingest::run(&options) {
+        Ok(report) => {
+            ingest::ensure_local_marker(&options.root);
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => {
+                        println!("{text}");
+                        Outcome::success(text)
+                    }
+                    Err(err) => {
+                        print_error(&err);
+                        Outcome::failure(err.to_string())
+                    }
+                }
+            } else {
+                let text = report.summary();
+                print!("{text}");
+                Outcome::success(text)
+            }
         }
         Err(err) => {
             print_error(&err);

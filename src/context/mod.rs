@@ -18,6 +18,7 @@ use crate::store::Store;
 use crate::wiki::Wiki;
 use crate::work_item::WorkItem;
 
+pub mod ignore;
 pub mod index;
 mod repo;
 

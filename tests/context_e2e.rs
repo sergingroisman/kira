@@ -173,12 +173,19 @@ fn json_report_is_parseable_and_marks_the_source() {
 #[test]
 fn grep_is_the_fallback_for_a_repo_without_indexable_files() {
     let sandbox = Sandbox::new("fallback-grep");
-    // A fixture .txt nunca entra no índice (extensão fora da allowlist): a
-    // única "fonte" do repo não é indexável ⇒ repo_file_count = 0 ⇒ fail-open
-    // para o grep, sem erro.
+    // Depois do ADR-0038 a decisão é **denylist**, então `.txt` passou a ser
+    // indexável. Para o repositório ficar sem nenhum arquivo indexável, o work
+    // item mora num diretório que a caminhada ignora (dot-dir) e o único conteúdo
+    // do repo é um binário — o fallback para o grep continua sendo o contrato.
     write_item_without_source_extension(&sandbox);
-    sandbox.write("binarios/leia.bin", "não é fonte\n");
-    let (code, stdout, stderr) = sandbox.run(&["context", "--file", "work-item.txt"]);
+    std::fs::create_dir_all(sandbox.cwd.join(".tmp")).expect("mkdir .tmp");
+    std::fs::rename(
+        sandbox.cwd.join("work-item.txt"),
+        sandbox.cwd.join(".tmp/work-item.txt"),
+    )
+    .expect("mover work item");
+    sandbox.write(".tmp/leia.bin", "não é fonte\n");
+    let (code, stdout, stderr) = sandbox.run(&["context", "--file", ".tmp/work-item.txt"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(
         stdout.contains("fonte do repositório: grep"),
