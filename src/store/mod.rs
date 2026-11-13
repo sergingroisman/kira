@@ -774,7 +774,7 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
             .map_err(schema_error)?;
     }
 
-    // v6 — `posts` (ADR-0038, M2): a fila que o `Courier` consome. A unidade é o
+    // v6 — `posts` (ADR-0038, M2): a fila que o turno consome. A unidade é o
     // artigo, e a procedência (`source_hash`, `prompt_version`, `model`, `lang`)
     // mora na linha — é o que torna retomada e cache a mesma coisa.
     // `draft_ttl` é o lease: vencido, a carta volta para a fila sozinha.
