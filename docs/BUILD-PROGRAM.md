@@ -19,6 +19,24 @@
    dinheiro (`max_cost_per_day_brl`) só com provedor pago (PR11).
 6. **Cadência do cron `kira-autobuild`: a cada 3 h**, um PR por ciclo. ✅
 
+## Decisões do dono (12–13/Nov/2026 — ADR-0038; onde conflitar, vencem as de 10/Nov)
+
+7. **Ollama é o backend do `digest`, sempre primeiro.** Foundry é capacidade; `copilot` nunca implícito.
+8. **Trust do repositório no onboarding:** `ingest` roda read-only sem trust; `digest` **exige** o aceite (é ele que manda código ao modelo).
+9. **Fila em SQL** no `store.db`, sem broker: tabela `posts` + view `outbox`, claim com lease;
+   `read_at` = não lido; `tokio::broadcast` é só sino, nunca fonte da verdade.
+10. **1 M tokens por run** de `digest` + **teto de 30 k por post** (sem o segundo, um post guloso come o run).
+11. **Multi-stack desde o MVP**, "como o gitingest": denylist de padrões + detector de stack,
+   em vez da allowlist de 34 extensões.
+12. **Idioma:** `.kira/**`, prompts e contratos internos **sempre em inglês**; posts/cards/PR usam
+   `output.lang`, escolhido no `kira setup` (`--lang` no não-interativo), com override por projeto.
+   `lang` entra no `cache_key`.
+13. **Domínio `post`** (tabela `posts`): a unidade de trabalho é o artigo. Lore de carta/selo/
+   carteiro vive na doc e na UI — `outbox`, `Courier`, `Postage`, `DeadLetter`, `Postmaster`.
+   `letters` descartado.
+14. **O orquestrador Hermes fica no DeepSeek de propósito** (paga 2× com o OpenCode Go no crew).
+   Registrado aqui para que nenhuma sessão futura "otimize" isso de novo.
+
 ## Regras duras do programa (valem para todo ciclo, sem exceção)
 
 1. **Um item por ciclo.** Nunca dois PRs num mesmo ciclo.
@@ -128,6 +146,42 @@
 - [ ] **PR18** `kira approve <id>` + `awaiting_approval` no ciclo (guarda da
       autonomia) — **pré-requisito de qualquer escrita autônoma**.
 - [ ] **PR19** `kira audit --weekly` (sem blog).
+
+### M — onboarding: ingestão → digestão → emissão (ADR-0038, 12–13/Nov/2026)
+
+> Onda nova, **independente** de F2/F5: nada aqui depende do gate M2 nem dos 20 bugs rotulados.
+> M4 absorve parte do painel de arquivos de F4/PR23 (caixa de correio em modo leitura); PR21–PR26
+> continuam valendo para o resto do dashboard.
+
+- [ ] **M1** `kira ingest` — fatos, sem LLM. `src/context/ignore.rs` (denylist + sniff binário +
+  cap por arquivo **com nota** + fix depth-0 + `packages/` fora do skip) · `src/stack.rs`
+  (detector por marcador: `go.mod`, `pubspec.yaml`, `*.sln`, `build.gradle.kts`, `app.json`,
+  `Package.swift`, `terraform/`) · `src/ingest/{mod,inventory,digest}.rs` (`render` puro) ·
+  `Command::Ingest { path, json, skip_scan }` · grava `.kira/ingest/{inventory.json,tree.txt}`
+  e `.kira/digest.md`.
+  **Aceite:** dois `ingest` seguidos ⇒ `digest.md` byte-idêntico; `packages/core/src/lib.rs`
+  indexado; raiz chamada `build` ingerida; arquivo acima do cap sai com nota "truncado"; repositório
+  Go e Flutter detectados no perfil; gates verdes.
+- [ ] **M2** `posts` + `outbox` + trust. Migração v6 (tabela `posts`: `id, slug, kind, lang,
+  source_hash, prompt_version, model, state, postage_until, attempts, read_at, path, envelope,
+  created_at` + view `outbox`) · claim `UPDATE … RETURNING` com lease · `.kira/trust.json`
+  (hash do path) · `kira trust`.
+  **Aceite:** dois claims não pegam a mesma linha; lease vencida devolve à fila; migração preserva
+  dados; `ingest` não pede trust e `digest` recusa sem ele.
+- [ ] **M3** `kira digest` (Ollama). 2 kinds (`intro`, `c4-container`), prompts versionados em
+  `src/llm/prompts/` (EN), 30 k/post + 1 M/run, `--pause`/`--resume`/`--budget`,
+  `.kira/briefing.md`, `cache_key = (input_hash, prompt_version, model, lang)`.
+  **Aceite:** segundo run não repete post; `--lang` diferente não reaproveita cache; budget
+  estourado para com nota; sem ollama ⇒ erro acionável com exit != 0.
+- [ ] **M4** caixa de correio no dashboard (modo leitura). Painel com `não lido`, Markdown
+  renderizado (`tui-markdown` — dependência nova, registrar no ADR-0038 no PR), `read_at` grava.
+  **Aceite:** `--snapshot` mostra o painel; hash do store muda só em `read_at`; tecla não escreve
+  arquivo do dev.
+- [ ] **M5** `kira emit` + docs. Publica `.kira/wiki/<slug>.md` (front-matter + índice derivado)
+  com gate por `source_hash`; `doctor` reporta ingestão e posts desatualizados; corrige
+  `docs/kira-jornadas.md` (BOM) e `docs/ux-setup-jornada.md`.
+  **Aceite:** publicar duas vezes é idempotente; `doctor` lista post velho quando o repo muda;
+  nunca sobrescreve wiki escrito pelo dev sem aprovação.
 
 ### F3 — provedores e hardware
 - [ ] **PR20** tuning local: detecção de VRAM/backend, escolha de modelo por
