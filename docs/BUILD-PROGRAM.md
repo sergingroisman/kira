@@ -162,7 +162,7 @@
   **Aceite:** dois `ingest` seguidos ⇒ `digest.md` byte-idêntico; `packages/core/src/lib.rs`
   indexado; raiz chamada `build` ingerida; arquivo acima do cap sai com nota "truncado"; repositório
   Go e Flutter detectados no perfil; gates verdes.
-- [ ] **M2** `posts` + `outbox` + trust. Migração v6 (tabela `posts`: `id, slug, kind, lang,
+- [x] **M2** `posts` + `outbox` + trust. Migração v6 (tabela `posts`: `id, slug, kind, lang,
   source_hash, prompt_version, model, state, postage_until, attempts, read_at, path, envelope,
   created_at` + view `outbox`) · claim `UPDATE … RETURNING` com lease · `.kira/trust.json`
   (hash do path) · `kira trust`.
