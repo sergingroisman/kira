@@ -153,7 +153,7 @@
 > M4 absorve parte do painel de arquivos de F4/PR23 (caixa de correio em modo leitura); PR21–PR26
 > continuam valendo para o resto do dashboard.
 
-- [ ] **M1** `kira ingest` — fatos, sem LLM. `src/context/ignore.rs` (denylist + sniff binário +
+- [x] **M1** `kira ingest` — fatos, sem LLM. `src/context/ignore.rs` (denylist + sniff binário +
   cap por arquivo **com nota** + fix depth-0 + `packages/` fora do skip) · `src/stack.rs`
   (detector por marcador: `go.mod`, `pubspec.yaml`, `*.sln`, `build.gradle.kts`, `app.json`,
   `Package.swift`, `terraform/`) · `src/ingest/{mod,inventory,digest}.rs` (`render` puro) ·
