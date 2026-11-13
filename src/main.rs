@@ -180,6 +180,35 @@ enum Command {
         #[arg(long)]
         revoke: bool,
     },
+    /// Digest the ingested facts into posts with the LOCAL model (ADR-0038): enqueues
+    /// what is missing in `posts`, claims with a lease and writes drafts under
+    /// .kira/digest/. Requires `kira trust` and a previous `kira ingest`
+    #[command(
+        after_help = "Exemplos:\n  kira digest --lang pt-BR\n  kira digest --pause 1\n  kira digest --resume --budget 200000"
+    )]
+    Digest {
+        /// Project folder (defaults to the project root detected like in the store)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Ollama model tag (overrides KIRA_MODEL); goes into the cache key
+        #[arg(long)]
+        model: Option<String>,
+        /// Language of the generated posts (pt-BR, en, ...); overrides KIRA_LANG
+        #[arg(long)]
+        lang: Option<String>,
+        /// Token ceiling for this run (default 1_000_000)
+        #[arg(long)]
+        budget: Option<u64>,
+        /// Stop after N delivered posts — the pause switch
+        #[arg(long)]
+        pause: Option<usize>,
+        /// Release posts left claimed by a previous run before starting
+        #[arg(long)]
+        resume: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Read and grow the local project wiki at .kira/wiki (knowledge, not chat logs)
     #[command(
         after_help = "Exemplos:\n  kira wiki list\n  kira wiki show contexto\n  kira wiki decision \"fix roda em jail mínimo — ADR-0011\""
@@ -437,6 +466,15 @@ async fn run(command: Command) -> Outcome {
             skip_scan,
         } => ingest_command(path.as_deref(), json, skip_scan),
         Command::Trust { path, revoke } => trust_command(path.as_deref(), revoke),
+        Command::Digest {
+            path,
+            model,
+            lang,
+            budget,
+            pause,
+            resume,
+            json,
+        } => digest_command(path.as_deref(), model, lang, budget, pause, resume, json).await,
         Command::Wiki { action, path } => wiki_command(action, path.as_deref()),
         Command::Context {
             id,
@@ -746,6 +784,39 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 args.push_str(" --revoke");
             }
             ("trust".to_string(), args.trim().to_string(), None)
+        }
+        Command::Digest {
+            path,
+            model,
+            lang,
+            budget,
+            pause,
+            resume,
+            json,
+        } => {
+            let mut args = String::new();
+            if let Some(path) = path {
+                args.push_str(&format!("--path {}", path.display()));
+            }
+            if let Some(model) = model {
+                args.push_str(&format!(" --model {model}"));
+            }
+            if let Some(lang) = lang {
+                args.push_str(&format!(" --lang {lang}"));
+            }
+            if let Some(budget) = budget {
+                args.push_str(&format!(" --budget {budget}"));
+            }
+            if let Some(pause) = pause {
+                args.push_str(&format!(" --pause {pause}"));
+            }
+            if *resume {
+                args.push_str(" --resume");
+            }
+            if *json {
+                args.push_str(" --json");
+            }
+            ("digest".to_string(), args.trim().to_string(), model.clone())
         }
         Command::Wiki { action, path } => {
             let args = match action {
@@ -1186,6 +1257,78 @@ fn trust_command(path: Option<&Path>, revoke: bool) -> Outcome {
             Outcome::failure(err.to_string())
         }
     }
+}
+
+/// `kira digest` — o `Courier` local (ADR-0038, M3).
+///
+/// O backend é construído **aqui** (composition root) e o módulo de decisão recebe
+/// a referência: `post` não escolhe provider, só decide com o modelo.
+#[allow(clippy::too_many_arguments)]
+async fn digest_command(
+    path: Option<&Path>,
+    model: Option<String>,
+    lang: Option<String>,
+    budget: Option<u64>,
+    pause: Option<usize>,
+    resume: bool,
+    json: bool,
+) -> Outcome {
+    let root = path.map_or_else(
+        || store::detect_project_root().unwrap_or_else(|| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
+    let model_tag = model.unwrap_or_else(ollama::model_from_env);
+    let lang = lang
+        .or_else(|| std::env::var("KIRA_LANG").ok())
+        .unwrap_or_else(|| "en".to_string());
+    let mut options = kira::post::DigestOptions::at(root);
+    options.model = format!("ollama:{model_tag}");
+    options.lang = lang;
+    if let Some(budget) = budget {
+        options.budget_tokens = budget;
+    }
+    options.pause_after = pause;
+    options.resume = resume;
+
+    let backend = ollama::OllamaBackend::new(ollama::base_url_from_env(), model_tag);
+    match kira::post::run(&options, &backend).await {
+        Ok(report) => {
+            if json {
+                match serde_json::to_string_pretty(&report_json(&report)) {
+                    Ok(text) => {
+                        println!("{text}");
+                        Outcome::success(text)
+                    }
+                    Err(err) => {
+                        print_error(&err);
+                        Outcome::failure(err.to_string())
+                    }
+                }
+            } else {
+                let text = report.summary();
+                print!("{text}");
+                Outcome::success(text)
+            }
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+fn report_json(report: &kira::post::DigestReport) -> serde_json::Value {
+    serde_json::json!({
+        "planned": report.planned,
+        "generated": report.generated,
+        "cached": report.cached,
+        "failed": report.failed,
+        "tokens_used": report.tokens_used,
+        "budget_tokens": report.budget_tokens,
+        "budget_hit": report.budget_hit,
+        "briefing_path": report.briefing_path,
+        "notes": report.notes,
+    })
 }
 
 /// `kira wiki <action>` — reads and appends to the project wiki (ADR-0013).

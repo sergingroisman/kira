@@ -19,6 +19,7 @@ pub mod guard;
 pub mod html;
 pub mod ingest;
 pub mod llm;
+pub mod post;
 pub mod prdraft;
 pub mod redact;
 pub mod scan;
