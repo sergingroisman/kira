@@ -23,6 +23,7 @@ pub mod redact;
 pub mod scan;
 pub mod setup;
 pub mod shellline;
+pub mod stack;
 pub mod store;
 pub mod triage;
 pub mod tui;
