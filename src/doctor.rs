@@ -127,8 +127,8 @@ pub fn format_ingest_lines() -> Vec<String> {
         ];
     };
     let kira = root.join(".kira");
-    let digest_path = kira.join("digest.md");
-    let digest = std::fs::read_to_string(&digest_path).ok();
+    let facts_path = kira.join("facts.md");
+    let digest = std::fs::read_to_string(&facts_path).ok();
     let files = std::fs::read_to_string(kira.join("ingest").join("inventory.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<crate::ingest::inventory::Inventory>(&text).ok())
@@ -141,10 +141,10 @@ pub fn format_ingest_lines() -> Vec<String> {
     let mut lines = Vec::new();
     match (&digest, files) {
         (Some(_), Some(count)) => lines.push(format!(
-            "ingestão: {count} arquivo(s) ingerido(s), digest ok, repositório {trust}"
+            "ingestão: {count} arquivo(s) ingerido(s), facts ok, repositório {trust}"
         )),
         (Some(_), None) => lines.push(format!(
-            "ingestão: digest ok (inventário ausente — rode `kira ingest`), repositório {trust}"
+            "ingestão: facts ok (inventário ausente — rode `kira ingest`), repositório {trust}"
         )),
         _ => lines.push(format!(
             "ingestão: nenhuma (rode `kira ingest`), repositório {trust}"

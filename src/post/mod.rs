@@ -135,8 +135,8 @@ pub async fn run<B: LlmBackend>(
     if !trust::is_trusted(root) {
         return Err(DigestError::NotTrusted);
     }
-    let digest_path = root.join(".kira").join("digest.md");
-    let digest = std::fs::read_to_string(&digest_path).map_err(|_| DigestError::NotIngested)?;
+    let facts_path = root.join(".kira").join("facts.md");
+    let digest = std::fs::read_to_string(&facts_path).map_err(|_| DigestError::NotIngested)?;
 
     let store = Store::open_default().map_err(|err| DigestError::Store(err.to_string()))?;
     let project_id = crate::store::project_id_for_root(root)

@@ -68,7 +68,7 @@ pub struct IngestReport {
     pub files_indexed: usize,
     pub lines_indexed: usize,
     pub index_truncated: bool,
-    pub digest_path: String,
+    pub facts_path: String,
     pub inventory_path: String,
     pub notes: Vec<String>,
 }
@@ -109,7 +109,7 @@ impl IngestReport {
         for note in &self.notes {
             out.push_str(&format!("nota: {note}\n"));
         }
-        out.push_str(&format!("digest: {}\n", self.digest_path));
+        out.push_str(&format!("facts: {}\n", self.facts_path));
         out
     }
 }
@@ -175,8 +175,8 @@ pub fn run(options: &IngestOptions) -> Result<IngestReport, IngestError> {
     let kira_dir = root.join(".kira");
     let ingest_dir = kira_dir.join("ingest");
     write_file(&ingest_dir.join("inventory.json"), &inventory_json(&inv)?)?;
-    let digest_path = kira_dir.join("digest.md");
-    write_file(&digest_path, &text)?;
+    let facts_path = kira_dir.join("facts.md");
+    write_file(&facts_path, &text)?;
 
     Ok(IngestReport {
         project_name: inv.project_name.clone(),
@@ -189,7 +189,7 @@ pub fn run(options: &IngestOptions) -> Result<IngestReport, IngestError> {
         files_indexed,
         lines_indexed,
         index_truncated,
-        digest_path: display_rel(root, &digest_path),
+        facts_path: display_rel(root, &facts_path),
         inventory_path: display_rel(root, &ingest_dir.join("inventory.json")),
         notes: {
             let mut all = notes;
