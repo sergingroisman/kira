@@ -159,8 +159,8 @@ fn digest_generates_the_two_posts_and_writes_the_briefing() {
         "briefing sem idioma: {briefing}"
     );
     assert!(
-        briefing.contains("kira emit"),
-        "fila vazia deve apontar o emit: {briefing}"
+        briefing.contains("kira publish"),
+        "fila vazia deve apontar o publish: {briefing}"
     );
 }
 

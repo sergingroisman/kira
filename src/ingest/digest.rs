@@ -5,7 +5,7 @@
 //! arquivo é o chamador, que passa as linhas já recortadas e já redigidas.
 //!
 //! O digest é **índice**, não documento: árvore + perfil + até 12 arquivos-chave com
-//! até 60 linhas cada. O texto longo e humano mora no post (`emit`), não aqui.
+//! até 60 linhas cada. O texto longo e humano mora no post (`publish`), não aqui.
 
 use std::collections::BTreeMap;
 

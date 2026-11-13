@@ -10,11 +10,11 @@ use kira::board::BoardProvider;
 use kira::capabilities::{self, Capability};
 use kira::credentials;
 use kira::doctor;
-use kira::emit;
 use kira::error::Error;
 use kira::format;
 use kira::ingest;
 use kira::llm::ollama;
+use kira::publish;
 use kira::scan;
 use kira::setup;
 use kira::store::{self, Store, StoreError};
@@ -210,10 +210,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Emit the digested drafts into the project wiki (.kira/wiki), gated by the
+    /// Publish the digested drafts into the project wiki (.kira/wiki), gated by the
     /// source hash: a post edited by hand is never overwritten without --force
-    #[command(after_help = "Exemplos:\n  kira emit\n  kira emit --force")]
-    Emit {
+    #[command(after_help = "Exemplos:\n  kira publish\n  kira publish --force")]
+    Publish {
         /// Project folder (defaults to the project root detected like in the store)
         #[arg(long)]
         path: Option<PathBuf>,
@@ -481,7 +481,7 @@ async fn run(command: Command) -> Outcome {
             skip_scan,
         } => ingest_command(path.as_deref(), json, skip_scan),
         Command::Trust { path, revoke } => trust_command(path.as_deref(), revoke),
-        Command::Emit { path, force, json } => emit_command(path.as_deref(), force, json),
+        Command::Publish { path, force, json } => publish_command(path.as_deref(), force, json),
         Command::Digest {
             path,
             model,
@@ -834,7 +834,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             }
             ("digest".to_string(), args.trim().to_string(), model.clone())
         }
-        Command::Emit { path, force, json } => {
+        Command::Publish { path, force, json } => {
             let mut args = String::new();
             if let Some(path) = path {
                 args.push_str(&format!("--path {}", path.display()));
@@ -845,7 +845,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             if *json {
                 args.push_str(" --json");
             }
-            ("emit".to_string(), args.trim().to_string(), None)
+            ("publish".to_string(), args.trim().to_string(), None)
         }
         Command::Wiki { action, path } => {
             let args = match action {
@@ -1360,18 +1360,18 @@ fn report_json(report: &kira::post::DigestReport) -> serde_json::Value {
     })
 }
 
-/// `kira emit` — publica os rascunhos no wiki, gate por hash (ADR-0038, M5).
+/// `kira publish` — publica os rascunhos no wiki, gate por hash (ADR-0038, M5).
 ///
 /// A decisão de sobrescrever é do dono: `--force` explícito. Sem ele, post editado
 /// à mão é recusado com o nome do arquivo na frente.
-fn emit_command(path: Option<&Path>, force: bool, json: bool) -> Outcome {
+fn publish_command(path: Option<&Path>, force: bool, json: bool) -> Outcome {
     let root = path.map_or_else(
         || store::detect_project_root().unwrap_or_else(|| PathBuf::from(".")),
         Path::to_path_buf,
     );
-    let mut options = emit::EmitOptions::at(root);
+    let mut options = publish::PublishOptions::at(root);
     options.force = force;
-    match emit::run(&options) {
+    match publish::run(&options) {
         Ok(report) => {
             if json {
                 let value = serde_json::json!({
