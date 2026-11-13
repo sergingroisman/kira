@@ -245,6 +245,36 @@ fn the_store_never_keeps_the_secret_from_the_indexed_lines() {
     }
 }
 
+/// Item 4 da onda M: o `## Perfil`/`## Árvore` do `.kira/digest.md` que o
+/// **binário real** do `kira ingest` escreveu entram no pack — dado real, não
+/// cópia escrita à mão. `--skip-scan` mantém o teste offline de ponta a ponta.
+#[test]
+fn the_digest_profile_written_by_kira_ingest_enters_the_pack() {
+    let sandbox = Sandbox::new("digest-pack");
+    write_item(&sandbox);
+    sandbox.write("src/queue/fila.rs", "pub fn cooldown() -> u32 { 30 }\n");
+
+    let (code, stdout, stderr) = sandbox.run(&["ingest", "--skip-scan"]);
+    assert_eq!(code, 0, "ingest falhou: {stderr}");
+    assert!(stdout.contains(".kira/digest.md"), "{stdout}");
+
+    let (code, out, err) = sandbox.run(&["context", "--file", "item.json", "--explain"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("- perfil do digest:"), "{out}");
+    assert!(out.contains("perfil do digest"), "resumo honesto: {out}");
+
+    let (code, json, err) = sandbox.run(&["context", "--file", "item.json", "--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).unwrap_or_else(|e| panic!("JSON inválido: {e}"));
+    assert!(
+        parsed["pack"]["digest"]["profile"]
+            .as_str()
+            .is_some_and(|profile| profile.contains("- arquivos:")),
+        "perfil real no JSON: {parsed}"
+    );
+}
+
 #[test]
 fn the_pack_is_deterministic_across_runs() {
     let sandbox = Sandbox::new("determinism");

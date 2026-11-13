@@ -438,6 +438,7 @@ mod tests {
             used_chars: 120,
             budget_chars: 12_288,
             notes: Vec::new(),
+            digest: None,
             repo_source: crate::context::RepoSource::Grep,
         };
         let with = build_prompt_with_context(&item, &pack);

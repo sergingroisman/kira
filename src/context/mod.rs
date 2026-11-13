@@ -45,6 +45,16 @@ const MAX_CODE_EXCERPTS: usize = 8;
 /// How many individual findings are spelled out in the prompt.
 const MAX_FINDING_LINES: usize = 3;
 
+/// Cap for the `## Perfil` block the pack may carry from `.kira/digest.md`
+/// (onda M item 4). The real profile runs 20–40 lines; anything longer means
+/// the digest itself was truncated — the tail is noise for the prompt.
+const MAX_PACK_PROFILE_CHARS: usize = 1_500;
+
+/// Cap for the `## Árvore` lines the pack may carry (onda M item 4). Forty
+/// lines already outline a monorepo; beyond that the tree costs tokens the
+/// excerpts could spend.
+const MAX_PACK_TREE_LINES: usize = 40;
+
 /// Shortest keyword worth searching (drops "de", "erro", "não").
 const MIN_KEYWORD_CHARS: usize = 5;
 
@@ -85,6 +95,19 @@ pub struct ContextSection {
     pub excerpt: String,
 }
 
+/// The project's own outline, extracted from the `.kira/digest.md` that
+/// `kira ingest` wrote: `## Perfil` (counts, stacks, extensions) and
+/// `## Árvore` (the directory tree). Pure extraction with caps applied by
+/// [`digest_brief`] — no LLM, no timestamps (the digest is a deterministic
+/// artifact, ADR-0038 decisão 9).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DigestBrief {
+    /// `## Perfil` as written, cut at [`MAX_PACK_PROFILE_CHARS`].
+    pub profile: String,
+    /// `## Árvore` without the fence, at most [`MAX_PACK_TREE_LINES`] lines.
+    pub tree: Vec<String>,
+}
+
 /// What the prompt will carry beyond the work item.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextPack {
@@ -106,6 +129,10 @@ pub struct ContextPack {
     /// walk. New field (ADR-0021); serde default keeps old payloads valid.
     #[serde(default)]
     pub repo_source: RepoSource,
+    /// Profile and tree from `.kira/digest.md` when the project has been
+    /// ingested (onda M item 4). Serde default keeps old payloads valid.
+    #[serde(default)]
+    pub digest: Option<DigestBrief>,
 }
 
 impl ContextPack {
@@ -116,6 +143,14 @@ impl ContextPack {
             && self.code.is_empty()
             && self.findings_brief.is_none()
             && self.findings.is_empty()
+            && self.digest.is_none()
+    }
+
+    /// Whether `.kira/digest.md` contributed to this pack (onda M item 4) —
+    /// the honest answer `kira context` prints in its one-line summary.
+    #[must_use]
+    pub fn digest_used(&self) -> bool {
+        self.digest.is_some()
     }
 
     /// Markdown block to append to the user prompt; empty when the pack is empty.
@@ -133,6 +168,19 @@ impl ContextPack {
         }
         for finding in &self.findings {
             out.push_str(&format!("- achado: {finding}\n"));
+        }
+        if let Some(digest) = &self.digest {
+            out.push_str("\n### Perfil do projeto (`kira ingest`)\n");
+            out.push_str(&digest.profile);
+            out.push('\n');
+            if !digest.tree.is_empty() {
+                out.push_str("\n### Árvore do repositório\n```text\n");
+                for line in &digest.tree {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                out.push_str("```\n");
+            }
         }
         for section in &self.sections {
             let age = section.age_days.map_or_else(
@@ -165,6 +213,9 @@ impl ContextPack {
         }
         if self.findings_brief.is_some() {
             sources.push("findings do scan".to_string());
+        }
+        if self.digest_used() {
+            sources.push("perfil do digest".to_string());
         }
         if sources.is_empty() {
             sources.push("nenhum contexto".to_string());
@@ -215,6 +266,13 @@ pub fn explain_report(pack: &ContextPack, item_id: i32, explain: bool) -> String
     }
     for finding in &pack.findings {
         out.push_str(&format!("- achado: {finding}\n"));
+    }
+    if let Some(digest) = &pack.digest {
+        out.push_str(&format!(
+            "- perfil do digest: {} caractere(s), árvore com {} linha(s)\n",
+            digest.profile.chars().count(),
+            digest.tree.len()
+        ));
     }
     for section in &pack.sections {
         let age = section.age_days.map_or_else(
@@ -318,13 +376,65 @@ pub fn pack_with(
     pack_partial(root, Some(store), Some(wiki), item, budget_chars, &[])
 }
 
+/// Lines of one `## Heading` section of the digest, until the next `## `
+/// heading. Pure and exact-match on the heading: `###` sub-headings belong to
+/// the section, and the last section runs to the end of the file.
+fn digest_section(markdown: &str, heading: &str) -> Option<Vec<String>> {
+    let mut wanted: Vec<String> = Vec::new();
+    let mut inside = false;
+    for line in markdown.lines() {
+        if line.starts_with("## ") {
+            if inside {
+                return Some(wanted);
+            }
+            inside = line.trim_end() == heading;
+            continue;
+        }
+        if inside {
+            wanted.push(line.to_string());
+        }
+    }
+    if inside { Some(wanted) } else { None }
+}
+
+/// Extracts `## Perfil` and `## Árvore` from the markdown `kira ingest`
+/// rendered (onda M item 4). None when the profile is missing or empty — a
+/// digest without our headings is not our digest, and the pack simply carries
+/// nothing. The tree loses the ` ```text ` fence and is capped; the remainder
+/// is stated, never silently dropped.
+fn digest_brief(markdown: &str) -> Option<DigestBrief> {
+    let profile_raw = digest_section(markdown, "## Perfil")?;
+    let profile_text = profile_raw.join("\n").trim().to_string();
+    if profile_text.is_empty() {
+        return None;
+    }
+    let profile = if profile_text.chars().count() > MAX_PACK_PROFILE_CHARS {
+        let mut cut: String = profile_text.chars().take(MAX_PACK_PROFILE_CHARS).collect();
+        cut.push_str("\n_perfil cortado no teto de 1 500 caracteres_");
+        cut
+    } else {
+        profile_text
+    };
+    let mut tree: Vec<String> = digest_section(markdown, "## Árvore")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|line| !line.trim().starts_with("```") && !line.trim().is_empty())
+        .collect();
+    if tree.len() > MAX_PACK_TREE_LINES {
+        let hidden = tree.len() - MAX_PACK_TREE_LINES;
+        tree.truncate(MAX_PACK_TREE_LINES);
+        tree.push(format!("… (+{hidden} linha(s) fora do teto)"));
+    }
+    Some(DigestBrief { profile, tree })
+}
+
 /// Builds the pack from whatever sources the caller managed to open (PR5).
 ///
 /// Each source is independent on purpose: a broken wiki must not cost the
 /// repository excerpts, and a missing store must not cost the findings. The
 /// budget is spent in a **declared** priority order — findings brief, individual
-/// findings, wiki pages, repository excerpts — so a small `KIRA_NUM_CTX` always
-/// drops the least specific evidence first.
+/// findings, digest profile/tree (item 4), wiki pages, repository excerpts — so
+/// a small `KIRA_NUM_CTX` always drops the least specific evidence first.
 ///
 /// `skip_paths` are repository-relative files the caller already sent whole (the
 /// work item file): grepping them again would only duplicate the prompt.
@@ -361,6 +471,38 @@ pub fn pack_partial(
             pack.used_chars += cost;
             pack.findings.push(entry);
         }
+    }
+
+    // 1b. The project's outline from `kira ingest` (onda M item 4): `## Perfil`
+    //     + `## Árvore` of `.kira/digest.md`, spent right after the findings
+    //     and before the wiki pages — the declared budget order holds. Read
+    //     before the keyword gate: the digest is project identity, it does not
+    //     depend on the work item. Absent digest is normal (fail-open, no
+    //     note); unreadable is a note, never an error.
+    match std::fs::read_to_string(root.join(".kira").join("digest.md")) {
+        Ok(markdown) => {
+            if let Some(brief) = digest_brief(&markdown) {
+                let cost = brief.profile.chars().count()
+                    + brief
+                        .tree
+                        .iter()
+                        .map(|line| line.chars().count() + 1)
+                        .sum::<usize>()
+                    + 48;
+                if pack.used_chars + cost > budget_chars {
+                    pack.notes.push(format!(
+                        "orçamento de contexto esgotado em {budget_chars} caracteres; o perfil do digest ficou de fora"
+                    ));
+                } else {
+                    pack.used_chars += cost;
+                    pack.digest = Some(brief);
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => pack
+            .notes
+            .push(format!("não foi possível ler .kira/digest.md ({err})")),
     }
 
     let haystack = format!(
@@ -1018,6 +1160,176 @@ mod tests {
         )
         .unwrap_or_else(|err| panic!("pack legado: {err}"));
         assert_eq!(legacy.repo_source, RepoSource::Grep);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A forma exata do `kira ingest`: seções `## `, árvore cercada por fence
+    /// de texto, sub-headings `###` dentro de Arquivos-chave.
+    fn synthetic_digest(tree_lines: usize, profile: &str) -> String {
+        let mut out = String::from("# Digest — demo\n\n<!-- interno -->\n\n## Árvore\n\n```text\n");
+        for index in 0..tree_lines {
+            out.push_str(&format!("src/file{index}.rs\n"));
+        }
+        out.push_str("```\n\n## Perfil\n\n");
+        out.push_str(profile);
+        out.push_str("\n\n## Arquivos-chave\n\n### `README.md`\n\nblá\n\n## Notas\n\n_nada_\n");
+        out
+    }
+
+    #[test]
+    fn digest_brief_extracts_profile_and_tree_without_the_fence() {
+        let brief = digest_brief(&synthetic_digest(3, "- arquivos: 3\n- stacks: rust"))
+            .expect("o digest do ingest sempre tem as duas seções");
+        assert_eq!(brief.tree, ["src/file0.rs", "src/file1.rs", "src/file2.rs"]);
+        assert_eq!(brief.profile, "- arquivos: 3\n- stacks: rust");
+    }
+
+    #[test]
+    fn digest_brief_caps_the_tree_and_states_the_remainder() {
+        let brief = digest_brief(&synthetic_digest(45, "- arquivos: 45\n")).expect("perfil");
+        assert_eq!(brief.tree.len(), 41, "40 linhas + a nota do corte");
+        assert_eq!(brief.tree[40], "… (+5 linha(s) fora do teto)");
+    }
+
+    #[test]
+    fn digest_brief_caps_the_profile_at_its_ceiling() {
+        let long = "x".repeat(MAX_PACK_PROFILE_CHARS + 500);
+        let brief = digest_brief(&synthetic_digest(1, &long)).expect("perfil");
+        assert!(
+            brief
+                .profile
+                .ends_with("_perfil cortado no teto de 1 500 caracteres_"),
+            "corte nota a própria existência"
+        );
+        let kept: String = brief.profile.chars().take(MAX_PACK_PROFILE_CHARS).collect();
+        assert_eq!(kept, long[..MAX_PACK_PROFILE_CHARS]);
+    }
+
+    #[test]
+    fn digest_brief_refuses_markdown_without_our_sections() {
+        assert!(digest_brief("# Digest — outro\n\n## Resumo\n\n- nada\n").is_none());
+        assert!(
+            digest_brief(&synthetic_digest(1, "   \n")).is_none(),
+            "perfil vazio não entra no pack"
+        );
+    }
+
+    #[test]
+    fn pack_carries_the_digest_and_reports_it_everywhere() {
+        let dir = temp_project("pack-digest");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        write_file(&dir, "src/a.rs", "let cooldown = 30;\n");
+        write_file(
+            &dir,
+            ".kira/digest.md",
+            &synthetic_digest(2, "- arquivos: 2\n- stacks: rust"),
+        );
+
+        let pack = pack_with(
+            &dir,
+            &store,
+            &wiki,
+            &item_with("Cooldown expirou", "o cooldown da fila nunca volta"),
+            12_000,
+        );
+        assert!(pack.digest_used(), "notas: {:?}", pack.notes);
+        let rendered = pack.render();
+        assert!(
+            rendered.contains("### Perfil do projeto (`kira ingest`)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("### Árvore do repositório"), "{rendered}");
+        assert!(
+            pack.summary().contains("perfil do digest"),
+            "{}",
+            pack.summary()
+        );
+        let report = explain_report(&pack, 4821, false);
+        assert!(report.contains("- perfil do digest:"), "{report}");
+        let json = report_json(&pack, 4821).unwrap_or_else(|err| panic!("{err}"));
+        assert!(json.contains("\"digest\""), "{json}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_absent_digest_changes_nothing() {
+        let dir = temp_project("pack-no-digest");
+        write_file(&dir, "src/a.rs", "let cooldown = 30;\n");
+        let pack = pack_partial(
+            &dir,
+            None,
+            None,
+            &item_with("Cooldown expirou", "o cooldown da fila"),
+            12_000,
+            &[],
+        );
+        assert!(!pack.digest_used());
+        assert!(
+            pack.notes.iter().all(|note| !note.contains("digest")),
+            "projeto sem ingestão não gera nota: {:?}",
+            pack.notes
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_digest_is_a_note_not_an_error() {
+        let dir = temp_project("pack-broken-digest");
+        // Um diretório no caminho do digest: a leitura falha com erro que não é
+        // NotFound — fail-open com nota, e o grep do repositório continua.
+        fs::create_dir_all(dir.join(".kira").join("digest.md"))
+            .unwrap_or_else(|err| panic!("mkdir: {err}"));
+        write_file(&dir, "src/a.rs", "let cooldown = 30;\n");
+        let pack = pack_partial(
+            &dir,
+            None,
+            None,
+            &item_with("Cooldown expirou", "o cooldown da fila"),
+            12_000,
+            &[],
+        );
+        assert!(!pack.digest_used());
+        assert!(
+            pack.notes
+                .iter()
+                .any(|note| note.contains(".kira/digest.md")),
+            "a causa aparece: {:?}",
+            pack.notes
+        );
+        assert!(!pack.code.is_empty(), "fail-open: o grep aconteceu");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn budget_drops_the_digest_with_a_note_and_keeps_the_excerpts() {
+        let dir = temp_project("pack-digest-budget");
+        write_file(&dir, "src/a.rs", "let cooldown = 30;\n");
+        write_file(
+            &dir,
+            ".kira/digest.md",
+            &synthetic_digest(200, &"y".repeat(4_000)),
+        );
+        // Orçamento pequeno: o digest (cortado no teto, ~1.5 k) não cabe, e o
+        // corte vira nota — os trechos, mais baratos, ainda entram.
+        let pack = pack_partial(
+            &dir,
+            None,
+            None,
+            &item_with("Cooldown expirou", "o cooldown da fila"),
+            100,
+            &[],
+        );
+        assert!(!pack.digest_used());
+        assert!(
+            pack.notes
+                .iter()
+                .any(|note| note.contains("perfil do digest ficou de fora")),
+            "{:?}",
+            pack.notes
+        );
+        assert!(!pack.code.is_empty(), "trechos cabem no resto do orçamento");
         let _ = fs::remove_dir_all(&dir);
     }
 
