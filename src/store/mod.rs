@@ -35,7 +35,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -820,6 +820,15 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
         .map_err(schema_error)?;
     }
 
+    // v8 — renome do estado (ADR-0039): o valor serializado `dead` vira
+    // `failed`. Sem este UPDATE, linhas antigas cairiam no fallback do
+    // `from_stored` e voltariam a `sealed` — reclassificação silenciosa de
+    // dado. UPDATE idempotente: numa base já migrada não muda nada.
+    if current < 8 {
+        conn.execute_batch("UPDATE posts SET state = 'failed' WHERE state = 'dead';")
+            .map_err(schema_error)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(schema_error)
 }
@@ -1365,6 +1374,10 @@ mod tests {
                  prompt_version, model, state, postage_until, attempts, read_at, path, \
                  created_at) VALUES ('id1', 'p1', 'intro', 'intro', 'pt-BR', 'h1', 'v1', \
                  'ollama:qwen', 'picked', 1700, 1, NULL, NULL, '2026-11-12T00:00:00Z');
+                 INSERT INTO posts (id, project_id, slug, kind, lang, source_hash, \
+                 prompt_version, model, state, postage_until, attempts, read_at, path, \
+                 created_at) VALUES ('id2', 'p1', 'falhou', 'intro', 'pt-BR', 'h2', 'v1', \
+                 'ollama:qwen', 'dead', NULL, 3, NULL, NULL, '2026-11-12T00:00:00Z');
                  PRAGMA user_version = 6;",
             )
             .unwrap_or_else(|err| panic!("criar v6: {err}"));
@@ -1392,9 +1405,24 @@ mod tests {
         let rows = store
             .posts_of("p1")
             .unwrap_or_else(|err| panic!("posts_of: {err}"));
-        assert_eq!(rows.len(), 1, "linha antiga preservada");
-        assert_eq!(rows[0].draft_ttl, Some(1700), "valor do lease preservado");
-        assert_eq!(rows[0].state, PostState::Picked, "estado preservado");
+        assert_eq!(rows.len(), 2, "linhas antigas preservadas");
+        let picked = rows
+            .iter()
+            .find(|row| row.id == "id1")
+            .unwrap_or_else(|| panic!("linha 'picked' sumiu na migração"));
+        assert_eq!(picked.draft_ttl, Some(1700), "valor do lease preservado");
+        assert_eq!(picked.state, PostState::Picked, "estado preservado");
+        // v8: o estado serializado `dead` vira `failed` — sem o UPDATE, a linha
+        // cairia no fallback de `from_stored` e voltaria a `sealed`.
+        let failed = rows
+            .iter()
+            .find(|row| row.id == "id2")
+            .unwrap_or_else(|| panic!("linha 'dead' sumiu na migração"));
+        assert_eq!(
+            failed.state,
+            PostState::Failed,
+            "estado 'dead' migra para 'failed'"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
