@@ -73,6 +73,7 @@ impl Sandbox {
                     1_200,
                     true,
                     "scan fixture para o dashboard",
+                    None,
                 )
                 .unwrap_or_else(|err| panic!("gravar sessão scan fixture: {err}"));
         }
@@ -106,6 +107,7 @@ impl Sandbox {
                     duration_ms,
                     ok,
                     summary,
+                    None,
                 )
                 .unwrap_or_else(|err| panic!("gravar sessão {command} fixture: {err}"));
         };

@@ -92,6 +92,7 @@ impl Sandbox {
                 10,
                 true,
                 TRIAGE_SUMMARY,
+                Some(4821),
             )
             .unwrap_or_else(|err| panic!("gravar sessão triage: {err}"));
         store
@@ -338,6 +339,7 @@ fn token_no_summary_do_triage_nao_vaza_no_rascunho() {
             10,
             true,
             "Causa raiz provável:\nPAT colado no log: token=AbC123XyZ789QqQ.\n\nArquivos prováveis:\nsrc/a.rs\n\nConfiança:\nalta\n",
+            Some(7),
         )
         .unwrap_or_else(|err| panic!("gravar sessão: {err}"));
 

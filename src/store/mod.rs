@@ -767,7 +767,7 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     // `ALTER TABLE ADD COLUMN` não é idempotente (ao contrário do
     // `CREATE TABLE IF NOT EXISTS` que domina este arquivo), então a coluna é
     // checada antes: um banco onde a migração rodou pela metade não quebra.
-    if current < 5 && !column_exists(&conn, "sessions", "item_id")? {
+    if current < 5 && !column_exists(conn, "sessions", "item_id")? {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN item_id INTEGER;")
             .map_err(schema_error)?;
     }
@@ -1267,7 +1267,10 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap_or_else(|err| panic!("user_version: {err}"));
-        assert_eq!(version, 4, "migração deveria subir para a v4");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "migração deveria subir para a versão atual"
+        );
         assert!(
             store.wiki_fts5_enabled(),
             "wiki_fts deveria existir após a v2"
@@ -1334,7 +1337,18 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap_or_else(|err| panic!("user_version: {err}"));
-        assert_eq!(version, 4, "migração deveria subir para a v4");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "migração deveria subir para a versão atual"
+        );
+
+        // A v5 também roda neste caminho: o banco foi rebaixado para v3 e a
+        // coluna do item precisa voltar (ALTER guardado por `column_exists`).
+        assert!(
+            column_exists(&reopened.conn, "sessions", "item_id")
+                .unwrap_or_else(|err| panic!("PRAGMA table_info: {err}")),
+            "sessions.item_id deveria existir após a migração v5"
+        );
 
         // Tabela nova apareceu e funciona (estado por projeto, UPSERT).
         reopened
