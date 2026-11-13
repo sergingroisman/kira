@@ -280,8 +280,11 @@ pub async fn run<B: LlmBackend>(
         .iter()
         .filter(|p| p.state == PostState::Delivered)
         .count();
-    let dead = posts.iter().filter(|p| p.state == PostState::Dead).count();
-    let briefing = render_briefing(options, &report, sealed, delivered, dead);
+    let failed = posts
+        .iter()
+        .filter(|p| p.state == PostState::Failed)
+        .count();
+    let briefing = render_briefing(options, &report, sealed, delivered, failed);
     let briefing_path = root.join(".kira").join("briefing.md");
     write_text(&briefing_path, &briefing).map_err(|source| DigestError::Write {
         path: briefing_path.display().to_string(),
@@ -379,7 +382,7 @@ fn render_briefing(
     report: &DigestReport,
     sealed: usize,
     delivered: usize,
-    dead: usize,
+    failed: usize,
 ) -> String {
     let mut out = String::new();
     out.push_str("# Briefing do digest\n\n");
@@ -397,7 +400,7 @@ fn render_briefing(
         report.tokens_used, options.budget_tokens
     ));
     out.push_str(&format!(
-        "- fila: {sealed} pendente(s) · {delivered} entregue(s) · {dead} extraviada(s)\n"
+        "- fila: {sealed} pendente(s) · {delivered} entregue(s) · {failed} falha(s)\n"
     ));
     if !report.notes.is_empty() {
         out.push_str("\n## Notas\n\n");

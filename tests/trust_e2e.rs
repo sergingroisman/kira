@@ -122,11 +122,11 @@ fn migration_creates_posts_and_outbox_on_an_existing_store() {
     // Primeiro uso (qualquer comando cria o store na versão corrente).
     let (code, _, stderr) = sandbox.run(&["profile"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    // ADR-0039 (rename 4/6): a versão corrente do schema é a 7 — o store
-    // nasce na última migração, não mais na 6 da v6 original do posts.
+    // ADR-0039 (renames 4/6 e 5/6): schema corrente é a v8 (v7 = coluna
+    // `draft_ttl`, v8 = estado `failed`).
     assert_eq!(
         user_version(&sandbox.db()),
-        7,
+        8,
         "migração não subiu para a versão corrente"
     );
 

@@ -12,7 +12,7 @@
 //! - dois `claim` concorrentes **não** pegam a mesma linha;
 //! - lease vencida devolve a linha à fila sem código de recuperação;
 //! - a mesma identidade + mesmo `source_hash` **não** reenfileira (idempotência);
-//! - `attempts` >= 3 vira `dead` (carta extraviada), não loop infinito.
+//! - `attempts` >= 3 vira `failed` (post que falhou), não loop infinito.
 
 use rusqlite::{OptionalExtension, params};
 
@@ -27,8 +27,8 @@ pub enum PostState {
     Picked,
     /// Entregue: o `.md` existe no destino.
     Delivered,
-    /// Falhou 3 vezes: carta extraviada.
-    Dead,
+    /// Falhou 3 vezes.
+    Failed,
 }
 
 impl PostState {
@@ -37,7 +37,7 @@ impl PostState {
             PostState::Sealed => "sealed",
             PostState::Picked => "picked",
             PostState::Delivered => "delivered",
-            PostState::Dead => "dead",
+            PostState::Failed => "failed",
         }
     }
 
@@ -45,13 +45,13 @@ impl PostState {
         match text {
             "picked" => PostState::Picked,
             "delivered" => PostState::Delivered,
-            "dead" => PostState::Dead,
+            "failed" => PostState::Failed,
             _ => PostState::Sealed,
         }
     }
 }
 
-/// Tentativas antes de a carta ser declarada extraviada.
+/// Tentativas antes de o post ser declarado falhado.
 pub const MAX_ATTEMPTS: i64 = 3;
 
 /// Uma linha de `posts`.
@@ -229,7 +229,7 @@ impl Store {
         Ok(())
     }
 
-    /// Registra falha: volta para a fila ou vira carta extraviada.
+    /// Registra falha: volta para a fila ou fica `failed`.
     ///
     /// Devolve o estado resultante para o chamador poder reportar.
     pub fn post_fail(&self, id: &str) -> Result<PostState, StoreError> {
@@ -242,7 +242,7 @@ impl Store {
             )
             .map_err(StoreError::Sql)?;
         let next = if attempts >= MAX_ATTEMPTS {
-            PostState::Dead
+            PostState::Failed
         } else {
             PostState::Sealed
         };
@@ -463,8 +463,8 @@ mod tests {
     }
 
     #[test]
-    fn three_failures_turn_the_post_into_a_dead_letter() {
-        let (dir, store, project) = sandbox("dead");
+    fn three_failures_mark_the_post_as_failed() {
+        let (dir, store, project) = sandbox("failed");
         store.post_enqueue(&project, &post("a", "h")).unwrap();
         let mut state = PostState::Sealed;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -481,10 +481,10 @@ mod tests {
                 );
             }
         }
-        assert_eq!(state, PostState::Dead, "3 falhas = carta extraviada");
+        assert_eq!(state, PostState::Failed, "3 falhas = post falhado");
         assert!(
             store.post_claim(&project, 99_000, 60).unwrap().is_none(),
-            "extraviada sai da fila"
+            "post falhado sai da fila"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

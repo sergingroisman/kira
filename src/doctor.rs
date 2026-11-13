@@ -179,9 +179,9 @@ pub fn format_ingest_lines() -> Vec<String> {
         .iter()
         .filter(|p| p.state == crate::store::posts::PostState::Delivered)
         .count();
-    let dead = posts
+    let failed = posts
         .iter()
-        .filter(|p| p.state == crate::store::posts::PostState::Dead)
+        .filter(|p| p.state == crate::store::posts::PostState::Failed)
         .count();
     let stale = posts
         .iter()
@@ -195,7 +195,7 @@ pub fn format_ingest_lines() -> Vec<String> {
         .count();
     let unread = store.posts_unread(&project_id).unwrap_or(0);
     let mut line = format!(
-        "posts: {pending} pendente(s) · {delivered} entregue(s) · {unread} não lido(s) · {dead} extraviada(s)"
+        "posts: {pending} pendente(s) · {delivered} entregue(s) · {unread} não lido(s) · {failed} falha(s)"
     );
     if stale > 0 {
         line.push_str(&format!(
