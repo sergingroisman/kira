@@ -64,7 +64,7 @@ loop {
 ```
 
 As propriedades que fazem esse loop ser **engenharia, não promessa**:
-- **lease** (`postage_until`): processo morre ⇒ a carta volta sozinha à fila;
+- **lease** (`draft_ttl`): processo morre ⇒ a carta volta sozinha à fila;
 - **cache** (`source_hash` + `prompt_version` + `model` + `lang`): segundo run não refaz;
 - **budget** (1 M/run + 30 k/post): parada dura com nota, nunca loop infinito;
 - **retry capado**: backend quebrou ⇒ `break` (não tenta 3× por carta com o mesmo erro).

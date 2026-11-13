@@ -75,3 +75,8 @@
   (`claim`, `generate`, `deliver`).
 - Renomear nome de comando/coluna/estado **quebra compatibilidade** (migração + flags) —
   por isso cada rename de código é um PR isolado, com gate verde e nota de migração.
+- **Estaleiro não é sistema**: `Hermes`/`Delta` (agentes de build) e Kombai
+  (ferramenta de design do dono) **constroem** o KIRA com o dono — nunca aparecem
+  em diagramas C4, atores de sistema ou fluxos de runtime. C4 descreve só o
+  binário em execução e os sistemas externos com que ele fala; menções em docs
+  de processo (BUILD-PROGRAM, roadmap) ficam como registro de *quem constrói*.

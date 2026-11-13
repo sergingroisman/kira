@@ -87,7 +87,7 @@ Nome: KIRA = Knowledge-Informed Remediation Agent.
 ## CLI-first, LLM-last (regra do dono, ADR-0016)
 - **Tudo que um comando de linha resolve, o KIRA faz por comando de linha.** A escada é obrigatória e de baixo para cima: (1) CLI real (`dotnet`, `pnpm`/`npm`, `git`, `rg`, `gh`) → (2) parser puro / SQL / FTS5 → (3) cálculo em Rust → (4) **LLM só quando 1–3 não respondem**.
 - Toda chamada ao `LlmBackend` exige: pergunta de julgamento (não recuperação/extração/contagem/comparação), nenhuma camada inferior capaz de responder, e o comentário `// LLM porque: <razão>` no call site.
-- Só `src/triage.rs`, `src/loop/` e `src/wiki/` podem importar `llm::*`. Teste de allowlist (PR33) reprova o resto — `scan`, `store`, `board`, `ado`, `guard`, `format`, `tui`, `doctor`, `scheduler` nunca falam com modelo.
+- Só `src/triage.rs`, `src/eval.rs`, `src/setup.rs` (probe do backend de IA) e os módulos `src/llm/`, `src/loop/` (reservado, ainda não existe) e `src/post/` podem importar `llm::*` — lista espelhada em `tests/llm_allowlist.rs`. O teste de allowlist (PR33) reprova o resto — `scan`, `store`, `board`, `ado`, `guard`, `format`, `tui`, `doctor`, `scheduler` nunca falam com modelo; `wiki/` entra na lista quando consolidar com LLM.
 - O budget de 50 chamadas/dia mede **LLM**, não trabalho: comando determinístico não consome budget.
 ## Wiki (`src/wiki/`, ADR-0013)
 - Fonte de verdade em markdown **local** (W2-fix PR-F3): `<projeto>/.kira/wiki/{contexto,decisoes,padroes,glossario}.md` e `<projeto>/.kira/wiki/bugs/<slug>.md`. Índice (FTS5, PR29) é derivado e descartável.
