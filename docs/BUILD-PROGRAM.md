@@ -174,14 +174,30 @@
   **Aceite:** segundo run não repete post; `--lang` diferente não reaproveita cache; budget
   estourado para com nota; sem ollama ⇒ erro acionável com exit != 0.
 - [ ] **M4** caixa de correio no dashboard (modo leitura). Painel com `não lido`, Markdown
-  renderizado (`tui-markdown` — dependência nova, registrar no ADR-0038 no PR), `read_at` grava.
+  renderizado **nativo** (ADR-0036: nativo do ratatui primeiro; `tui-markdown` só com aprovação
+  do dono no PR), `read_at` grava.
   **Aceite:** `--snapshot` mostra o painel; hash do store muda só em `read_at`; tecla não escreve
   arquivo do dev.
-- [ ] **M5** `kira emit` + docs. Publica `.kira/wiki/<slug>.md` (front-matter + índice derivado)
-  com gate por `source_hash`; `doctor` reporta ingestão e posts desatualizados; corrige
-  `docs/kira-jornadas.md` (BOM) e `docs/ux-setup-jornada.md`.
+- [x] **M5** `kira emit` + linha de ingestão/posts no `doctor` *(código; docs da onda em M8)*.
+  Publica `.kira/wiki/<slug>.md` (front-matter + índice derivado) com gate por
+  `source_hash`/`published_hash`; `doctor` reporta ingestão, trust, fila e posts desatualizados.
   **Aceite:** publicar duas vezes é idempotente; `doctor` lista post velho quando o repo muda;
-  nunca sobrescreve wiki escrito pelo dev sem aprovação.
+  nunca sobrescreve wiki escrito pelo dev sem `--force`.
+- [ ] **M6** etapa Ingestão no wizard (`src/setup/wizard.rs` + `src/setup.rs`). `Step` vira
+  `Ambiente, Projeto, Ingestao, Ia, Resumo`; a etapa só MOSTRA preview read-only e coleta
+  `Enter = ingerir / n = pular`; efeito todo em `setup::run` (ADR-0034). `--skip` aceita
+  `pat|ia|ingest`; resumo troca o próximo passo de `kira scan` para `kira connect azure`.
+  **Aceite:** `setup_e2e` com `--yes` (digest criado) e `--skip ingest` (nada criado).
+- [ ] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
+  com UTF-8/UTF-16 LE/BE nos call sites de `node.rs`/`dotnet.rs` + fixture) e **P5 `.gitignore`**
+  (`src/context/gitignore.rs`, subset gitwildmatch, aninhado, sem dependência).
+  **Aceite:** fixture BOM parseia; `.gitignore` aninhado com negação honrado no índice e no grep;
+  repo sem `.gitignore` inalterado.
+- [ ] **M8** docs da onda M: `docs/ux-setup-jornada.md` (trilha real de 5 etapas),
+  `docs/kira-jornadas.md` (remover a promessa de "parse tolerante BOM/UTF-16" até M7;
+  registrar ingest/digest/emit/trust), `docs/gitingest-vale-trazer.md` (P1/P3/P4/P5),
+  `docs/roadmap-prs.md`.
+  **Aceite:** nenhum doc promete comportamento que o código não tem.
 
 ### F3 — provedores e hardware
 - [ ] **PR20** tuning local: detecção de VRAM/backend, escolha de modelo por
