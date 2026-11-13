@@ -168,7 +168,7 @@
   (hash do path) · `kira trust`.
   **Aceite:** dois claims não pegam a mesma linha; lease vencida devolve à fila; migração preserva
   dados; `ingest` não pede trust e `digest` recusa sem ele.
-- [ ] **M3** `kira digest` (Ollama). 2 kinds (`intro`, `c4-container`), prompts versionados em
+- [x] **M3** `kira digest` (Ollama). 2 kinds (`intro`, `c4-container`), prompts versionados em
   `src/llm/prompts/` (EN), 30 k/post + 1 M/run, `--pause`/`--resume`/`--budget`,
   `.kira/briefing.md`, `cache_key = (input_hash, prompt_version, model, lang)`.
   **Aceite:** segundo run não repete post; `--lang` diferente não reaproveita cache; budget
