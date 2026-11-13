@@ -72,8 +72,17 @@ pub enum ScanError {
     #[error("falha de arquivo em '{path}' — verifique as permissões do diretório: {source}")]
     Io {
         path: String,
+        #[source]
         source: std::io::Error,
     },
+
+    /// A scan worker thread died without producing an error (panic). Rare by
+    /// construction (workers only spawn processes and parse JSON); the message
+    /// says what to do instead of hiding the crash.
+    #[error(
+        "uma thread do scan morreu sem deixar erro — rode o kira scan de novo; se persistir, reporte com o comando completo e o stack detectado"
+    )]
+    WorkerPanic,
 
     /// Anything else from the runtime (never the raw tool body).
     #[error("{message}")]
@@ -317,16 +326,7 @@ pub(crate) fn stderr_hint(stderr: &str) -> String {
 pub fn run(path_flag: Option<&Path>) -> Result<String, ScanError> {
     let root = resolve_root(path_flag)?;
     let stacks = detect_stacks(&root)?;
-    let mut raw_findings = Vec::new();
-    for stack in &stacks {
-        let scope = stack.scope_of(&root);
-        let more = match stack.kind {
-            StackKind::Dotnet => dotnet::scan_dir(&scope),
-            StackKind::Pnpm => node::scan_dir(node::NodeAuditTool::Pnpm, &scope),
-            StackKind::Npm => node::scan_dir(node::NodeAuditTool::Npm, &scope),
-        }?;
-        raw_findings.extend(more);
-    }
+    let raw_findings = scan_stacks(&stacks, &root)?;
     let findings = finding::finalize(raw_findings);
     let file_path = write_findings_file(&root, &findings, &stacks)?;
     let stacks_text = stack_lines(&root, &stacks);
@@ -347,6 +347,53 @@ pub fn run(path_flag: Option<&Path>) -> Result<String, ScanError> {
         counts_brief,
         display_path(&file_path)
     ))
+}
+
+/// Audita um stack (processo externo: dotnet/npm/pnpm) num escopo de diretório.
+fn scan_stack(stack: &Stack, root: &Path) -> Result<Vec<Finding>, ScanError> {
+    let scope = stack.scope_of(root);
+    match stack.kind {
+        StackKind::Dotnet => dotnet::scan_dir(&scope),
+        StackKind::Pnpm => node::scan_dir(node::NodeAuditTool::Pnpm, &scope),
+        StackKind::Npm => node::scan_dir(node::NodeAuditTool::Npm, &scope),
+    }
+}
+
+/// Audita todos os stacks detectados.
+///
+/// Por que thread aqui (e só aqui): cada scan passa a maior parte do tempo
+/// ESPERANDO I/O do processo da ferramenta (dotnet/npm levam segundos), então
+/// com 2+ stacks o wall-time cai pela metade com `std::thread::scope` — sem
+/// rayon, sem dependência nova (auditoria P1, "multithread na dose certa").
+/// Com 1 stack roda inline: thread para esperar um processo só é cerimônia.
+///
+/// Determinismo intacto: os resultados são agregados NA ORDEM das stacks
+/// (que já é ordenada em `detect_stacks`) e o `finding::finalize` reordena por
+/// fingerprint — mesma entrada ⇒ mesmos bytes em `findings.json`. O primeiro
+/// erro na ordem das stacks vence, o mesmo contrato do antigo loop sequencial.
+fn scan_stacks(stacks: &[Stack], root: &Path) -> Result<Vec<Finding>, ScanError> {
+    if stacks.len() < 2 {
+        let mut out = Vec::new();
+        for stack in stacks {
+            out.extend(scan_stack(stack, root)?);
+        }
+        return Ok(out);
+    }
+    let results: Vec<Result<Vec<Finding>, ScanError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = stacks
+            .iter()
+            .map(|stack| scope.spawn(move || scan_stack(stack, root)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(Err(ScanError::WorkerPanic)))
+            .collect()
+    });
+    let mut out = Vec::new();
+    for result in results {
+        out.extend(result?);
+    }
+    Ok(out)
 }
 
 /// Contagem de achados LIDA de volta do summary que o próprio `kira scan`
