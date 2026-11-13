@@ -22,12 +22,16 @@ const COMPOSITION_ROOT: &str = "main.rs";
 /// pré-requisito (ollama list, copilot no PATH) e faz UMA chamada de teste
 /// barata do Foundry — é wiring/probe de configuração, nunca decisão com o
 /// modelo (não está em `MUST_JUSTIFY`).
+/// `post/` entra por ADR-0038: o `digest` transforma os fatos determinísticos do
+/// `ingest` em prosa e diagrama C4 — é a decisão com o modelo que a onda M existe
+/// para fazer, atrás de trust, orçamento e cache.
 const ALLOWED_EXACT: [&str; 3] = ["triage.rs", "eval.rs", "setup.rs"];
-const ALLOWED_PREFIXES: [&str; 2] = ["llm/", "loop/"];
+const ALLOWED_PREFIXES: [&str; 3] = ["llm/", "loop/", "post/"];
 
 /// Modules allowed *and* required to justify each decision with the model.
 /// `wiki/` joins this list when it starts consolidating with an LLM (PR30).
-const MUST_JUSTIFY: [&str; 2] = ["triage.rs", "eval.rs"];
+/// Entradas aqui são **arquivos** (o teste lê o fonte), não prefixos.
+const MUST_JUSTIFY: [&str; 3] = ["triage.rs", "eval.rs", "post/mod.rs"];
 
 const JUSTIFICATION: &str = "// LLM porque:";
 
