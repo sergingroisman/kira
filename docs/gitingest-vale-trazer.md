@@ -28,7 +28,7 @@ inteligência):
 
 | # | Ideia do gitingest | Onde cai no KIRA | Prioridade |
 |---|---|---|---|
-| P1 | **BOM-sniff antes de parsear JSON de ferramenta** (`EF BB BF`/`FF FE`/`FE FF`) | `src/scan/node.rs`, `src/scan/dotnet.rs` | **Bug real** — a captura `pnpm-audit-real.json` (redirect PowerShell) saiu UTF-16 LE com BOM; o `serde_json` quebraria |
+| P1 | **BOM-sniff antes de parsear JSON de ferramenta** (`EF BB BF`/`FF FE`/`FE FF`) | `src/scan/node.rs`, `src/scan/dotnet.rs` | **Bug real** — a captura `pnpm-audit-real.json` (redirect PowerShell) saiu UTF-16 LE com BOM; o `serde_json` quebraria. **Implementado 13/Nov/2026 (M7)**: `src/scan/decode.rs` cobre os 3 BOMs nos dois call sites, com fixture UTF-16 LE real |
 | P2 | ~~Sniff de binário (1 KB + decodificação)~~ | `src/context/repo.rs` | **Cortado (11/Nov)** — `read_text_file` já faz probe de NUL + `from_utf8` no arquivo inteiro; melhoria fantasma |
 | P3 | **Tabela `DEFAULT_IGNORE_PATTERNS`** (~150 padrões curados por linguagem) | `src/context/index.rs` + allowlist do grep | Alta — MIT, copiar tabela com atribuição, unificar numa única fonte |
 | P4 | **Orçamentos da caminhada**: profundidade máx. + total de bytes | `src/context/index.rs` (constantes fixas; env só com justificativa) | Média |
@@ -54,7 +54,7 @@ comunidades chegaram no mesmo contrato por dor real.
 
 ## Ordem de execução sugerida
 
-1. **P1** (bug, pequeno, fixture pronta) — pode entrar na fila W2.
+1. ~~**P1**~~ — **implementado em 13/Nov/2026 (M7)**: `src/scan/decode.rs` + fixture `scan_pnpm_audit_utf16le.json` (a captura real reencodada UTF-16 LE com BOM).
 2. **P3 → P4 → P5** (todos tocam `src/context/`; nessa ordem para não
    rebasear) — fila depois do W2-FIX, um PR por item.
 3. ~~**P2**~~ — cortado em 11/Nov/2026: `read_text_file` (probe de NUL +

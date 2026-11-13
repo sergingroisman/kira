@@ -47,9 +47,10 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<Finding>, ScanError> {
     parse_output(&output_stdout(&output), dir)
 }
 
-/// Decoded stdout of the tool run (lossy keeps the parse testable).
+/// Decoded stdout of the tool run: BOM-aware (ADR-0023 P1), lossy keeps the
+/// parse testable.
 fn output_stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    super::decode::decode_tool_output(&output.stdout)
 }
 
 /// Pure parse of the `dotnet list package --format json` output (v2 of the

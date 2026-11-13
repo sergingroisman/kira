@@ -43,7 +43,9 @@ pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanErr
     let output = command
         .output()
         .map_err(|source| spawn_error(kind, source))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // BOM-aware (ADR-0023 P1): a PowerShell redirect can hand us UTF-16 LE
+    // with BOM, which serde_json refuses — decode first, parse after.
+    let stdout = super::decode::decode_tool_output(&output.stdout);
     let parsed = match tool {
         NodeAuditTool::Npm => parse_npm_output(&stdout),
         NodeAuditTool::Pnpm => parse_pnpm_output(&stdout),
@@ -234,6 +236,12 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/scan/scan_pnpm_audit_real.json"
     ));
+    /// The same real capture re-encoded as UTF-16 LE with BOM — the exact
+    /// shape a PowerShell redirect produced (ADR-0023 P1, M7).
+    const PNPM_UTF16LE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/scan/scan_pnpm_audit_utf16le.json"
+    ));
 
     /// The yarn-style array-of-events shape that real pnpm NEVER emits
     /// (W2-fix PR-F1b: it was the documented-format guess, not reality).
@@ -358,6 +366,23 @@ mod tests {
                 .any(|f| f.severity == "high" && f.message.contains("Path Traversal")),
             "o segundo advisory do tmp: {tmp_findings:?}"
         );
+    }
+
+    /// The bug of ADR-0023 P1, proven end-to-end at the parse layer: the
+    /// real capture re-encoded as UTF-16 LE with BOM must decode (via
+    /// `decode_tool_output`) and produce the SAME findings as the UTF-8
+    /// file. Before the decode, `serde_json` refused the BOM.
+    #[test]
+    fn utf16le_bom_capture_parses_like_the_utf8_one() {
+        let decoded = super::super::decode::decode_tool_output(PNPM_UTF16LE);
+        let from_utf16 = finding::finalize(
+            parse_pnpm_output(&decoded).unwrap_or_else(|err| panic!("parse utf16le: {err}")),
+        );
+        let from_utf8 = finding::finalize(
+            parse_pnpm_output(PNPM).unwrap_or_else(|err| panic!("parse utf8: {err}")),
+        );
+        assert_eq!(from_utf16.len(), 39, "mesma captura, mesmos achados");
+        assert_eq!(from_utf16, from_utf8, "decode não pode mudar o resultado");
     }
 
     /// A dependency path recorded by pnpm (`findings[0].paths[0]`) wins over
