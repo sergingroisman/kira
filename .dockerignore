@@ -1,0 +1,13 @@
+# O que o build da imagem NÃO leva: nada de artefato local, nada de segredo,
+# nada de lixo — o build copia só Cargo.* + src (ver docker/Dockerfile).
+/target
+.git
+.gitignore
+.kira
+.kombai
+docs
+tests
+third_party
+scripts
+docker/compose.yml
+docker/README.md
