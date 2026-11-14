@@ -7,6 +7,27 @@
 # roda. Se qualquer byte mudou no caminho (proxy, CDN, download truncado), a
 # instalação para antes de tocar no sistema.
 #
+#   NUNCA rode este script via `curl | sh`. Ele valida e orienta — o fluxo
+#   seguro é baixar, conferir o SHA256SUMS e SÓ DEPOIS executar:
+#     curl -fsSLO <base>/install.sh <base>/SHA256SUMS
+#     sha256sum -c SHA256SUMS      # install.sh precisa estar listado
+#     bash install.sh [--with-model <repo>] [--yes]
+#
+# Uso:
+#   install.sh                      # só o binário do KIRA
+#   install.sh --with-model <repo>  # + download do modelo (opt-in, nunca
+#                                   #  silencioso — mesmo contrato do
+#                                   #  `kira model pull`: consentimento
+#                                   #  explícito `--yes` OU prompt em TTY,
+#                                   #  destino + disco livre medidos ANTES
+#                                   #  de qualquer download/spawn)
+#   install.sh --yes                # atalho de consentimento (script/CI)
+#
+# Ollama NUNCA é instalado daqui: ausente ⇒ instrução manual e saída limpa
+# (exit 0) — instalar dependência de IA silenciosamente é exatamente o que
+# este script existe para não fazer. Piso de disco para `--with-model`:
+# `KIRA_MIN_FREE_MB` (default 4096 MB — qwen3.5:4b Q4_K_M ≈ 3,3 GB + margem).
+#
 # Fronteira honesta do que isso prova: o SHA256SUMS vem do mesmo host do
 # binário, então isso garante INTEGRIDADE DE TRANSPORTE, não autoria. Quem
 # controla o host controla os dois arquivos. Para provar autoria, fixe o hash
@@ -19,6 +40,7 @@ REPO="sergingroisman/kira"
 BASE_URL="${KIRA_BASE_URL:-https://github.com/${REPO}/releases/latest/download}"
 INSTALL_DIR="${KIRA_INSTALL_DIR:-$HOME/.local/bin}"
 PINNED_SHA256="${KIRA_PINNED_SHA256:-}"
+MIN_FREE_MB="${KIRA_MIN_FREE_MB:-4096}"
 
 die() { printf 'erro: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -29,6 +51,24 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # --- 1. Requisitos: falhar cedo e dizendo o que falta -------------------------
 have curl || die "curl não encontrado — instale o curl e tente de novo"
 have tar || die "tar não encontrado — instale o tar e tente de novo"
+
+# --- 1b. Argumentos: opt-in do modelo ----------------------------------------
+# Sem `--with-model` NENHUM download de modelo acontece — o instalador só
+# coloca o binário do KIRA no disco. O repo é o formato do Ollama
+# (`hf.co/<org>/<repo>:Q4_K_M` ou tag local como `qwen3.5:4b`).
+WITH_MODEL=""
+ASSUME_YES=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --with-model)
+            [ $# -ge 2 ] || die "--with-model exige o repo (ex.: hf.co/org/model:Q4_K_M)"
+            WITH_MODEL="$2"
+            shift 2
+            ;;
+        --yes) ASSUME_YES=1; shift ;;
+        *) die "argumento desconhecido: $1 (uso: install.sh [--with-model <repo>] [--yes])" ;;
+    esac
+done
 
 # --- 2. Plataforma ------------------------------------------------------------
 uname_s="$(uname -s)"
@@ -112,3 +152,96 @@ case ":$PATH:" in
         note "depois: kira setup"
         ;;
 esac
+
+# --- 7. Ollama: detectar e orientar, NUNCA instalar ---------------------------
+# O Ollama é o backend de IA local (default eterno) e quem baixa/executa
+# modelos (ADR-0040). Este script nunca o instala: ausente ⇒ instrução manual
+# e saída limpa (exit 0) — instalar dependência de IA silenciosamente é
+# exatamente o que este script existe para não fazer. A override
+# `KIRA_MODEL_OLLAMA_BIN` espelha o contrato do `kira model pull` (HF-2).
+ollama_bin=""
+if [ -n "${KIRA_MODEL_OLLAMA_BIN:-}" ]; then
+    # Override presente é contrato do usuário (mesma conduta do binresolve):
+    # arquivo executável é usado como veio; inválido conta como ausente.
+    if [ -x "$KIRA_MODEL_OLLAMA_BIN" ]; then
+        ollama_bin="$KIRA_MODEL_OLLAMA_BIN"
+    fi
+elif have ollama; then
+    ollama_bin="$(command -v ollama)"
+fi
+
+if [ -z "$ollama_bin" ]; then
+    say ""
+    say "Ollama não encontrado — o KIRA funciona, mas o backend de IA local não."
+    note "instale manualmente: https://ollama.com (este script não instala nada silenciosamente)"
+    note "depois rode: kira setup   (o kira doctor detecta o ollama)"
+    if [ -n "$WITH_MODEL" ]; then
+        note "--with-model $WITH_MODEL NÃO baixado: sem ollama não há pull — instale o Ollama e rode 'kira model pull $WITH_MODEL'"
+    fi
+else
+    # --- 7b. --with-model: mesmo contrato do `kira model pull` (HF-2) ---------
+    # Disco medido ANTES de qualquer consentimento/spawn; consentimento é
+    # estado (`--yes` OU prompt em TTY); recusa em qualquer um = nada baixado.
+    # Sem `--with-model`, NADA desta seção roda — nenhum download implícito.
+    if [ -n "$WITH_MODEL" ]; then
+        case "$MIN_FREE_MB" in
+            '' | *[!0-9]*) die "KIRA_MIN_FREE_MB='$MIN_FREE_MB' não é um inteiro (MB) — fixe um valor numérico" ;;
+        esac
+
+        dest="${OLLAMA_MODELS:-$HOME/.ollama/models}"
+        # df -k: coluna 4 (avail, blocos de 1K) da ÚLTIMA linha — números POSIX
+        # sem separador de locale (mesma leitura do parse_df_k do model.rs).
+        # df que falha ⇒ medição vazia, nunca zero fabricado.
+        free_kb="$(df -k "$dest" 2>/dev/null | awk 'NF { last = $4 } END { print last }' || true)"
+        case "$free_kb" in
+            '' | *[!0-9]*) free_kb="" ;;
+        esac
+
+        # Disco é limite físico, não consentimento: sem medição ou abaixo do
+        # piso, recusa ANTES de qualquer spawn — mesmo com --yes.
+        if [ -z "$free_kb" ]; then
+            die "não consegui medir o disco livre de $dest — NADA foi baixado; confira o destino (OLLAMA_MODELS?) e rode de novo"
+        fi
+        required_kb=$((MIN_FREE_MB * 1024))
+        if [ "$free_kb" -lt "$required_kb" ]; then
+            die "espaço livre insuficiente em $dest: $((free_kb / 1024)) MB livre, piso ${MIN_FREE_MB} MB (KIRA_MIN_FREE_MB) — NADA foi baixado; libere espaço ou rode 'ollama pull $WITH_MODEL' por sua conta"
+        fi
+
+        if [ "$ASSUME_YES" -ne 1 ]; then
+            if [ ! -t 0 ]; then
+                die "download de modelo é escrita no disco — confirme com --yes ou rode em um terminal interativo (a pergunta mostra destino e espaço livre)"
+            fi
+            printf 'baixar modelo do Hugging Face? %s\n' "$WITH_MODEL"
+            printf '  destino: %s\n' "$dest"
+            printf '  espaço livre: %s MB\n' "$((free_kb / 1024))"
+            printf '  o Ollama mostra o tamanho durante o download\n'
+            printf 'confirmar [y/N]: '
+            # EOF/Enter vazio = recusa (mesmo contrato do connect: nunca baixa).
+            read -r answer || answer=""
+            case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
+                y | yes | s | sim) ;; # consentido
+                *) die "download cancelado — nada foi baixado" ;;
+            esac
+        fi
+
+        if ! "$ollama_bin" pull "$WITH_MODEL"; then
+            die "o 'ollama pull $WITH_MODEL' falhou — rode o pull direto para ver o erro completo e rode 'install.sh --with-model $WITH_MODEL' de novo"
+        fi
+        say "modelo baixado: $WITH_MODEL (destino $dest)"
+    fi
+fi
+
+# --- 8. Smoke: `kira doctor` no fim — aviso ≠ erro -----------------------------
+# Em instalação nova o doctor SEMPRE sinaliza pendências (PAT, config, ollama
+# ausente): são estados esperados pós-instalação, não defeito do install. O
+# binário já provou que executa (`--version` acima); o smoke é diagnóstico
+# impresso para o dev, nunca decisão de falha do instalador.
+say ""
+say "smoke: kira doctor"
+if "$INSTALL_DIR/kira" doctor; then
+    note "doctor ok"
+else
+    note "doctor sinalizou pendências — esperado em instalação nova (PAT/config); o binário funciona e o install está completo"
+fi
+
+exit 0

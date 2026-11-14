@@ -68,6 +68,20 @@ jobs:
       - name: E2E tests
         run: cargo test --tests
 
+  # HF-4: o instalador é shell, não Rust — o aceite dele roda AQUI (ubuntu
+  # apenas, não mexe na matriz unit/e2e). Testes: scripts/tests/install.sh
+  # (SHA256SUMS fail-closed, Ollama ausente = instrução + exit 0, --with-model
+  # com consentimento e disco medidos antes de qualquer spawn).
+  install-check:
+    name: install-check (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell tests do instalador
+        run: bash scripts/tests/install.sh
+
   e2e-desktop:
     name: e2e (${{ matrix.os }})
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
