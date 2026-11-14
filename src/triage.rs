@@ -469,6 +469,8 @@ mod tests {
             }],
             findings_brief: Some("high 1".to_string()),
             findings: vec!["high · Newtonsoft.Json 12.0.1 (src/App.csproj)".to_string()],
+            skills: Vec::new(),
+            knowledge: Vec::new(),
             used_chars: 120,
             budget_chars: 12_288,
             notes: Vec::new(),

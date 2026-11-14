@@ -40,6 +40,12 @@ const MAX_EXCERPT_CHARS: usize = 600;
 /// How many wiki pages the pack may carry.
 const MAX_PAGES: usize = 3;
 
+/// How many skills the pack may carry (SK-3).
+const MAX_SKILLS: usize = 3;
+
+/// How many owner-knowledge excerpts the pack may carry (SK-3).
+const MAX_KNOWLEDGE: usize = 3;
+
 /// How many repository excerpts the pack may carry (PR5).
 const MAX_CODE_EXCERPTS: usize = 8;
 
@@ -86,6 +92,43 @@ pub struct ContextSection {
     pub excerpt: String,
 }
 
+/// One skill hit carried into the prompt (SK-3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextSkill {
+    /// Skill name (`react`) — the anchor is `skill:<name>@<version>`.
+    pub name: String,
+    /// `bundled` | `user` (cadeia de custódia, igual ao `kira skills list`).
+    pub origin: String,
+    /// Semver from the frontmatter.
+    pub version: String,
+    /// Bounded excerpt around the first keyword hit.
+    pub snippet: String,
+}
+
+impl ContextSkill {
+    /// `skill:react@1.0.0 [bundled]` — âncora citável na conclusão. O skill
+    /// bundled não tem caminho no disco: a âncora é o caminho dele no prompt.
+    #[must_use]
+    pub fn anchor(&self) -> String {
+        format!("skill:{}@{} [{}]", self.name, self.version, self.origin)
+    }
+}
+
+/// One owner-knowledge excerpt carried into the prompt (SK-3, índice do SK-2).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextKnowledge {
+    /// File stem of the source markdown (`pbm`).
+    pub id: String,
+    /// Path shown to the model (`<store>/knowledge/pbm.md`), `/` normalized.
+    pub path: String,
+    /// Age in days from the file mtime (`None` when the file left the disk).
+    pub age_days: Option<i64>,
+    /// First markdown heading of the source document.
+    pub title: String,
+    /// Bounded excerpt around the first keyword hit.
+    pub snippet: String,
+}
+
 /// What the prompt will carry beyond the work item.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextPack {
@@ -97,6 +140,13 @@ pub struct ContextPack {
     pub findings_brief: Option<String>,
     /// Individual findings worth spelling out (severity, package, project file).
     pub findings: Vec<String>,
+    /// Skill hits, most relevant first (SK-3; serde default keeps old
+    /// payloads valid).
+    #[serde(default)]
+    pub skills: Vec<ContextSkill>,
+    /// Owner knowledge excerpts, most relevant first (SK-3).
+    #[serde(default)]
+    pub knowledge: Vec<ContextKnowledge>,
     /// Characters the pack occupies in the prompt.
     pub used_chars: usize,
     /// The budget the pack was allowed to use.
@@ -117,9 +167,15 @@ impl ContextPack {
             && self.code.is_empty()
             && self.findings_brief.is_none()
             && self.findings.is_empty()
+            && self.skills.is_empty()
+            && self.knowledge.is_empty()
     }
 
     /// Markdown block to append to the user prompt; empty when the pack is empty.
+    ///
+    /// The section order is the budget priority (SK-3): brief → findings →
+    /// skills → knowledge → wiki → repo — the same order the pack spent the
+    /// budget in.
     #[must_use]
     pub fn render(&self) -> String {
         if self.is_empty() {
@@ -134,6 +190,21 @@ impl ContextPack {
         }
         for finding in &self.findings {
             out.push_str(&format!("- achado: {finding}\n"));
+        }
+        for skill in &self.skills {
+            out.push_str(&format!("\n### {}\n{}\n", skill.anchor(), skill.snippet));
+        }
+        for knowledge in &self.knowledge {
+            let age = knowledge.age_days.map_or_else(
+                || "idade desconhecida".to_string(),
+                |days| format!("{days} dia(s) atrás"),
+            );
+            out.push_str(&format!(
+                "\n### {path} ({age})\n{title} — {snippet}\n",
+                path = knowledge.path,
+                title = knowledge.title,
+                snippet = knowledge.snippet
+            ));
         }
         for section in &self.sections {
             let age = section.age_days.map_or_else(
@@ -154,18 +225,28 @@ impl ContextPack {
     }
 
     /// One auditable line about what was sent — printed by `kira triage` so the
-    /// user can see exactly which evidence the model had (ADR-0015).
+    /// user can see exactly which evidence the model had (ADR-0015). Sources
+    /// listed in the pack priority (SK-3).
     #[must_use]
     pub fn summary(&self) -> String {
         let mut sources: Vec<String> = Vec::new();
+        if self.findings_brief.is_some() {
+            sources.push("findings do scan".to_string());
+        }
+        if !self.skills.is_empty() {
+            sources.push(format!("{} skill(s)", self.skills.len()));
+        }
+        if !self.knowledge.is_empty() {
+            sources.push(format!(
+                "{} documento(s) de conhecimento",
+                self.knowledge.len()
+            ));
+        }
         if !self.sections.is_empty() {
             sources.push(format!("{} página(s) da wiki", self.sections.len()));
         }
         if !self.code.is_empty() {
             sources.push(format!("{} trecho(s) de repositório", self.code.len()));
-        }
-        if self.findings_brief.is_some() {
-            sources.push("findings do scan".to_string());
         }
         if sources.is_empty() {
             sources.push("nenhum contexto".to_string());
@@ -216,6 +297,19 @@ pub fn explain_report(pack: &ContextPack, item_id: i32, explain: bool) -> String
     }
     for finding in &pack.findings {
         out.push_str(&format!("- achado: {finding}\n"));
+    }
+    for skill in &pack.skills {
+        out.push_str(&format!("- skill {}: {}\n", skill.anchor(), skill.snippet));
+    }
+    for knowledge in &pack.knowledge {
+        let age = knowledge.age_days.map_or_else(
+            || "idade desconhecida".to_string(),
+            |days| format!("{days} dia(s) atrás"),
+        );
+        out.push_str(&format!(
+            "- conhecimento {} ({age}): {}\n",
+            knowledge.path, knowledge.snippet
+        ));
     }
     for section in &pack.sections {
         let age = section.age_days.map_or_else(
@@ -316,7 +410,15 @@ pub fn pack_with(
     item: &WorkItem,
     budget_chars: usize,
 ) -> ContextPack {
-    pack_partial(root, Some(store), Some(wiki), item, budget_chars, &[])
+    pack_partial(
+        root,
+        Some(store),
+        Some(wiki),
+        item,
+        budget_chars,
+        &[],
+        crate::knowledge::dir().as_deref(),
+    )
 }
 
 /// Builds the pack from whatever sources the caller managed to open (PR5).
@@ -324,11 +426,13 @@ pub fn pack_with(
 /// Each source is independent on purpose: a broken wiki must not cost the
 /// repository excerpts, and a missing store must not cost the findings. The
 /// budget is spent in a **declared** priority order — findings brief, individual
-/// findings, wiki pages, repository excerpts — so a small `KIRA_NUM_CTX` always
-/// drops the least specific evidence first.
+/// findings, skills, owner knowledge, wiki pages, repository excerpts — so a
+/// small `KIRA_NUM_CTX` always drops the least specific evidence first (SK-3).
 ///
 /// `skip_paths` are repository-relative files the caller already sent whole (the
 /// work item file): grepping them again would only duplicate the prompt.
+/// `knowledge_dir` is `<store_dir>/knowledge/` — it only feeds the path/age of
+/// the knowledge excerpts; retrieval itself just needs the store (SK-2 index).
 #[must_use]
 pub fn pack_partial(
     root: &Path,
@@ -337,6 +441,7 @@ pub fn pack_partial(
     item: &WorkItem,
     budget_chars: usize,
     skip_paths: &[String],
+    knowledge_dir: Option<&Path>,
 ) -> ContextPack {
     let mut pack = ContextPack {
         budget_chars,
@@ -376,7 +481,58 @@ pub fn pack_partial(
         return pack;
     }
 
-    // 2. Wiki pages (PR31): FTS5 first, one query per term, ranked by hits.
+    // 2. Skills (SK-3): cartas de instrução que casam com os termos. O orçamento
+    //    gasta aqui antes da wiki porque a instrução vale para qualquer
+    //    evidência que vier depois — sem ela, trecho nenhum é interpretável.
+    if let Some(store) = store
+        && let Ok(project_id) = crate::store::project_id_for_root(root)
+    {
+        match skills_of(store, &project_id, &terms) {
+            Ok(hits) => {
+                for skill in hits {
+                    let anchor = skill.anchor();
+                    let cost = skill.snippet.chars().count() + anchor.chars().count() + 16;
+                    if pack.used_chars + cost > budget_chars {
+                        pack.notes.push(format!(
+                            "orçamento de contexto esgotado em {budget_chars} caracteres; skill '{}' ficou de fora",
+                            skill.name
+                        ));
+                        break;
+                    }
+                    pack.used_chars += cost;
+                    pack.skills.push(skill);
+                }
+            }
+            Err(cause) => pack.notes.push(format!("busca de skills falhou ({cause})")),
+        }
+
+        // 3. Conhecimento do dono (SK-2): o índice `knowledge_fts` é derivado;
+        //    caminho e idade vêm do disco — blob anônimo no prompt é proibido.
+        match knowledge_of(knowledge_dir, store, &terms) {
+            Ok(hits) => {
+                for entry in hits {
+                    let cost = entry.snippet.chars().count()
+                        + entry.title.chars().count()
+                        + entry.path.chars().count()
+                        + 24;
+                    if pack.used_chars + cost > budget_chars {
+                        pack.notes.push(format!(
+                            "orçamento de contexto esgotado em {budget_chars} caracteres; conhecimento '{}' ficou de fora",
+                            entry.id
+                        ));
+                        break;
+                    }
+                    pack.used_chars += cost;
+                    pack.knowledge.push(entry);
+                }
+            }
+            Err(cause) => pack
+                .notes
+                .push(format!("busca de conhecimento falhou ({cause})")),
+        }
+    }
+
+    // 4. Wiki pages (PR31): FTS5 first, one query per term, ranked by hits.
     if let (Some(store), Some(wiki)) = (store, wiki) {
         let mut scored: Vec<(usize, String)> = Vec::new();
         let mut search_failed = false;
@@ -438,7 +594,7 @@ pub fn pack_partial(
         }
     }
 
-    // 3. Repository excerpts (PR5): the KIRA greps, the model interprets. The
+    // 5. Repository excerpts (PR5): the KIRA greps, the model interprets. The
     //    FTS5 retrieval index (ADR-0021) is tried first — it ranks with bm25
     //    and has no 400-file alphabetical ceiling — and the grep walk is the
     //    fail-open fallback for a missing or empty index. Files named by a
@@ -501,6 +657,7 @@ pub fn pack_excluding(root: &Path, item: &WorkItem, exclude: Option<&Path>) -> C
     let budget = budget_chars();
     let store = Store::open_default();
     let wiki = Wiki::open(root);
+    let knowledge_dir = crate::knowledge::dir();
     let mut source_notes: Vec<String> = Vec::new();
     if let Err(cause) = &store {
         source_notes.push(format!("sem store para buscar na wiki ({cause})"));
@@ -515,6 +672,17 @@ pub fn pack_excluding(root: &Path, item: &WorkItem, exclude: Option<&Path>) -> C
         if let Err(cause) = index::reindex(root, store, &project_id) {
             source_notes.push(format!("índice do repositório não atualizado ({cause})"));
         }
+        // SK-3: skills e conhecimento também têm índice derivado (SK-1/SK-2);
+        // o pack fresco exige índice fresco, e falha é nota, nunca erro do
+        // triage.
+        if let Err(cause) = crate::skills::reindex(root, store, &project_id) {
+            source_notes.push(format!("índice de skills não atualizado ({cause})"));
+        }
+    }
+    if let Ok(store) = &store
+        && let Err(cause) = crate::knowledge::reindex(store)
+    {
+        source_notes.push(format!("índice de conhecimento não atualizado ({cause})"));
     }
     if let Err(cause) = &wiki {
         source_notes.push(format!("wiki indisponível ({cause})"));
@@ -530,6 +698,7 @@ pub fn pack_excluding(root: &Path, item: &WorkItem, exclude: Option<&Path>) -> C
         item,
         budget,
         &skip,
+        knowledge_dir.as_deref(),
     );
     source_notes.append(&mut pack.notes);
     pack.notes = source_notes;
@@ -551,6 +720,109 @@ fn relative_to_root(root: &Path, path: &Path) -> Option<String> {
 /// Findings of the last `kira scan`, when the file exists and parses.
 fn findings_of(root: &Path) -> Option<Vec<Finding>> {
     crate::scan::read_findings_file(root).ok().flatten()
+}
+
+/// Skills that match the terms (SK-3): one query per term against the derived
+/// index, score = number of matching terms, tie broken by name — the same
+/// formula as the wiki, so the pack stays reproducible. Bundled and user
+/// skills of the current project compete in the same ranking.
+fn skills_of(
+    store: &Store,
+    project_id: &str,
+    terms: &[String],
+) -> Result<Vec<ContextSkill>, String> {
+    let mut scored: Vec<(usize, ContextSkill)> = Vec::new();
+    for term in terms {
+        let hits = crate::skills::search(store, project_id, term, MAX_SKILLS * 2)
+            .map_err(|err| err.to_string())?;
+        for hit in hits {
+            match scored.iter_mut().find(|(_, skill)| skill.name == hit.name) {
+                Some((score, _)) => *score += 1,
+                None => scored.push((
+                    1,
+                    ContextSkill {
+                        name: hit.name,
+                        origin: hit.origin,
+                        version: hit.version,
+                        snippet: hit.snippet,
+                    },
+                )),
+            }
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    Ok(scored
+        .into_iter()
+        .take(MAX_SKILLS)
+        .map(|(_, skill)| skill)
+        .collect())
+}
+
+/// Owner knowledge that matches the terms (SK-3 over the SK-2 index): one
+/// query per term against `knowledge_fts`, same scoring as the wiki. The
+/// disk gives the path and the age (`None` when the file left the disk — the
+/// index is derived, so a stale entry still shows, just without age).
+/// Without a store dir the excerpt carries the `knowledge:<id>` anchor
+/// instead of a path: an anonymous blob is forbidden (ADR-0015).
+fn knowledge_of(
+    knowledge_dir: Option<&Path>,
+    store: &Store,
+    terms: &[String],
+) -> Result<Vec<ContextKnowledge>, String> {
+    let mut scored: Vec<(usize, ContextKnowledge)> = Vec::new();
+    for term in terms {
+        let hits = crate::knowledge::search(store, term, MAX_KNOWLEDGE * 2)
+            .map_err(|err| err.to_string())?;
+        for hit in hits {
+            match scored.iter_mut().find(|(_, entry)| entry.id == hit.id) {
+                Some((score, _)) => *score += 1,
+                None => {
+                    // Normalised to `/` like every prompt path: the pack must
+                    // be identical across Windows, macOS and Linux. The path
+                    // comes from the disk only when the file still exists —
+                    // pointing the model at a gone file is a lie; the anchor
+                    // `knowledge:<id>` is what remains (the index is derived
+                    // and the next pack refreshes it).
+                    let (path, age_days) = knowledge_dir
+                        .map(|dir| {
+                            let file = dir.join(format!("{}.md", hit.id));
+                            (
+                                crate::store::display_path(&file).replace('\\', "/"),
+                                age_days_from_mtime(&file),
+                            )
+                        })
+                        .filter(|(_, age)| age.is_some())
+                        .unwrap_or_else(|| (format!("knowledge:{}", hit.id), None));
+                    scored.push((
+                        1,
+                        ContextKnowledge {
+                            id: hit.id,
+                            path,
+                            age_days,
+                            title: hit.title,
+                            snippet: hit.snippet,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    Ok(scored
+        .into_iter()
+        .take(MAX_KNOWLEDGE)
+        .map(|(_, entry)| entry)
+        .collect())
+}
+
+/// Age in days from the file mtime (`None` = file gone or clock ahead —
+/// never a panic, just an un-aged excerpt).
+fn age_days_from_mtime(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let now = std::time::SystemTime::now();
+    // mtime no futuro (relógio à frente) vale como idade 0, não como erro.
+    let seconds = now.duration_since(modified).unwrap_or_default().as_secs();
+    i64::try_from(seconds / 86_400).ok()
 }
 
 /// Up to `max` findings, worst severity first, ties broken by fingerprint so the
@@ -891,6 +1163,7 @@ mod tests {
             &item_with("Sessão expirada", "token inválido"),
             12_000,
             &[],
+            None,
         );
         assert!(pack.sections.is_empty());
         assert!(!pack.code.is_empty(), "notas: {:?}", pack.notes);
@@ -1040,6 +1313,243 @@ mod tests {
         assert_eq!(relative_to_root(&dir, &item), Some("item.json".to_string()));
         let outside = std::env::temp_dir().join("kira-fora-do-root.json");
         assert_eq!(relative_to_root(&dir, &outside), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// SK-3: com as seis fontes presentes, o prompt carrega na ordem
+    /// contratada `brief → findings → skills → knowledge → wiki → repo` —
+    /// cada trecho ancorado, conhecimento com caminho e idade, e o mesmo
+    /// estado produz o mesmo pack.
+    #[test]
+    fn pack_order_contract_with_all_six_sources() {
+        let dir = temp_project("sk3-order");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+
+        write_findings(&dir, FINDINGS_HIGH);
+        write_file(&dir, "src/auth/session.rs", "let token = session_token;\n");
+
+        // Skill do usuário casando com os termos do work item (SK-1).
+        write_file(
+            &dir,
+            ".kira/skills/sessao.md",
+            "---\nname: sessao\ndescription: Use when token refresh expires. Do NOT use for cookies.\nlicense: MIT\nauthor: Ana\nversion: 1.0.0\n---\n\n- renove o token com rotação\n",
+        );
+        let project_id = crate::store::project_id_for_root(&dir)
+            .unwrap_or_else(|err| panic!("project id: {err}"));
+        crate::skills::reindex(&dir, &store, &project_id)
+            .unwrap_or_else(|err| panic!("reindex skills: {err}"));
+
+        // Conhecimento do dono (SK-2): disco + índice derivado.
+        let knowledge_dir = dir.join("knowledge");
+        fs::create_dir_all(&knowledge_dir).unwrap_or_else(|err| panic!("criar: {err}"));
+        fs::write(
+            knowledge_dir.join("token-refresh.md"),
+            "# Token refresh\n- sessão expira: rotacionar o token\n",
+        )
+        .unwrap_or_else(|err| panic!("escrever: {err}"));
+        crate::knowledge::reindex_from(&knowledge_dir, &store)
+            .unwrap_or_else(|err| panic!("reindex knowledge: {err}"));
+
+        // Wiki (PR31).
+        wiki.write(
+            "bugs/4821-sessao-expirada",
+            "# Sessão expirada\ntoken renovado sem rotacionar; refresh inválido",
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        wiki.reindex(&store).unwrap_or_else(|err| panic!("{err}"));
+
+        let item = item_with("Sessão expirada", "token inválido no refresh");
+        let pack = pack_partial(
+            &dir,
+            Some(&store),
+            Some(&wiki),
+            &item,
+            12_000,
+            &[],
+            Some(&knowledge_dir),
+        );
+
+        assert_eq!(pack.findings_brief.as_deref(), Some("critical 1, high 1"));
+        assert!(!pack.findings.is_empty(), "notas: {:?}", pack.notes);
+        // Skills bundled ("token" em tailwind/shadcn) competem na mesma busca:
+        // o do usuário vence por casar com mais termos (score = nº de termos).
+        assert!(
+            !pack.skills.is_empty()
+                && pack.skills[0].name == "sessao"
+                && pack.skills[0].origin == "user",
+            "skills: {:?}",
+            pack.skills
+        );
+        assert_eq!(pack.knowledge.len(), 1, "knowledge: {:?}", pack.knowledge);
+        assert_eq!(pack.knowledge[0].id, "token-refresh");
+        assert!(
+            pack.knowledge[0]
+                .path
+                .ends_with("/knowledge/token-refresh.md"),
+            "caminho ancorado: {}",
+            pack.knowledge[0].path
+        );
+        assert_eq!(
+            pack.knowledge[0].age_days,
+            Some(0),
+            "idade vem do mtime do disco"
+        );
+        assert_eq!(pack.sections.len(), 1, "wiki: {:?}", pack.sections);
+        assert!(!pack.code.is_empty(), "repo: {:?}", pack.notes);
+
+        let rendered = pack.render();
+        let pos = |needle: &str| {
+            rendered
+                .find(needle)
+                .unwrap_or_else(|| panic!("falta `{needle}` no render:\n{rendered}"))
+        };
+        let brief = pos("findings do último");
+        let finding = pos("achado:");
+        let skill = pos("skill:sessao@1.0.0 [user]");
+        let knowledge = pos("knowledge/token-refresh.md");
+        let wiki_pos = pos(".kira/wiki/bugs/4821-sessao-expirada.md");
+        let repo = pos("### Trechos do repositório");
+        assert!(
+            brief < finding
+                && finding < skill
+                && skill < knowledge
+                && knowledge < wiki_pos
+                && wiki_pos < repo,
+            "ordem contratada violada:\n{rendered}"
+        );
+
+        let summary = pack.summary();
+        assert!(
+            summary.contains(&format!("{} skill(s)", pack.skills.len()))
+                && summary.contains("1 documento(s) de conhecimento")
+                && summary.contains("1 página(s) da wiki")
+                && summary.contains("3 trecho(s) de repositório"),
+            "{summary}"
+        );
+
+        // Mesmo estado ⇒ mesmo pack (gate do M1), com as fontes novas dentro.
+        let second = pack_partial(
+            &dir,
+            Some(&store),
+            Some(&wiki),
+            &item,
+            12_000,
+            &[],
+            Some(&knowledge_dir),
+        );
+        assert_eq!(pack, second, "determinismo com skills/knowledge");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// SK-3: teto honrado — orçamento minúsculo derruba skills, conhecimento,
+    /// wiki e repositório antes de apagar o brief, e explica o corte em nota.
+    #[test]
+    fn tiny_budget_drops_the_new_sources_first() {
+        let dir = temp_project("sk3-budget");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        write_findings(&dir, FINDINGS_HIGH);
+        write_file(
+            &dir,
+            ".kira/skills/sessao.md",
+            "---\nname: sessao\ndescription: Use when token refresh expires. Do NOT use for cookies.\nlicense: MIT\nauthor: Ana\nversion: 1.0.0\n---\n\n- renove o token com rotação\n",
+        );
+        let project_id = crate::store::project_id_for_root(&dir)
+            .unwrap_or_else(|err| panic!("project id: {err}"));
+        crate::skills::reindex(&dir, &store, &project_id)
+            .unwrap_or_else(|err| panic!("reindex skills: {err}"));
+        let knowledge_dir = dir.join("knowledge");
+        fs::create_dir_all(&knowledge_dir).unwrap_or_else(|err| panic!("criar: {err}"));
+        fs::write(
+            knowledge_dir.join("token-refresh.md"),
+            "# Token refresh\n- sessão expira: rotacionar o token\n",
+        )
+        .unwrap_or_else(|err| panic!("escrever: {err}"));
+        crate::knowledge::reindex_from(&knowledge_dir, &store)
+            .unwrap_or_else(|err| panic!("reindex knowledge: {err}"));
+        wiki.write("bugs/4821-sessao-expirada", "# Sessão expirada\ntoken")
+            .unwrap_or_else(|err| panic!("{err}"));
+        wiki.reindex(&store).unwrap_or_else(|err| panic!("{err}"));
+
+        let pack = pack_partial(
+            &dir,
+            Some(&store),
+            Some(&wiki),
+            &item_with("Sessão expirada", "token inválido no refresh"),
+            130,
+            &[],
+            Some(&knowledge_dir),
+        );
+        assert!(pack.findings_brief.is_some(), "brief sobrevive sempre");
+        assert!(
+            pack.skills.is_empty() && pack.knowledge.is_empty() && pack.sections.is_empty(),
+            "fontes caras não cabem: {:?} {:?} {:?}",
+            pack.skills,
+            pack.knowledge,
+            pack.sections
+        );
+        assert!(
+            pack.notes.iter().any(|note| note.contains("orçamento")),
+            "corte explicado: {:?}",
+            pack.notes
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// SK-3: o índice derivado pode ficar atrás do disco — arquivo removido
+    /// ainda aparece do índice, mas sem idade (nunca inventa dado), e a saída
+    /// usa a âncora em vez de apontar arquivo que não existe.
+    #[test]
+    fn knowledge_indexed_but_gone_from_disk_carries_no_age() {
+        let dir = temp_project("sk3-stale");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        let knowledge_dir = dir.join("knowledge");
+        fs::create_dir_all(&knowledge_dir).unwrap_or_else(|err| panic!("criar: {err}"));
+        fs::write(
+            knowledge_dir.join("token-refresh.md"),
+            "# Token refresh\n- sessão expira: rotacionar o token\n",
+        )
+        .unwrap_or_else(|err| panic!("escrever: {err}"));
+        crate::knowledge::reindex_from(&knowledge_dir, &store)
+            .unwrap_or_else(|err| panic!("reindex knowledge: {err}"));
+        // O disco manda: arquivo saiu, índice derivado ainda não foi refresco.
+        fs::remove_file(knowledge_dir.join("token-refresh.md"))
+            .unwrap_or_else(|err| panic!("remover: {err}"));
+
+        let pack = pack_partial(
+            &dir,
+            Some(&store),
+            Some(&wiki),
+            &item_with("Sessão expirada", "token inválido no refresh"),
+            12_000,
+            &[],
+            Some(&knowledge_dir),
+        );
+        assert_eq!(
+            pack.knowledge.len(),
+            1,
+            "stale indexado não some: {:?}",
+            pack.knowledge
+        );
+        assert_eq!(
+            pack.knowledge[0].age_days, None,
+            "idade inventada é proibido"
+        );
+        assert_eq!(
+            pack.knowledge[0].path, "knowledge:token-refresh",
+            "arquivo que não existe não recebe caminho: {:?}",
+            pack.knowledge[0].path
+        );
+        let rendered = pack.render();
+        assert!(
+            rendered.contains("idade desconhecida"),
+            "render honesto: {rendered}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
