@@ -35,7 +35,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -778,6 +778,118 @@ impl Store {
         }
         Ok(hits)
     }
+
+    /// Replaces the derived knowledge index FROM SCRATCH (delete-then-insert
+    /// in one transaction): a reindex never mixes old and new rows and never
+    /// loses knowledge — the truth is the markdown on disk (SK-2).
+    pub fn knowledge_replace(&self, rows: &[KnowledgeRow]) -> Result<usize, StoreError> {
+        let tx = self.conn.unchecked_transaction().map_err(StoreError::Sql)?;
+        tx.execute("DELETE FROM knowledge", [])
+            .map_err(StoreError::Sql)?;
+        if self.knowledge_fts5_enabled() {
+            tx.execute("DELETE FROM knowledge_fts", [])
+                .map_err(StoreError::Sql)?;
+        }
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO knowledge (id, title, body) VALUES (?1, ?2, ?3)")
+                .map_err(StoreError::Sql)?;
+            for row in rows {
+                insert
+                    .execute(rusqlite::params![row.id, row.title, row.body])
+                    .map_err(StoreError::Sql)?;
+            }
+        }
+        if self.knowledge_fts5_enabled() {
+            let mut insert = tx
+                .prepare("INSERT INTO knowledge_fts (id, title, body) VALUES (?1, ?2, ?3)")
+                .map_err(StoreError::Sql)?;
+            for row in rows {
+                insert
+                    .execute(rusqlite::params![row.id, row.title, row.body])
+                    .map_err(StoreError::Sql)?;
+            }
+        }
+        tx.commit().map_err(StoreError::Sql)?;
+        Ok(rows.len())
+    }
+
+    /// True when the knowledge FTS5 virtual table exists in this database.
+    #[must_use]
+    pub fn knowledge_fts5_enabled(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|count| count > 0)
+    }
+
+    /// Searches the owner knowledge: FTS5 `MATCH` when available (quoted
+    /// phrase, same trick as skills/wiki), `LIKE` otherwise.
+    pub fn knowledge_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeHit>, StoreError> {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut hits = Vec::new();
+        if self.knowledge_fts5_enabled() {
+            let phrase = format!("\"{}\"", needle.replace('"', " "));
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT id, title, \
+                            snippet(knowledge_fts, -1, '[', ']', '…', 10) \
+                     FROM knowledge_fts \
+                     WHERE knowledge_fts MATCH ?1 \
+                     ORDER BY rank LIMIT ?2",
+                )
+                .map_err(StoreError::Sql)?;
+            let rows = statement
+                .query_map(rusqlite::params![phrase, limit], |row| {
+                    Ok(KnowledgeHit {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        snippet: row.get(2)?,
+                    })
+                })
+                .map_err(StoreError::Sql)?;
+            for row in rows {
+                hits.push(row.map_err(StoreError::Sql)?);
+            }
+            return Ok(hits);
+        }
+        // Degradação sem FTS5: LIKE sobre título/corpo (documentada).
+        let pattern = format!("%{needle}%");
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, title, substr(body, 1, 200) \
+                 FROM knowledge \
+                 WHERE title LIKE ?1 OR body LIKE ?1 \
+                 ORDER BY id LIMIT ?2",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map(rusqlite::params![pattern, limit], |row| {
+                Ok(KnowledgeHit {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    snippet: row.get(2)?,
+                })
+            })
+            .map_err(StoreError::Sql)?;
+        for row in rows {
+            hits.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(hits)
+    }
 }
 
 /// One wiki page as stored in the derived index.
@@ -823,6 +935,28 @@ pub struct SkillHit {
     pub name: String,
     pub origin: String,
     pub version: String,
+    /// Context around the match (FTS5 snippet or the first 200 chars).
+    pub snippet: String,
+}
+
+/// One owner knowledge document as stored in the derived index (onda SK,
+/// SK-2). The stored text is already redacted — the store never keeps a
+/// secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeRow {
+    /// File stem of the source markdown (stable anchor).
+    pub id: String,
+    /// First markdown heading, or the file stem when the file has none.
+    pub title: String,
+    /// Redacted full text of the document.
+    pub body: String,
+}
+
+/// One search hit from the knowledge index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeHit {
+    pub id: String,
+    pub title: String,
     /// Context around the match (FTS5 snippet or the first 200 chars).
     pub snippet: String,
 }
@@ -1131,6 +1265,30 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
             );",
         ) {
             eprintln!("aviso: FTS5 indisponível para skills ({error}) — busca cai para LIKE");
+        }
+    }
+
+    // v11 — knowledge (onda SK, SK-2): os textos do dono em
+    // `<store_dir>/knowledge/*.md` (normalmente `~/.config/kira/knowledge/`).
+    // Índice DERIVADO (fonte de verdade = markdown no disco — reconstruir
+    // nunca perde conhecimento) e de escopo GLOBAL: conhecimento do dono
+    // vale para qualquer projeto, sem coluna de projeto. FTS5 opcional,
+    // mesma degradação da wiki/skills: sem o módulo, busca cai para LIKE.
+    if current < 11 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS knowledge (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL
+            );",
+        )
+        .map_err(schema_error)?;
+        if let Err(error) = conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+                id UNINDEXED, title, body
+            );",
+        ) {
+            eprintln!("aviso: FTS5 indisponível para knowledge ({error}) — busca cai para LIKE");
         }
     }
 
