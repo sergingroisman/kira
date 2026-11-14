@@ -930,6 +930,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Fail-open do wiki ilegível é POR SISTEMA: no Unix, `.kira` como arquivo
+    // dá ENOTDIR (Err com causa); no Windows o mesmo cenário degrada para
+    // NotFound (Ok(None) = miss). Os dois caminhos são o contrato de fail-open
+    // — "rota LLM de sempre, nunca pânico" — testados separadamente, cada um
+    // no SO que o produz (cenários de chmod/ENOTDIR não são portáveis).
+    #[cfg(unix)]
     #[test]
     fn cache_lookup_fails_with_a_cause_when_the_wiki_is_unreadable() {
         // `.kira` como ARQUIVO: ler `bugs/4821.md` é impossível (ENOTDIR).
@@ -943,6 +949,22 @@ mod tests {
                 "a causa alimenta a nota acionável no stderr"
             ),
             other => panic!("wiki ilegível deve devolver Err, veio {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cache_lookup_misses_when_the_wiki_root_is_not_a_directory() {
+        // Windows: abrir `arquivo/filho` volta ERROR_PATH_NOT_FOUND (NotFound),
+        // então a página "não existe" — miss limpo, rota LLM, sem pânico.
+        let root = temp_wiki("broken-windows");
+        std::fs::write(root.join(".kira"), "não sou um diretório")
+            .unwrap_or_else(|err| panic!("criar .kira: {err}"));
+        let item = parse(FIXTURE_FULL);
+        match cache_lookup_at(&root, &item) {
+            Ok(None) => {}
+            other => panic!("no Windows o cenário é miss, veio {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
     }
