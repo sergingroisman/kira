@@ -51,6 +51,14 @@ pub enum Error {
     )]
     ConfigParse { path: String, line: usize },
 
+    /// PR40: `token_profile` (config.toml) ou `--profile` com um valor que
+    /// não existe. Perfil é escolha de dono — o erro é acionável com a lista
+    /// dos válidos e o comando para; fallback silencioso é proibido.
+    #[error(
+        "perfil de token '{value}' não existe — use um de: budget, balanced, quality (corrija o valor do --profile passado ou da chave token_profile no config.toml)"
+    )]
+    TokenProfile { value: String },
+
     /// Azure DevOps request failed (network, authentication, not found, ...).
     #[error(
         "falha ao consultar o Azure DevOps: {0} — rode `kira doctor` para diagnosticar credencial e conectividade (a resposta crua do servidor não é exibida)"
@@ -453,6 +461,12 @@ mod tests {
                 Error::ConfigParse {
                     path: "/tmp/config.toml".to_string(),
                     line: 3,
+                },
+            ),
+            (
+                "TokenProfile",
+                Error::TokenProfile {
+                    value: "esquisito".to_string(),
                 },
             ),
             (

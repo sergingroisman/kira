@@ -257,7 +257,10 @@ pub fn sections_of(formatted: &str) -> [String; 3] {
 /// with [`triage_file_llm`] (ADR-0019/ADR-0020: the costly backend is never
 /// implicit). The reasoning cache (PR35) is ON — it is the product default.
 pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<TriageReport, Error> {
-    triage_file_llm(LlmKind::Ollama, base_url, model, path, true, None).await
+    // O wrapper resolve o perfil da casa (flag não existe aqui): config >
+    // default. Config inválido falha com o erro acionável — nunca adivinha.
+    let profile = crate::context::resolve_profile(None)?;
+    triage_file_llm(LlmKind::Ollama, base_url, model, path, true, None, profile).await
 }
 
 /// Same as [`triage_file`] with an explicit backend choice.
@@ -269,6 +272,8 @@ pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<Tri
 /// `ledger` is the store that counts the call for the daily budget
 /// (auditoria P0). In-process callers without a ledger (tests) pass `None`
 /// and touch no store — the counter belongs to the command layer.
+/// `profile` (PR40) já vem resolvido pela camada de comando: os caps do pack
+/// e o gate do cache usam o MESMO perfil — nunca dois.
 pub async fn triage_file_llm(
     kind: LlmKind,
     base_url: &str,
@@ -276,13 +281,24 @@ pub async fn triage_file_llm(
     path: &Path,
     cache: bool,
     ledger: Option<&Store>,
+    profile: crate::context::TokenProfile,
 ) -> Result<TriageReport, Error> {
     let body = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,
     })?;
     let item = WorkItem::from_api_json(&body)?;
-    triage_item(kind, base_url, model, &item, Some(path), cache, ledger).await
+    triage_item(
+        kind,
+        base_url,
+        model,
+        &item,
+        Some(path),
+        cache,
+        ledger,
+        profile,
+    )
+    .await
 }
 
 /// Runs triage for a work item fetched live through the board provider
@@ -293,10 +309,22 @@ pub async fn triage_live(
     base_url: &str,
     model: &str,
 ) -> Result<TriageReport, Error> {
-    triage_live_llm(LlmKind::Ollama, board, id, base_url, model, true, None).await
+    let profile = crate::context::resolve_profile(None)?;
+    triage_live_llm(
+        LlmKind::Ollama,
+        board,
+        id,
+        base_url,
+        model,
+        true,
+        None,
+        profile,
+    )
+    .await
 }
 
 /// Same as [`triage_live`] with an explicit backend choice.
+#[allow(clippy::too_many_arguments)] // PR40: perfil/ledger atravessam a borda; estilo do repo (setup.rs, store)
 pub async fn triage_live_llm(
     kind: LlmKind,
     board: &dyn BoardProvider,
@@ -305,9 +333,10 @@ pub async fn triage_live_llm(
     model: &str,
     cache: bool,
     ledger: Option<&Store>,
+    profile: crate::context::TokenProfile,
 ) -> Result<TriageReport, Error> {
     let item = board.work_item(id).await?;
-    triage_item(kind, base_url, model, &item, None, cache, ledger).await
+    triage_item(kind, base_url, model, &item, None, cache, ledger, profile).await
 }
 
 /// A backend built for one triage call: wiring only — which backend runs is
@@ -318,6 +347,7 @@ enum TriageBackend {
     Foundry(FoundryBackend),
 }
 
+#[allow(clippy::too_many_arguments)] // PR40: perfil/ledger atravessam a borda; estilo do repo (setup.rs, store)
 async fn triage_item(
     kind: LlmKind,
     base_url: &str,
@@ -326,6 +356,7 @@ async fn triage_item(
     exclude_from_grep: Option<&Path>,
     cache: bool,
     ledger: Option<&Store>,
+    profile: crate::context::TokenProfile,
 ) -> Result<TriageReport, Error> {
     // PR35 (cache de raciocínio): ANTES de qualquer backend — o hit é
     // determinístico (similaridade em Rust, nível 3 da escada, ADR-0016),
@@ -335,7 +366,7 @@ async fn triage_item(
     // wiki é fail-open: nota no pack e rota normal de hoje, byte a byte.
     let mut cache_note: Option<String> = None;
     if cache {
-        match cache_lookup(item) {
+        match cache_lookup(item, profile) {
             Ok(Some((hit, episode))) => return Ok(cache_report(item.id, &hit, &episode)),
             Ok(None) => {}
             Err(cause) => cache_note = Some(cause),
@@ -359,7 +390,7 @@ async fn triage_item(
         // `kira setup` (ADR-0035) — configurar pelo wizard basta.
         LlmKind::Foundry => TriageBackend::Foundry(FoundryBackend::from_sources()?),
     };
-    let mut pack = context_pack(item, exclude_from_grep);
+    let mut pack = context_pack(item, exclude_from_grep, profile);
     if let Some(cause) = cache_note {
         pack.notes
             .push(format!("cache-wiki indisponível ({cause})"));
@@ -439,22 +470,32 @@ fn item_text_for_cache(item: &WorkItem) -> String {
 /// A fonte de verdade é o MARKDOWN (ADR-0013): `Wiki::list()` varre o disco, o
 /// índice FTS5 é derivado e pode estar ausente/velho — o cache não depende dele.
 /// Fail-open fica na camada de cima: `Err` vira nota, nunca erro do comando.
-fn cache_lookup(item: &WorkItem) -> Result<Option<(CacheHit, Episode)>, String> {
+/// `profile` (PR40) é a identidade do cache nesta execução: o episódio que
+/// responde tem que ter sido produzido SOB O MESMO perfil — trocar de perfil
+/// REGENERA (rota LLM), nunca serve a conclusão de outro pack.
+fn cache_lookup(
+    item: &WorkItem,
+    profile: crate::context::TokenProfile,
+) -> Result<Option<(CacheHit, Episode)>, String> {
     let Some(root) = crate::store::detect_project_root() else {
         // Sem raiz não há wiki — mesma conduta do pack (silêncio, rota normal).
         return Ok(None);
     };
-    cache_lookup_at(&root, item)
+    cache_lookup_at(&root, item, profile)
 }
 
 /// [`cache_lookup`] com a raiz explícita — o mesmo desenho de `context_pack`
 /// vs `pack_excluding`: a variante com raiz é a testável sem `chdir`.
-fn cache_lookup_at(root: &Path, item: &WorkItem) -> Result<Option<(CacheHit, Episode)>, String> {
+fn cache_lookup_at(
+    root: &Path,
+    item: &WorkItem,
+    profile: crate::context::TokenProfile,
+) -> Result<Option<(CacheHit, Episode)>, String> {
     let wiki = Wiki::open(root).map_err(|err| err.to_string())?;
     let texto = item_text_for_cache(item);
     // 1) Página direta do item: o caso comum (re-triagem do mesmo bug).
     let page = episode::page_for(item.id);
-    if let Some(hit) = cached_episode(&wiki, &page, &texto)? {
+    if let Some(hit) = cached_episode(&wiki, &page, &texto, profile)? {
         return Ok(Some(hit));
     }
     // 2) Candidatas: as outras páginas de bugs, em ordem de `list()` (sorted);
@@ -464,7 +505,7 @@ fn cache_lookup_at(root: &Path, item: &WorkItem) -> Result<Option<(CacheHit, Epi
         if !candidata.starts_with("bugs/") || candidata == page {
             continue;
         }
-        if let Some(hit) = cached_episode(&wiki, &candidata, &texto)?
+        if let Some(hit) = cached_episode(&wiki, &candidata, &texto, profile)?
             && melhor
                 .as_ref()
                 .is_none_or(|(atual, _)| hit.0.similarity > atual.similarity)
@@ -476,11 +517,14 @@ fn cache_lookup_at(root: &Path, item: &WorkItem) -> Result<Option<(CacheHit, Epi
 }
 
 /// Lê a página, extrai o episódio mais recente e decide se ele responde o item:
-/// causa conhecida (não vazia/`—`) e similaridade ≥ [`CACHE_LIMIAR`].
+/// causa conhecida (não vazia/`—`), similaridade ≥ [`CACHE_LIMIAR`] e o MESMO
+/// perfil (PR40) — o gate por perfil vem antes do score, porque um episódio
+/// de outro perfil não é resposta para esta execução, por mais parecido.
 fn cached_episode(
     wiki: &Wiki,
     page: &str,
     item_text: &str,
+    profile: crate::context::TokenProfile,
 ) -> Result<Option<(CacheHit, Episode)>, String> {
     let Some(content) = wiki.read(page).map_err(|err| err.to_string())? else {
         return Ok(None);
@@ -488,6 +532,9 @@ fn cached_episode(
     let Some(episode) = episode::latest(&content) else {
         return Ok(None);
     };
+    if !cache_serves(episode.profile.as_deref(), profile.as_str()) {
+        return Ok(None);
+    }
     let causa = episode.root_cause.trim();
     if causa.is_empty() || causa == SECTION_EMPTY {
         return Ok(None);
@@ -503,6 +550,20 @@ fn cached_episode(
         },
         episode,
     )))
+}
+
+/// O episódio serve a resposta sob o perfil atual? (PR40 — identidade do
+/// cache de raciocínio.)
+///
+/// Regras, determinísticas:
+/// - episódio legado (sem `- Perfil:` na página, produzido antes do PR40) serve
+///   em qualquer perfil: ele é o conhecimento do item, independente de pack;
+/// - episódio com perfil gravado serve só no MATCH — trocar de perfil muda a
+///   identidade do cache (o "cache_key" do conceito) e força a rota LLM
+///   REGENERAR, nunca servir a conclusão de outro pack.
+#[must_use]
+pub fn cache_serves(episode_profile: Option<&str>, current: &str) -> bool {
+    episode_profile.is_none_or(|recorded| recorded == current)
 }
 
 /// D2 (PR35): a confiança do hit é a da página original, CAPADA em `média` —
@@ -555,12 +616,17 @@ fn cache_report(item_id: i32, hit: &CacheHit, episodio: &Episode) -> TriageRepor
 ///
 /// Fail-open by design: without a project root, store or wiki the pack is empty
 /// and `triage` behaves exactly as before — context is an improvement, never a
-/// new way to fail.
-fn context_pack(item: &WorkItem, exclude: Option<&Path>) -> crate::context::ContextPack {
+/// new way to fail. `profile` já foi resolvido pela camada de comando (PR40):
+/// os caps do pack vêm dele, e o MESMO perfil decide o gate do cache.
+fn context_pack(
+    item: &WorkItem,
+    exclude: Option<&Path>,
+    profile: crate::context::TokenProfile,
+) -> crate::context::ContextPack {
     let Some(root) = crate::store::detect_project_root() else {
         return crate::context::ContextPack::default();
     };
-    crate::context::pack_excluding(&root, item, exclude)
+    crate::context::pack_excluding(&root, item, exclude, profile.caps())
 }
 
 #[cfg(test)]
@@ -873,6 +939,61 @@ mod tests {
         std::fs::write(&path, content).unwrap_or_else(|err| panic!("escrever {path:?}: {err}"));
     }
 
+    /// PR40: página com o perfil gravado — a identidade do cache na página.
+    fn write_bug_page_with_profile(root: &Path, item_id: i32, cause: &str, profile: &str) {
+        let path = root
+            .join(".kira")
+            .join("wiki")
+            .join("bugs")
+            .join(format!("{item_id}.md"));
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or_else(|err| panic!("criar bugs/: {err}"));
+        let content = format!(
+            "<!-- kira-wiki updated_at=2026-11-10T22:18:00Z -->\n\n# Bug {item_id}\n\n## Episódio 2026-11-10T22:18:00Z · item {item_id}\n- Causa raiz prevista: {cause}\n- Arquivos prováveis: src/auth/session.rs\n- Confiança: média\n- Perfil: {profile}\n"
+        );
+        std::fs::write(&path, content).unwrap_or_else(|err| panic!("escrever {path:?}: {err}"));
+    }
+
+    /// PR40: a identidade do cache — episódio com perfil serve só no match.
+    #[test]
+    fn cache_serves_requires_the_same_profile_for_stamped_episodes() {
+        // Legado (sem Perfil na página) serve em qualquer perfil — é o
+        // conhecimento do item, independente de pack.
+        assert!(cache_serves(None, "balanced"));
+        assert!(cache_serves(None, "quality"));
+        // Com perfil gravado: match serve, trocar de perfil NÃO serve.
+        assert!(cache_serves(Some("balanced"), "balanced"));
+        assert!(!cache_serves(Some("balanced"), "quality"));
+        assert!(!cache_serves(Some("quality"), "balanced"));
+    }
+
+    /// Aceite (b) do PR40, no lookup: trocar de perfil ⇒ cache NÃO servido —
+    /// a execução REGENERA na rota LLM, nunca serve a conclusão de outro pack.
+    #[test]
+    fn cache_lookup_skips_episodes_from_a_different_profile() {
+        let root = temp_wiki("profile-gate");
+        write_bug_page_with_profile(
+            &root,
+            4821,
+            "sessão expirada com token válido após minutos",
+            "quality",
+        );
+        let item = parse(FIXTURE_FULL);
+        // Mesmo episódio, perfil diferente: o cache não serve — miss, rota LLM.
+        let lookup = cache_lookup_at(&root, &item, crate::context::TokenProfile::Balanced)
+            .unwrap_or_else(|cause| panic!("wiki válida não pode falhar: {cause}"));
+        assert!(
+            lookup.is_none(),
+            "perfil diferente ⇒ cache não servido: {lookup:?}"
+        );
+        // Mesmo perfil: hit.
+        let (hit, _) = cache_lookup_at(&root, &item, crate::context::TokenProfile::Quality)
+            .unwrap_or_else(|cause| panic!("wiki válida não pode falhar: {cause}"))
+            .unwrap_or_else(|| panic!("mesmo perfil deve bater no cache"));
+        assert_eq!(hit.page, "bugs/4821", "{hit:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn cache_score_is_token_overlap_with_a_documented_threshold() {
         // Cobertura total da causa ⇒ 1.0 (hit confortável).
@@ -905,7 +1026,7 @@ mod tests {
             "alta",
         );
         let item = parse(FIXTURE_FULL);
-        let (hit, episodio) = cache_lookup_at(&root, &item)
+        let (hit, episodio) = cache_lookup_at(&root, &item, crate::context::TokenProfile::Balanced)
             .unwrap_or_else(|cause| panic!("wiki válida não pode falhar: {cause}"))
             .unwrap_or_else(|| panic!("item com página parecida deve bater no cache"));
         assert_eq!(hit.page, "bugs/4821", "{hit:?}");
@@ -928,7 +1049,7 @@ mod tests {
             "baixa",
         );
         let item = parse(FIXTURE_FULL);
-        let lookup = cache_lookup_at(&root, &item)
+        let lookup = cache_lookup_at(&root, &item, crate::context::TokenProfile::Balanced)
             .unwrap_or_else(|cause| panic!("wiki válida não pode falhar: {cause}"));
         assert!(
             lookup.is_none(),
@@ -948,7 +1069,7 @@ mod tests {
             "média",
         );
         let item = parse(FIXTURE_FULL);
-        let (hit, episodio) = cache_lookup_at(&root, &item)
+        let (hit, episodio) = cache_lookup_at(&root, &item, crate::context::TokenProfile::Balanced)
             .unwrap_or_else(|cause| panic!("wiki válida não pode falhar: {cause}"))
             .unwrap_or_else(|| panic!("bug parecido em outra página deve bater (cross-item)"));
         assert_eq!(hit.page, "bugs/9999", "{hit:?}");
@@ -969,7 +1090,7 @@ mod tests {
         std::fs::write(root.join(".kira"), "não sou um diretório")
             .unwrap_or_else(|err| panic!("criar .kira: {err}"));
         let item = parse(FIXTURE_FULL);
-        match cache_lookup_at(&root, &item) {
+        match cache_lookup_at(&root, &item, crate::context::TokenProfile::Balanced) {
             Err(cause) => assert!(
                 !cause.is_empty(),
                 "a causa alimenta a nota acionável no stderr"
@@ -988,7 +1109,7 @@ mod tests {
         std::fs::write(root.join(".kira"), "não sou um diretório")
             .unwrap_or_else(|err| panic!("criar .kira: {err}"));
         let item = parse(FIXTURE_FULL);
-        match cache_lookup_at(&root, &item) {
+        match cache_lookup_at(&root, &item, crate::context::TokenProfile::Balanced) {
             Ok(None) => {}
             other => panic!("no Windows o cenário é miss, veio {other:?}"),
         }
@@ -1014,6 +1135,7 @@ mod tests {
             files: "src/auth/session.rs".to_string(),
             confidence: "alta".to_string(),
             findings_brief: None,
+            profile: None,
         };
         let hit = CacheHit {
             page: "bugs/4821".to_string(),

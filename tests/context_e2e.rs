@@ -57,6 +57,7 @@ impl Sandbox {
             .env_remove("KIRA_MODEL")
             .env_remove("KIRA_BOARD")
             .env_remove("KIRA_INDEX_MAX_FILES")
+            .env_remove("KIRA_NUM_CTX")
             .output()
             .unwrap_or_else(|err| panic!("executar kira {args:?}: {err}"));
         (
@@ -418,4 +419,302 @@ fn a_missing_inventory_degrades_to_an_actionable_note() {
         notes.iter().any(|note| note.contains("rode `kira ingest`")),
         "nota acionável: {notes:?}"
     );
+}
+// ===========================================================================
+// PR40 — token_profile em config.toml (docs/te-implementacao.md §10, D10).
+// ===========================================================================
+
+/// Estado determinístico do fixture: work item + 4 findings (severidades
+/// distintas) + 13 arquivos com o termo + 5 páginas de wiki (conteúdo longo,
+/// para o cap de 400/600/800 chars aparecer). Skills bundled não casam com os
+/// termos (checado) e a sandbox não tem knowledge — o pack é só findings +
+/// mapa ausente (nota) + wiki + repositório.
+fn write_profile_fixture(sandbox: &Sandbox) {
+    write_item(sandbox);
+    sandbox.write(
+        ".kira/findings.json",
+        r#"{"findings":[
+{"tool":"dotnet","rule":"vulnerable","package":"Pkg.One","version":"1.0.0","severity":"critical","path":"src/mod_00.rs","message":"advisory","fingerprint":"0000000000000001"},
+{"tool":"dotnet","rule":"vulnerable","package":"Pkg.Two","version":"2.0.0","severity":"high","path":"src/mod_01.rs","message":"advisory","fingerprint":"0000000000000002"},
+{"tool":"dotnet","rule":"vulnerable","package":"Pkg.Three","version":"3.0.0","severity":"moderate","path":"src/mod_02.rs","message":"advisory","fingerprint":"0000000000000003"},
+{"tool":"audit","rule":"vulnerable","package":"Pkg.Four","version":"4.0.0","severity":"low","path":"src/mod_03.rs","message":"advisory","fingerprint":"0000000000000004"}],"stacks":[]}"#,
+    );
+    for n in 0..13 {
+        sandbox.write(
+            &format!("src/mod_{n:02}.rs"),
+            &format!("pub fn cooldown_{n}() -> u32 {{ {n} }}\n"),
+        );
+    }
+    // Wiki: 5 páginas com conteúdo longo (o cap do excerpt é o que muda entre
+    // perfis). Grava pelo Wiki::write REAL (header `updated_at` = agora ⇒
+    // idade 0 na corrida seguinte — determinística) e reindexa o FTS5 na
+    // store do sandbox, porque o comando `context` não reindexa wiki.
+    let store = kira::store::Store::open_in_dir(&sandbox.store)
+        .unwrap_or_else(|err| panic!("store: {err}"));
+    let wiki = kira::wiki::Wiki::open(&sandbox.cwd).unwrap_or_else(|err| panic!("wiki: {err}"));
+    for n in 0..5 {
+        let mut content = String::from("# Cooldown do reprocesso\n");
+        content
+            .push_str("A fila do reprocesso nunca recomeça depois do erro; o cooldown expirou. ");
+        content.push_str("O reprocesso de cada item da fila depende do cooldown anterior; ");
+        content.push_str("sem o recomeço do cooldown o reprocesso para e a fila cresce. ");
+        content.push_str("Fila cresce até o cooldown voltar; o reprocesso recomeça tarde. ");
+        content.push_str("Cooldown longo atrasa o reprocesso e a fila inteira do dia. ");
+        content.push_str("Reprocesso em lote quebra quando o cooldown da fila não recomeça. ");
+        content.push_str("O cooldown expira; o reprocesso recomeça só no dia seguinte. ");
+        content.push_str("Fila de reprocesso empacada: cooldown sem recomeço é o defeito. ");
+        wiki.write(&format!("bugs/p{n}"), &content)
+            .unwrap_or_else(|err| panic!("wiki {n}: {err}"));
+    }
+    wiki.reindex(&store)
+        .unwrap_or_else(|err| panic!("reindex wiki: {err}"));
+}
+
+/// Os contados do pack por perfil (D10): 4/8/12 trechos, 2/3/4 páginas,
+/// 2/3/4 achados detalhados — três packs DISTINTOS e reprodutíveis (M1 ×3).
+#[test]
+fn the_three_profiles_produce_three_distinct_deterministic_packs() {
+    let sandbox = Sandbox::new("profiles-caps");
+    write_profile_fixture(&sandbox);
+    let mut per_profile: std::collections::HashMap<&str, (usize, usize, usize)> =
+        std::collections::HashMap::new();
+    for profile in ["budget", "balanced", "quality"] {
+        let first = sandbox.run(&[
+            "context",
+            "--file",
+            "item.json",
+            "--json",
+            "--profile",
+            profile,
+        ]);
+        assert_eq!(first.0, 0, "{}: {}", profile, first.2);
+        let second = sandbox.run(&[
+            "context",
+            "--file",
+            "item.json",
+            "--json",
+            "--profile",
+            profile,
+        ]);
+        assert_eq!(second.0, 0, "{}: {}", profile, second.2);
+        // Mesmo estado ⇒ mesmo pack byte a byte (gate M1, por perfil).
+        assert_eq!(first.1, second.1, "determinismo do perfil {profile}");
+        let parsed: serde_json::Value = serde_json::from_str(&first.1)
+            .unwrap_or_else(|err| panic!("JSON inválido ({profile}): {err}"));
+        assert_eq!(
+            parsed["token_profile"], profile,
+            "o JSON nomeia o perfil: {parsed}"
+        );
+        // Os caps aparecem como DESIGUALDADE monotônica aqui — o pool do
+        // índice é cortado antes do filtro do `--file` (quirk pré-existente
+        // do packer, fora do escopo do PR40), então o cap exato é provado no
+        // teste unitário `the_profile_caps_govern_the_pack_per_profile`.
+        let code_len = parsed["pack"]["code"]
+            .as_array()
+            .unwrap_or_else(|| panic!("code: {parsed}"))
+            .len();
+        let pages_len = parsed["pack"]["sections"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sections: {parsed}"))
+            .len();
+        let findings_len = parsed["pack"]["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("findings: {parsed}"))
+            .len();
+        per_profile.insert(profile, (code_len, pages_len, findings_len));
+    }
+    // Os três packs são DIFERENTES entre si (perfis distintos ⇒ packs
+    // distintos): mesmo estado, três saídas diferentes.
+    let mut outputs = Vec::new();
+    for profile in ["budget", "balanced", "quality"] {
+        let run = sandbox.run(&[
+            "context",
+            "--file",
+            "item.json",
+            "--json",
+            "--profile",
+            profile,
+        ]);
+        outputs.push(run.1);
+    }
+    assert_ne!(outputs[0], outputs[1], "budget != balanced");
+    assert_ne!(outputs[1], outputs[2], "balanced != quality");
+    assert_ne!(outputs[0], outputs[2], "budget != quality");
+    // D10 na prática: quality ≥ balanced ≥ budget em TODAS as três contagens.
+    let (b, m, q) = (
+        per_profile["budget"],
+        per_profile["balanced"],
+        per_profile["quality"],
+    );
+    assert!(
+        q.0 >= m.0 && m.0 >= b.0 && q.1 >= m.1 && m.1 >= b.1 && q.2 >= m.2 && m.2 >= b.2,
+        "caps monotônicos violados: budget={b:?} balanced={m:?} quality={q:?}"
+    );
+}
+
+/// Aceite (d): sem chave e com `token_profile = "balanced"` explícito ⇒
+/// packs BYTE-IDÊNTICOS — ninguém muda de comportamento sem querer.
+#[test]
+fn the_default_matches_an_explicit_balanced_config_byte_for_byte() {
+    let sandbox = Sandbox::new("default-balanced");
+    write_profile_fixture(&sandbox);
+    let absent = sandbox.run(&["context", "--file", "item.json", "--json"]);
+    assert_eq!(absent.0, 0, "{}", absent.2);
+    let config = sandbox.store.join("balanced.toml");
+    fs::write(&config, "token_profile = \"balanced\"\n")
+        .unwrap_or_else(|err| panic!("escrever config: {err}"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
+    command
+        .args(["context", "--file", "item.json", "--json"])
+        .current_dir(&sandbox.cwd)
+        .env("KIRA_STORE_DIR", &sandbox.store)
+        .env("KIRA_CONFIG", &config)
+        .env("KIRA_SECRET_STORE", "off")
+        .env_remove("KIRA_NUM_CTX");
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("executar: {err}"));
+    assert_eq!(output.status.code().unwrap_or(-1), 0);
+    let explicit = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        absent.1, explicit,
+        "default == balanced explícito, byte a byte"
+    );
+}
+
+/// Aceite (c): perfil inválido ⇒ erro acionável com a lista dos válidos,
+/// vindo do flag OU do config.toml — nunca fallback silencioso.
+#[test]
+fn an_invalid_profile_fails_with_the_actionable_list() {
+    let sandbox = Sandbox::new("profile-invalid");
+    write_profile_fixture(&sandbox);
+    let (code, stdout, stderr) = sandbox.run(&[
+        "context",
+        "--file",
+        "item.json",
+        "--json",
+        "--profile",
+        "esquisito",
+    ]);
+    assert_ne!(code, 0, "perfil inválido não pode passar: {stdout}");
+    assert!(stdout.is_empty(), "sem pack inválido: {stdout}");
+    assert!(stderr.contains("esquisito"), "erro acionável: {stderr}");
+    assert!(
+        stderr.contains("budget, balanced, quality"),
+        "lista dos válidos: {stderr}"
+    );
+    // Via config.toml: mesmo contrato, sem flag.
+    let config = sandbox.store.join("bad.toml");
+    fs::write(&config, "token_profile = \"esquisito\"\n")
+        .unwrap_or_else(|err| panic!("escrever config: {err}"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
+    command
+        .args(["context", "--file", "item.json", "--json"])
+        .current_dir(&sandbox.cwd)
+        .env("KIRA_STORE_DIR", &sandbox.store)
+        .env("KIRA_CONFIG", &config)
+        .env("KIRA_SECRET_STORE", "off")
+        .env_remove("KIRA_NUM_CTX");
+    let output = command
+        .output()
+        .unwrap_or_else(|err| panic!("executar: {err}"));
+    assert_ne!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "config inválido não passa"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("esquisito") && stderr.contains("budget, balanced, quality"),
+        "erro via config: {stderr}"
+    );
+}
+
+/// Raiz temporária do sandbox vira `<ROOT>` e carimbo de escrita da wiki
+/// (`updated_at=...`) vira `<STAMP>` — os dois são dados de MÁQUINA/relógio,
+/// não de pack. Tudo o que sobra é comparado byte a byte.
+fn normalize_golden(output: &str, root: &str) -> String {
+    let mut out = output.replace(root, "<ROOT>");
+    // cursor avança para não re-achar o `updated_at=<STAMP>` que acabou de
+    // entrar: antes, o loop re-findava a própria substituição e o `break`
+    // deixava a 2ª ocorrência crua (bugs/p1 divergia do dourado).
+    let mut cursor = 0;
+    while let Some(rel) = out[cursor..].find("updated_at=") {
+        let start = cursor + rel;
+        let end = start + "updated_at=".len();
+        let rest = &out[end..];
+        let stamp_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '-' || c == ':' || c == 'T' || c == 'Z'))
+            .unwrap_or(rest.len());
+        if stamp_len >= 19 {
+            out.replace_range(start..end + stamp_len, "updated_at=<STAMP>");
+            cursor = start + "updated_at=<STAMP>".len();
+        } else {
+            cursor = end;
+        }
+    }
+    out
+}
+
+/// Os 3 dourados (aceite a): um por perfil, byte a byte. O JSON carrega
+/// caminhos ABSOLUTOS das páginas de wiki (o pack cita `caminho` do disco),
+/// então o dourado é comparado depois de trocar a raiz temporária do sandbox
+/// por `<ROOT>` — a comparação continua byte a byte no resto, e em DUAS
+/// execuções no mesmo sandbox é byte a byte sem normalização (M1 ×3).
+/// `KIRA_UPDATE_CONTEXT_GOLDENS=1` regenera os arquivos (padrão PR6).
+#[test]
+fn the_three_golden_packs_are_reproducible_per_profile() {
+    let sandbox = Sandbox::new("profiles-golden");
+    write_profile_fixture(&sandbox);
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    for profile in ["budget", "balanced", "quality"] {
+        let first = sandbox.run(&[
+            "context",
+            "--file",
+            "item.json",
+            "--json",
+            "--profile",
+            profile,
+        ]);
+        assert_eq!(first.0, 0, "{}: {}", profile, first.2);
+        let second = sandbox.run(&[
+            "context",
+            "--file",
+            "item.json",
+            "--json",
+            "--profile",
+            profile,
+        ]);
+        assert_eq!(first.1, second.1, "mesmo estado ⇒ mesmo pack ({profile})");
+
+        let root = sandbox.cwd.to_string_lossy().replace('\\', "/");
+        // O excerpt da wiki começa no header da página, e o header carrega o
+        // carimbo da ESCRITA (`updated_at=<agora>`) — dado de relógio, não de
+        // pack. Normaliza a raiz temporária e o carimbo; o resto é byte a byte.
+        let normalized = normalize_golden(&first.1, &root);
+        let golden_path = std::path::Path::new(manifest)
+            .join("tests/fixtures/context/profile")
+            .join(format!("{profile}.json"));
+        if std::env::var("KIRA_UPDATE_CONTEXT_GOLDENS").is_ok() {
+            fs::create_dir_all(
+                golden_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+            .unwrap_or_else(|err| panic!("criar fixtures: {err}"));
+            fs::write(&golden_path, &normalized)
+                .unwrap_or_else(|err| panic!("escrever {}: {err}", golden_path.display()));
+            continue;
+        }
+        let golden = fs::read_to_string(&golden_path).unwrap_or_else(|err| {
+            panic!(
+                "ler dourado {}: {err} (gere com KIRA_UPDATE_CONTEXT_GOLDENS=1)",
+                golden_path.display()
+            )
+        });
+        assert_eq!(
+            normalized, golden,
+            "dourado do perfil {profile} divergiu — mudança de comportamento não autorizada"
+        );
+    }
 }

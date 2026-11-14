@@ -40,6 +40,10 @@ const CAUSE_LABEL: &str = "- Causa raiz prevista:";
 const FILES_LABEL: &str = "- Arquivos prováveis:";
 const CONFIDENCE_LABEL: &str = "- Confiança:";
 const BRIEF_LABEL: &str = "- Achados do scan:";
+/// PR40: perfil de token que produziu a conclusão — a identidade do cache de
+/// raciocínio (`triage::cache_serves`). Ausente ⇒ episódio legado (pré-PR40),
+/// que serve em qualquer perfil; presente ⇒ só no match.
+const PROFILE_LABEL: &str = "- Perfil:";
 
 /// Placeholder used when the model answered nothing for a section.
 const EMPTY_FIELD: &str = "—";
@@ -57,6 +61,10 @@ pub struct Episode {
     pub confidence: String,
     /// `kira scan` brief (`high 2, moderate 1`), when a scan file exists.
     pub findings_brief: Option<String>,
+    /// PR40: perfil de token da execução que produziu a conclusão
+    /// (`budget`/`balanced`/`quality`). `None` = episódio legado (a linha não
+    /// existe na página) — o cache o serve em qualquer perfil.
+    pub profile: Option<String>,
 }
 
 /// Where the episode lands (ADR-0013).
@@ -96,6 +104,7 @@ pub fn latest(content: &str) -> Option<Episode> {
         files: block.files,
         confidence: block.confidence,
         findings_brief: (!block.brief.is_empty()).then_some(block.brief),
+        profile: (!block.profile.is_empty()).then_some(block.profile),
     })
 }
 
@@ -134,6 +143,18 @@ impl Episode {
             .filter(|brief| !brief.is_empty() && *brief != "nenhum")
         {
             block.push_str(&format!("- Achados do scan: {}\n", one_line(brief)));
+        }
+        // PR40: a identidade do cache viaja na página — trocar de perfil gera
+        // bloco novo (o dedup de episódio repetido compara as linhas de campo,
+        // e o Perfil muda). Legado (None) não grava a linha: a página antiga
+        // continua byte-idêntica e o cache a serve em qualquer perfil.
+        if let Some(profile) = self
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            block.push_str(&format!("{PROFILE_LABEL} {}\n", one_line(profile)));
         }
         block
     }
@@ -276,6 +297,8 @@ struct EpisodeBlock {
     confidence: String,
     /// Scan brief, flattened to one line (empty when the field is absent).
     brief: String,
+    /// Token profile of the run (PR40; empty when the field is absent).
+    profile: String,
 }
 
 /// Splits the content into episode blocks: a block starts at an episode heading
@@ -295,6 +318,7 @@ fn episode_blocks(lines: &[&str]) -> Vec<EpisodeBlock> {
         let mut files = String::new();
         let mut confidence = String::new();
         let mut brief = String::new();
+        let mut profile = String::new();
         while index < lines.len() {
             let line = lines[index].trim();
             if line.starts_with(EPISODE_HEADING)
@@ -322,6 +346,10 @@ fn episode_blocks(lines: &[&str]) -> Vec<EpisodeBlock> {
                 && let Some(value) = line.strip_prefix(BRIEF_LABEL)
             {
                 brief = one_line(value);
+            } else if profile.is_empty()
+                && let Some(value) = line.strip_prefix(PROFILE_LABEL)
+            {
+                profile = one_line(value);
             }
             index += 1;
         }
@@ -334,6 +362,7 @@ fn episode_blocks(lines: &[&str]) -> Vec<EpisodeBlock> {
             files,
             confidence,
             brief,
+            profile,
         });
     }
     blocks
@@ -414,6 +443,7 @@ mod tests {
             files: "src/auth/session.rs".to_string(),
             confidence: "média".to_string(),
             findings_brief: Some("high 2, moderate 1".to_string()),
+            profile: None,
         }
     }
 
@@ -617,6 +647,7 @@ mod tests {
                 files: "src/legacy.rs".to_string(),
                 confidence: "baixa".to_string(),
                 findings_brief: None,
+                profile: None,
             },
             EpisodeTarget::Wiki,
             "2026-09-01T10:00:00Z",
@@ -724,5 +755,27 @@ mod tests {
         assert_eq!(parsed.files, "", "campo ausente volta vazio");
         assert_eq!(parsed.confidence, "");
         assert!(parsed.findings_brief.is_none());
+        assert!(parsed.profile.is_none(), "sem linha Perfil ⇒ legado");
+    }
+
+    // -----------------------------------------------------------------------
+    // PR40: o perfil gravado no episódio — a identidade do cache de raciocínio.
+    // -----------------------------------------------------------------------
+
+    /// O bloco novo carrega `- Perfil: <p>` e o parse devolve o valor — e um
+    /// episódio sob OUTRO perfil vira bloco novo (o dedup compara as linhas).
+    #[test]
+    fn render_and_parse_carry_the_profile_line() {
+        let mut item = episode("TTL do token");
+        item.profile = Some("quality".to_string());
+        let block = item.render("2026-11-14T12:00:00Z");
+        assert!(block.contains("- Perfil: quality\n"), "{block}");
+        let content = format!("# Bug 4821\n\n{block}");
+        let parsed = latest(&content).unwrap_or_else(|| panic!("deve parsear"));
+        assert_eq!(parsed.profile.as_deref(), Some("quality"), "{parsed:?}");
+        // Perfil ausente não grava linha (legado byte-idêntico ao de hoje).
+        let legacy = episode("TTL do token").render("2026-11-14T12:00:00Z");
+        assert!(!legacy.contains("Perfil"), "legado sem linha: {legacy}");
+        assert!(latest(&format!("# Bug 4821\n\n{legacy}")) == Some(episode("TTL do token")));
     }
 }

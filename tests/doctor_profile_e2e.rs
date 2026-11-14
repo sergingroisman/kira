@@ -105,6 +105,57 @@ impl Sandbox {
     }
 }
 
+/// PR40: o doctor lista o perfil de token ativo — a linha existe nos três
+/// estados (ausente, válida e inválida) e a config nunca é tocada.
+#[test]
+fn doctor_prints_the_token_profile_line_in_every_state() {
+    let sandbox = Sandbox::new("token-profile-line");
+
+    // Sem chave: o default é o que de fato governa o pack — dito na linha.
+    // Sem credenciais o doctor para no passo 1 (exit 1 — semântica do PR20),
+    // mas a linha do perfil de token sai mesmo assim.
+    let (code, out) = sandbox.run(&[], &[]);
+    assert_eq!(code, 1, "sem credenciais o doctor para no passo 1: {out}");
+    assert!(
+        out.contains("perfil de token: — (default balanced)"),
+        "linha do perfil sem chave: {out}"
+    );
+
+    // Chave válida: o valor e a fonte, sem rodeio.
+    fs::write(
+        sandbox.config_path(),
+        "dev_name = \"Tester\"\ntoken_profile = \"quality\"\n",
+    )
+    .unwrap_or_else(|err| panic!("escrever config: {err}"));
+    let (code, out) = sandbox.run(&[], &[]);
+    assert_eq!(code, 1, "sem credenciais o doctor para no passo 1: {out}");
+    assert!(
+        out.contains("perfil de token: quality (config.toml)"),
+        "linha com chave válida: {out}"
+    );
+
+    // Chave inválida: listagem de config não esconde erro — o texto acionável
+    // com a lista dos válidos aparece (nunca fallback silencioso).
+    fs::write(
+        sandbox.config_path(),
+        "dev_name = \"Tester\"\ntoken_profile = \"esquisito\"\n",
+    )
+    .unwrap_or_else(|err| panic!("escrever config: {err}"));
+    let (code, out) = sandbox.run(&[], &[]);
+    assert_eq!(code, 1, "sem credenciais o doctor para no passo 1: {out}");
+    assert!(
+        out.contains("perfil de token") && out.contains("budget, balanced, quality"),
+        "erro acionável na listagem: {out}"
+    );
+
+    // A config sai byte-idêntica: o doctor é read-only (decisão do dono).
+    let bytes = fs::read(sandbox.config_path()).unwrap_or_else(|err| panic!("ler config: {err}"));
+    assert!(
+        bytes.windows(10).any(|w| w == b"esquisito\""),
+        "conteúdo preservado"
+    );
+}
+
 /// O doctor sempre imprime a linha do perfil e NUNCA muda o config.toml.
 /// Metal no macOS, CPU nos demais (com PATH vazio não há nvidia-smi).
 #[test]

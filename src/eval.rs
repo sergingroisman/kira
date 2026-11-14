@@ -401,6 +401,7 @@ pub async fn run(
     base_url: &str,
     model: &str,
     ledger: Option<&crate::store::Store>,
+    profile: crate::context::TokenProfile,
 ) -> Result<(Vec<ItemResult>, GateResult), Error> {
     let pastas = item_dirs(dir)?;
     if pastas.is_empty() {
@@ -417,7 +418,7 @@ pub async fn run(
         {
             return Err(Error::Eval(err.to_string()));
         }
-        itens.push(medir_item(pasta, kind, base_url, model, ledger).await?);
+        itens.push(medir_item(pasta, kind, base_url, model, ledger, profile).await?);
     }
     let resultado_gate = gate(&itens);
     Ok((itens, resultado_gate))
@@ -430,6 +431,7 @@ async fn medir_item(
     base_url: &str,
     model: &str,
     ledger: Option<&crate::store::Store>,
+    profile: crate::context::TokenProfile,
 ) -> Result<ItemResult, Error> {
     let gold = ler_gold(pasta)?;
     let item_path = pasta.join("item.json");
@@ -442,7 +444,7 @@ async fn medir_item(
     // `--eval` com cache on mediria o cache contra si mesmo (hit ⇒ resposta
     // idêntica ao episódio); a contagem de hits na medição fica para quando os
     // 20 rótulos do dono existirem (gate M2).
-    let report = triage::triage_file_llm(kind, base_url, model, &item_path, false, ledger)
+    let report = triage::triage_file_llm(kind, base_url, model, &item_path, false, ledger, profile)
         .await
         .map_err(|err| {
             Error::Eval(format!(

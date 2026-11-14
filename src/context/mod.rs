@@ -18,6 +18,7 @@ use crate::store::Store;
 use crate::wiki::Wiki;
 use crate::work_item::WorkItem;
 
+pub mod caps;
 pub mod dedup;
 pub mod evidence;
 pub mod gitignore;
@@ -26,6 +27,7 @@ pub mod index;
 mod repo;
 pub mod repo_map;
 
+pub use caps::{Caps, TOKEN_PROFILE_VALUES, TokenProfile, resolve as resolve_profile};
 pub use dedup::{DEDUP_MIN_CUT_PCT, omitted_marker};
 pub use evidence::{EvidenceState, state_for_anchor};
 pub use index::{ContextError, IndexStats, reindex};
@@ -40,23 +42,17 @@ pub const CHARS_PER_TOKEN: usize = 3;
 /// Floor for the budget, so a silly `KIRA_NUM_CTX=16` still sends something.
 const MIN_BUDGET_CHARS: usize = 1_500;
 
-/// Hard cap for one excerpt, before the global budget is applied.
-const MAX_EXCERPT_CHARS: usize = 600;
-
-/// How many wiki pages the pack may carry.
-const MAX_PAGES: usize = 3;
+// PR40: os caps que eram consts soltas (`MAX_EXCERPT_CHARS=600`,
+// `MAX_PAGES=3`, `MAX_CODE_EXCERPTS=8`, `MAX_FINDING_LINES=3`) agora são o
+// perfil `balanced` (default) em [`caps::Caps`] — um `token_profile` coordena
+// teto e caps de pack sem mudar o comportamento. `MAX_SKILLS`/`MAX_KNOWLEDGE`
+// ficam consts: o escopo do PR40 (D10) não cobre cartas nem conhecimento.
 
 /// How many skills the pack may carry (SK-3).
 const MAX_SKILLS: usize = 3;
 
 /// How many owner-knowledge excerpts the pack may carry (SK-3).
 const MAX_KNOWLEDGE: usize = 3;
-
-/// How many repository excerpts the pack may carry (PR5).
-const MAX_CODE_EXCERPTS: usize = 8;
-
-/// How many individual findings are spelled out in the prompt.
-const MAX_FINDING_LINES: usize = 3;
 
 /// Shortest keyword worth searching (drops "de", "erro", "não").
 const MIN_KEYWORD_CHARS: usize = 5;
@@ -378,6 +374,9 @@ pub struct ContextReport<'a> {
     /// Where the repository excerpts came from (`index`/`grep`) — o mesmo
     /// valor do header do pack (PR34).
     pub repo_source: RepoSource,
+    /// PR40: o perfil que governou os caps — o `--json` nomeia o perfil para
+    /// o dourado e a auditoria saberem com qual parâmetro o pack nasceu.
+    pub token_profile: &'static str,
     /// The pack that would reach the prompt.
     pub pack: &'a ContextPack,
 }
@@ -471,14 +470,21 @@ pub fn context_summary(pack: &ContextPack) -> String {
     )
 }
 
-/// `kira context --json`: the serializable report (pretty-printed).
-pub fn report_json(pack: &ContextPack, item_id: i32) -> Result<String, serde_json::Error> {
+/// `kira context --json`: the serializable report (pretty-printed). `profile`
+/// (PR40) é o que governou os caps do pack nesta execução — nomeado no JSON
+/// para o dourado e a auditoria saberem com qual parâmetro ele nasceu.
+pub fn report_json(
+    pack: &ContextPack,
+    item_id: i32,
+    profile: caps::TokenProfile,
+) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&ContextReport {
         item_id,
         tokens_estimate: pack.used_chars / CHARS_PER_TOKEN,
         chars_per_token: CHARS_PER_TOKEN,
         budget_chars: pack.budget_chars,
         repo_source: pack.repo_source,
+        token_profile: profile.as_str(),
         pack,
     })
 }
@@ -522,6 +528,7 @@ pub fn pack_with(
     wiki: &Wiki,
     item: &WorkItem,
     budget_chars: usize,
+    caps: Caps,
 ) -> ContextPack {
     pack_partial(
         root,
@@ -531,6 +538,7 @@ pub fn pack_with(
         budget_chars,
         &[],
         crate::knowledge::dir().as_deref(),
+        caps,
     )
 }
 
@@ -546,7 +554,10 @@ pub fn pack_with(
 /// work item file): grepping them again would only duplicate the prompt.
 /// `knowledge_dir` is `<store_dir>/knowledge/` — it only feeds the path/age of
 /// the knowledge excerpts; retrieval itself just needs the store (SK-2 index).
+/// `caps` is the token profile's packer caps (PR40): same profile ⇒ same caps
+/// ⇒ same pack.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // PR40: caps/ledger atravessam a borda; estilo do repo (setup.rs, store)
 pub fn pack_partial(
     root: &Path,
     store: Option<&Store>,
@@ -555,6 +566,7 @@ pub fn pack_partial(
     budget_chars: usize,
     skip_paths: &[String],
     knowledge_dir: Option<&Path>,
+    caps: Caps,
 ) -> ContextPack {
     let mut pack = ContextPack {
         budget_chars,
@@ -569,7 +581,7 @@ pub fn pack_partial(
         let line = format!("- findings do último `kira scan`: {brief}\n");
         pack.used_chars += line.chars().count();
         pack.findings_brief = Some(brief);
-        for entry in ranked_findings(findings, MAX_FINDING_LINES) {
+        for entry in ranked_findings(findings, caps.finding_lines) {
             let cost = entry.chars().count() + 12;
             if pack.used_chars + cost > budget_chars {
                 pack.notes.push(format!(
@@ -692,7 +704,7 @@ pub fn pack_partial(
         let mut scored: Vec<(usize, String)> = Vec::new();
         let mut search_failed = false;
         for term in &terms {
-            match wiki.search(store, term, MAX_PAGES * 2) {
+            match wiki.search(store, term, caps.pages * 2) {
                 Ok(hits) => {
                     for hit in hits {
                         match scored.iter_mut().find(|(_, page)| *page == hit.slug) {
@@ -712,11 +724,11 @@ pub fn pack_partial(
             // Stable: more matches first, then page id, so the pack is
             // reproducible.
             scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            for (_, page) in scored.into_iter().take(MAX_PAGES) {
+            for (_, page) in scored.into_iter().take(caps.pages) {
                 let Ok(Some(content)) = wiki.read(&page) else {
                     continue;
                 };
-                let excerpt = excerpt_around(&content, &terms, MAX_EXCERPT_CHARS);
+                let excerpt = excerpt_around(&content, &terms, caps.excerpt_chars);
                 if excerpt.is_empty() {
                     continue;
                 }
@@ -768,7 +780,7 @@ pub fn pack_partial(
             &project_id,
             &terms,
             &priority,
-            MAX_CODE_EXCERPTS,
+            caps.code_excerpts,
         );
         if indexed.files_scanned > 0 {
             repo_source = RepoSource::Index;
@@ -784,7 +796,7 @@ pub fn pack_partial(
         }
     }
     if repo_source == RepoSource::Grep {
-        grep = repo::grep(root, &terms, &priority, skip_paths, MAX_CODE_EXCERPTS);
+        grep = repo::grep(root, &terms, &priority, skip_paths, caps.code_excerpts);
     }
     pack.repo_source = repo_source;
     // PR36: a tag de evidência é calculada AQUI — o único ponto que conhece
@@ -817,16 +829,18 @@ pub fn pack_partial(
     pack
 }
 
-/// Production entry point: opens what it needs and degrades to an empty pack.
-#[must_use]
-pub fn pack(root: &Path, item: &WorkItem) -> ContextPack {
-    pack_excluding(root, item, None)
-}
-
 /// Production entry point that also refuses to grep `exclude` — the work item
-/// file the caller already placed whole in the prompt (PR5).
+/// file the caller already placed whole in the prompt (PR5). `caps` comes from
+/// the resolved [`TokenProfile`] (PR40): the command layer resolves the profile
+/// BEFORE calling this, so an invalid value fails there with the actionable
+/// error and this function never guesses.
 #[must_use]
-pub fn pack_excluding(root: &Path, item: &WorkItem, exclude: Option<&Path>) -> ContextPack {
+pub fn pack_excluding(
+    root: &Path,
+    item: &WorkItem,
+    exclude: Option<&Path>,
+    caps: Caps,
+) -> ContextPack {
     let budget = budget_chars();
     let store = Store::open_default();
     let wiki = Wiki::open(root);
@@ -872,6 +886,7 @@ pub fn pack_excluding(root: &Path, item: &WorkItem, exclude: Option<&Path>) -> C
         budget,
         &skip,
         knowledge_dir.as_deref(),
+        caps,
     );
     source_notes.append(&mut pack.notes);
     pack.notes = source_notes;
@@ -1249,6 +1264,7 @@ mod tests {
             &wiki,
             &item_with("Sessão expirada", "token inválido no refresh"),
             8000,
+            Caps::default(),
         );
         assert_eq!(pack.sections.len(), 1, "notas: {:?}", pack.notes);
         assert_eq!(pack.sections[0].page, "bugs/4821-sessao-expirada");
@@ -1276,7 +1292,14 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
         wiki.reindex(&store).unwrap_or_else(|err| panic!("{err}"));
 
-        let pack = pack_with(&dir, &store, &wiki, &item_with("token problema", ""), 10);
+        let pack = pack_with(
+            &dir,
+            &store,
+            &wiki,
+            &item_with("token problema", ""),
+            10,
+            Caps::default(),
+        );
         assert!(
             pack.sections.is_empty(),
             "orçamento minúsculo não carrega página"
@@ -1300,6 +1323,7 @@ mod tests {
             &wiki,
             &item_with("Sessão expirada", "token"),
             8000,
+            Caps::default(),
         );
         assert!(pack.is_empty(), "notas: {:?}", pack.notes);
         assert!(pack.render().is_empty());
@@ -1364,6 +1388,7 @@ mod tests {
                 "token inválido no refresh do session_ttl",
             ),
             12_000,
+            Caps::default(),
         );
 
         assert_eq!(pack.findings_brief.as_deref(), Some("critical 1, high 1"));
@@ -1408,8 +1433,8 @@ mod tests {
         write_file(&dir, "src/b.ts", "const token = sessionToken;\n");
         let item = item_with("Sessão expirada", "token inválido");
 
-        let first = pack_with(&dir, &store, &wiki, &item, 12_000);
-        let second = pack_with(&dir, &store, &wiki, &item, 12_000);
+        let first = pack_with(&dir, &store, &wiki, &item, 12_000, Caps::default());
+        let second = pack_with(&dir, &store, &wiki, &item, 12_000, Caps::default());
         assert_eq!(first, second);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1427,6 +1452,7 @@ mod tests {
             12_000,
             &[],
             None,
+            Caps::default(),
         );
         assert!(pack.sections.is_empty());
         assert!(!pack.code.is_empty(), "notas: {:?}", pack.notes);
@@ -1455,6 +1481,7 @@ mod tests {
             &wiki,
             &item_with("Sessão expirada", "token inválido"),
             130,
+            Caps::default(),
         );
         assert!(pack.findings_brief.is_some());
         assert!(!pack.findings.is_empty(), "notas: {:?}", pack.notes);
@@ -1486,7 +1513,7 @@ mod tests {
         );
         let item = item_with("Sessão expirada", "token inválido no cooldown");
 
-        let without_index = pack_with(&dir, &store, &wiki, &item, 12_000);
+        let without_index = pack_with(&dir, &store, &wiki, &item, 12_000, Caps::default());
         assert_eq!(
             without_index.repo_source,
             RepoSource::Grep,
@@ -1498,7 +1525,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("project id: {err}"));
         index::reindex(&dir, &store, &project_id).unwrap_or_else(|err| panic!("{err}"));
 
-        let with_index = pack_with(&dir, &store, &wiki, &item, 12_000);
+        let with_index = pack_with(&dir, &store, &wiki, &item, 12_000, Caps::default());
         assert_eq!(with_index.repo_source, RepoSource::Index);
         assert!(!with_index.code.is_empty(), "notas: {:?}", with_index.notes);
         assert!(
@@ -1552,6 +1579,7 @@ mod tests {
             &wiki,
             &item_with("Sessão expirada", "o check_token falhou no refresh"),
             12_000,
+            Caps::default(),
         );
         assert_eq!(pack.repo_source, RepoSource::Grep, "{:?}", pack.notes);
         assert!(
@@ -1598,6 +1626,7 @@ mod tests {
             &wiki,
             &item_with("Sessão expirada", "token inválido"),
             12_000,
+            Caps::default(),
         );
         assert_eq!(pack.repo_source, RepoSource::Index, "{:?}", pack.notes);
         assert!(
@@ -1627,8 +1656,10 @@ mod tests {
             &wiki,
             &item_with("Sessão expirada", "token inválido"),
             12_000,
+            Caps::default(),
         );
-        let json = report_json(&pack, 4821).unwrap_or_else(|err| panic!("{err}"));
+        let json =
+            report_json(&pack, 4821, TokenProfile::Balanced).unwrap_or_else(|err| panic!("{err}"));
         assert!(json.contains("\"repo_source\": \"index\""), "{json}");
         assert!(json.contains("\"item_id\": 4821"), "{json}");
         assert!(json.contains("\"chars_per_token\": 3"), "{json}");
@@ -1715,6 +1746,7 @@ mod tests {
             12_000,
             &[],
             Some(&knowledge_dir),
+            Caps::default(),
         );
 
         assert_eq!(pack.findings_brief.as_deref(), Some("critical 1, high 1"));
@@ -1784,6 +1816,7 @@ mod tests {
             12_000,
             &[],
             Some(&knowledge_dir),
+            Caps::default(),
         );
         assert_eq!(pack, second, "determinismo com skills/knowledge");
         let _ = fs::remove_dir_all(&dir);
@@ -1828,6 +1861,7 @@ mod tests {
             130,
             &[],
             Some(&knowledge_dir),
+            Caps::default(),
         );
         assert!(pack.findings_brief.is_some(), "brief sobrevive sempre");
         assert!(
@@ -1841,6 +1875,91 @@ mod tests {
             pack.notes.iter().any(|note| note.contains("orçamento")),
             "corte explicado: {:?}",
             pack.notes
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR40 — token_profile: os caps do perfil governam o pack (D10).
+    // -----------------------------------------------------------------------
+
+    /// Aceite (a) do PR40, nos CAPS exatos: com fontes suficientes e NENHUM
+    /// `--file` a excluir (o pool do índice é cortado antes do filtro do
+    /// `--file`, então aqui a contagem fecha no cap), cada perfil entrega
+    /// exatamente `{code_excerpts, pages, finding_lines}` — e dois packs do
+    /// MESMO perfil são byte-idênticos (determinismo M1 por perfil).
+    #[test]
+    fn the_profile_caps_govern_the_pack_per_profile() {
+        let dir = temp_project("caps-profile");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        // 4 findings com severidades distintas: budget mostra 2, balanced 3,
+        // quality 4 (ranking já coloca as piores primeiro).
+        write_findings(&dir, FINDINGS_HIGH);
+        write_findings(
+            &dir,
+            r#"{"findings":[
+{"tool":"dotnet","rule":"vulnerable","package":"Pkg.One","version":"1.0.0","severity":"critical","path":"src/mod_00.rs","message":"advisory","fingerprint":"0000000000000001"},
+{"tool":"dotnet","rule":"vulnerable","package":"Pkg.Two","version":"2.0.0","severity":"high","path":"src/mod_01.rs","message":"advisory","fingerprint":"0000000000000002"},
+{"tool":"dotnet","rule":"vulnerable","package":"Pkg.Three","version":"3.0.0","severity":"moderate","path":"src/mod_02.rs","message":"advisory","fingerprint":"0000000000000003"},
+{"tool":"audit","rule":"vulnerable","package":"Pkg.Four","version":"4.0.0","severity":"low","path":"src/mod_03.rs","message":"advisory","fingerprint":"0000000000000004"}],"stacks":[]}"#,
+        );
+        // 13 arquivos com o termo: os caps de trecho fecham em 4/8/12.
+        for n in 0..13 {
+            write_file(
+                &dir,
+                &format!("src/mod_{n:02}.rs"),
+                &format!("pub fn cooldown() {{ {n} }}\n"),
+            );
+        }
+        // 5 páginas de wiki com conteúdo longo: os caps de páginas fecham em
+        // 2/3/4 e o cap de chars do excerpt aparece no tamanho (400/600/800).
+        for n in 0..5 {
+            wiki.write(
+                &format!("bugs/p{n}"),
+                "# Cooldown do reprocesso\n a fila do reprocesso nunca recomeça depois do erro, o cooldown expirou e o reprocesso de cada item depende do cooldown anterior, sem o recomeço do cooldown o reprocesso para e a fila cresce até o cooldown voltar, o reprocesso recomeça tarde e a fila inteira atrasa o dia, o cooldown longo atrasa o reprocesso e o reprocesso em lote quebra quando o cooldown da fila não recomeça, o cooldown expira e o reprocesso recomeça só no dia seguinte, a fila de reprocesso empacada tem cooldown sem recomeço e isso é o defeito do reprocesso\n",
+            )
+            .unwrap_or_else(|err| panic!("{err}"));
+        }
+        wiki.reindex(&store).unwrap_or_else(|err| panic!("{err}"));
+        let item = item_with(
+            "Sessão expirada",
+            "token inválido no cooldown do reprocesso",
+        );
+
+        let expected = [
+            (TokenProfile::Budget, (4usize, 2usize, 2usize)),
+            (TokenProfile::Balanced, (8, 3, 3)),
+            (TokenProfile::Quality, (12, 4, 4)),
+        ];
+        for (profile, (excerpts, pages, lines)) in expected {
+            let pack = pack_with(&dir, &store, &wiki, &item, 30_000, profile.caps());
+            assert_eq!(
+                (pack.code.len(), pack.sections.len(), pack.findings.len()),
+                (excerpts, pages, lines),
+                "caps do perfil {}: {:?}",
+                profile.as_str(),
+                pack
+            );
+            // Determinismo por perfil: duas montagens ⇒ mesmo pack.
+            let again = pack_with(&dir, &store, &wiki, &item, 30_000, profile.caps());
+            assert_eq!(pack, again, "determinismo do perfil {}", profile.as_str());
+        }
+        // O teto do orçamento segue KIRA_NUM_CTX (`budget_chars`), não o
+        // perfil — o pack nunca passa do teto em nenhum dos três.
+        let tiniest = pack_with(
+            &dir,
+            &store,
+            &wiki,
+            &item,
+            130,
+            TokenProfile::Quality.caps(),
+        );
+        assert!(
+            tiniest.used_chars <= 130,
+            "perfil quality NÃO é teto maior: {}",
+            tiniest.used_chars
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1875,6 +1994,7 @@ mod tests {
             12_000,
             &[],
             Some(&knowledge_dir),
+            Caps::default(),
         );
         assert_eq!(
             pack.knowledge.len(),
