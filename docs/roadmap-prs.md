@@ -155,7 +155,7 @@ Ordem: PR34 → PR35 → PR36/37 → PR38/39/40 → PR41 → PR42 (43 é W6).
 |---|---|---|
 | PR34 | Ledger de economia (pack vs teto, chamadas, pack ocioso; schema **v13** — o plano base dizia v4, renumerado porque `llm_calls` v9 e `model_admission` v12 entraram antes) — **PR #115**, mergeado 14/Nov | ✅ entregue |
 | PR35 | Cache de raciocínio — wiki-hit ≥0.50 = causa sem LLM, `cache-wiki`, `--no-cache`; hit **não grava episódio** (D1) | ✅ entregue (PR, 14/Nov) — mede só com os 20 rótulos (bloqueio B1) |
-| PR36 | Evidência em 3 estados (tag por arquivo, prompt v3) — `CONFIRMADA`/`INFERIDA`/`AUSENTE` calculadas em Rust no packer (`context::evidence`), prompt v3 manda preservar; hash + dourados no mesmo PR | ✅ entregue (PR, 14/Nov) — desvio do plano base: o packer passou a marcar trechos (o dono pediu determinismo antes do prompt; D4 default `(observado)` foi substituído pelos rótulos do item) |
+| PR36 | Evidência em 3 estados (tag por arquivo, prompt v3) — `CONFIRMADA`/`INFERIDA`/`AUSENTE` calculadas em Rust no packer (`context::evidence`), prompt v3 manda preservar; hash + dourados no mesmo PR | ✅ entregue (**PR #117**, mergeado 14/Nov) — desvio do plano base: o packer passou a marcar trechos (o dono pediu determinismo antes do prompt; D4 default `(observado)` foi substituído pelos rótulos do item) |
 | PR37 | Digest bruto `.kira/raw/` (512 KiB, redigido) + `.kira/` fora do git + BOM-sniff | fila |
 | PR38 | Dedup contíguo nos trechos (barra ≥20% por estratégia) | fila |
 | PR39 | Repo map determinístico no brief (≤20 arquivos/≤600 chars) | fila |

@@ -224,8 +224,8 @@ Rótulos do dono em `tests/fixtures/triage_gold/` (20 itens) validam a métrica
 
 ## 6. PR36 — Evidência em 3 estados (observado/inferido/desconhecido)
 
-> **Executada (14/Nov — branch `feat/te-pr36-evidence-states`, PR registrada no
-> roadmap):** os
+> **Executada (14/Nov — **PR #117**, mergeado; branch
+> `feat/te-pr36-evidence-states`):** os
 > três estados entraram como **`CONFIRMADA`/`INFERIDA`/`AUSENTE`** (rótulos do
 > item na execução, não o default `(observado)`/`(inferido)` de D4 — o cron do
 > dono pediu determinismo ANTES do prompt). **Desvio do escopo fechado acima,
