@@ -316,6 +316,15 @@ enum Command {
         #[command(subcommand)]
         action: ModelAction,
     },
+    /// Textos do dono em `<store_dir>/knowledge/*.md` (onda SK, SK-2): a
+    /// fonte é o markdown no disco; o índice FTS5 no store é derivado
+    #[command(
+        after_help = "Exemplos:\n  kira knowledge list                # o que está indexado (fonte: *.md no disco)\n  kira knowledge search \"pbm\"        # top-k no índice (rode reindex antes)\n  kira knowledge reindex             # reconstrói o índice derivado do zero\n\nO diretório é seu: o KIRA nunca escreve nele — só lê os *.md"
+    )]
+    Knowledge {
+        #[command(subcommand)]
+        action: KnowledgeAction,
+    },
     /// Ciclo local do KIRA (PR15): um tick = ingest → digest (se trusted) →
     /// publish. Tudo LOCAL — nunca escreve no mundo (Azure/git remoto); sem
     /// daemon: roda em primeiro plano e sai. `--once` = um tick (CI)
@@ -371,6 +380,23 @@ enum SkillsAction {
         limit: Option<usize>,
     },
     /// Reconstrói o índice derivado `skill`/`skill_fts`
+    Reindex,
+}
+
+/// Ações do `kira knowledge` (onda SK, SK-2).
+#[derive(Debug, Subcommand)]
+enum KnowledgeAction {
+    /// Lista os documentos indexados (fonte: `*.md` no disco do dono)
+    List,
+    /// Busca top-k no índice derivado
+    Search {
+        /// Termos da busca (frase única citada no FTS5)
+        query: String,
+        /// Quantos resultados no máximo (default 5)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Reconstrói o índice derivado `knowledge`/`knowledge_fts` do zero
     Reindex,
 }
 
@@ -600,6 +626,7 @@ async fn run(command: Command) -> Outcome {
         Command::Pr { action } => pr_command(action),
         Command::Connect { provider, yes } => connect_command(&provider, yes).await,
         Command::Skills { action, path } => skills_command(action, path.as_deref()),
+        Command::Knowledge { action } => knowledge_command(action),
         Command::Model { action } => match action {
             ModelAction::List => model_list_command(),
             ModelAction::Pull { repo, yes } => model_pull_command(repo.as_str(), yes),
@@ -1067,6 +1094,18 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             };
             ("skills".to_string(), args, None)
         }
+        Command::Knowledge { action } => match action {
+            KnowledgeAction::List => ("knowledge".to_string(), "list".to_string(), None),
+            KnowledgeAction::Search { query, limit } => (
+                "knowledge".to_string(),
+                match limit {
+                    Some(limit) => format!("search {query} --limit {limit}"),
+                    None => format!("search {query}"),
+                },
+                None,
+            ),
+            KnowledgeAction::Reindex => ("knowledge".to_string(), "reindex".to_string(), None),
+        },
         Command::Model { action } => match action {
             ModelAction::List => ("model".to_string(), "list".to_string(), None),
             ModelAction::Pull { repo, yes } => (
@@ -1491,6 +1530,68 @@ fn reindex_skills(root: &Path) -> Result<usize, kira::skills::SkillError> {
     let project_id = store::project_id_for_root(root)
         .map_err(|err| kira::skills::SkillError::Store(err.to_string()))?;
     kira::skills::reindex(root, &store, &project_id)
+}
+
+/// `kira knowledge` (onda SK, SK-2): textos do dono.
+///
+/// `list` lê o disco — leitura livre, e diretório vazio/ausente devolve a
+/// dica acionável, não erro. `search`/`reindex` usam o índice derivado no
+/// store (fail-open: sem FTS5 a busca degrada para LIKE dentro do store).
+/// NUNCA escreve no diretório do dono: é só leitura.
+fn knowledge_command(action: KnowledgeAction) -> Outcome {
+    match action {
+        KnowledgeAction::List => {
+            let text = kira::knowledge::list();
+            print!("{text}");
+            Outcome::success(text)
+        }
+        KnowledgeAction::Search { query, limit } => {
+            let store = match Store::open_default() {
+                Ok(store) => store,
+                Err(err) => {
+                    print_error(&err);
+                    return Outcome::failure(err.to_string());
+                }
+            };
+            match kira::knowledge::search(&store, &query, limit.unwrap_or(5)) {
+                Ok(hits) => {
+                    let text = kira::knowledge::render_hits(&hits);
+                    if text.is_empty() {
+                        println!(
+                            "nenhum conhecimento casou `{query}` — rode `kira knowledge reindex` se acabou de adicionar texto em knowledge/"
+                        );
+                    } else {
+                        print!("{text}");
+                    }
+                    Outcome::success(text)
+                }
+                Err(err) => {
+                    print_error(&err);
+                    Outcome::failure(err.to_string())
+                }
+            }
+        }
+        KnowledgeAction::Reindex => {
+            let store = match Store::open_default() {
+                Ok(store) => store,
+                Err(err) => {
+                    print_error(&err);
+                    return Outcome::failure(err.to_string());
+                }
+            };
+            match kira::knowledge::reindex(&store) {
+                Ok(count) => {
+                    let text = format!("índice de conhecimento: {count} documento(s)\n");
+                    print!("{text}");
+                    Outcome::success(text)
+                }
+                Err(err) => {
+                    print_error(&err);
+                    Outcome::failure(err.to_string())
+                }
+            }
+        }
+    }
 }
 
 /// `kira model list` (HF-2, ADR-0040): catálogo local via ollama — leitura

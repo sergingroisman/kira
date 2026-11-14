@@ -19,6 +19,7 @@ pub mod format;
 pub mod guard;
 pub mod html;
 pub mod ingest;
+pub mod knowledge;
 pub mod llm;
 pub mod r#loop;
 pub mod model;

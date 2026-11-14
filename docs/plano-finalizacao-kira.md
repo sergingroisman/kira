@@ -193,7 +193,8 @@ Brain, gold antes de declarar autonomia.
 - **SK** (onda em andamento): skills bundled + `.kira/skills/` com frontmatter
   (trigger/anti-trigger, semver, autor — formato do agent-skills reimplementado) +
   **trigger evals** no aceite ✅ **SK-1 entregue (13/Nov)**; `~/.config/kira/knowledge/`
-  para os textos do dono (`knowledge_fts`) — **SK-2 pendente**; prioridade do pack
+  para os textos do dono (`knowledge_fts`) — ✅ **SK-2 entregue (14/Nov, PR #109)**;
+  prioridade do pack
   `brief → findings → skills → knowledge → wiki → repo` — **SK-3 pendente**;
   **caveman** entra como compressão do que já foi recuperado (camada
   complementar, ADR-0038); **rtk** fica como referência de engenharia de
