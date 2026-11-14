@@ -52,7 +52,7 @@ virar verdade.
 |---|---|---|---|---|
 | F1 | **Allowlist de LLM desatualizada no AGENTS.md**: o contrato diz "só `triage.rs`, `loop/`, `wiki/`"; o teste permite `triage.rs`, `eval.rs`, `setup.rs` + prefixos `llm/`, `loop/`, `post/` (e `wiki/` ainda *não* entrou) | `AGENTS.md` (seção IA) vs `tests/llm_allowlist.rs:28-34` | média (doc mente sobre o código) | corrigir o AGENTS.md para a lista real do teste |
 | F2 | **Budget sem contador**: mandato/AGENTS prometem `max_llm_calls_per_day = 50` checado antes de transições; `src/config.rs` só tem `KIRA_NUM_CTX`; não há tabela/coluna de chamadas | `src/config.rs:1-33`; `src/tui/widgets/gauge.rs:12-13` admite honestamente | **alta** (autonomia depende disso) | PR novo: tabela `llm_calls` + cheque no `digest`/`triage` + linha no doctor/dashboard |
-| F3 | **Jornadas promete parse que não existe**: "parse tolerante (BOM/UTF-16)" | `docs/kira-jornadas.md:94`; M7 aberto no `BUILD-PROGRAM.md:194-198` | média (promessa de produto) | M7 ou remover a promessa (M8 manda remover) |
+| F3 | ✅ **resolvido (13/Nov, M7/IG)**: parse tolerante existe — `src/scan/decode.rs` (UTF-8/UTF-16 LE+BE com BOM) nos call sites de `node.rs`/`dotnet.rs` + fixture `scan_npm_audit_utf16le.json` parseando pelo extrator real; a promessa das jornadas foi atualizada | `docs/kira-jornadas.md:94`; M7 aberto no `BUILD-PROGRAM.md:194-198` | média (promessa de produto) | M7 ou remover a promessa (M8 manda remover) |
 | F4 | Nomenclatura: `kira-brain.md` ainda usa `postage_until` (canônico: `draft_ttl`) | `docs/kira-brain.md:67` | baixa | edição de 1 linha |
 | F5 | Docs históricos usam `Orchestrator` (canônico: `Hermes`) — aceitável como registro; mas docs *vivos* (BUILD-PROGRAM, campo Decisores dos ADRs) ainda não migraram | `docs/nomenclatura.md:57`; `BUILD-PROGRAM.md`, `kira-mandato.md:1` | baixa | varredura nos docs vivos |
 | F6 | README **atualizado** pós-rename (`kira publish`, `.kira/facts.md`) | `README.md:28,31` | — | nenhum |
@@ -144,7 +144,7 @@ engenharia de skill/prompt (`docs/rtk-gsd-rea-openclaude-vale-trazer.md`).
 
 | # | Item | Por que nesta posição | Aceite |
 |---|---|---|---|
-| P0 | **contador de chamadas LLM** (`llm_calls` + cheque no digest/triage + doctor/dashboard) | F2: autonomia e observabilidade dependem dele; é pequeno | 51ª chamada do dia recusa com mensagem acionável; dashboard mostra `chamadas hoje: N/50` |
+| P0 | ✅ **implementado (13/Nov, `feat/p0-llm-call-counter`)**: tabela `llm_calls` (schema v9) + ledger dentro do `triage_item` (cobre id/`--file`/`--eval`) + teto checado antes de cada claim no `digest` + linha `chamadas LLM hoje: N/50` no doctor; teto por `KIRA_MAX_LLM_CALLS_PER_DAY` > `max_llm_calls_per_day` (config) > 50. E2e: 2ª chamada com teto 1 falha acionável; digest para antes do claim com nota. **Falta só o dashboard** (`chamadas hoje: N/50` no gauge — PR17 segue para política 429/stale) | F2: autonomia e observabilidade dependem dele; é pequeno | 51ª chamada do dia recusa com mensagem acionável; dashboard mostra `chamadas hoje: N/50` |
 | P1 | **scan paralelo** (dotnet + audit) | 1º multithread, ganho medido, risco baixo | wall-time do scan cai; findings byte-idênticos (ordem por fingerprint) |
 | P2 | **PR15 `kira loop`** (turno do binário) | coração mínimo sobre a fila que já existe | 2 ciclos seguidos = estado idêntico no store |
 | P3 | **PR16-18** (agenda, budget no ciclo, approve) | autonomia com guarda | escrita sem approve é impossível por construção |

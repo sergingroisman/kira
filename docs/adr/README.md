@@ -49,6 +49,8 @@
 | **0036** | **Camada visual do TUI: nativo do ratatui primeiro, dependência depois** | **implementado** — aguarda aceite do dono | `ADR-0036-tui-visual-nativo-sem-dependencia.md` |
 | **0037** | **Resumo em cartões: chip vem da trilha, spinner só com filho vivo** | **proposto** — aguarda aval do dono | `ADR-0037-resumo-em-cartoes.md` |
 | **0038** | **Ingestão, digestão e emissão: do repositório ao post** (denylist multi-stack, `post`/`outbox`/`turn`/`phase`, idioma por instalação, Ollama primeiro) | **proposto** — decisões do dono 12–13/Nov, aguarda selo | `ADR-0038-ingestao-digestao-emissao.md` |
+| **0039** | **Nomenclatura canônica (um nome por conceito)** — linha adicionada retroativamente; o arquivo existia desde o merge sem registro aqui | **aceito** (13/Nov/2026, decisões do dono) | `ADR-0039-nomenclatura.md` |
+| **0040** | **Hugging Face é CATÁLOGO de GGUF via Ollama, nunca runtime de inferência** (sem candle/llama-cpp/hf-hub no binário; consentimento+disco no pull; gate de admissão com piso Q4_K_M) | **proposto** — aguarda aceite do dono | `ADR-0040-hugging-face-catalogo-gguf.md` |
 
 ## O que **não** é ADR aqui
 

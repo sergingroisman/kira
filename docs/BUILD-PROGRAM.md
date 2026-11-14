@@ -137,12 +137,23 @@
       sempre pelo caminho resolvido, zero parse de mensagem localizada.
 
 ### F2 — agente vivo (W5) — pedido explícito do dono
-- [ ] **PR15** `kira loop`: modo do binário (sem daemon), ciclos com estado no
+- [x] **PR15** `kira loop`: modo do binário (sem daemon), ciclos com estado no
       SQLite; teste de 2 ciclos idênticos = nada a fazer (anti PR inócuo).
+      *Entregue (13/Nov): `src/loop/` — tick = ingest → digest (só se trusted)
+      → publish, tudo local; `--once` (CI), `--ticks`, `--skip-digest`,
+      `--skip-scan`; driver roda até o ponto fixo ("estável: nada a fazer");
+      `TickReport::changed()` puro (facts mudaram / post novo / publicação
+      nova; cache e failed NÃO contam). E2e prova o D2: 2º tick deixa facts,
+      drafts, wiki e a fila `posts` byte-idênticos (a trilha de sessões cresce
+      de propósito — é auditoria, não estado do ciclo). Sem trust o digest é
+      pulado com nota acionável, ciclo segue exit 0.*
 - [ ] **PR16** modo agendado + `kira schedule add|list|rm` (CLI) e criação de
       agendamento pela TUI, com opt-in e aviso de que só roda com o KIRA vivo.
 - [ ] **PR17** budget `max_llm_calls_per_day = 50` + política de falha:
       stale-ok, 429 → 5 min de silêncio, cache atômico.
+      *Contador+enforcement já entregues no P0 (`llm_calls` v9, teto
+      checado antes de cada chamada, linha no doctor); falta a política
+      de quota/stale e o gauge do dashboard.*
 - [ ] **PR18** `kira approve <id>` + `awaiting_approval` no ciclo (guarda da
       autonomia) — **pré-requisito de qualquer escrita autônoma**.
 - [ ] **PR19** `kira audit --weekly` (sem blog).
@@ -191,11 +202,16 @@
   `Enter = ingerir / n = pular`; efeito todo em `setup::run` (ADR-0034). `--skip` aceita
   `pat|ia|ingest`; resumo troca o próximo passo de `kira scan` para `kira connect azure`.
   **Aceite:** `setup_e2e` com `--yes` (digest criado) e `--skip ingest` (nada criado).
-- [ ] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
+- [x] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
   com UTF-8/UTF-16 LE/BE nos call sites de `node.rs`/`dotnet.rs` + fixture) e **P5 `.gitignore`**
   (`src/context/gitignore.rs`, subset gitwildmatch, aninhado, sem dependência).
   **Aceite:** fixture BOM parseia; `.gitignore` aninhado com negação honrado no índice e no grep;
   repo sem `.gitignore` inalterado.
+  *Entregue (13/Nov, onda IG): decode nos dois call sites + fixture
+  `scan_npm_audit_utf16le.json` parseando pelo extrator real do npm; matcher
+  gitwildmatch subset (negação, ancoragem, dir-only, `**`, ancestral excluído
+  não re-incluível) honrado no `reindex` e no `grep`; 18 testes novos
+  (6 decode + 12 matcher) + 2 de integração.*
 - [ ] **M8** docs da onda M: `docs/ux-setup-jornada.md` (trilha real de 5 etapas),
   `docs/kira-jornadas.md` (remover a promessa de "parse tolerante BOM/UTF-16" até M7;
   registrar ingest/digest/emit/trust), `docs/gitingest-vale-trazer.md` (P1/P3/P4/P5),

@@ -160,7 +160,14 @@ pub fn run(options: &PublishOptions) -> Result<PublishReport, PublishError> {
 
         match outcome {
             PublishOutcome::Published => {
-                let text = with_front_matter(post, &body, &published_hash);
+                // HF-3: o rascunho do digest agora carrega o SEU front-matter
+                // (slug/lang/generator). O publish gerencia o front-matter de
+                // proveniência (com os hashes) — embutir o do rascunho dobraria
+                // o bloco dentro do corpo, então ele é descascado aqui. O
+                // `published_hash` continua sobre o rascunho CRU (mesma
+                // semântica de sempre: qualquer byte novo no rascunho = novo
+                // hash).
+                let text = with_front_matter(post, strip_front_matter(&body), &published_hash);
                 write_text(&target, &text)?;
                 report.published += 1;
             }
@@ -200,6 +207,20 @@ fn with_front_matter(
         post.created_at,
         body
     )
+}
+
+/// Remove o front-matter do RASCUNHO (bloco `---` inicial com slug/lang/
+/// generator, HF-3) antes de embutir o corpo no post publicado — o
+/// front-matter de proveniência é do `publish` e não pode dobrar. Texto sem
+/// bloco inicial volta intacto (rascunhos antigos seguem publicáveis).
+fn strip_front_matter(body: &str) -> &str {
+    let Some(rest) = body.strip_prefix(FRONT_MATTER_OPEN) else {
+        return body;
+    };
+    match rest.find("\n---") {
+        Some(close) => rest[close + "\n---".len()..].trim_start_matches('\n'),
+        None => body,
+    }
 }
 
 /// Lê um campo do bloco `---` no topo do arquivo.
@@ -284,6 +305,25 @@ mod tests {
             Some("abc")
         );
         assert_eq!(front_matter_value(text, "nao_existe"), None);
+    }
+
+    #[test]
+    fn strip_front_matter_removes_the_draft_block_and_keeps_plain_text() {
+        // Rascunho novo (HF-3): o bloco slug/lang/generator sai, o corpo fica.
+        assert_eq!(
+            strip_front_matter("---\nslug: intro\nlang: pt-BR\n---\n\ncorpo\n"),
+            "corpo\n"
+        );
+        // Texto sem bloco inicial volta intacto (rascunhos antigos).
+        assert_eq!(
+            strip_front_matter("<!-- gerado por kira digest -->\n\ncorpo\n"),
+            "<!-- gerado por kira digest -->\n\ncorpo\n"
+        );
+        // Bloco que não fecha não é meio-descascado.
+        assert_eq!(
+            strip_front_matter("---\nslug: intro\ncorpo sem fechamento\n"),
+            "---\nslug: intro\ncorpo sem fechamento\n"
+        );
     }
 
     #[test]

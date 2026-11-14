@@ -18,6 +18,7 @@ use crate::llm::ollama::OllamaBackend;
 // Single source for the prompt contract: the system text, the section headers
 // and the user preamble all live in `llm::prompts` (versioned, golden-tested).
 use crate::llm::prompts::{TRIAGE_SECTIONS as SECTION_NAMES, TRIAGE_SYSTEM_PROMPT};
+use crate::store::Store;
 use crate::work_item::WorkItem;
 
 /// Placeholder used when the model left a section empty.
@@ -230,22 +231,27 @@ pub fn sections_of(formatted: &str) -> [String; 3] {
 /// with [`triage_file_llm`] (ADR-0019/ADR-0020: the costly backend is never
 /// implicit).
 pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<TriageReport, Error> {
-    triage_file_llm(LlmKind::Ollama, base_url, model, path).await
+    triage_file_llm(LlmKind::Ollama, base_url, model, path, None).await
 }
 
 /// Same as [`triage_file`] with an explicit backend choice.
+///
+/// `ledger` is the store that counts the call for the daily budget
+/// (auditoria P0). In-process callers without a ledger (tests) pass `None`
+/// and touch no store — the counter belongs to the command layer.
 pub async fn triage_file_llm(
     kind: LlmKind,
     base_url: &str,
     model: &str,
     path: &Path,
+    ledger: Option<&Store>,
 ) -> Result<TriageReport, Error> {
     let body = std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,
     })?;
     let item = WorkItem::from_api_json(&body)?;
-    triage_item(kind, base_url, model, &item, Some(path)).await
+    triage_item(kind, base_url, model, &item, Some(path), ledger).await
 }
 
 /// Runs triage for a work item fetched live through the board provider
@@ -256,7 +262,7 @@ pub async fn triage_live(
     base_url: &str,
     model: &str,
 ) -> Result<TriageReport, Error> {
-    triage_live_llm(LlmKind::Ollama, board, id, base_url, model).await
+    triage_live_llm(LlmKind::Ollama, board, id, base_url, model, None).await
 }
 
 /// Same as [`triage_live`] with an explicit backend choice.
@@ -266,9 +272,10 @@ pub async fn triage_live_llm(
     id: i32,
     base_url: &str,
     model: &str,
+    ledger: Option<&Store>,
 ) -> Result<TriageReport, Error> {
     let item = board.work_item(id).await?;
-    triage_item(kind, base_url, model, &item, None).await
+    triage_item(kind, base_url, model, &item, None, ledger).await
 }
 
 /// A backend built for one triage call: wiring only — which backend runs is
@@ -285,6 +292,7 @@ async fn triage_item(
     model: &str,
     item: &WorkItem,
     exclude_from_grep: Option<&Path>,
+    ledger: Option<&Store>,
 ) -> Result<TriageReport, Error> {
     // LLM porque: hipótese de causa raiz é julgamento sobre texto — nenhuma CLI
     // nem parser responde "por que este bug acontece". Todo o resto do comando
@@ -302,16 +310,42 @@ async fn triage_item(
     };
     let pack = context_pack(item, exclude_from_grep);
     let prompt = build_prompt_with_context(item, &pack);
-    let text = match &backend {
-        TriageBackend::Ollama(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await?,
-        TriageBackend::Copilot(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await?,
-        TriageBackend::Foundry(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await?,
+    let answer = match &backend {
+        TriageBackend::Ollama(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await,
+        TriageBackend::Copilot(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await,
+        TriageBackend::Foundry(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await,
     };
+    // P0 (auditoria F2): a chamada entra no ledger do mandato, venha boa ou
+    // falha — o custo para o dev aconteceu do mesmo jeito. O ENFORCE do teto
+    // vive na camada de comando (checar ANTES de chamar); aqui é só registro.
+    record_triage_call(ledger, kind, model, &prompt, &answer);
+    let text = answer?;
     Ok(TriageReport {
         item_id: item.id,
         output: format_triage(&text)?,
         context: pack,
     })
+}
+
+/// Registra uma chamada de julgamento no contador diário (tabela `llm_calls`).
+///
+/// Best-effort por design: sem ledger (chamadas in-process de teste) nada
+/// acontece e nenhum store é tocado; com store que falha, o triage continua —
+/// a indisponibilidade do store já foi avisada por quem o abriu na camada de
+/// comando (regra da casa: o `aviso:` de store sai só no `main.rs`).
+fn record_triage_call(
+    ledger: Option<&Store>,
+    kind: LlmKind,
+    model: &str,
+    prompt: &str,
+    answer: &Result<String, Error>,
+) {
+    let Some(store) = ledger else { return };
+    // Mesma estimativa de `post::estimate_tokens`: 3 chars por token. É
+    // número de ledger (observabilidade), não de billing.
+    let answer_len = answer.as_ref().map_or(0, |text| text.len());
+    let tokens = u64::try_from((prompt.len() + answer_len) / 3).unwrap_or(0);
+    let _ = store.record_llm_call(kind.name(), model, "triage", tokens);
 }
 
 /// Retrieval for the prompt (PR31 + PR5).

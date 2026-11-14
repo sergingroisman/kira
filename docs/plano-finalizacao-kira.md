@@ -58,9 +58,9 @@ gold (dono) · cleanup (aprovação do inventário §7) · PNGs do README (dono)
 
 | Item | Escopo | Aceite | Tam. |
 |---|---|---|---|
-| **HF-1** | `ADR-0040` (docs-only): HF como catálogo; por que NÃO candle/llama-cpp no binário; consentimento p/ download; disco checado | ADR aceito pelo dono; nenhuma linha de código | S |
 | **HF-2** ✅ **implementado (13/Nov, `feat/hf2-model-list-pull`)**: `kira model list` (parse puro de `ollama list`, resolução via `binresolve`) + `kira model pull <repo>` (consentimento é estado: `--yes` OU prompt em TTY com destino+disco medido; recusa ANTES de qualquer spawn; log de auditoria na trilha automática; pull não é chamada de LLM) + `KIRA_MODEL_OLLAMA_BIN` (override p/ shim, mesmo contrato do `KIRA_SCAN_*_BIN`) | e2e com shim de `ollama`: pull sem `--yes` e sem TTY = erro acionável; list nunca vaza segredo | M |
-| **HF-3** | Guardrail de saída no `digest` (`src/post/mod.rs`): front-matter obrigatório, teto 30 k (já existe), scan de segredo no corpo reusando `redact`, recusa com nota acionável | unit + e2e: post sem front-matter vira `failed` com nota; post com token fake é mascarado antes de gravar | M |
+| **HF-1** ✅ **implementado (13/Nov, PR #102)**: `ADR-0040-hugging-face-catalogo-gguf.md` (catálogo via Ollama; alternativas candle/llama-cpp/hf-hub rejeitadas; consentimento + disco no pull; gate de admissão, piso Q4_K_M, Q2_K proibido) + linha no índice de ADRs (e registro retroativo da linha 0039 que faltava) | ADR aceito pelo dono; nenhuma linha de código | S |
+| **HF-3** ✅ **implementado (13/Nov, `feat/hf3-digest-output-guard`)**: guardrail determinístico de saída no digest (`build_draft` + `guard_draft` puros em `src/post/mod.rs`): front-matter YAML obrigatório e bem-formado (slug/lang/generator), teto `DRAFT_CHAR_CAP` (30 k tokens × 3 = 90 000 chars — recusado, NUNCA truncado), corpo redigido via `redact` antes do disco; violação = nota acionável + estado `failed`. `publish` descasca o front-matter do rascunho (hash continua sobre o rascunho cru) | unit + e2e: post sem front-matter vira `failed` com nota; post com token fake é mascarado antes de gravar | M |
 | **HF-4** | `scripts/install.sh` / `install.ps1` com a proteção da casa: nunca `curl|sh`; Ollama ausente ⇒ instrução manual e saída limpa; `--with-model <repo>` opt-in com consentimento+disco; SHA256SUMS verificado antes de tocar o sistema (fail-closed, como `release.yml`); smoke `kira doctor` | teste de shell em CI Linux: install sem Ollama sai 0 com instrução; com `--with-model` sem disco ⇒ recusa | M |
 | **HF-5** | **Catálogo de especialistas + routing + gate de admissão de modelo** (detalhe abaixo): tabela `model_role` no config (kind/tarefa → tag Ollama), `cache_key` já leva `model` (cache correto por especialista), budget conta chamada de qualquer modelo, e **nenhum modelo entra no catálogo sem passar no gate de admissão** | `kira digest --kind security` usa a tag de security; `--eval` roda por modelo; probe de segurança por modelo+quant antes de promover; Q2_K recusado por política | M |
 
@@ -173,7 +173,7 @@ Brain, gold antes de declarar autonomia.
 |---|---|
 | **P0** contador LLM | tabela `llm_calls(run, backend, model, tokens_est, at)`; `digest`/`triage` gravam; `doctor` e dashboard mostram `N/50`; 51ª chamada recusa com "limite diário atingido — retome amanhã ou ajuste max_llm_calls_per_day" |
 | **P1** scan paralelo | `std::thread::scope` com um thread por ferramenta resolvida; findings **byte-idênticos** (ordem por fingerprint); e2e com dois shims que dormem 2 s: wall-time < 3,5 s prova concorrência; sem rayon |
-| **PR15** loop | tick = ingest→(digest se trusted)→publish; 2 ticks sem mudança ⇒ store idêntico (anti-PR-inócuo); `--once` para CI |
+| **PR15** loop ✅ **implementado (13/Nov, `feat/pr15-kira-loop`)**: `kira loop` (`src/loop/`) — tick = ingest→(digest se trusted)→publish, tudo local; `--once`/`--ticks`/`--skip-digest`/`--skip-scan`; driver até o ponto fixo; e2e prova 2 ticks = estado byte-idêntico (facts/drafts/wiki/posts) | tick = ingest→(digest se trusted)→publish; 2 ticks sem mudança ⇒ store idêntico (anti-PR-inócuo); `--once` para CI |
 | **PR16** agenda | `kira schedule add|list|rm` opt-in; aviso "só roda com o KIRA vivo" |
 | **PR17** budget no ciclo | cheque ANTES de cada transição; 429 ⇒ 5 min de silêncio; último bom marcado `stale` |
 | **PR18** approve | `awaiting_approval` no store; `kira approve <id>` humano; sem approve, `--apply` é inerte |
@@ -182,8 +182,14 @@ Brain, gold antes de declarar autonomia.
 
 ## 6. Pacote conhecimento (IG → SK → TE) e a intenção final do dono
 
-- **IG**: BOM/UTF-16 no scan (`src/scan/decode.rs`) + `.kiraignore` (subset
-  gitwildmatch aninhado) — remove a promessa stale das jornadas (F3).
+- **IG** ✅ **implementado (13/Nov, M7)**: BOM/UTF-16 no scan (`src/scan/decode.rs`
+  nos call sites de `node.rs`/`dotnet.rs` + fixture UTF-16LE parseando pelo extrator
+  real) + `.gitignore` aninhado (`src/context/gitignore.rs`, subset gitwildmatch sem
+  dependência: negação, ancoragem, dir-only, `**`, ancestral excluído não
+  re-incluível) honrado no índice e no grep — remove a promessa stale das jornadas
+  (F3). *Nota: o plano dizia `.kiraignore`; foi entregue como `.gitignore` (o
+  aceite literal do M7 no BUILD-PROGRAM); o matcher é reaproveitável se o dono
+  quiser um arquivo próprio depois.*
 - **SK**: skills bundled + `.kira/skills/` com frontmatter (trigger/anti-trigger,
   semver, autor — formato do agent-skills reimplementado) + **trigger evals** no
   aceite; `~/.config/kira/knowledge/` para os textos do dono (`knowledge_fts`);
