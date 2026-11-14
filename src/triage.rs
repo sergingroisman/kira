@@ -19,10 +19,22 @@ use crate::llm::ollama::OllamaBackend;
 // and the user preamble all live in `llm::prompts` (versioned, golden-tested).
 use crate::llm::prompts::{TRIAGE_SECTIONS as SECTION_NAMES, TRIAGE_SYSTEM_PROMPT};
 use crate::store::Store;
+use crate::wiki::Wiki;
+use crate::wiki::episode::{self, Episode};
 use crate::work_item::WorkItem;
 
 /// Placeholder used when the model left a section empty.
 const SECTION_EMPTY: &str = "—";
+
+/// Limiar do cache de raciocínio (PR35, onda TE): similaridade item × causa
+/// conhecida ≥ 0.50 significa "o episódio da wiki já responde este bug".
+///
+/// A const é PRÓPRIA (e não `eval::CAUSA_LIMIAR`) para não acoplar a semântica
+/// do gold de medição à decisão de cache — os dois coincidem hoje (0.50) por
+/// escolha documentada e podem divergir. A régua, porém, é a mesma do eval:
+/// overlap de tokens de conteúdo `|interseção| / |causa|`, com a página
+/// conhecida no papel do gold — mesma conta, mesmo limiar, zero IA no meio.
+pub const CACHE_LIMIAR: f64 = 0.50;
 
 /// Builds the user prompt for a work item: title, type, state, area and the
 /// description with the raw HTML cleaned by [`html_to_text`].
@@ -198,12 +210,24 @@ fn section_header_index(line: &str) -> Option<(usize, String)> {
     None
 }
 
+/// Hit do cache de raciocínio (PR35): a resposta veio da wiki, sem LLM.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheHit {
+    /// Slug da página que serviu a resposta (`bugs/4821`).
+    pub page: String,
+    /// Similaridade que autorizou o hit (0.0–1.0) — vai ao stderr e ao teste.
+    pub similarity: f64,
+}
+
 /// Result of one triage run: the work item that was analyzed and the formatted
 /// three-section answer.
 ///
 /// The item id travels with the text so the caller can anchor the episodic
 /// capture (PR30) without reading the work item twice. The [`ContextPack`]
 /// travels too, so `kira triage` can print which evidence was sent (ADR-0015).
+/// `cache` is `Some` when the answer came from the reasoning cache (PR35): no
+/// LLM call happened, the episode is NOT re-recorded (D1) and the economy
+/// ledger records route `cache-wiki` with zero calls.
 ///
 /// [`ContextPack`]: crate::context::ContextPack
 #[derive(Debug, Clone, PartialEq)]
@@ -215,6 +239,8 @@ pub struct TriageReport {
     pub output: String,
     /// Context that was retrieved and sent with the prompt.
     pub context: crate::context::ContextPack,
+    /// Cache hit (PR35): `None` = the LLM produced the answer (rota de hoje).
+    pub cache: Option<CacheHit>,
 }
 
 /// The three sections of an already formatted triage, trimmed — in the fixed
@@ -229,12 +255,16 @@ pub fn sections_of(formatted: &str) -> [String; 3] {
 ///
 /// Kept with the Ollama default for existing callers; the backend is chosen
 /// with [`triage_file_llm`] (ADR-0019/ADR-0020: the costly backend is never
-/// implicit).
+/// implicit). The reasoning cache (PR35) is ON — it is the product default.
 pub async fn triage_file(base_url: &str, model: &str, path: &Path) -> Result<TriageReport, Error> {
-    triage_file_llm(LlmKind::Ollama, base_url, model, path, None).await
+    triage_file_llm(LlmKind::Ollama, base_url, model, path, true, None).await
 }
 
 /// Same as [`triage_file`] with an explicit backend choice.
+///
+/// `cache` enables the reasoning cache (PR35): a wiki hit (similarity ≥
+/// [`CACHE_LIMIAR`]) answers WITHOUT any LLM call. `--no-cache` (command
+/// layer) passes `false` and keeps today's route byte-identical.
 ///
 /// `ledger` is the store that counts the call for the daily budget
 /// (auditoria P0). In-process callers without a ledger (tests) pass `None`
@@ -244,6 +274,7 @@ pub async fn triage_file_llm(
     base_url: &str,
     model: &str,
     path: &Path,
+    cache: bool,
     ledger: Option<&Store>,
 ) -> Result<TriageReport, Error> {
     let body = std::fs::read_to_string(path).map_err(|source| Error::Io {
@@ -251,7 +282,7 @@ pub async fn triage_file_llm(
         source,
     })?;
     let item = WorkItem::from_api_json(&body)?;
-    triage_item(kind, base_url, model, &item, Some(path), ledger).await
+    triage_item(kind, base_url, model, &item, Some(path), cache, ledger).await
 }
 
 /// Runs triage for a work item fetched live through the board provider
@@ -262,7 +293,7 @@ pub async fn triage_live(
     base_url: &str,
     model: &str,
 ) -> Result<TriageReport, Error> {
-    triage_live_llm(LlmKind::Ollama, board, id, base_url, model, None).await
+    triage_live_llm(LlmKind::Ollama, board, id, base_url, model, true, None).await
 }
 
 /// Same as [`triage_live`] with an explicit backend choice.
@@ -272,10 +303,11 @@ pub async fn triage_live_llm(
     id: i32,
     base_url: &str,
     model: &str,
+    cache: bool,
     ledger: Option<&Store>,
 ) -> Result<TriageReport, Error> {
     let item = board.work_item(id).await?;
-    triage_item(kind, base_url, model, &item, None, ledger).await
+    triage_item(kind, base_url, model, &item, None, cache, ledger).await
 }
 
 /// A backend built for one triage call: wiring only — which backend runs is
@@ -292,8 +324,23 @@ async fn triage_item(
     model: &str,
     item: &WorkItem,
     exclude_from_grep: Option<&Path>,
+    cache: bool,
     ledger: Option<&Store>,
 ) -> Result<TriageReport, Error> {
+    // PR35 (cache de raciocínio): ANTES de qualquer backend — o hit é
+    // determinístico (similaridade em Rust, nível 3 da escada, ADR-0016),
+    // não fala com modelo e não consome budget. Por isso o lookup vem antes
+    // da construção do backend: com hit, até o `--llm copilot`/foundry mal
+    // configurado não é tocado — a resposta não precisa de modelo. Falha da
+    // wiki é fail-open: nota no pack e rota normal de hoje, byte a byte.
+    let mut cache_note: Option<String> = None;
+    if cache {
+        match cache_lookup(item) {
+            Ok(Some((hit, episode))) => return Ok(cache_report(item.id, &hit, &episode)),
+            Ok(None) => {}
+            Err(cause) => cache_note = Some(cause),
+        }
+    }
     // LLM porque: hipótese de causa raiz é julgamento sobre texto — nenhuma CLI
     // nem parser responde "por que este bug acontece". Todo o resto do comando
     // (campos, HTML, fingerprint, store, grep do repositório) é determinístico
@@ -312,7 +359,11 @@ async fn triage_item(
         // `kira setup` (ADR-0035) — configurar pelo wizard basta.
         LlmKind::Foundry => TriageBackend::Foundry(FoundryBackend::from_sources()?),
     };
-    let pack = context_pack(item, exclude_from_grep);
+    let mut pack = context_pack(item, exclude_from_grep);
+    if let Some(cause) = cache_note {
+        pack.notes
+            .push(format!("cache-wiki indisponível ({cause})"));
+    }
     let prompt = build_prompt_with_context(item, &pack);
     let answer = match &backend {
         TriageBackend::Ollama(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await,
@@ -328,6 +379,7 @@ async fn triage_item(
         item_id: item.id,
         output: format_triage(&text)?,
         context: pack,
+        cache: None,
     })
 }
 
@@ -350,6 +402,153 @@ fn record_triage_call(
     let answer_len = answer.as_ref().map_or(0, |text| text.len());
     let tokens = u64::try_from((prompt.len() + answer_len) / 3).unwrap_or(0);
     let _ = store.record_llm_call(kind.name(), model, "triage", tokens);
+}
+
+/// Similaridade item × causa conhecida (PR35): overlap de tokens de conteúdo,
+/// `|interseção| / |causa|` — a MESMA conta de `eval::causa_score`, com a
+/// página da wiki no papel do gold. Causa sem token de conteúdo devolve 0.0
+/// (página vazia não "acerta" de graça). Cálculo simétrico e auditável: nenhuma
+/// IA no meio, zero rede, zero chamada (CLI-first, LLM-last — ADR-0016).
+#[must_use]
+pub fn cache_score(item_text: &str, causa_texto: &str) -> f64 {
+    let causa_tokens = crate::eval::content_tokens(causa_texto);
+    if causa_tokens.is_empty() {
+        return 0.0;
+    }
+    let item_tokens = crate::eval::content_tokens(item_text);
+    let intersecao = causa_tokens.intersection(&item_tokens).count();
+    f64::from(u32::try_from(intersecao).unwrap_or(u32::MAX))
+        / f64::from(u32::try_from(causa_tokens.len()).unwrap_or(u32::MAX))
+}
+
+/// Texto do item usado na similaridade do cache: título + descrição em texto
+/// plano — a MESMA limpeza do prompt ([`description_for_prompt`]), então o
+/// HTML não vira token e um segredo colado no item não é tratado como termo.
+fn item_text_for_cache(item: &WorkItem) -> String {
+    format!(
+        "{}\n{}",
+        item.title,
+        description_for_prompt(item.description.as_deref())
+    )
+}
+
+/// Cache de raciocínio (PR35): procura um episódio da wiki cuja causa conhecida
+/// responda o item — página direta do MESMO item primeiro, depois as demais
+/// páginas de `wiki/bugs/` (cross-item).
+///
+/// A fonte de verdade é o MARKDOWN (ADR-0013): `Wiki::list()` varre o disco, o
+/// índice FTS5 é derivado e pode estar ausente/velho — o cache não depende dele.
+/// Fail-open fica na camada de cima: `Err` vira nota, nunca erro do comando.
+fn cache_lookup(item: &WorkItem) -> Result<Option<(CacheHit, Episode)>, String> {
+    let Some(root) = crate::store::detect_project_root() else {
+        // Sem raiz não há wiki — mesma conduta do pack (silêncio, rota normal).
+        return Ok(None);
+    };
+    cache_lookup_at(&root, item)
+}
+
+/// [`cache_lookup`] com a raiz explícita — o mesmo desenho de `context_pack`
+/// vs `pack_excluding`: a variante com raiz é a testável sem `chdir`.
+fn cache_lookup_at(root: &Path, item: &WorkItem) -> Result<Option<(CacheHit, Episode)>, String> {
+    let wiki = Wiki::open(root).map_err(|err| err.to_string())?;
+    let texto = item_text_for_cache(item);
+    // 1) Página direta do item: o caso comum (re-triagem do mesmo bug).
+    let page = episode::page_for(item.id);
+    if let Some(hit) = cached_episode(&wiki, &page, &texto)? {
+        return Ok(Some(hit));
+    }
+    // 2) Candidatas: as outras páginas de bugs, em ordem de `list()` (sorted);
+    // empate de similaridade fica com a primeira (determinismo do gate M1).
+    let mut melhor: Option<(CacheHit, Episode)> = None;
+    for candidata in wiki.list().map_err(|err| err.to_string())? {
+        if !candidata.starts_with("bugs/") || candidata == page {
+            continue;
+        }
+        if let Some(hit) = cached_episode(&wiki, &candidata, &texto)?
+            && melhor
+                .as_ref()
+                .is_none_or(|(atual, _)| hit.0.similarity > atual.similarity)
+        {
+            melhor = Some(hit);
+        }
+    }
+    Ok(melhor)
+}
+
+/// Lê a página, extrai o episódio mais recente e decide se ele responde o item:
+/// causa conhecida (não vazia/`—`) e similaridade ≥ [`CACHE_LIMIAR`].
+fn cached_episode(
+    wiki: &Wiki,
+    page: &str,
+    item_text: &str,
+) -> Result<Option<(CacheHit, Episode)>, String> {
+    let Some(content) = wiki.read(page).map_err(|err| err.to_string())? else {
+        return Ok(None);
+    };
+    let Some(episode) = episode::latest(&content) else {
+        return Ok(None);
+    };
+    let causa = episode.root_cause.trim();
+    if causa.is_empty() || causa == SECTION_EMPTY {
+        return Ok(None);
+    }
+    let similarity = cache_score(item_text, causa);
+    if similarity < CACHE_LIMIAR {
+        return Ok(None);
+    }
+    Ok(Some((
+        CacheHit {
+            page: page.to_string(),
+            similarity,
+        },
+        episode,
+    )))
+}
+
+/// D2 (PR35): a confiança do hit é a da página original, CAPADA em `média` —
+/// cache nunca diz `alta`: a resposta não foi produzida nesta execução.
+fn cap_confidence(confidence: &str) -> String {
+    let trimmed = confidence.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return SECTION_EMPTY.to_string();
+    }
+    if trimmed.eq_ignore_ascii_case("alta") {
+        return "média".to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Monta o [`TriageReport`] do hit (PR35): as 3 seções vêm da página — nada é
+/// inventado — no formato byte-idêntico ao da rota LLM (`render_sections`).
+/// O pack fica default (nada foi enviado ao prompt); o ledger registra pack 0,
+/// zero chamadas e rota `cache-wiki` na camada de comando.
+fn cache_report(item_id: i32, hit: &CacheHit, episodio: &Episode) -> TriageReport {
+    let placeholder = |text: &str| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            SECTION_EMPTY.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let contents = [
+        placeholder(&episodio.root_cause),
+        placeholder(&episodio.files),
+        cap_confidence(&episodio.confidence),
+    ];
+    let mut output = SECTION_NAMES
+        .iter()
+        .zip(contents)
+        .map(|(name, content)| format!("{name}:\n{content}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    output.push('\n');
+    TriageReport {
+        item_id,
+        output,
+        context: crate::context::ContextPack::default(),
+        cache: Some(hit.clone()),
+    }
 }
 
 /// Retrieval for the prompt (PR31 + PR5).
@@ -612,5 +811,198 @@ mod tests {
             "Causa raiz provável:\n\nArquivos prováveis:\n\nConfiança:\n",
         ));
         assert_eq!(empty, ["—", "—", "—"], "seções vazias voltam como —");
+    }
+
+    // -----------------------------------------------------------------------
+    // PR35 — cache de raciocínio: scorer, limiar, lookup e confiança capada.
+    // -----------------------------------------------------------------------
+
+    /// Wiki temporária de teste (mesma mecânica dos testes de `episode`).
+    fn temp_wiki(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kira-triage-cache-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        dir
+    }
+
+    /// Escreve uma página de episódio no formato que `episode::record` produz.
+    fn write_bug_page(root: &Path, item_id: i32, cause: &str, confidence: &str) {
+        let path = root
+            .join(".kira")
+            .join("wiki")
+            .join("bugs")
+            .join(format!("{item_id}.md"));
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or_else(|err| panic!("criar bugs/: {err}"));
+        let content = format!(
+            "<!-- kira-wiki updated_at=2026-11-10T22:18:00Z -->\n\n# Bug {item_id}\n\n## Episódio 2026-11-10T22:18:00Z · item {item_id}\n- Causa raiz prevista: {cause}\n- Arquivos prováveis: src/auth/session.rs\n- Confiança: {confidence}\n"
+        );
+        std::fs::write(&path, content).unwrap_or_else(|err| panic!("escrever {path:?}: {err}"));
+    }
+
+    #[test]
+    fn cache_score_is_token_overlap_with_a_documented_threshold() {
+        // Cobertura total da causa ⇒ 1.0 (hit confortável).
+        let item = "Sessão expirada com token válido após minutos";
+        let causa = "sessão expirada com token válido";
+        let score = cache_score(item, causa);
+        assert!(
+            (score - 1.0).abs() < f64::EPSILON,
+            "causa coberta ⇒ 1.0: {score}"
+        );
+        // Metade da causa coberta ⇒ exatamente o limiar (mesma régua do eval).
+        let metade = cache_score("sessão expirada", "sessão expirada com token válido");
+        assert!(
+            (metade - 0.5).abs() < f64::EPSILON && metade >= CACHE_LIMIAR,
+            "metade dos tokens = limiar: {metade}"
+        );
+        // Nada em comum ⇒ bem abaixo do limiar.
+        assert!(cache_score("deploy do front quebrou", "sessão expirada") < CACHE_LIMIAR);
+        // Causa sem token de conteúdo (só stopwords/curtas) ⇒ 0.0, nunca hit.
+        assert_eq!(cache_score("sessão expirada", "com que para"), 0.0);
+    }
+
+    #[test]
+    fn cache_lookup_hits_the_direct_page_of_the_same_item() {
+        let root = temp_wiki("direct-hit");
+        write_bug_page(
+            &root,
+            4821,
+            "sessão expirada com token válido após minutos",
+            "alta",
+        );
+        let item = parse(FIXTURE_FULL);
+        let (hit, episodio) = cache_lookup_at(&root, &item)
+            .unwrap_or_else(|cause| panic!("wiki válida não pode falhar: {cause}"))
+            .unwrap_or_else(|| panic!("item com página parecida deve bater no cache"));
+        assert_eq!(hit.page, "bugs/4821", "{hit:?}");
+        assert!(hit.similarity >= CACHE_LIMIAR, "{hit:?}");
+        assert_eq!(
+            episodio.root_cause,
+            "sessão expirada com token válido após minutos"
+        );
+        assert_eq!(episodio.files, "src/auth/session.rs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_lookup_misses_below_the_threshold_and_reports_none() {
+        let root = temp_wiki("miss");
+        write_bug_page(
+            &root,
+            4821,
+            "cache sem invalidação no deploy do front",
+            "baixa",
+        );
+        let item = parse(FIXTURE_FULL);
+        let lookup = cache_lookup_at(&root, &item)
+            .unwrap_or_else(|cause| panic!("wiki válida não pode falhar: {cause}"));
+        assert!(
+            lookup.is_none(),
+            "similaridade baixa ⇒ rota LLM: {lookup:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_lookup_falls_back_to_other_bug_pages() {
+        let root = temp_wiki("cross-item");
+        // O item 4821 não tem página; a causa conhecida está no bug 9999.
+        write_bug_page(
+            &root,
+            9999,
+            "sessão expirada com token válido após minutos",
+            "média",
+        );
+        let item = parse(FIXTURE_FULL);
+        let (hit, episodio) = cache_lookup_at(&root, &item)
+            .unwrap_or_else(|cause| panic!("wiki válida não pode falhar: {cause}"))
+            .unwrap_or_else(|| panic!("bug parecido em outra página deve bater (cross-item)"));
+        assert_eq!(hit.page, "bugs/9999", "{hit:?}");
+        assert_eq!(episodio.item_id, 9999, "{episodio:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_lookup_fails_with_a_cause_when_the_wiki_is_unreadable() {
+        // `.kira` como ARQUIVO: ler `bugs/4821.md` é impossível (ENOTDIR).
+        let root = temp_wiki("broken");
+        std::fs::write(root.join(".kira"), "não sou um diretório")
+            .unwrap_or_else(|err| panic!("criar .kira: {err}"));
+        let item = parse(FIXTURE_FULL);
+        match cache_lookup_at(&root, &item) {
+            Err(cause) => assert!(
+                !cause.is_empty(),
+                "a causa alimenta a nota acionável no stderr"
+            ),
+            other => panic!("wiki ilegível deve devolver Err, veio {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_confidence_is_capped_at_media_never_alta() {
+        // D2: cache nunca diga "alta" — a resposta não foi produzida aqui.
+        assert_eq!(cap_confidence("alta"), "média");
+        assert_eq!(cap_confidence("ALTA"), "média");
+        assert_eq!(cap_confidence("alta."), "média");
+        assert_eq!(cap_confidence("média"), "média");
+        assert_eq!(cap_confidence("baixa"), "baixa");
+        assert_eq!(cap_confidence(""), "—");
+    }
+
+    #[test]
+    fn cache_report_keeps_the_three_sections_in_the_llm_format() {
+        let episodio = Episode {
+            item_id: 4821,
+            root_cause: "sessão expirada com token válido".to_string(),
+            files: "src/auth/session.rs".to_string(),
+            confidence: "alta".to_string(),
+            findings_brief: None,
+        };
+        let hit = CacheHit {
+            page: "bugs/4821".to_string(),
+            similarity: 1.0,
+        };
+        let report = cache_report(4821, &hit, &episodio);
+        assert_eq!(report.item_id, 4821);
+        // D2: `alta` vinda de cache sai capada em `média`.
+        assert!(
+            report.output.contains("Confiança:\nmédia\n"),
+            "{}",
+            report.output
+        );
+        assert!(!report.output.contains("alta"), "{}", report.output);
+        assert!(
+            report
+                .output
+                .contains("Causa raiz provável:\nsessão expirada com token válido\n"),
+            "causa conhecida, nada inventado: {}",
+            report.output
+        );
+        assert!(
+            report
+                .output
+                .contains("Arquivos prováveis:\nsrc/auth/session.rs\n"),
+            "{}",
+            report.output
+        );
+        assert!(report.cache.is_some(), "o hit viaja para o ledger/stderr");
+        assert!(
+            report.context.is_empty(),
+            "no hit nada foi enviado ao prompt: pack default"
+        );
+        // O formato é o mesmo que `format_triage` produz — parseável por
+        // `sections_of` (pr draft, painel) sem tratamento especial.
+        let sections = sections_of(&report.output);
+        assert_eq!(sections[0], "sessão expirada com token válido");
+        assert_eq!(sections[2], "média");
     }
 }

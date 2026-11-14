@@ -66,6 +66,12 @@ enum Command {
         /// never fall back to Ollama
         #[arg(long, value_parser = ["ollama", "copilot", "foundry"])]
         llm: Option<String>,
+        /// Skip the wiki reasoning cache (PR35): always run the LLM route. A
+        /// cache hit is deterministic (similarity >= 0.50 against the known
+        /// cause in `.kira/wiki/bugs/`) and spends no LLM call — this flag
+        /// trades the economy for a fresh model answer
+        #[arg(long)]
+        no_cache: bool,
         /// Measure the M2 gate (ADR-0018) against a directory of gold labels:
         /// each item is a folder with `item.json` + `gold.json`. Runs triage
         /// offline (`--file` mode) on the chosen backend and compares the
@@ -609,7 +615,8 @@ async fn run(command: Command) -> Outcome {
             eval,
             json,
             seed,
-        } => triage_command(id, file, model, llm, eval, json, seed).await,
+            no_cache,
+        } => triage_command(id, file, model, llm, eval, json, seed, no_cache).await,
         Command::Setup {
             org,
             project,
@@ -932,6 +939,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             eval,
             json,
             seed,
+            no_cache,
         } => {
             // O `--eval` é outra origem (uma pasta de gold), exclusiva do id
             // e do `--file`; a trilha registra exatamente como foi chamado.
@@ -955,6 +963,11 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                     // (`ollama|copilot|foundry`) — a trilha registra exatamente o
                     // backend usado nesta execução.
                     args.push_str(&format!(" --llm {llm}"));
+                }
+                if *no_cache {
+                    // PR35: a trilha registra como a rota foi forçada — o
+                    // `pr draft` e a auditoria sabem que o cache foi pulado.
+                    args.push_str(" --no-cache");
                 }
             }
             (
@@ -2451,6 +2464,9 @@ fn resolve_task_model(
     routing.tag
 }
 
+// A flag do cache (PR35) soma o 8º argumento: o comando reflete o CLI — o
+// conserto estrutural (struct de opções) é refactor maior do que o escopo.
+#[allow(clippy::too_many_arguments)]
 async fn triage_command(
     id: Option<i32>,
     file: Option<PathBuf>,
@@ -2459,6 +2475,7 @@ async fn triage_command(
     eval: Option<PathBuf>,
     json: bool,
     seed: bool,
+    no_cache: bool,
 ) -> Outcome {
     // W2-bis (ADR-0018): o `--eval` mede o gate M2 e é exclusivo das demais
     // origens — um erro de composição aqui é acionável, nunca implícito.
@@ -2536,6 +2553,9 @@ async fn triage_command(
                     id,
                     &base_url,
                     &model,
+                    // PR35: `--no-cache` desliga o cache de raciocínio —
+                    // a rota LLM roda sempre, byte a byte como antes.
+                    !no_cache,
                     budget_store.as_ref(),
                 )
                 .await
@@ -2543,15 +2563,34 @@ async fn triage_command(
             Err(err) => Err(err),
         },
         TriageSource::File(path) => {
-            triage::triage_file_llm(kind, &base_url, &model, &path, budget_store.as_ref()).await
+            triage::triage_file_llm(
+                kind,
+                &base_url,
+                &model,
+                &path,
+                !no_cache,
+                budget_store.as_ref(),
+            )
+            .await
         }
     };
     match result {
         Ok(report) => {
             print!("{}", report.output);
+            // PR35: o hit aponta a página que serviu a resposta — o dev sabe
+            // que NÃO houve modelo nesta resposta (e o ledger registra isso).
+            if let Some(hit) = &report.cache {
+                eprintln!(
+                    "fonte: cache-wiki — {} (similaridade {:.2})",
+                    hit.page, hit.similarity
+                );
+            }
             // PR7: identifica a geração do prompt no stderr — duas saídas do
-            // modelo só são comparáveis se o texto do prompt foi o mesmo.
-            eprintln!("prompt: {}", kira::llm::prompts::triage_prompt_id());
+            // modelo só são comparáveis se o texto do prompt foi o mesmo. No
+            // hit não houve prompt: a linha só existe na rota LLM.
+            if report.cache.is_none() {
+                eprintln!("prompt: {}", kira::llm::prompts::triage_prompt_id());
+            }
             // ADR-0015: the user sees exactly which evidence the model got. Goes
             // to stderr so the three-section answer stays pipeable.
             if !report.context.is_empty() {
@@ -2560,28 +2599,50 @@ async fn triage_command(
             for note in &report.context.notes {
                 eprintln!("aviso: contexto — {note}");
             }
-            // Ledger de economia (PR34, onda TE): o pack que a sessão REALMENTE
-            // enviou, o teto e a chamada de julgamento que ela custou. O sinal
-            // de pack ocioso (D9) fica visível no stderr — é nota, nunca
-            // erro, e nunca conta como chamada (determinístico não consome
-            // budget, ADR-0016). As constantes espelham o schema v13
-            // (`store::economy`); a rota é `llm` — o PR35 acrescentará
-            // `cache-wiki` sem nova migração.
+            // Ledger de economia (PR34/PR35, onda TE): o pack que a sessão
+            // REALMENTE enviou, o teto e a chamada de julgamento que ela
+            // custou. No hit do cache NADA foi enviado: pack 0, ZERO chamadas
+            // (determinístico não consome budget, ADR-0016) e rota
+            // `cache-wiki` — a economia que o ledger existe para provar.
+            // O sinal de pack ocioso (D9) fica visível no stderr — é nota,
+            // nunca erro, e nunca conta como chamada. As constantes espelham
+            // o schema v13 (`store::economy`).
+            let cache_hit = report.cache.is_some();
             let economy = store::economy::EconomyRow {
-                pack_chars: i64::try_from(report.context.used_chars).unwrap_or(0),
-                budget_chars: i64::try_from(report.context.budget_chars).unwrap_or(0),
-                tokens_est: i64::try_from(report.context.used_chars / 3).unwrap_or(0),
-                llm_calls: 1,
-                route: "llm".to_string(),
-                pack_idle: report.context.idle_warning().is_some(),
+                pack_chars: if cache_hit {
+                    0
+                } else {
+                    i64::try_from(report.context.used_chars).unwrap_or(0)
+                },
+                budget_chars: if cache_hit {
+                    i64::try_from(kira::context::budget_chars()).unwrap_or(0)
+                } else {
+                    i64::try_from(report.context.budget_chars).unwrap_or(0)
+                },
+                tokens_est: if cache_hit {
+                    0
+                } else {
+                    i64::try_from(report.context.used_chars / 3).unwrap_or(0)
+                },
+                llm_calls: i64::from(!cache_hit),
+                route: if cache_hit { "cache-wiki" } else { "llm" }.to_string(),
+                // No hit o pack ocioso é o OBJETIVO (não houve coleta a furar):
+                // a flag D9 só sinaliza furo de coleta na rota LLM.
+                pack_idle: !cache_hit && report.context.idle_warning().is_some(),
             };
-            if let Some(aviso) = report.context.idle_warning() {
+            if !cache_hit && let Some(aviso) = report.context.idle_warning() {
                 eprintln!("{aviso}");
             }
             // Episodic capture (ADR-0013, PR30): fail-open, never changes the
             // output or the exit code. A capture failure also prefixes the
             // session-trail summary (W2-fix PR-F3) so `kira history` shows it.
-            let (episode_note, episode_failed) = record_triage_episode(&report);
+            // D1 (PR35): o hit NÃO grava episódio — a página original já
+            // guarda a conclusão; regravar viraria log de re-execução.
+            let (episode_note, episode_failed) = if cache_hit {
+                (None, false)
+            } else {
+                record_triage_episode(&report)
+            };
             if let Some(note) = episode_note {
                 eprint!("{note}");
             }

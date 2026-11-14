@@ -1065,3 +1065,169 @@ fn triage_foundry_without_key_fails_before_any_request() {
         "sem chave, NENHUM byte pode chegar ao servidor: {captured:?}"
     );
 }
+
+// ===========================================================================
+// PR35 (onda TE) — cache de raciocínio: hit responde SEM LLM
+// ===========================================================================
+
+/// Writes a wiki episode page for item 4821 in the exact shape
+/// `episode::record` produces, so the cache has knowledge to serve.
+fn write_episode_page(cwd: &Path, cause: &str, files: &str, confidence: &str) -> PathBuf {
+    let page = cwd.join(".kira").join("wiki").join("bugs").join("4821.md");
+    std::fs::create_dir_all(page.parent().unwrap_or_else(|| Path::new(".")))
+        .unwrap_or_else(|err| panic!("criar bugs/: {err}"));
+    let content = format!(
+        "<!-- kira-wiki updated_at=2026-11-10T22:18:00Z -->\n\n# Bug 4821\n\n## Episódio 2026-11-10T22:18:00Z · item 4821\n- Causa raiz prevista: {cause}\n- Arquivos prováveis: {files}\n- Confiança: {confidence}\n"
+    );
+    std::fs::write(&page, &content).unwrap_or_else(|err| panic!("escrever {page:?}: {err}"));
+    page
+}
+
+/// Aceite (a) e (b) e (d) do PR35: item com página de episódio parecida
+/// (similaridade ≥ 0.50) ⇒ o triage responde SEM NENHUMA chamada ao Ollama
+/// (porta morta: qualquer tentativa derrubaria o comando), NÃO grava episódio
+/// novo (D1 — a wiki fica byte-idêntica) e registra `cache-wiki` com 0
+/// chamadas no ledger de economia.
+#[test]
+fn cache_hit_answers_without_any_llm_call_and_without_touching_the_wiki() {
+    let sandbox = Sandbox::new("cache-hit");
+    let page = write_episode_page(
+        &sandbox.cwd,
+        "sessão expirada com token válido após minutos",
+        "src/auth/session.rs",
+        "alta",
+    );
+    let before = std::fs::read_to_string(&page).unwrap_or_else(|err| panic!("ler página: {err}"));
+
+    // Porta MORTA de propósito: um hit que falasse com o modelo sairia != 0.
+    let (code, stdout, stderr) = sandbox.run_with(
+        &[
+            "triage",
+            "--file",
+            &sandbox.fixture(),
+            "--model",
+            "qwen3.5:4b",
+        ],
+        &[("KIRA_OLLAMA_URL", dead_ollama_url())],
+        &[],
+    );
+    assert_eq!(
+        code, 0,
+        "hit deve responder sem LLM — stdout: {stdout} / stderr: {stderr}"
+    );
+    // A resposta vem da PÁGINA, não do modelo (o fake serviria outro texto).
+    assert!(
+        stdout.contains("Causa raiz provável:\nsessão expirada com token válido após minutos"),
+        "causa conhecida servida pelo cache: {stdout}"
+    );
+    assert!(
+        stdout.contains("Arquivos prováveis:\nsrc/auth/session.rs"),
+        "arquivos do episódio: {stdout}"
+    );
+    // D2: a confiança da página é capada — cache nunca diga "alta".
+    assert!(
+        stdout.contains("Confiança:\nmédia\n") && !stdout.contains("alta"),
+        "confiança capada em média: {stdout}"
+    );
+    // O hit aponta a página e a similaridade no stderr.
+    assert!(
+        stderr.contains("fonte: cache-wiki — bugs/4821 (similaridade"),
+        "o hit aponta a fonte: {stderr}"
+    );
+    // D1: hit NÃO grava episódio — nenhum note de captura e a wiki intacta.
+    assert!(
+        !stderr.contains("episódio do item 4821 registrado"),
+        "hit não regrava episódio (D1): {stderr}"
+    );
+    let after = std::fs::read_to_string(&page).unwrap_or_else(|err| panic!("ler página: {err}"));
+    assert_eq!(before, after, "a wiki fica byte-idêntica no hit (D1)");
+
+    // Ledger (d): rota `cache-wiki`, ZERO chamadas — a economia medida.
+    let db_path = sandbox.store.join("store.db");
+    let conn = rusqlite::Connection::open(&db_path)
+        .unwrap_or_else(|err| panic!("abrir {db_path:?}: {err}"));
+    let (llm_calls, route): (i64, String) = conn
+        .query_row(
+            "SELECT e.llm_calls, e.route FROM sessions s JOIN session_economy e \
+             ON e.session_id = s.id ORDER BY s.id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or_else(|err| panic!("ledger ausente: {err}"));
+    assert_eq!(llm_calls, 0, "hit NÃO consome budget (ADR-0016): {route}");
+    assert_eq!(route, "cache-wiki", "rota do hit: {route}");
+
+    // E o history mostra a economia com a rota e zero chamadas.
+    let (code, stdout, stderr) = sandbox.run(&["history"]);
+    assert_eq!(code, 0, "history: {stderr}");
+    assert!(
+        stdout.contains("rota: cache-wiki") && stdout.contains("chamadas de LLM: 0"),
+        "history prova a economia do hit: {stdout}"
+    );
+}
+
+/// Aceite (c): `--no-cache` desliga o cache — a rota LLM roda sempre, mesmo
+/// com página parecida na wiki, e a resposta vem do MODELO (fake), byte a byte
+/// como antes do PR35.
+#[test]
+fn no_cache_always_runs_the_llm_route() {
+    let sandbox = Sandbox::new("cache-no-cache");
+    write_episode_page(
+        &sandbox.cwd,
+        "sessão expirada com token válido após minutos",
+        "src/auth/session.rs",
+        "alta",
+    );
+    let (code, stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+        "--no-cache",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("TTL do token muito curto."),
+        "--no-cache ⇒ resposta do MODELO, não da página: {stdout}"
+    );
+    assert!(
+        !stderr.contains("fonte: cache-wiki"),
+        "nenhum hit com o cache desligado: {stderr}"
+    );
+    assert!(
+        stderr.contains("prompt: triage v2"),
+        "a rota LLM segue identificando a geração do prompt: {stderr}"
+    );
+}
+
+/// Item novo (página dissimilar ou ausente) ⇒ MISS ⇒ comportamento idêntico ao
+/// de hoje: rota LLM, resposta do modelo, nenhum sinal de cache.
+#[test]
+fn cache_miss_runs_the_llm_route_byte_identical_to_before() {
+    let sandbox = Sandbox::new("cache-miss");
+    // Página existe, mas a causa não casa com o item (similaridade < 0.50).
+    write_episode_page(
+        &sandbox.cwd,
+        "cache sem invalidação no deploy do front",
+        "src/web/app.ts",
+        "baixa",
+    );
+    let (code, stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("TTL do token muito curto."),
+        "miss ⇒ rota LLM de sempre: {stdout}"
+    );
+    assert!(
+        !stderr.contains("cache-wiki"),
+        "miss não anuncia cache: {stderr}"
+    );
+    assert!(stderr.contains("prompt: triage v2"), "{stderr}");
+}

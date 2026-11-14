@@ -428,7 +428,11 @@ async fn medir_item(
     // determinística — o `--eval` jamais usa um LLM como juiz.
     // A medição é abortada no primeiro item que falha: número parcial não é
     // número, e o erro do backend/triage já é acionável por si só.
-    let report = triage::triage_file_llm(kind, base_url, model, &item_path, ledger)
+    // PR35: a medição é a rota LLM (verdade de ouro) — cache desligado. O
+    // `--eval` com cache on mediria o cache contra si mesmo (hit ⇒ resposta
+    // idêntica ao episódio); a contagem de hits na medição fica para quando os
+    // 20 rótulos do dono existirem (gate M2).
+    let report = triage::triage_file_llm(kind, base_url, model, &item_path, false, ledger)
         .await
         .map_err(|err| {
             Error::Eval(format!(
