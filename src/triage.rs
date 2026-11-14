@@ -670,6 +670,7 @@ mod tests {
                 rank: None,
                 priority: false,
                 evidence: crate::context::EvidenceState::Confirmed,
+                omitted: 0,
             }],
             findings_brief: Some("high 1".to_string()),
             findings: vec!["high · Newtonsoft.Json 12.0.1 (src/App.csproj)".to_string()],
@@ -679,6 +680,7 @@ mod tests {
             budget_chars: 12_288,
             notes: Vec::new(),
             repo_source: crate::context::RepoSource::Grep,
+            dedup_chars_saved: 0,
         };
         let with = build_prompt_with_context(&item, &pack);
         assert!(

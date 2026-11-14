@@ -264,6 +264,9 @@ pub fn search(
                     // Sem raiz aqui, não há verificação: o default INFERIDA
                     // é corrigido em `pack_partial`, onde a raiz existe.
                     evidence: EvidenceState::default(),
+                    // PR38: o índice não deduplica — o colapso acontece no
+                    // `pack_partial`, depois da ordenação final da lista.
+                    omitted: 0,
                 },
             )
         })

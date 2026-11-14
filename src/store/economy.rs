@@ -1,6 +1,8 @@
 //! Ledger de economia de uma sessão (PR34, onda TE): o que o pack de contexto
 //! consumiu vs o teto, quantas chamadas de LLM a sessão custou e qual rota a
-//! produziram (hoje só `llm`; o PR35 acrescenta `cache-wiki`).
+//! produziram (PR35 acrescenta `cache-wiki`). PR38 acrescenta a categoria
+//! própria do dedup contíguo: os chars que os trechos repetidos deixaram de
+//! gastar.
 //!
 //! É MEDIÇÃO, não enforcement: o teto de chamadas continua na tabela
 //! `llm_calls` (v9). Aqui fica o retrato por sessão — o `rtk gain` da casa.
@@ -28,15 +30,19 @@ pub struct EconomyRow {
     /// — suspeita de furo de coleta, visível no ledger, nunca contado como
     /// chamada.
     pub pack_idle: bool,
+    /// Chars que o dedup contíguo (PR38, schema v14) economizou na montagem
+    /// dos trechos do pack. Categoria própria do PR38: 0 = nada a
+    /// deduplicar (ou pack vazio/rota sem pack — dado antigo nasce com 0).
+    pub dedup_chars_saved: i64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// O ledger é dado puro: campos na ordem do schema v13, sem inventar nada.
+    /// O ledger é dado puro: campos na ordem do schema v14, sem inventar nada.
     #[test]
-    fn row_carries_the_seven_ledger_fields() {
+    fn row_carries_the_eight_ledger_fields() {
         let row = EconomyRow {
             pack_chars: 4096,
             budget_chars: 12_288,
@@ -44,6 +50,8 @@ mod tests {
             llm_calls: 1,
             route: "llm".to_string(),
             pack_idle: false,
+            // PR38: a economia do dedup é categoria própria (schema v14).
+            dedup_chars_saved: 153,
         };
         assert_eq!(row.pack_chars, 4096);
         assert_eq!(row.budget_chars, 12_288);
@@ -51,5 +59,6 @@ mod tests {
         assert_eq!(row.llm_calls, 1);
         assert_eq!(row.route, "llm");
         assert!(!row.pack_idle);
+        assert_eq!(row.dedup_chars_saved, 153);
     }
 }

@@ -870,11 +870,11 @@ fn triage_records_the_economy_ledger_and_history_shows_it() {
     let db_path = sandbox.store.join("store.db");
     let conn = rusqlite::Connection::open(&db_path)
         .unwrap_or_else(|err| panic!("abrir {db_path:?}: {err}"));
-    let row: (i64, i64, i64, i64, i64, String, i64) = conn
+    let row: (i64, i64, i64, i64, i64, String, i64, i64) = conn
         .query_row(
             "SELECT s.id, e.pack_chars, e.budget_chars, e.tokens_est, e.llm_calls, e.route, \
-             e.pack_idle FROM sessions s JOIN session_economy e ON e.session_id = s.id \
-             ORDER BY s.id DESC LIMIT 1",
+             e.pack_idle, e.dedup_chars_saved FROM sessions s JOIN session_economy e \
+             ON e.session_id = s.id ORDER BY s.id DESC LIMIT 1",
             [],
             |row| {
                 Ok((
@@ -885,11 +885,21 @@ fn triage_records_the_economy_ledger_and_history_shows_it() {
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
         .unwrap_or_else(|err| panic!("ledger ausente para a sessão do triage: {err}"));
-    let (session_id, pack_chars, budget_chars, tokens_est, llm_calls, ref route, pack_idle) = row;
+    let (
+        session_id,
+        pack_chars,
+        budget_chars,
+        tokens_est,
+        llm_calls,
+        ref route,
+        pack_idle,
+        dedup_saved,
+    ) = row;
     assert!(session_id > 0, "sessão amarrada ao ledger");
     assert_eq!(llm_calls, 1, "UMA chamada de julgamento: {row:?}");
     assert_eq!(route, "llm", "rota do PR34 é sempre llm: {row:?}");
@@ -902,6 +912,9 @@ fn triage_records_the_economy_ledger_and_history_shows_it() {
         pack_chars / 3,
         "tokens_est é a mesma conta do packer: {row:?}"
     );
+    // PR38: sandbox sem repositório ⇒ nenhum trecho, nada a deduplicar — a
+    // categoria do dedup existe no ledger e mede ZERO aqui, nunca inventa.
+    assert_eq!(dedup_saved, 0, "sem trechos repetidos ⇒ dedup 0: {row:?}");
     assert_eq!(
         pack_idle,
         i64::from(pack_chars * 100 < budget_chars * (kira::context::PACK_IDLE_MIN_PCT as i64),),

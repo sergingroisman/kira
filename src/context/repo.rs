@@ -62,6 +62,11 @@ pub struct CodeExcerpt {
     /// CONFIRMADA de graça.
     #[serde(default)]
     pub evidence: crate::context::evidence::EvidenceState,
+    /// Quantas linhas idênticas o dedup contíguo (PR38) omitiu depois desta —
+    /// 0 = nenhuma. A âncora é da PRIMEIRA ocorrência; o render mostra o
+    /// marcador contável (` ... ×N`) e o custo dele entra no orçamento.
+    #[serde(default)]
+    pub omitted: usize,
 }
 
 impl CodeExcerpt {
@@ -138,6 +143,9 @@ fn scored_text(path: &str, content: &str, terms: &[String]) -> Vec<(usize, CodeE
                 // Sem raiz aqui, não há verificação: o default INFERIDA é
                 // corrigido em `pack_partial`, onde a raiz existe.
                 evidence: EvidenceState::default(),
+                // PR38: o grep não deduplica — o colapso acontece no
+                // `pack_partial`, depois da ordenação final da lista.
+                omitted: 0,
             },
         ));
         if found.len() == MAX_HITS_PER_FILE {
