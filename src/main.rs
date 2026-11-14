@@ -295,6 +295,33 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Catálogo local de modelos via Ollama (HF-2, ADR-0040: HF é catálogo
+    /// de GGUF, nunca runtime — quem baixa e executa é o Ollama)
+    #[command(
+        after_help = "Exemplos:\n  kira model list                            # catálogo local (leitura, sempre livre)\n  kira model pull hf.co/<repo>:Q4_K_M        # baixa via ollama pull (pergunta em TTY)\n  kira model pull hf.co/<repo>:Q4_K_M --yes  # sem pergunta (não-interativo)\n\nPiso da casa: Q4_K_M — Q2_K é proibido por política (gate de admissão, ADR-0040)"
+    )]
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+}
+
+/// Ações do `kira model` (HF-2).
+#[derive(Debug, clap::Subcommand)]
+enum ModelAction {
+    /// Lista os modelos locais do Ollama (parse de `ollama list`; sem rede
+    /// fora do localhost do servidor ollama)
+    List,
+    /// Baixa um modelo GGUF (ex.: `hf.co/<repo>:<quant>`) via `ollama pull`
+    /// — só com consentimento: `--yes` OU prompt interativo em TTY com
+    /// destino e espaço livre; sem um dos dois, NADA é baixado
+    Pull {
+        /// Modelo no formato do Ollama (`hf.co/<repo>:Q4_K_M` ou `qwen3.5:4b`)
+        repo: String,
+        /// Confirma o download sem perguntar (em TTY a flag vence o prompt)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `kira pr` actions: for now only the local draft.
@@ -504,6 +531,10 @@ async fn run(command: Command) -> Outcome {
         } => dashboard_command(snapshot, read_only),
         Command::Pr { action } => pr_command(action),
         Command::Connect { provider, yes } => connect_command(&provider, yes).await,
+        Command::Model { action } => match action {
+            ModelAction::List => model_list_command(),
+            ModelAction::Pull { repo, yes } => model_pull_command(repo.as_str(), yes),
+        },
     }
 }
 
@@ -930,6 +961,14 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 ("pr".to_string(), args, None)
             }
         },
+        Command::Model { action } => match action {
+            ModelAction::List => ("model".to_string(), "list".to_string(), None),
+            ModelAction::Pull { repo, yes } => (
+                "model".to_string(),
+                format!("pull {repo}{}", if *yes { " --yes" } else { "" }),
+                None,
+            ),
+        },
     }
 }
 
@@ -1197,6 +1236,39 @@ fn scan_command(path: Option<&Path>) -> Outcome {
     match scan::run(path) {
         Ok(text) => {
             print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira model list` (HF-2, ADR-0040): catálogo local via ollama — leitura
+/// pura, nunca LLM, nunca rede fora do localhost do ollama.
+fn model_list_command() -> Outcome {
+    match kira::model::list() {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira model pull <repo>` (HF-2, ADR-0040): baixa GGUF via `ollama pull`
+/// com consentimento (`--yes` ou prompt em TTY) e disco checado antes.
+/// O download NÃO é chamada de LLM — não toca o contador (`llm_calls`
+/// mede inferência, não trabalho); o log de auditoria do pull é a trilha
+/// automática do `Outcome`.
+fn model_pull_command(repo: &str, yes: bool) -> Outcome {
+    match kira::model::pull(repo, yes) {
+        Ok(text) => {
+            println!("{text}");
             Outcome::success(text)
         }
         Err(err) => {
