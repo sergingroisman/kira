@@ -117,6 +117,16 @@ localhost"), nunca request anônimo que falha confuso. Chave nunca em log/
 egresso** no doctor/digest vale para os dois modos (cloud processa o prompt;
 não treina com ele, porém ele *sai* da máquina).
 
+> **OC-1 ✅ entregue (14/Nov/2026, `feat/oc1-ollama-cloud`, PR #113, merge
+> `9e00af7`)**: Bearer em host não-local com `OLLAMA_API_KEY` (env) ou keyring
+> (`ollama-api-key`); não-local sem chave = erro acionável na CONSTRUÇÃO do
+> backend (antes de qualquer request, nos 3 call sites: digest/loop/triage);
+> localhost idêntico ao de hoje (sem header — modo `signin` não tocou código);
+> chave nunca em log/`Debug`/store (Debug manual mascarado); aviso de egresso
+> no digest (stderr/nota do tick do loop), no doctor (origem da chave, nunca o
+> valor) e por tag `*:cloud` no routing HF-5. Fonte única da classificação em
+> `src/endpoint.rs` (puro, fora da camada LLM — allowlist do ADR-0016).
+
 **PR20 promovido (perfil de hardware, acaba com o chute de modelo)**: detectar
 VRAM via `nvidia-smi` resolvido no PATH (mesmo estilo `binresolve` das
 ferramentas de scan; ausente ⇒ perfil CPU) e recomendar tag por perfil:
