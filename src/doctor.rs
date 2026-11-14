@@ -113,6 +113,24 @@ pub fn format_unauthorized_check(organization: &str) -> String {
     )
 }
 
+/// P0 (auditoria F2): o número do budget do mandato — quantas chamadas de
+/// julgamento (triage/digest/eval) o KIRA fez HOJE contra o teto configurado
+/// (env > config.toml > 50). Fail-open: sem store a linha diz a causa —
+/// número inventado é proibido aqui como em toda tela.
+#[must_use]
+pub fn format_llm_lines() -> Vec<String> {
+    let max = crate::credentials::max_llm_calls_per_day();
+    let Ok(store) = crate::store::Store::open_default() else {
+        return vec![format!(
+            "chamadas LLM hoje: — (store indisponível; teto {max})"
+        )];
+    };
+    match store.llm_calls_today() {
+        Ok(today) => vec![format!("chamadas LLM hoje: {today}/{max}")],
+        Err(_) => vec![format!("chamadas LLM hoje: — (store ilegível; teto {max})")],
+    }
+}
+
 /// Linhas da onda M (ADR-0038): o que foi ingerido e o estado da fila de posts.
 ///
 /// Fail-open: qualquer dado ausente vira uma frase com a causa e o comando que
@@ -382,6 +400,12 @@ pub async fn run() -> (bool, String) {
     // Onda M (ADR-0038): ingestão e fila de posts. Fail-open — sem projeto ou sem
     // store, a linha diz que não há dado em vez de inventar número.
     for line in format_ingest_lines() {
+        emit(&mut out, &line);
+    }
+
+    // P0 (auditoria F2): o contador de chamadas de LLM do mandato — o número
+    // que o dono precisa ver antes do teto cortar o ciclo em silêncio.
+    for line in format_llm_lines() {
         emit(&mut out, &line);
     }
 

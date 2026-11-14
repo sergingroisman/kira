@@ -390,14 +390,24 @@ pub async fn run(
     kind: LlmKind,
     base_url: &str,
     model: &str,
+    ledger: Option<&crate::store::Store>,
 ) -> Result<(Vec<ItemResult>, GateResult), Error> {
     let pastas = item_dirs(dir)?;
     if pastas.is_empty() {
         return Err(erro_schema(dir));
     }
+    let max_calls = crate::credentials::max_llm_calls_per_day();
     let mut itens: Vec<ItemResult> = Vec::with_capacity(pastas.len());
     for pasta in &pastas {
-        itens.push(medir_item(pasta, kind, base_url, model).await?);
+        // P0 (auditoria F2): o `--eval` faz UMA chamada de LLM por item do
+        // gold; o teto diário é checado ANTES de cada uma — esgotou, a medição
+        // aborta inteira (nunca parcial, mesmo contrato do erro de item).
+        if let Some(store) = ledger
+            && let Err(err) = store.ensure_llm_budget(max_calls, "triage --eval")
+        {
+            return Err(Error::Eval(err.to_string()));
+        }
+        itens.push(medir_item(pasta, kind, base_url, model, ledger).await?);
     }
     let resultado_gate = gate(&itens);
     Ok((itens, resultado_gate))
@@ -409,6 +419,7 @@ async fn medir_item(
     kind: LlmKind,
     base_url: &str,
     model: &str,
+    ledger: Option<&crate::store::Store>,
 ) -> Result<ItemResult, Error> {
     let gold = ler_gold(pasta)?;
     let item_path = pasta.join("item.json");
@@ -417,7 +428,7 @@ async fn medir_item(
     // determinística — o `--eval` jamais usa um LLM como juiz.
     // A medição é abortada no primeiro item que falha: número parcial não é
     // número, e o erro do backend/triage já é acionável por si só.
-    let report = triage::triage_file_llm(kind, base_url, model, &item_path)
+    let report = triage::triage_file_llm(kind, base_url, model, &item_path, ledger)
         .await
         .map_err(|err| {
             Error::Eval(format!(

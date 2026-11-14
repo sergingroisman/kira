@@ -12,7 +12,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    Finding, ScanError, ToolKind, exit_code_label, spawn_error, stderr_hint, tool_command,
+    Finding, ScanError, ToolKind, decode, exit_code_label, spawn_error, stderr_hint, tool_command,
 };
 
 /// Which package manager audit to run: choice made in the stack detection
@@ -43,7 +43,10 @@ pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanErr
     let output = command
         .output()
         .map_err(|source| spawn_error(kind, source))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // M7/P1: decodificação tolerante (BOM/UTF-16) — a saída do npm/pnpm pode
+    // chegar UTF-16 no Windows (redirecionamento/wrapper); lossy puro viraria
+    // mojibake e o JSON bom não parsearia.
+    let stdout = decode::decode_tool_output(&output.stdout);
     let parsed = match tool {
         NodeAuditTool::Npm => parse_npm_output(&stdout),
         NodeAuditTool::Pnpm => parse_pnpm_output(&stdout),

@@ -196,6 +196,26 @@ pub async fn run<B: LlmBackend>(
             ));
             break;
         }
+        // P0 (auditoria F2): o teto diário de CHAMADAS é checado antes do
+        // claim — nunca retirar uma carta que não dá para gerar (o lease
+        // venceria e a devolveria de qualquer jeito). O budget de tokens
+        // acima limita tamanho; este limita quantas vezes o turno fala com
+        // o modelo (mandato: 50/dia, env/config).
+        match store.ensure_llm_budget(crate::credentials::max_llm_calls_per_day(), "digest") {
+            Ok(()) => {}
+            Err(crate::store::StoreError::BudgetExhausted {
+                today,
+                max,
+                command,
+            }) => {
+                report.budget_hit = true;
+                report.notes.push(format!(
+                    "limite diário de chamadas de LLM atingido ({today}/{max} hoje em `{command}`) — retome amanhã ou aumente max_llm_calls_per_day"
+                ));
+                break;
+            }
+            Err(err) => return Err(DigestError::Store(err.to_string())),
+        }
         let claimed = match store.post_claim(&project_id, now(), LEASE_SECONDS) {
             Ok(Some(row)) => row,
             Ok(None) => break,
@@ -214,16 +234,47 @@ pub async fn run<B: LlmBackend>(
         // ADR-0038 confina a chamada a este módulo, atrás de trust e de orçamento.
         let answer = backend.complete(&system, &prompt).await;
 
+        // P0 (auditoria F2): a chamada entra no ledger do mandato, venha boa,
+        // vazia ou falha — o custo aconteceu. Best-effort: falha de store vira
+        // nota, nunca quebra o turno. O backend do digest é Ollama hoje
+        // (main.rs constrói só ele); quando virar plugável, o kind vem junto.
+        if let Err(err) = store.record_llm_call(
+            "ollama",
+            &options.model,
+            "digest",
+            estimate_tokens(&prompt, answer.as_deref().unwrap_or("")),
+        ) {
+            report
+                .notes
+                .push(format!("chamada LLM não registrada no ledger ({err})"));
+        }
+
         match answer {
             Ok(text) if !text.trim().is_empty() => {
                 report.tokens_used = report
                     .tokens_used
                     .saturating_add(estimate_tokens(&prompt, &text));
+                // HF-3: guardrail determinístico de saída (puro Rust, zero
+                // dependência). O rascunho é montado AQUI (front-matter +
+                // corpo já redigido) e CONFERIDO antes de tocar o disco:
+                // front-matter ausente/malformado ou teto estourado vira
+                // nota acionável + estado failed — nunca truncamento, nunca
+                // gravação pela metade.
+                let draft_text = build_draft(&claimed.slug, &options.lang, &text);
+                if let Err(violation) = guard_draft(&draft_text) {
+                    let state = store.post_fail(&claimed.id).unwrap_or(PostState::Sealed);
+                    report.failed += 1;
+                    report.notes.push(format!(
+                        "{}: guardrail de saída recusou ({violation}); estado {state:?} — nada gravado",
+                        claimed.slug
+                    ));
+                    continue;
+                }
                 let draft = root
                     .join(".kira")
                     .join("drafts")
                     .join(format!("{}.md", claimed.slug));
-                if let Err(source) = write_draft(&draft, &claimed.slug, &options.lang, &text) {
+                if let Err(source) = write_text(&draft, &draft_text) {
                     let state = store.post_fail(&claimed.id).unwrap_or(PostState::Sealed);
                     report.failed += 1;
                     report.notes.push(format!(
@@ -358,10 +409,77 @@ pub fn estimate_tokens(prompt: &str, answer: &str) -> u64 {
     chars / CHARS_PER_TOKEN
 }
 
-fn write_draft(path: &Path, slug: &str, lang: &str, body: &str) -> Result<(), std::io::Error> {
-    let header =
-        format!("<!-- gerado por `kira digest` (ADR-0038). slug: {slug} · lang: {lang} -->\n\n");
-    write_text(path, &format!("{header}{}", crate::redact::redact(body)))
+/// Teto de chars do rascunho pronto (front-matter + corpo): o MESMO teto do
+/// prompt por post (`PER_POST_TOKENS` × `CHARS_PER_TOKEN`). Saída acima do
+/// teto é RECUSADA, nunca truncada — cortar texto do modelo no meio é
+/// publicar meia frase com cara de inteira.
+pub const DRAFT_CHAR_CAP: usize = (PER_POST_TOKENS * CHARS_PER_TOKEN) as usize;
+
+/// Monta o texto final do rascunho: front-matter YAML (slug/lang/generator)
+/// seguido do corpo JÁ redigido (`redact` — segredo nunca chega ao disco, nem
+/// em dado derivado). O `publish` descasca este front-matter antes de embutir
+/// o corpo no post publicado (o front-matter de proveniência é dele).
+pub fn build_draft(slug: &str, lang: &str, body: &str) -> String {
+    format!(
+        "---\nslug: {slug}\nlang: {lang}\ngenerator: kira digest (ADR-0038)\n---\n\n{}",
+        crate::redact::redact(body)
+    )
+}
+
+/// Violação do guardrail de saída (HF-3). Toda variante é acionável: diz o
+/// que faltou e o que fazer — nunca só "inválido".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftViolation {
+    /// O texto não começa com o bloco `---`.
+    MissingFrontMatter,
+    /// O bloco `---` não fecha ou não tem `slug:`/`lang:`.
+    MalformedFrontMatter,
+    /// Acima do teto — nada é truncado.
+    TooLong { chars: usize, cap: usize },
+}
+
+impl std::fmt::Display for DraftViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingFrontMatter => write!(
+                f,
+                "front-matter ausente — o rascunho precisa começar com o bloco --- (slug/lang)"
+            ),
+            Self::MalformedFrontMatter => write!(
+                f,
+                "front-matter malformado — o bloco --- precisa fechar e conter slug e lang"
+            ),
+            Self::TooLong { chars, cap } => write!(
+                f,
+                "rascunho com {chars} chars acima do teto de {cap} — o modelo passou do orçamento do post; nada foi truncado"
+            ),
+        }
+    }
+}
+
+/// Guardrail determinístico de saída (HF-3, função pura): front-matter
+/// obrigatório e bem-formado + teto de tamanho. Zero LLM, zero rede — é
+/// conferência de forma sobre texto, cálculo em Rust (ADR-0016).
+pub fn guard_draft(text: &str) -> Result<(), DraftViolation> {
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return Err(DraftViolation::MissingFrontMatter);
+    };
+    let Some(close) = rest.find("\n---") else {
+        return Err(DraftViolation::MalformedFrontMatter);
+    };
+    let block = &rest[..close];
+    let has = |key: &str| block.lines().any(|line| line.starts_with(key));
+    if !has("slug: ") || !has("lang: ") {
+        return Err(DraftViolation::MalformedFrontMatter);
+    }
+    let chars = text.chars().count();
+    if chars > DRAFT_CHAR_CAP {
+        return Err(DraftViolation::TooLong {
+            chars,
+            cap: DRAFT_CHAR_CAP,
+        });
+    }
+    Ok(())
 }
 
 fn write_text(path: &Path, body: &str) -> Result<(), std::io::Error> {
@@ -435,6 +553,100 @@ mod tests {
         assert!(
             prompt.chars().count() < chars_for(10) + 2_000,
             "teto do post não respeitado"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // HF-3 — guardrail determinístico de saída (build_draft + guard_draft)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_draft_emits_front_matter_and_passes_the_guard() {
+        let text = build_draft("intro", "pt-BR", "KIRA é um CLI.\n");
+        assert!(
+            text.starts_with("---\n"),
+            "front-matter obrigatório: {text}"
+        );
+        assert!(text.contains("slug: intro"), "{text}");
+        assert!(text.contains("lang: pt-BR"), "{text}");
+        assert!(text.contains("KIRA é um CLI."), "corpo preservado: {text}");
+        guard_draft(&text).unwrap_or_else(|err| panic!("rascunho válido: {err}"));
+    }
+
+    #[test]
+    fn build_draft_masks_a_fake_token_before_it_reaches_the_disk() {
+        // Segredo nunca chega ao disco, nem em dado derivado (regra dura):
+        // o corpo passa por `redact` DENTRO do build_draft.
+        let text = build_draft(
+            "intro",
+            "pt-BR",
+            "configuração: token=AbC123XyZ789QqQ e chave ghp_0123456789abcdefghijABCDEFGHIJ012345\n",
+        );
+        assert!(
+            !text.contains("AbC123XyZ789QqQ"),
+            "token de atribuição vazou: {text}"
+        );
+        assert!(
+            !text.contains("ghp_0123456789abcdefghijABCDEFGHIJ012345"),
+            "token em formato conhecido vazou: {text}"
+        );
+        guard_draft(&text).unwrap_or_else(|err| panic!("rascunho válido: {err}"));
+    }
+
+    #[test]
+    fn guard_refuses_text_without_front_matter() {
+        // O caso do aceite ("post sem front-matter vira failed"): a recusa é
+        // da função pura — o binário só grava o que passa por ela.
+        assert_eq!(
+            guard_draft("só o corpo, sem cabeçalho\n"),
+            Err(DraftViolation::MissingFrontMatter)
+        );
+        assert_eq!(
+            guard_draft(""),
+            Err(DraftViolation::MissingFrontMatter),
+            "vazio também não tem front-matter"
+        );
+    }
+
+    #[test]
+    fn guard_refuses_malformed_front_matter() {
+        assert_eq!(
+            guard_draft("---\nslug: intro\nsem fechamento\n"),
+            Err(DraftViolation::MalformedFrontMatter),
+            "bloco que não fecha"
+        );
+        assert_eq!(
+            guard_draft("---\nfoo: bar\n---\n\ncorpo\n"),
+            Err(DraftViolation::MalformedFrontMatter),
+            "bloco sem slug/lang"
+        );
+    }
+
+    #[test]
+    fn guard_refuses_a_draft_over_the_cap_without_truncating() {
+        let huge = "a".repeat(DRAFT_CHAR_CAP + 1);
+        let text = build_draft("intro", "pt-BR", &huge);
+        let violation = guard_draft(&text).expect_err("acima do teto precisa recusar");
+        assert!(
+            matches!(violation, DraftViolation::TooLong { .. }),
+            "violação de teto: {violation:?}"
+        );
+        assert!(
+            violation.to_string().contains("acima do teto"),
+            "mensagem acionável: {violation}"
+        );
+        // Fronteira exata (sem número mágico): o cabeçalho é medido e o corpo
+        // preenche até o teto — no limite passa (inclusivo), um char a mais
+        // estoura.
+        let head = build_draft("intro", "pt-BR", "");
+        let filler = DRAFT_CHAR_CAP - head.chars().count();
+        let exact = build_draft("intro", "pt-BR", &"a".repeat(filler));
+        assert_eq!(exact.chars().count(), DRAFT_CHAR_CAP);
+        guard_draft(&exact).unwrap_or_else(|err| panic!("no teto exato: {err}"));
+        let over = build_draft("intro", "pt-BR", &"a".repeat(filler + 1));
+        assert!(
+            matches!(guard_draft(&over), Err(DraftViolation::TooLong { .. })),
+            "um char acima do teto precisa recusar"
         );
     }
 

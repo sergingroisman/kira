@@ -91,8 +91,8 @@ ler issues, abrir PR; nunca push em branch protegida).
 ## J1 — Percepção: `scan`
 
 Igual ao desenho anterior: stacks (node/dotnet), workspace pnpm dobrado no root, resolução de
-ferramenta no PATH (PATHEXT no Windows), parse tolerante (BOM/UTF-16 — **planejado,
-onda IG/M7; ainda não implementado**), finding com fingerprint,
+ferramenta no PATH (PATHEXT no Windows), parse tolerante (BOM/UTF-16 — `src/scan/decode.rs`,
+M7 ✅), finding com fingerprint,
 saída determinística. **Zero rede, zero credencial.**
 
 ## J3 — Conhecimento: `codex` (wiki)

@@ -122,13 +122,12 @@ fn migration_creates_posts_and_outbox_on_an_existing_store() {
     // Primeiro uso (qualquer comando cria o store na versão corrente).
     let (code, _, stderr) = sandbox.run(&["profile"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    // ADR-0039 (renames 4/6 e 5/6) + onda SK (SK-1): schema corrente é a v9
-    // (v7 = coluna `draft_ttl`, v8 = estado `failed`, v9 = `skill`/`skill_fts`).
-    // NOTA: o PR #101 (llm_calls) também reserva a v9; quem mergear por segundo
-    // renumera o seu passo para v10.
+    // ADR-0039 (renames 4/6 e 5/6) + P0 (F2) + onda SK (SK-1): schema corrente é a
+    // v10 (v7 = coluna `draft_ttl`, v8 = estado `failed`, v9 = `llm_calls`,
+    // v10 = `skill`/`skill_fts` — renumerado no merge, v9 já era do llm_calls).
     assert_eq!(
         user_version(&sandbox.db()),
-        9,
+        10,
         "migração não subiu para a versão corrente"
     );
 

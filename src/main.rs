@@ -307,6 +307,44 @@ enum Command {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// Catálogo local de modelos via Ollama (HF-2, ADR-0040: HF é catálogo
+    /// de GGUF, nunca runtime — quem baixa e executa é o Ollama)
+    #[command(
+        after_help = "Exemplos:\n  kira model list                            # catálogo local (leitura, sempre livre)\n  kira model pull hf.co/<repo>:Q4_K_M        # baixa via ollama pull (pergunta em TTY)\n  kira model pull hf.co/<repo>:Q4_K_M --yes  # sem pergunta (não-interativo)\n\nPiso da casa: Q4_K_M — Q2_K é proibido por política (gate de admissão, ADR-0040)"
+    )]
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+    /// Ciclo local do KIRA (PR15): um tick = ingest → digest (se trusted) →
+    /// publish. Tudo LOCAL — nunca escreve no mundo (Azure/git remoto); sem
+    /// daemon: roda em primeiro plano e sai. `--once` = um tick (CI)
+    #[command(
+        after_help = "Exemplos:\n  kira loop --once                 # um tick e sai (CI/teste)\n  kira loop                        # ticks até estabilizar (nada a fazer)\n  kira loop --skip-digest --once   # ciclo determinístico, sem LLM\n  kira loop --ticks 4              # teto de ticks por execução"
+    )]
+    Loop {
+        /// Roda UM tick e sai (nunca entra no modo "até estabilizar")
+        #[arg(long)]
+        once: bool,
+        /// Teto de ticks por execução (default 16; só sem --once)
+        #[arg(long)]
+        ticks: Option<usize>,
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Tag do modelo do digest (default: KIRA_MODEL/qwen3.5:4b)
+        #[arg(long)]
+        model: Option<String>,
+        /// Idioma dos posts (default: KIRA_LANG ou en)
+        #[arg(long)]
+        lang: Option<String>,
+        /// Pula o digest: ciclo 100% determinístico (ingest + publish)
+        #[arg(long)]
+        skip_digest: bool,
+        /// O ingest não roda o scan dentro do ciclo
+        #[arg(long)]
+        skip_scan: bool,
+    },
 }
 
 /// `kira skills` actions (onda SK, SK-1).
@@ -334,6 +372,24 @@ enum SkillsAction {
     },
     /// Reconstrói o índice derivado `skill`/`skill_fts`
     Reindex,
+}
+
+/// Ações do `kira model` (HF-2).
+#[derive(Debug, clap::Subcommand)]
+enum ModelAction {
+    /// Lista os modelos locais do Ollama (parse de `ollama list`; sem rede
+    /// fora do localhost do servidor ollama)
+    List,
+    /// Baixa um modelo GGUF (ex.: `hf.co/<repo>:<quant>`) via `ollama pull`
+    /// — só com consentimento: `--yes` OU prompt interativo em TTY com
+    /// destino e espaço livre; sem um dos dois, NADA é baixado
+    Pull {
+        /// Modelo no formato do Ollama (`hf.co/<repo>:Q4_K_M` ou `qwen3.5:4b`)
+        repo: String,
+        /// Confirma o download sem perguntar (em TTY a flag vence o prompt)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `kira pr` actions: for now only the local draft.
@@ -544,6 +600,30 @@ async fn run(command: Command) -> Outcome {
         Command::Pr { action } => pr_command(action),
         Command::Connect { provider, yes } => connect_command(&provider, yes).await,
         Command::Skills { action, path } => skills_command(action, path.as_deref()),
+        Command::Model { action } => match action {
+            ModelAction::List => model_list_command(),
+            ModelAction::Pull { repo, yes } => model_pull_command(repo.as_str(), yes),
+        },
+        Command::Loop {
+            once,
+            ticks,
+            path,
+            model,
+            lang,
+            skip_digest,
+            skip_scan,
+        } => {
+            loop_command(
+                path.as_deref(),
+                once,
+                ticks,
+                model,
+                lang,
+                skip_digest,
+                skip_scan,
+            )
+            .await
+        }
     }
 }
 
@@ -987,6 +1067,47 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             };
             ("skills".to_string(), args, None)
         }
+        Command::Model { action } => match action {
+            ModelAction::List => ("model".to_string(), "list".to_string(), None),
+            ModelAction::Pull { repo, yes } => (
+                "model".to_string(),
+                format!("pull {repo}{}", if *yes { " --yes" } else { "" }),
+                None,
+            ),
+        },
+        Command::Loop {
+            once,
+            ticks,
+            path,
+            model,
+            lang,
+            skip_digest,
+            skip_scan,
+        } => {
+            let mut args = String::new();
+            if *once {
+                args.push_str("--once");
+            }
+            if let Some(ticks) = ticks {
+                args.push_str(&format!(" --ticks {ticks}"));
+            }
+            if let Some(path) = path {
+                args.push_str(&format!(" --path {}", path.display()));
+            }
+            if let Some(model) = model {
+                args.push_str(&format!(" --model {model}"));
+            }
+            if let Some(lang) = lang {
+                args.push_str(&format!(" --lang {lang}"));
+            }
+            if *skip_digest {
+                args.push_str(" --skip-digest");
+            }
+            if *skip_scan {
+                args.push_str(" --skip-scan");
+            }
+            ("loop".to_string(), args.trim().to_string(), model.clone())
+        }
     }
 }
 
@@ -1370,6 +1491,78 @@ fn reindex_skills(root: &Path) -> Result<usize, kira::skills::SkillError> {
     let project_id = store::project_id_for_root(root)
         .map_err(|err| kira::skills::SkillError::Store(err.to_string()))?;
     kira::skills::reindex(root, &store, &project_id)
+}
+
+/// `kira model list` (HF-2, ADR-0040): catálogo local via ollama — leitura
+/// pura, nunca LLM, nunca rede fora do localhost do ollama.
+fn model_list_command() -> Outcome {
+    match kira::model::list() {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira loop` (PR15): o turno do binário — ticks locais (ingest → digest se
+/// trusted → publish) até estabilizar; `--once` roda um tick e sai (CI).
+/// Read-only no mundo: escrita externa só via `awaiting_approval` +
+/// `kira approve` humano (PR18). O digest dentro do ciclo passa pelo mesmo
+/// `post::run` do comando (cache, trust, orçamento — nada reimplementado).
+#[allow(clippy::too_many_arguments)]
+async fn loop_command(
+    path: Option<&Path>,
+    once: bool,
+    ticks: Option<usize>,
+    model: Option<String>,
+    lang: Option<String>,
+    skip_digest: bool,
+    skip_scan: bool,
+) -> Outcome {
+    let root = kira::r#loop::resolve_root(path);
+    let mut options = kira::r#loop::LoopOptions::at(root);
+    if let Some(model) = model {
+        options.model = model;
+    }
+    if let Some(lang) = lang {
+        options.lang = lang;
+    } else if let Ok(lang) = std::env::var("KIRA_LANG") {
+        options.lang = lang;
+    }
+    options.skip_digest = skip_digest;
+    options.run_scan = !skip_scan;
+    match kira::r#loop::run(&options, once, ticks.unwrap_or(16)).await {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira model pull <repo>` (HF-2, ADR-0040): baixa GGUF via `ollama pull`
+/// com consentimento (`--yes` ou prompt em TTY) e disco checado antes.
+/// O download NÃO é chamada de LLM — não toca o contador (`llm_calls`
+/// mede inferência, não trabalho); o log de auditoria do pull é a trilha
+/// automática do `Outcome`.
+fn model_pull_command(repo: &str, yes: bool) -> Outcome {
+    match kira::model::pull(repo, yes) {
+        Ok(text) => {
+            println!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
 }
 
 /// `kira ingest` — fatos do projeto, sem LLM (ADR-0038, M1).
@@ -1969,12 +2162,43 @@ async fn triage_command(
     };
     let base_url = ollama::base_url_from_env();
     let model = model_flag.unwrap_or_else(ollama::model_from_env);
+    // Budget diário (mandato/auditoria P0): checado ANTES da chamada. Store
+    // indisponível = fail-open com aviso VISÍVEL (regra dura da trilha), nunca
+    // bypass silencioso; teto atingido = erro acionável, exit ≠ 0. O mesmo
+    // store serve de LEDGER — `record_llm_call` acontece dentro do
+    // `triage_item`, que recebe a referência abaixo.
+    let budget_max = kira::credentials::max_llm_calls_per_day();
+    let budget_store = match kira::store::Store::open_default() {
+        Ok(store) => {
+            if let Err(err) = store.ensure_llm_budget(budget_max, "triage") {
+                print_error(&err);
+                return Outcome::failure(err.to_string());
+            }
+            Some(store)
+        }
+        Err(err) => {
+            eprintln!("aviso: budget de chamadas não verificado ({err}) — sigo sem enforcement");
+            None
+        }
+    };
     let result = match source {
         TriageSource::Id(id) => match resolve_board(None) {
-            Ok(board) => triage::triage_live_llm(kind, board.as_ref(), id, &base_url, &model).await,
+            Ok(board) => {
+                triage::triage_live_llm(
+                    kind,
+                    board.as_ref(),
+                    id,
+                    &base_url,
+                    &model,
+                    budget_store.as_ref(),
+                )
+                .await
+            }
             Err(err) => Err(err),
         },
-        TriageSource::File(path) => triage::triage_file_llm(kind, &base_url, &model, &path).await,
+        TriageSource::File(path) => {
+            triage::triage_file_llm(kind, &base_url, &model, &path, budget_store.as_ref()).await
+        }
     };
     match result {
         Ok(report) => {
@@ -2048,7 +2272,25 @@ async fn eval_command(
         }
         eprintln!("seeds sintéticas copiadas para {}", dir.display());
     }
-    match kira::eval::run(&dir, kind, &base_url, &model).await {
+    // P0 (auditoria F2): o `--eval` faz UMA chamada de LLM por item do gold —
+    // o mesmo teto do triage vale aqui, checado antes de cada item (o run
+    // aborta inteiro, nunca parcial). Store indisponível = aviso visível e
+    // execução sem teto, mesma conduta do triage vivo.
+    let budget_max = kira::credentials::max_llm_calls_per_day();
+    let budget_store = match kira::store::Store::open_default() {
+        Ok(store) => {
+            if let Err(err) = store.ensure_llm_budget(budget_max, "triage --eval") {
+                print_error(&err);
+                return Outcome::failure(err.to_string());
+            }
+            Some(store)
+        }
+        Err(err) => {
+            eprintln!("aviso: budget de chamadas não verificado ({err}) — sigo sem enforcement");
+            None
+        }
+    };
+    match kira::eval::run(&dir, kind, &base_url, &model, budget_store.as_ref()).await {
         Ok((itens, gate)) => {
             if json {
                 let report = kira::eval::report(&itens, &gate);

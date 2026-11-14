@@ -413,6 +413,30 @@ pub fn dev_name_from_config() -> Option<String> {
         .filter(|name| !name.trim().is_empty())
 }
 
+/// Chave do budget do mandato em `config.toml` (default 50 chamadas/dia).
+pub const CONFIG_KEY_MAX_LLM_CALLS: &str = "max_llm_calls_per_day";
+
+/// Env que sobrescreve o teto do config (precedência flag > env > config).
+pub const MAX_LLM_CALLS_ENV: &str = "KIRA_MAX_LLM_CALLS_PER_DAY";
+
+/// Teto diário de chamadas de LLM: env > `config.toml` > 50 (mandato).
+/// Valor inválido (não numérico ou ≤ 0) cai no default — typo no config não
+/// pode nem travar o ciclo nem escancarar o budget (auditoria P0).
+pub fn max_llm_calls_per_day() -> usize {
+    const DEFAULT: usize = 50;
+    let parse = |value: &str| value.trim().parse::<usize>().ok().filter(|n| *n > 0);
+    std::env::var(MAX_LLM_CALLS_ENV)
+        .ok()
+        .as_deref()
+        .and_then(parse)
+        .or_else(|| {
+            read_config()
+                .ok()
+                .and_then(|cfg| config_get(&cfg, CONFIG_KEY_MAX_LLM_CALLS).and_then(parse))
+        })
+        .unwrap_or(DEFAULT)
+}
+
 /// Core of the PAT resolution: env wins over the store; a missing store or an
 /// empty store degrades to the actionable `MissingPat` error — never a panic.
 fn resolve_pat_parts(

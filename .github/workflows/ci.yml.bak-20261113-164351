@@ -1,0 +1,90 @@
+name: CI
+
+# Por que esta divisão: no runner windows-latest o passo `cargo test` levava 27–31 min,
+# contra ~2 min no Linux. A causa não era teste lento: era a LINKAGEM dos 19 binários de
+# teste (cada um linka a crate inteira + azure_devops_rust_api + rusqlite bundled) somada
+# ao custo de spawn de processo no Windows (todo e2e roda o binário real).
+#
+# Estratégia:
+# - `unit`: os três SOs, só `--lib`. Pega regressão de lógica e é rápido.
+# - `e2e-linux`: sempre. É onde os e2e encontram bug de I/O e de processo.
+# - `e2e-desktop`: Windows e macOS APENAS no push para main (ou sob demanda): o Windows
+#   valida o que o Linux não pega (caminho/PATHEXT/cmd), mas custa caro por PR.
+# - `timeout-minutes` em todos: falhar em 20 min é melhor que pendurar a fila por 40.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Build
+        run: cargo build
+
+  e2e-linux:
+    name: e2e (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
+
+      - name: E2E tests
+        run: cargo test --tests
+
+  e2e-desktop:
+    name: e2e (${{ matrix.os }})
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-desktop
+
+      - name: E2E tests
+        run: cargo test --tests
