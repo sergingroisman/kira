@@ -131,6 +131,63 @@ pub fn format_llm_lines() -> Vec<String> {
     }
 }
 
+/// OC-1: linhas de egresso do Ollama no `doctor` — URL não-local ou tag
+/// `*:cloud` no routing significam que o prompt SAI da máquina. Aviso, não
+/// erro. A chave NUNCA aparece em valor: só a ORIGEM (env/keyring) — o mesmo
+/// padrão do `redact`. PURA: os parâmetros chegam prontos do caller.
+#[must_use]
+pub fn format_ollama_egress_lines(
+    base_url: &str,
+    api_key_source: Option<&str>,
+    cloud_tags: &[String],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !crate::endpoint::is_local_url(base_url) {
+        let key = match api_key_source {
+            Some(origin) => format!("chave presente ({origin})"),
+            // O dev precisa saber que o digest VAI falhar antes de rodá-lo.
+            None => "chave AUSENTE — defina a env OLLAMA_API_KEY ou volte ao local: \
+                     KIRA_OLLAMA_URL=http://localhost:11434"
+                .to_string(),
+        };
+        lines.push(format!(
+            "aviso: egresso de dados neste run — KIRA_OLLAMA_URL ({base_url}) não é local: \
+             o prompt sai da máquina (o cloud processa, não treina com ele); {key}"
+        ));
+    }
+    if !cloud_tags.is_empty() {
+        lines.push(format!(
+            "aviso: egresso de dados neste run — tags `*:cloud` no routing: {} (o prompt sai da máquina)",
+            cloud_tags.join(", ")
+        ));
+    }
+    lines
+}
+
+/// Tags `*:cloud` visíveis no routing de hoje: tabela `model_role.<kind>` do
+/// `config.toml` + `KIRA_MODEL` explícito. Builtin tags nunca são cloud.
+#[must_use]
+fn collect_cloud_routing_tags() -> Vec<String> {
+    let mut tags: Vec<String> = match credentials::read_config() {
+        Ok(pairs) => pairs
+            .iter()
+            .filter(|(key, _)| key.starts_with(credentials::CONFIG_MODEL_ROLE_PREFIX))
+            .map(|(_, value)| value.trim().to_string())
+            .filter(|value| crate::endpoint::is_cloud_tag(value))
+            .collect(),
+        // Fail-open: config ilegível não esconde as outras fontes, nem quebra.
+        Err(_) => Vec::new(),
+    };
+    if let Some(explicit) = std::env::var("KIRA_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        && crate::endpoint::is_cloud_tag(&explicit)
+    {
+        tags.push(explicit);
+    }
+    tags
+}
+
 /// HF-5 (ADR-0040): linhas do piso do Ollama no `doctor` — a versão vem do
 /// binário (nunca inventada); abaixo do piso 0.17.1 vira aviso com a causa
 /// (CVE-2026-7482). Fail-open: sem ollama ou com saída ilegível, a linha
@@ -454,6 +511,17 @@ pub async fn run() -> (bool, String) {
         emit(&mut out, &line);
     }
 
+    // OC-1: egresso do Ollama (URL não-local OU tag `*:cloud` no routing) —
+    // aviso, nunca erro. A chave aparece só pela ORIGEM (env/keyring), nunca
+    // em valor — o mesmo padrão do `redact`.
+    let ollama_url = crate::endpoint::base_url_from_env();
+    let api_key_source =
+        credentials::resolve_ollama_api_key_with_source().map(|resolved| resolved.source.label());
+    let cloud_tags = collect_cloud_routing_tags();
+    for line in format_ollama_egress_lines(&ollama_url, api_key_source, &cloud_tags) {
+        emit(&mut out, &line);
+    }
+
     if !missing.is_empty() {
         emit(&mut out, "2. Conexão com a organização");
         emit(&mut out, "   - ignorada: corrija os itens ✗ acima");
@@ -532,6 +600,55 @@ pub async fn run() -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_lines_appear_only_when_data_leaves_the_machine() {
+        // Local: nenhuma linha de egresso (o padrão de hoje é silencioso).
+        let lines = format_ollama_egress_lines("http://localhost:11434", None, &[]);
+        assert!(lines.is_empty(), "localhost nunca é egresso: {lines:?}");
+
+        // URL não-local SEM chave: aviso + o que fazer (o digest vai falhar).
+        let lines = format_ollama_egress_lines("https://ollama.com", None, &[]);
+        assert_eq!(lines.len(), 1, "uma linha para a URL: {lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("egresso de dados neste run"), "linha: {line}");
+        assert!(line.contains("sai da máquina"), "linha: {line}");
+        assert!(line.contains("OLLAMA_API_KEY"), "acionável: {line}");
+        assert!(
+            line.contains("localhost"),
+            "caminho de volta ao local: {line}"
+        );
+
+        // Com chave: presente pela ORIGEM — NUNCA o valor (padrão do redact).
+        let lines = format_ollama_egress_lines("https://ollama.com", Some("env"), &[]);
+        assert!(
+            lines[0].contains("chave presente (env)") && !lines[0].contains("sk-"),
+            "origem, não valor: {}",
+            lines[0]
+        );
+
+        // Tag `*:cloud` no routing com URL local: egresso igual (o prompt sai
+        // pelo cloud mesmo com server local — matriz HF-5).
+        let lines = format_ollama_egress_lines(
+            "http://localhost:11434",
+            None,
+            &["qwen3-coder:480b-cloud".to_string()],
+        );
+        assert_eq!(lines.len(), 1, "uma linha para a tag: {lines:?}");
+        assert!(
+            lines[0].contains("qwen3-coder:480b-cloud") && lines[0].contains("sai da máquina"),
+            "linha: {}",
+            lines[0]
+        );
+
+        // Os dois egressos juntos: duas linhas, uma por causa.
+        let lines = format_ollama_egress_lines(
+            "https://ollama.com",
+            Some("keyring do OS"),
+            &["fake:cloud".to_string()],
+        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
+    }
 
     #[test]
     fn ollama_lines_report_the_floor_or_the_cause() {

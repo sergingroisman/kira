@@ -299,7 +299,11 @@ async fn triage_item(
     // (campos, HTML, fingerprint, store, grep do repositório) é determinístico
     // (ADR-0016).
     let backend = match kind {
-        LlmKind::Ollama => TriageBackend::Ollama(OllamaBackend::new(base_url, model)),
+        LlmKind::Ollama => {
+            // OC-1: a validação URL × chave acontece AQUI (igual ao digest) —
+            // host não-local sem chave é erro acionável antes do request.
+            TriageBackend::Ollama(OllamaBackend::for_base_url(base_url, model)?)
+        }
         // The costly paths resolve their own binary/auth/key HERE and FAIL
         // LOUDLY (CopilotMissing/CopilotAuth; FoundryMissingKey/...) — never a
         // silent fallback to Ollama.

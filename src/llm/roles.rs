@@ -55,7 +55,10 @@ pub fn role_for_kind(kind: &str) -> Role {
 }
 
 /// Prefixo das chaves de override no `config.toml`: `model_role.<kind> = tag`.
-pub const CONFIG_MODEL_ROLE_PREFIX: &str = "model_role.";
+/// Fonte única em `credentials` (o `doctor` lê a tabela sem importar `llm::*`
+/// — allowlist do ADR-0016); aqui fica só o reexport para os usuários da
+/// camada LLM não mudarem de caminho.
+pub use crate::credentials::CONFIG_MODEL_ROLE_PREFIX;
 
 /// Tag configurada para o kind (override do dono) — `None` sem override.
 /// A leitura dos pares é feita pelo caller (`credentials::read_config`);

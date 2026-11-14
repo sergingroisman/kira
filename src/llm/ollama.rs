@@ -1,13 +1,21 @@
-//! Ollama backend: a local, offline LLM server (`http://localhost:11434`).
+//! Ollama backend: local by default (`http://localhost:11434`), with explicit
+//! authentication for non-local hosts (OC-1 — Ollama Cloud direto).
 //!
-//! Zero cloud, localhost only. The base URL comes from `KIRA_OLLAMA_URL`
-//! (default `http://localhost:11434`) and the model from `KIRA_MODEL` or the
-//! `--model` flag (default `qwen3.5:4b`).
+//! The base URL comes from `KIRA_OLLAMA_URL` (default `http://localhost:11434`)
+//! and the model from `KIRA_MODEL` or the `--model` flag (default
+//! `qwen3.5:4b`). A non-local URL is ALLOWED (Ollama Cloud direct API) but
+//! REQUIRES a key (`OLLAMA_API_KEY` env or keyring entry `ollama-api-key`):
+//! an anonymous request would fail in a confusing way, so the pair URL × key
+//! is validated at construction — never mid-request. The key never appears in
+//! `Debug`, logs or errors.
 
+use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::credentials;
+use crate::endpoint::is_local_url;
 use crate::error::Error;
 use crate::llm::LlmBackend;
 
@@ -15,8 +23,9 @@ use crate::llm::LlmBackend;
 /// 6 GB RTX 2060 entirely in GPU memory).
 pub const DEFAULT_MODEL: &str = "qwen3.5:4b";
 
-/// Default base URL of the local Ollama server.
-pub const DEFAULT_BASE_URL: &str = "http://localhost:11434";
+/// Default base URL of the local Ollama server — fonte única em `endpoint`
+/// (o `doctor` lê sem importar a camada LLM).
+pub use crate::endpoint::DEFAULT_BASE_URL;
 
 /// Conservative context window for a 6 GB GPU.
 pub const DEFAULT_NUM_CTX: u32 = 4096;
@@ -28,10 +37,9 @@ pub const DEFAULT_TEMPERATURE: f32 = 0.2;
 pub const REQUEST_TIMEOUT_SECS: u64 = 120;
 
 /// Reads the Ollama base URL from `KIRA_OLLAMA_URL`, falling back to
-/// [`DEFAULT_BASE_URL`].
-pub fn base_url_from_env() -> String {
-    env_or_default("KIRA_OLLAMA_URL", DEFAULT_BASE_URL)
-}
+/// [`crate::endpoint::DEFAULT_BASE_URL`] — a única fonte do nome de env e do
+/// default é o módulo de endpoint (o `doctor` usa o mesmo sem importar `llm`).
+pub use crate::endpoint::base_url_from_env;
 
 /// Reads the model tag from `KIRA_MODEL`, falling back to [`DEFAULT_MODEL`].
 pub fn model_from_env() -> String {
@@ -50,22 +58,123 @@ fn env_or_default(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Backend that talks to a local Ollama server over `POST /api/chat`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Backend that talks to an Ollama server over `POST /api/chat` — local by
+/// default, Bearer-authenticated when the URL is non-local (OC-1).
 pub struct OllamaBackend {
     base_url: String,
     model: String,
+    /// Chave da API, resolvida por [`Self::for_base_url`] — `None` em
+    /// localhost (comportamento idêntico ao de hoje: sem header).
+    api_key: Option<String>,
 }
+
+impl fmt::Debug for OllamaBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A chave NUNCA aparece no Debug (OC-1): presente/ausente basta —
+        // qualquer `println!("{backend:?}")` de debug futuro não pode vazar.
+        let key = self.api_key.as_ref().map(|_| "<redacted>");
+        f.debug_struct("OllamaBackend")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &key)
+            .finish()
+    }
+}
+
+impl Clone for OllamaBackend {
+    fn clone(&self) -> Self {
+        // Clone manual: o derive copiaria o valor da chave para um novo
+        // campo sem o controle do Debug (o clone herda a máscara acima).
+        Self {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            api_key: self.api_key.clone(),
+        }
+    }
+}
+
+impl PartialEq for OllamaBackend {
+    fn eq(&self, other: &Self) -> bool {
+        self.base_url == other.base_url && self.model == other.model
+    }
+}
+
+impl Eq for OllamaBackend {}
 
 impl OllamaBackend {
     /// Creates a backend for the given base URL (trailing `/` is trimmed) and
-    /// model tag.
+    /// model tag — sem chave: use [`Self::for_base_url`] nos comandos, que
+    /// valida o par URL × chave (OC-1) antes de qualquer request.
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
+            api_key: None,
         }
     }
+
+    /// Constrói o backend validando o par URL × chave (OC-1): URL NÃO-local
+    /// sem chave é erro acionável ANTES de qualquer request — nunca request
+    /// anônimo que falha confuso. Em localhost a chave não é exigida nem
+    /// anexada (o server local autentica por conta própria, modo `signin`).
+    ///
+    /// A chave vem da env `OLLAMA_API_KEY` ou do keyring do OS (entrada
+    /// `ollama-api-key`); falha de leitura do keyring conta como ausente —
+    /// o erro acionável da falta de chave já diz onde definir a env.
+    pub fn for_base_url(base_url: &str, model: impl Into<String>) -> Result<Self, Error> {
+        let key = credentials::resolve_ollama_api_key_with_source();
+        require_key_for_url(base_url, key.as_ref().map(|r| r.value.as_str()))?;
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.into(),
+            api_key: key_for_url(base_url, key.as_ref().map(|r| r.value.as_str())),
+        })
+    }
+
+    /// Clona o backend trocando a tag do modelo — mesma URL, mesma chave. A
+    /// fábrica do routing por kind (HF-5) chama por post sem re-resolver a
+    /// credencial nem revalidar a URL.
+    pub fn with_model(&self, model: impl Into<String>) -> Self {
+        let mut clone = self.clone();
+        clone.model = model.into();
+        clone
+    }
+
+    /// Cria o backend com chave EXPLÍCITA SEMPRE anexada (uso de teste): o
+    /// fake server dos testes vive em `127.0.0.1` — local por definição —,
+    /// então para exercitar o header `Authorization: Bearer` contra ele o
+    /// helper ignora a regra de URL (que é coberta por [`key_for_url`]).
+    #[cfg(test)]
+    pub(crate) fn with_key_for_tests(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
+        let mut backend = Self::new(base_url, model);
+        backend.api_key = Some(api_key.into());
+        backend
+    }
+}
+
+/// Valida o par URL × chave (OC-1, PURA): URL não-local sem chave é o erro
+/// acionável — nunca request anônimo que falha confuso. Local dispensa chave.
+fn require_key_for_url(base_url: &str, key: Option<&str>) -> Result<(), Error> {
+    if is_local_url(base_url) || key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
+        return Ok(());
+    }
+    Err(Error::OllamaKeyMissing {
+        url: base_url.to_string(),
+    })
+}
+
+/// Decide se a chave é anexada ao request (PURA): nunca em localhost — o
+/// server local autentica por conta própria (modo `signin`, OC-1 modo (a)),
+/// e o comportamento local tem que ficar idêntico ao de hoje (sem header).
+fn key_for_url(base_url: &str, key: Option<&str>) -> Option<String> {
+    if is_local_url(base_url) {
+        return None;
+    }
+    key.map(str::to_string)
 }
 
 #[derive(Debug, Serialize)]
@@ -123,7 +232,14 @@ impl LlmBackend for OllamaBackend {
                 temperature: DEFAULT_TEMPERATURE,
             },
         };
-        let response = client.post(url.as_str()).json(&request).send().await;
+        let mut builder = client.post(url.as_str()).json(&request);
+        // OC-1: Bearer só quando há chave resolvida (host não-local). Em
+        // localhost NUNCA há header — comportamento idêntico ao de hoje, e o
+        // valor nunca vai para log/erro: o header sai e o resto é silêncio.
+        if let Some(key) = &self.api_key {
+            builder = builder.bearer_auth(key);
+        }
+        let response = builder.send().await;
         let response = match response {
             Ok(response) => response,
             Err(err) if err.is_timeout() => return Err(Error::LlmTimeout),
@@ -312,5 +428,108 @@ mod tests {
             "mensagem: {message}"
         );
         let _ = server.join();
+    }
+
+    // -------------------------------------------------------------------
+    // OC-1 — Ollama Cloud direto: header Bearer, máscara e validação
+    // -------------------------------------------------------------------
+
+    /// Chave FALSA de teste (nunca um segredo real: valor literal aqui é
+    /// seguro — o contrato é o header chegar e a MÁSCARA valer para chave
+    /// verdadeira, provado pelo Debug abaixo).
+    const TEST_KEY: &str = "fake-test-key-not-a-secret";
+
+    #[tokio::test]
+    async fn non_local_with_key_sends_the_bearer_header() {
+        let (base_url, server) = spawn_fake_ollama("HTTP/1.1 200 OK", FAKE_BODY);
+        let backend = OllamaBackend::with_key_for_tests(base_url, DEFAULT_MODEL, TEST_KEY);
+        let content = backend
+            .complete("sistema fixo", "prompt de teste")
+            .await
+            .unwrap_or_else(|err| panic!("complete com chave deve funcionar: {err}"));
+        assert_eq!(content, FAKE_CONTENT);
+        let request = server
+            .join()
+            .unwrap_or_else(|_| panic!("thread do servidor falso entrou em pânico"))
+            .expect("requisição capturada");
+        assert!(
+            request
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {TEST_KEY}")),
+            "o header Bearer tem que chegar ao servidor: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn localhost_never_sends_an_authorization_header() {
+        // Comportamento local idêntico ao de hoje (OC-1 (c)): o server local
+        // autentica por conta própria (modo `signin`) — sem header, sem chave.
+        let (base_url, server) = spawn_fake_ollama("HTTP/1.1 200 OK", FAKE_BODY);
+        let backend = OllamaBackend::new(base_url, DEFAULT_MODEL);
+        backend
+            .complete("sistema", "prompt")
+            .await
+            .unwrap_or_else(|err| panic!("complete local deve funcionar: {err}"));
+        let request = server
+            .join()
+            .unwrap_or_else(|_| panic!("thread do servidor falso entrou em pânico"))
+            .expect("requisição capturada");
+        assert!(
+            !request.to_lowercase().contains("authorization:"),
+            "localhost não manda Authorization: {request}"
+        );
+    }
+
+    #[test]
+    fn debug_never_contains_the_key_value() {
+        let backend =
+            OllamaBackend::with_key_for_tests("https://ollama.com", DEFAULT_MODEL, TEST_KEY);
+        let rendered = format!("{backend:?}");
+        assert!(
+            !rendered.contains(TEST_KEY),
+            "Debug NUNCA mostra a chave: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug mostra que a chave existe (presente), mascarada: {rendered}"
+        );
+    }
+
+    #[test]
+    fn non_local_without_key_is_an_actionable_error() {
+        let err = require_key_for_url("https://ollama.com", None)
+            .expect_err("não-local sem chave deve falhar");
+        let message = err.to_string();
+        assert!(
+            message.contains("OLLAMA_API_KEY"),
+            "erro deve dizer onde definir a chave: {message}"
+        );
+        assert!(
+            message.contains("localhost"),
+            "erro deve oferecer o caminho local: {message}"
+        );
+        // Com chave (mesma URL): passa — é o caso (a) do OC-1.
+        assert!(require_key_for_url("https://ollama.com", Some("qualquer")).is_ok());
+        // Chave em branco não conta como presente.
+        assert!(
+            require_key_for_url("https://ollama.com", Some("   ")).is_err(),
+            "chave em branco não autentica"
+        );
+        // Local dispensa chave: erro nunca acontece (comportamento de hoje).
+        assert!(require_key_for_url("http://localhost:11434", None).is_ok());
+        assert!(require_key_for_url("http://127.0.0.1:11434", None).is_ok());
+    }
+
+    #[test]
+    fn key_is_never_attached_for_local_urls() {
+        // A regra de anexação é pura e separada da validação: localhost SEMPRE
+        // sem header, mesmo com chave resolvida (modo (a) — signin).
+        assert!(key_for_url("http://localhost:11434", Some("chave")).is_none());
+        assert!(key_for_url("http://[::1]:11434", Some("chave")).is_none());
+        assert_eq!(
+            key_for_url("https://ollama.com", Some("chave")).as_deref(),
+            Some("chave")
+        );
+        assert!(key_for_url("https://ollama.com", None).is_none());
     }
 }
