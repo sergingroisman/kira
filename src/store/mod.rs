@@ -26,6 +26,7 @@ use thiserror::Error;
 
 use crate::credentials;
 
+pub mod admission;
 pub mod posts;
 
 /// Name of the single central DB file inside the store directory.
@@ -35,7 +36,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -1292,6 +1293,25 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
         }
     }
 
+    // v12 — gate de admissão de modelo (HF-5, ADR-0040): uma linha por tag
+    // admitida no catálogo de especialistas (proveniência + SHA-256 + template
+    // + probes). É ESTADO, não índice derivado: reconstruir nunca perde
+    // admissão — e `CREATE TABLE IF NOT EXISTS` mantém a migração idempotente.
+    if current < 12 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS model_admission (
+                tag TEXT PRIMARY KEY,
+                quant TEXT NOT NULL,
+                provenance TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                template_hash TEXT NOT NULL,
+                probes_ok INTEGER NOT NULL,
+                admitted_at TEXT NOT NULL
+            );",
+        )
+        .map_err(schema_error)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(schema_error)
 }
@@ -1892,6 +1912,53 @@ mod tests {
             PostState::Failed,
             "estado 'dead' migra para 'failed'"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migração v11 → v12 (HF-5, ADR-0040): o store da versão anterior ganha
+    /// a tabela `model_admission` sem perder linha nenhuma — migração aditiva
+    /// (`CREATE TABLE IF NOT EXISTS`), e a admissão é estado: nunca recriada
+    /// do zero.
+    #[test]
+    fn migration_from_v11_adds_model_admission_and_keeps_data() {
+        let dir = temp_dir("migrate-v11-admission");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        let path = dir.join("store.db");
+        {
+            let conn =
+                rusqlite::Connection::open(&path).unwrap_or_else(|err| panic!("abrir v11: {err}"));
+            conn.execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, root_path TEXT NOT NULL, \
+                 name TEXT NOT NULL, first_seen_at TEXT NOT NULL);
+                 PRAGMA user_version = 11;",
+            )
+            .unwrap_or_else(|err| panic!("criar v11: {err}"));
+        }
+        let store = Store::open_at(&path).unwrap_or_else(|err| panic!("abrir v12: {err}"));
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or_else(|err| panic!("user_version: {err}"));
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "migração deveria subir para a versão atual"
+        );
+        // A tabela nova funciona: registrar e ler uma admissão.
+        store
+            .model_admission_put(&crate::store::admission::AdmissionRow {
+                tag: "hf.co/bartowski/X-GGUF:Q4_K_M".to_string(),
+                quant: "Q4_K_M".to_string(),
+                provenance: "bartowski".to_string(),
+                sha256: "a".repeat(64),
+                template_hash: "abc".to_string(),
+                probes_ok: true,
+                admitted_at: "2026-11-14T12:00:00Z".to_string(),
+            })
+            .unwrap_or_else(|err| panic!("admission_put: {err}"));
+        let got = store
+            .model_admission_get("hf.co/bartowski/X-GGUF:Q4_K_M")
+            .unwrap_or_else(|err| panic!("admission_get: {err}"));
+        assert!(got.is_some(), "admissão sobrevive à migração: {got:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

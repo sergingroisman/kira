@@ -139,10 +139,16 @@ pub async fn tick(options: &LoopOptions) -> Result<TickReport, LoopError> {
         let mut digest_options = DigestOptions::at(root.clone());
         digest_options.model = format!("ollama:{}", options.model);
         digest_options.lang = options.lang.clone();
-        // Wiring: o backend é construído aqui e a DECISÃO com o modelo
-        // acontece dentro de `post::run` (que carrega o `// LLM porque:`).
-        let backend = ollama::OllamaBackend::new(ollama::base_url_from_env(), &options.model);
-        match post::run(&digest_options, &backend).await {
+        // Wiring: a FÁBRICA de backend é construída aqui (URL do Ollama) e a
+        // DECISÃO com o modelo acontece dentro de `post::run` (que carrega o
+        // `// LLM porque:` e o routing de especialistas por kind, HF-5). O
+        // modelo do loop é explícito (`LoopOptions.model`) — vence o routing.
+        let base_url = ollama::base_url_from_env();
+        match post::run(&digest_options, &|_kind: &str, tag: &str| {
+            ollama::OllamaBackend::new(&base_url, tag)
+        })
+        .await
+        {
             Ok(digest) => {
                 report.digest_generated = digest.generated;
                 report.digest_cached = digest.cached;

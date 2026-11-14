@@ -1,1 +1,4 @@
 /target
+
+# Estado local do próprio KIRA (findings, wiki, drafts) — NUNCA comitar (AGENTS.md)
+.kira/

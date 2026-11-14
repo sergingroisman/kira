@@ -14,6 +14,7 @@ pub mod copilot;
 pub mod foundry;
 pub mod ollama;
 pub mod prompts;
+pub mod roles;
 
 use std::future::Future;
 
