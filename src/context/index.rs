@@ -99,12 +99,25 @@ fn reindex_limited(
 
     // 1. Collect the candidate paths first, then sort: the same tree always
     //    indexes in the same order, independent of filesystem reply order.
+    //    M7/P5: `.gitignore` aninhado é honrado AQUI (dirs na descida,
+    //    arquivos no laço) — o índice é derivado do que o git já excluiria.
+    //    Repo sem `.gitignore`: conjunto vazio, comportamento idêntico ao
+    //    antigo (aceite do M7).
+    let gitignore = super::gitignore::GitIgnore::load(root);
     let walker = WalkDir::new(root)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
             if entry.file_type().is_dir() {
-                !repo::is_skipped_dir(entry.path(), entry.depth())
+                if repo::is_skipped_dir(entry.path(), entry.depth()) {
+                    return false;
+                }
+                // Raiz (depth 0) nunca é ignorada; demais dirs passam pelo
+                // matcher com o caminho relativo.
+                match repo::relative_path(root, entry.path()) {
+                    Some(rel) => !gitignore.is_ignored(&rel, true),
+                    None => true,
+                }
             } else {
                 true
             }
@@ -120,6 +133,9 @@ fn reindex_limited(
         let Some(rel) = repo::relative_path(root, entry.path()) else {
             continue;
         };
+        if gitignore.is_ignored(&rel, false) {
+            continue;
+        }
         if repo::is_source_file(&rel) {
             candidates.push(rel);
         }
@@ -507,6 +523,58 @@ mod tests {
         assert_eq!(found.excerpts[0].line, 1);
         assert_eq!(found.excerpts[0].anchor(), "src/rare.rs:1");
         assert!(found.excerpts[0].rank.is_some(), "rank bm25 presente");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// M7/P5 (aceite): `.gitignore` aninhado com negação é honrado no
+    /// ÍNDICE — arquivo ignorado nunca vira linha do `repo_fts`, e o
+    /// re-incluído por `.gitignore` mais fundo volta a entrar.
+    #[test]
+    fn reindex_honors_nested_gitignore_with_negation() {
+        let (root, store, project_id) = setup("gitignore");
+        write(&root, ".gitignore", "ignored.rs\nvendor/\n*.md\n");
+        write(&root, "docs/.gitignore", "!important.md\n");
+        write(&root, "src/a.rs", "token a\n");
+        write(&root, "ignored.rs", "token ignorado\n");
+        write(&root, "vendor/lib.rs", "token vendor\n");
+        write(&root, "docs/important.md", "token importante\n");
+        write(&root, "docs/other.md", "token outro\n");
+        write(&root, "README.md", "token readme\n");
+
+        let _ = reindex(&root, &store, &project_id).unwrap_or_else(|err| panic!("{err}"));
+        let paths: Vec<String> = store
+            .repo_file_rows(&project_id)
+            .unwrap_or_else(|err| panic!("{err}"))
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+
+        assert!(
+            paths.contains(&"src/a.rs".to_string()),
+            "fonte normal entra: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"docs/important.md".to_string()),
+            "negação do .gitignore aninhado re-inclui: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"ignored.rs".to_string()),
+            "arquivo ignorado fica fora: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"vendor/lib.rs".to_string()),
+            "diretório ignorado leva o conteúdo junto: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"docs/other.md".to_string())
+                && !paths.contains(&"README.md".to_string()),
+            "*.md ignorado (menos o negado): {paths:?}"
+        );
+        let dump = fts_dump(&store, &project_id);
+        assert!(
+            !dump.iter().any(|(path, _, _)| path == "ignored.rs"),
+            "nenhuma LINHA do ignorado pode sobrar no FTS: {dump:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

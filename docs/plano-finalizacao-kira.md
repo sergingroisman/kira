@@ -182,8 +182,14 @@ Brain, gold antes de declarar autonomia.
 
 ## 6. Pacote conhecimento (IG → SK → TE) e a intenção final do dono
 
-- **IG**: BOM/UTF-16 no scan (`src/scan/decode.rs`) + `.kiraignore` (subset
-  gitwildmatch aninhado) — remove a promessa stale das jornadas (F3).
+- **IG** ✅ **implementado (13/Nov, M7)**: BOM/UTF-16 no scan (`src/scan/decode.rs`
+  nos call sites de `node.rs`/`dotnet.rs` + fixture UTF-16LE parseando pelo extrator
+  real) + `.gitignore` aninhado (`src/context/gitignore.rs`, subset gitwildmatch sem
+  dependência: negação, ancoragem, dir-only, `**`, ancestral excluído não
+  re-incluível) honrado no índice e no grep — remove a promessa stale das jornadas
+  (F3). *Nota: o plano dizia `.kiraignore`; foi entregue como `.gitignore` (o
+  aceite literal do M7 no BUILD-PROGRAM); o matcher é reaproveitável se o dono
+  quiser um arquivo próprio depois.*
 - **SK**: skills bundled + `.kira/skills/` com frontmatter (trigger/anti-trigger,
   semver, autor — formato do agent-skills reimplementado) + **trigger evals** no
   aceite; `~/.config/kira/knowledge/` para os textos do dono (`knowledge_fts`);
