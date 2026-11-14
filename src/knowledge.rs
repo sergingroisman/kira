@@ -234,35 +234,35 @@ mod tests {
     }
 
     #[test]
-    fn missing_directory_is_not_an_error_and_unreadable_file_is_a_note() {
+    fn missing_directory_is_not_an_error() {
         let dir = temp_dir("ausente");
         std::fs::remove_dir(&dir).expect("tirar o diretório vazio");
         let (docs, notes) = load_from(&dir);
         assert!(docs.is_empty());
         assert!(notes.is_empty(), "sem diretório não é erro: {notes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    // Arquivo ilegível vira nota (fail-open) — mas só há como simular leitura
+    // bloqueada com chmod no unix: no Windows o dono consegue ler o próprio
+    // arquivo com chmod 000, então o cenário não existe ali.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_becomes_a_note() {
         let dir = temp_dir("ilegivel");
         std::fs::write(dir.join("quebrado.md"), "conteúdo\n").expect("escrever");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(dir.join("quebrado.md"))
-                .expect("metadata")
-                .permissions();
-            perms.set_mode(0o000);
-            std::fs::set_permissions(dir.join("quebrado.md"), perms).expect("permissão 000");
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir.join("quebrado.md"))
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(dir.join("quebrado.md"), perms).expect("permissão 000");
         let (docs, notes) = load_from(&dir);
         assert!(docs.is_empty());
-        // No Windows não há chmod 000 efetivo, então a nota só é exigível no
-        // unix; a leitura ter batido não é defeito ali, é semântica do FS.
-        #[cfg(unix)]
         assert!(
             notes.len() == 1 && notes[0].contains("ilegível"),
             "falha de leitura vira nota: {notes:?}"
         );
-        #[cfg(not(unix))]
-        let _ = notes;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
