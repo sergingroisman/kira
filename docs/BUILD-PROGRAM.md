@@ -137,8 +137,16 @@
       sempre pelo caminho resolvido, zero parse de mensagem localizada.
 
 ### F2 — agente vivo (W5) — pedido explícito do dono
-- [ ] **PR15** `kira loop`: modo do binário (sem daemon), ciclos com estado no
+- [x] **PR15** `kira loop`: modo do binário (sem daemon), ciclos com estado no
       SQLite; teste de 2 ciclos idênticos = nada a fazer (anti PR inócuo).
+      *Entregue (13/Nov): `src/loop/` — tick = ingest → digest (só se trusted)
+      → publish, tudo local; `--once` (CI), `--ticks`, `--skip-digest`,
+      `--skip-scan`; driver roda até o ponto fixo ("estável: nada a fazer");
+      `TickReport::changed()` puro (facts mudaram / post novo / publicação
+      nova; cache e failed NÃO contam). E2e prova o D2: 2º tick deixa facts,
+      drafts, wiki e a fila `posts` byte-idênticos (a trilha de sessões cresce
+      de propósito — é auditoria, não estado do ciclo). Sem trust o digest é
+      pulado com nota acionável, ciclo segue exit 0.*
 - [ ] **PR16** modo agendado + `kira schedule add|list|rm` (CLI) e criação de
       agendamento pela TUI, com opt-in e aviso de que só roda com o KIRA vivo.
 - [ ] **PR17** budget `max_llm_calls_per_day = 50` + política de falha:

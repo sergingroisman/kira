@@ -173,7 +173,7 @@ Brain, gold antes de declarar autonomia.
 |---|---|
 | **P0** contador LLM | tabela `llm_calls(run, backend, model, tokens_est, at)`; `digest`/`triage` gravam; `doctor` e dashboard mostram `N/50`; 51ª chamada recusa com "limite diário atingido — retome amanhã ou ajuste max_llm_calls_per_day" |
 | **P1** scan paralelo | `std::thread::scope` com um thread por ferramenta resolvida; findings **byte-idênticos** (ordem por fingerprint); e2e com dois shims que dormem 2 s: wall-time < 3,5 s prova concorrência; sem rayon |
-| **PR15** loop | tick = ingest→(digest se trusted)→publish; 2 ticks sem mudança ⇒ store idêntico (anti-PR-inócuo); `--once` para CI |
+| **PR15** loop ✅ **implementado (13/Nov, `feat/pr15-kira-loop`)**: `kira loop` (`src/loop/`) — tick = ingest→(digest se trusted)→publish, tudo local; `--once`/`--ticks`/`--skip-digest`/`--skip-scan`; driver até o ponto fixo; e2e prova 2 ticks = estado byte-idêntico (facts/drafts/wiki/posts) | tick = ingest→(digest se trusted)→publish; 2 ticks sem mudança ⇒ store idêntico (anti-PR-inócuo); `--once` para CI |
 | **PR16** agenda | `kira schedule add|list|rm` opt-in; aviso "só roda com o KIRA vivo" |
 | **PR17** budget no ciclo | cheque ANTES de cada transição; 429 ⇒ 5 min de silêncio; último bom marcado `stale` |
 | **PR18** approve | `awaiting_approval` no store; `kira approve <id>` humano; sem approve, `--apply` é inerte |
