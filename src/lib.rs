@@ -20,6 +20,7 @@ pub mod guard;
 pub mod html;
 pub mod ingest;
 pub mod llm;
+pub mod r#loop;
 pub mod post;
 pub mod prdraft;
 pub mod publish;

@@ -295,6 +295,35 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Ciclo local do KIRA (PR15): um tick = ingest → digest (se trusted) →
+    /// publish. Tudo LOCAL — nunca escreve no mundo (Azure/git remoto); sem
+    /// daemon: roda em primeiro plano e sai. `--once` = um tick (CI)
+    #[command(
+        after_help = "Exemplos:\n  kira loop --once                 # um tick e sai (CI/teste)\n  kira loop                        # ticks até estabilizar (nada a fazer)\n  kira loop --skip-digest --once   # ciclo determinístico, sem LLM\n  kira loop --ticks 4              # teto de ticks por execução"
+    )]
+    Loop {
+        /// Roda UM tick e sai (nunca entra no modo "até estabilizar")
+        #[arg(long)]
+        once: bool,
+        /// Teto de ticks por execução (default 16; só sem --once)
+        #[arg(long)]
+        ticks: Option<usize>,
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Tag do modelo do digest (default: KIRA_MODEL/qwen3.5:4b)
+        #[arg(long)]
+        model: Option<String>,
+        /// Idioma dos posts (default: KIRA_LANG ou en)
+        #[arg(long)]
+        lang: Option<String>,
+        /// Pula o digest: ciclo 100% determinístico (ingest + publish)
+        #[arg(long)]
+        skip_digest: bool,
+        /// O ingest não roda o scan dentro do ciclo
+        #[arg(long)]
+        skip_scan: bool,
+    },
 }
 
 /// `kira pr` actions: for now only the local draft.
@@ -504,6 +533,26 @@ async fn run(command: Command) -> Outcome {
         } => dashboard_command(snapshot, read_only),
         Command::Pr { action } => pr_command(action),
         Command::Connect { provider, yes } => connect_command(&provider, yes).await,
+        Command::Loop {
+            once,
+            ticks,
+            path,
+            model,
+            lang,
+            skip_digest,
+            skip_scan,
+        } => {
+            loop_command(
+                path.as_deref(),
+                once,
+                ticks,
+                model,
+                lang,
+                skip_digest,
+                skip_scan,
+            )
+            .await
+        }
     }
 }
 
@@ -930,6 +979,39 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 ("pr".to_string(), args, None)
             }
         },
+        Command::Loop {
+            once,
+            ticks,
+            path,
+            model,
+            lang,
+            skip_digest,
+            skip_scan,
+        } => {
+            let mut args = String::new();
+            if *once {
+                args.push_str("--once");
+            }
+            if let Some(ticks) = ticks {
+                args.push_str(&format!(" --ticks {ticks}"));
+            }
+            if let Some(path) = path {
+                args.push_str(&format!(" --path {}", path.display()));
+            }
+            if let Some(model) = model {
+                args.push_str(&format!(" --model {model}"));
+            }
+            if let Some(lang) = lang {
+                args.push_str(&format!(" --lang {lang}"));
+            }
+            if *skip_digest {
+                args.push_str(" --skip-digest");
+            }
+            if *skip_scan {
+                args.push_str(" --skip-scan");
+            }
+            ("loop".to_string(), args.trim().to_string(), model.clone())
+        }
     }
 }
 
@@ -1195,6 +1277,45 @@ fn note_output(text: Option<String>, remove: Option<i64>) -> Result<String, Stor
 /// as the trail summary (stacks + counts).
 fn scan_command(path: Option<&Path>) -> Outcome {
     match scan::run(path) {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira loop` (PR15): o turno do binário — ticks locais (ingest → digest se
+/// trusted → publish) até estabilizar; `--once` roda um tick e sai (CI).
+/// Read-only no mundo: escrita externa só via `awaiting_approval` +
+/// `kira approve` humano (PR18). O digest dentro do ciclo passa pelo mesmo
+/// `post::run` do comando (cache, trust, orçamento — nada reimplementado).
+#[allow(clippy::too_many_arguments)]
+async fn loop_command(
+    path: Option<&Path>,
+    once: bool,
+    ticks: Option<usize>,
+    model: Option<String>,
+    lang: Option<String>,
+    skip_digest: bool,
+    skip_scan: bool,
+) -> Outcome {
+    let root = kira::r#loop::resolve_root(path);
+    let mut options = kira::r#loop::LoopOptions::at(root);
+    if let Some(model) = model {
+        options.model = model;
+    }
+    if let Some(lang) = lang {
+        options.lang = lang;
+    } else if let Ok(lang) = std::env::var("KIRA_LANG") {
+        options.lang = lang;
+    }
+    options.skip_digest = skip_digest;
+    options.run_scan = !skip_scan;
+    match kira::r#loop::run(&options, once, ticks.unwrap_or(16)).await {
         Ok(text) => {
             print!("{text}");
             Outcome::success(text)
