@@ -632,7 +632,10 @@ fn an_invalid_profile_fails_with_the_actionable_list() {
 
 /// Raiz temporária do sandbox vira `<ROOT>` e carimbo de escrita da wiki
 /// (`updated_at=...`) vira `<STAMP>` — os dois são dados de MÁQUINA/relógio,
-/// não de pack. Tudo o que sobra é comparado byte a byte.
+/// não de pack. Os contadores `tokens_estimate`/`used_chars` também: são
+/// calculados sobre os caminhos ABSOLUTOS crus do pack, e o root do sandbox
+/// tem comprimento diferente por runner (VPS ≠ CI). Conteúdo continua byte a
+/// byte; a monotonicidade dos caps é coberta pelo teste dos três estados.
 fn normalize_golden(output: &str, root: &str) -> String {
     let mut out = output.replace(root, "<ROOT>");
     // cursor avança para não re-achar o `updated_at=<STAMP>` que acabou de
@@ -651,6 +654,20 @@ fn normalize_golden(output: &str, root: &str) -> String {
             cursor = start + "updated_at=<STAMP>".len();
         } else {
             cursor = end;
+        }
+    }
+    for field in ["tokens_estimate", "used_chars"] {
+        let needle = format!("\"{field}\": ");
+        let mut cursor = 0;
+        while let Some(rel) = out[cursor..].find(&needle) {
+            let start = cursor + rel + needle.len();
+            let digits = out[start..]
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(out[start..].len());
+            if digits > 0 {
+                out.replace_range(start..start + digits, "<N>");
+            }
+            cursor = start + "<N>".len();
         }
     }
     out

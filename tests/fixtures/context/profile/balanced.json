@@ -1,6 +1,6 @@
 {
   "item_id": 4821,
-  "tokens_estimate": 939,
+  "tokens_estimate": <N>,
   "chars_per_token": 3,
   "budget_chars": 12288,
   "repo_source": "index",
@@ -88,7 +88,7 @@
     ],
     "skills": [],
     "knowledge": [],
-    "used_chars": 2818,
+    "used_chars": <N>,
     "budget_chars": 12288,
     "notes": [
       "mapa do repo: `.kira/ingest/inventory.json` ausente — rode `kira ingest`"
