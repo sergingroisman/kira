@@ -295,6 +295,45 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Catálogo de cartas de instrução (onda SK, SK-1): bundled no binário +
+    /// `<projeto>/.kira/skills/*.md`; o índice FTS5 é derivado
+    #[command(
+        after_help = "Exemplos:\n  kira skills list                       # bundled + skills do projeto\n  kira skills show react                 # corpo do skill\n  kira skills add meu-skill.md           # valida, redige e copia para .kira/skills/\n  kira skills search testing             # top-k no índice (rode reindex antes)\n  kira skills reindex                    # reconstrói o índice derivado"
+    )]
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
+/// `kira skills` actions (onda SK, SK-1).
+#[derive(Debug, Subcommand)]
+enum SkillsAction {
+    /// Lista bundled + skills do usuário com origem e descrição
+    List,
+    /// Mostra o corpo de um skill (bundled ou do usuário)
+    Show {
+        /// Nome do skill (o `name` do frontmatter)
+        name: String,
+    },
+    /// Valida o frontmatter, redige o corpo e copia para `.kira/skills/`
+    Add {
+        /// Arquivo `.md` do skill
+        file: PathBuf,
+    },
+    /// Busca top-k no índice derivado (bundled + projeto atual)
+    Search {
+        /// Termos da busca (frase única citada no FTS5)
+        query: String,
+        /// Quantos resultados no máximo (default 5)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Reconstrói o índice derivado `skill`/`skill_fts`
+    Reindex,
 }
 
 /// `kira pr` actions: for now only the local draft.
@@ -504,6 +543,7 @@ async fn run(command: Command) -> Outcome {
         } => dashboard_command(snapshot, read_only),
         Command::Pr { action } => pr_command(action),
         Command::Connect { provider, yes } => connect_command(&provider, yes).await,
+        Command::Skills { action, path } => skills_command(action, path.as_deref()),
     }
 }
 
@@ -930,6 +970,23 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 ("pr".to_string(), args, None)
             }
         },
+        Command::Skills { action, path } => {
+            let args = match action {
+                SkillsAction::List => "list".to_string(),
+                SkillsAction::Show { name } => format!("show {name}"),
+                SkillsAction::Add { file } => format!("add {}", file.display()),
+                SkillsAction::Search { query, limit } => match limit {
+                    Some(limit) => format!("search {query} --limit {limit}"),
+                    None => format!("search {query}"),
+                },
+                SkillsAction::Reindex => "reindex".to_string(),
+            };
+            let args = match path {
+                Some(path) => format!("{args} --path {}", path.display()),
+                None => args,
+            };
+            ("skills".to_string(), args, None)
+        }
     }
 }
 
@@ -1204,6 +1261,115 @@ fn scan_command(path: Option<&Path>) -> Outcome {
             Outcome::failure(err.to_string())
         }
     }
+}
+
+/// `kira skills` (onda SK, SK-1): catálogo de cartas de instrução.
+///
+/// `list`/`show` leem o disco (bundled embutido + `.kira/skills/`) — leitura
+/// livre. `add` grava o skill redigido em `.kira/skills/` (local, nunca
+/// commitado) e tenta atualizar o índice; falha de índice vira nota, nunca
+/// desfaz o add. `search`/`reindex` usam o `skill_fts` derivado (fail-open:
+/// sem FTS5 a busca degrada para LIKE dentro do store).
+fn skills_command(action: SkillsAction, path: Option<&Path>) -> Outcome {
+    let root = path.map_or_else(
+        || store::detect_project_root().unwrap_or_else(|| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
+    match action {
+        SkillsAction::List => {
+            let text = kira::skills::list(&root);
+            print!("{text}");
+            Outcome::success(text)
+        }
+        SkillsAction::Show { name } => match kira::skills::show(&root, &name) {
+            Ok(text) => {
+                print!("{text}");
+                Outcome::success(text)
+            }
+            Err(err) => {
+                print_error(&err);
+                Outcome::failure(err.to_string())
+            }
+        },
+        SkillsAction::Add { file } => match kira::skills::add(&root, &file) {
+            Ok(skill) => {
+                let mut text = format!("skill adicionado: {}@{}\n", skill.name, skill.version);
+                match reindex_skills(&root) {
+                    Ok(count) => text.push_str(&format!("índice: {count} skill(s)\n")),
+                    Err(cause) => {
+                        text.push_str(&format!("aviso: índice não atualizado ({cause})\n"));
+                    }
+                }
+                print!("{text}");
+                Outcome::success(text)
+            }
+            Err(err) => {
+                print_error(&err);
+                Outcome::failure(err.to_string())
+            }
+        },
+        SkillsAction::Search { query, limit } => {
+            let store = match open_skills_store() {
+                Ok(pair) => pair,
+                Err(err) => {
+                    print_error(&err);
+                    return Outcome::failure(err.to_string());
+                }
+            };
+            let (store, project_id) = store;
+            match kira::skills::search(&store, &project_id, &query, limit.unwrap_or(5)) {
+                Ok(hits) => {
+                    let text = kira::skills::render_hits(&hits);
+                    if text.is_empty() {
+                        println!(
+                            "nenhum skill casou `{query}` — rode `kira skills reindex` se acabou de adicionar"
+                        );
+                    } else {
+                        print!("{text}");
+                    }
+                    Outcome::success(text)
+                }
+                Err(err) => {
+                    print_error(&err);
+                    Outcome::failure(err.to_string())
+                }
+            }
+        }
+        SkillsAction::Reindex => match reindex_skills(&root) {
+            Ok(count) => {
+                let text = format!("índice de skills: {count} skill(s)\n");
+                print!("{text}");
+                Outcome::success(text)
+            }
+            Err(err) => {
+                print_error(&err);
+                Outcome::failure(err.to_string())
+            }
+        },
+    }
+}
+
+/// Store central + id do projeto atual (Search/Reindex de skills).
+fn open_skills_store() -> Result<(Store, String), kira::skills::SkillError> {
+    let root = store::detect_project_root().ok_or_else(|| {
+        kira::skills::SkillError::Store(
+            "sem projeto detectado — rode dentro da raiz do repositório".to_string(),
+        )
+    })?;
+    let store =
+        Store::open_default().map_err(|err| kira::skills::SkillError::Store(err.to_string()))?;
+    let project_id = store::project_id_for_root(&root)
+        .map_err(|err| kira::skills::SkillError::Store(err.to_string()))?;
+    Ok((store, project_id))
+}
+
+/// Reconstrói o índice derivado de skills para o projeto da raiz.
+fn reindex_skills(root: &Path) -> Result<usize, kira::skills::SkillError> {
+    let store =
+        Store::open_default().map_err(|err| kira::skills::SkillError::Store(err.to_string()))?;
+    let project_id = store::project_id_for_root(root)
+        .map_err(|err| kira::skills::SkillError::Store(err.to_string()))?;
+    kira::skills::reindex(root, &store, &project_id)
 }
 
 /// `kira ingest` — fatos do projeto, sem LLM (ADR-0038, M1).

@@ -27,6 +27,7 @@ pub mod redact;
 pub mod scan;
 pub mod setup;
 pub mod shellline;
+pub mod skills;
 pub mod stack;
 pub mod store;
 pub mod triage;

@@ -184,10 +184,11 @@ Brain, gold antes de declarar autonomia.
 
 - **IG**: BOM/UTF-16 no scan (`src/scan/decode.rs`) + `.kiraignore` (subset
   gitwildmatch aninhado) — remove a promessa stale das jornadas (F3).
-- **SK**: skills bundled + `.kira/skills/` com frontmatter (trigger/anti-trigger,
-  semver, autor — formato do agent-skills reimplementado) + **trigger evals** no
-  aceite; `~/.config/kira/knowledge/` para os textos do dono (`knowledge_fts`);
-  prioridade do pack `brief → findings → skills → knowledge → wiki → repo`;
+- **SK** (onda em andamento): skills bundled + `.kira/skills/` com frontmatter
+  (trigger/anti-trigger, semver, autor — formato do agent-skills reimplementado) +
+  **trigger evals** no aceite ✅ **SK-1 entregue (13/Nov)**; `~/.config/kira/knowledge/`
+  para os textos do dono (`knowledge_fts`) — **SK-2 pendente**; prioridade do pack
+  `brief → findings → skills → knowledge → wiki → repo` — **SK-3 pendente**;
   **caveman** entra como compressão do que já foi recuperado (camada
   complementar, ADR-0038); **rtk** fica como referência de engenharia de
   prompt/skill; kind de post **`getting-started`** com tom de storytelling

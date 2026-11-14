@@ -33,6 +33,7 @@ O que existe de verdade, verificado em `src/main.rs`:
 | `kira note "<texto>"` / `kira note --remove N` | Fato do perfil do projeto (append-only, numerado). |
 | `kira profile` | Root, nome, primeira vez visto e todos os fatos do projeto. |
 | `kira wiki list\|show\|decision\|reindex\|search\|forget\|promote\|export` | Wiki local do projeto (seção Wiki abaixo). |
+| `kira skills list\|show\|add\|search\|reindex` | Catálogo de skills (onda SK, SK-1): **bundled** embutido no binário (`skills/`) + `<projeto>/.kira/skills/*.md` (local, nunca commitado; o do usuário substitui o bundled pelo `name`). `add` valida o frontmatter (`name/description/license/author/version` semver) e **redige** o corpo antes de gravar; `search` consulta o índice FTS5 **derivado** (`skill`/`skill_fts`) com âncora `skill:<nome>@<versão>`. Sem LLM, sem rede. |
 | `kira context --file <json> [--explain] [--json]` | Mostra o **context pack** que iria ao prompt do `kira triage` — sem LLM, sem rede: fonte do repositório (`index` FTS5 ou `grep`), seções da wiki, cada trecho como `path:linha — trecho` e o resumo `contexto: N trechos — X/Y chars (~Z tokens, 3 chars/token)`. `--explain` mostra também por que cada item entrou (rank bm25, prioridade de finding); `--json` devolve a estrutura serializável. O id ao vivo (`kira context <id>`) é recusado: este comando não toca na rede. |
 
 O que **não existe ainda** vai no [Roadmap](#roadmap) — nada é prometido como

@@ -35,7 +35,7 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -546,6 +546,178 @@ impl Store {
         }
         Ok(pages)
     }
+
+    /// Replaces the derived skill index of ONE scope (`__bundled__` or the
+    /// project id): delete-then-insert in a transaction, so a reindex never
+    /// mixes old and new rows.
+    pub fn skill_replace(&self, project_id: &str, rows: &[SkillRow]) -> Result<usize, StoreError> {
+        let tx = self.conn.unchecked_transaction().map_err(StoreError::Sql)?;
+        tx.execute("DELETE FROM skill WHERE project_id = ?1", [project_id])
+            .map_err(StoreError::Sql)?;
+        if self.skill_fts5_enabled() {
+            tx.execute("DELETE FROM skill_fts WHERE project_id = ?1", [project_id])
+                .map_err(StoreError::Sql)?;
+        }
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO skill \
+                     (project_id, name, origin, version, description, body) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(StoreError::Sql)?;
+            for row in rows {
+                insert
+                    .execute(rusqlite::params![
+                        row.project_id,
+                        row.name,
+                        row.origin,
+                        row.version,
+                        row.description,
+                        row.body,
+                    ])
+                    .map_err(StoreError::Sql)?;
+            }
+        }
+        if self.skill_fts5_enabled() {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO skill_fts (project_id, name, origin, version, description, body) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(StoreError::Sql)?;
+            for row in rows {
+                insert
+                    .execute(rusqlite::params![
+                        row.project_id,
+                        row.name,
+                        row.origin,
+                        row.version,
+                        row.description,
+                        row.body,
+                    ])
+                    .map_err(StoreError::Sql)?;
+            }
+        }
+        tx.commit().map_err(StoreError::Sql)?;
+        Ok(rows.len())
+    }
+
+    /// True when the skill FTS5 virtual table exists in this database.
+    #[must_use]
+    pub fn skill_fts5_enabled(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'skill_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|count| count > 0)
+    }
+
+    /// Every indexed skill of one scope, ordered by name.
+    pub fn skill_rows(&self, project_id: &str) -> Result<Vec<SkillRow>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT project_id, name, origin, version, description, body \
+                 FROM skill WHERE project_id = ?1 ORDER BY name",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok(SkillRow {
+                    project_id: row.get(0)?,
+                    name: row.get(1)?,
+                    origin: row.get(2)?,
+                    version: row.get(3)?,
+                    description: row.get(4)?,
+                    body: row.get(5)?,
+                })
+            })
+            .map_err(StoreError::Sql)?;
+        let mut skills = Vec::new();
+        for row in rows {
+            skills.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(skills)
+    }
+
+    /// Searches the bundled scope and ONE project scope: FTS5 `MATCH` when
+    /// available (quoted phrase, same trick as the wiki), `LIKE` otherwise.
+    pub fn skill_search(
+        &self,
+        bundled_id: &str,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SkillHit>, StoreError> {
+        let needle = query.trim();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut hits = Vec::new();
+        if self.skill_fts5_enabled() {
+            let phrase = format!("\"{}\"", needle.replace('"', " "));
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT name, origin, version, \
+                            snippet(skill_fts, -1, '[', ']', '…', 10) \
+                     FROM skill_fts \
+                     WHERE skill_fts MATCH ?1 AND project_id IN (?2, ?3) \
+                     ORDER BY rank LIMIT ?4",
+                )
+                .map_err(StoreError::Sql)?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![phrase, bundled_id, project_id, limit],
+                    |row| {
+                        Ok(SkillHit {
+                            name: row.get(0)?,
+                            origin: row.get(1)?,
+                            version: row.get(2)?,
+                            snippet: row.get(3)?,
+                        })
+                    },
+                )
+                .map_err(StoreError::Sql)?;
+            for row in rows {
+                hits.push(row.map_err(StoreError::Sql)?);
+            }
+            return Ok(hits);
+        }
+        // Degradação sem FTS5: LIKE sobre descrição/corpo (documentada).
+        let pattern = format!("%{needle}%");
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT name, origin, version, substr(description, 1, 200) \
+                 FROM skill \
+                 WHERE project_id IN (?1, ?2) \
+                   AND (description LIKE ?3 OR body LIKE ?3) \
+                 ORDER BY name LIMIT ?4",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![bundled_id, project_id, pattern, limit],
+                |row| {
+                    Ok(SkillHit {
+                        name: row.get(0)?,
+                        origin: row.get(1)?,
+                        version: row.get(2)?,
+                        snippet: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(StoreError::Sql)?;
+        for row in rows {
+            hits.push(row.map_err(StoreError::Sql)?);
+        }
+        Ok(hits)
+    }
 }
 
 /// One wiki page as stored in the derived index.
@@ -568,6 +740,29 @@ pub struct WikiHit {
     pub slug: String,
     pub kind: String,
     pub title: String,
+    /// Context around the match (FTS5 snippet or the first 200 chars).
+    pub snippet: String,
+}
+
+/// One skill as stored in the derived index (onda SK, SK-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillRow {
+    /// `__bundled__` para o catálogo embutido; id do projeto para o usuário.
+    pub project_id: String,
+    pub name: String,
+    /// `bundled` | `user`.
+    pub origin: String,
+    pub version: String,
+    pub description: String,
+    pub body: String,
+}
+
+/// One search hit from the skill index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillHit {
+    pub name: String,
+    pub origin: String,
+    pub version: String,
     /// Context around the match (FTS5 snippet or the first 200 chars).
     pub snippet: String,
 }
@@ -827,6 +1022,37 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     if current < 8 {
         conn.execute_batch("UPDATE posts SET state = 'failed' WHERE state = 'dead';")
             .map_err(schema_error)?;
+    }
+
+    // v9 — skills (onda SK, SK-1): catálogo bundled + do usuário. Índice
+    // DERIVADO (fonte de verdade: markdown no binário e em .kira/skills/).
+    // FTS5 opcional, mesma degradação da wiki: sem o módulo, busca cai para
+    // LIKE e nada mais quebra.
+    // NOTA DE MIGRAÇÃO: o PR #101 (llm_calls) também reserva a v9; o que
+    // mergear por SEGUNDO renumera o seu passo para v10 (blocos são
+    // sequenciais por `current < N`).
+    if current < 9 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill (
+                project_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                version TEXT NOT NULL,
+                description TEXT NOT NULL,
+                body TEXT NOT NULL,
+                PRIMARY KEY (project_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS ix_skill_project ON skill (project_id, origin);",
+        )
+        .map_err(schema_error)?;
+        if let Err(error) = conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS skill_fts USING fts5(
+                project_id UNINDEXED, name UNINDEXED, origin UNINDEXED,
+                version UNINDEXED, description, body
+            );",
+        ) {
+            eprintln!("aviso: FTS5 indisponível para skills ({error}) — busca cai para LIKE");
+        }
     }
 
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
