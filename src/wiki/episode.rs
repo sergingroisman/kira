@@ -36,6 +36,11 @@ const COLLAPSED_HEADING: &str = "## Histórico colapsado";
 /// Field label carrying the predicted root cause (also what survives the decay).
 const CAUSE_LABEL: &str = "- Causa raiz prevista:";
 
+/// Field labels of the remaining episode fields (parsed back by [`latest`]).
+const FILES_LABEL: &str = "- Arquivos prováveis:";
+const CONFIDENCE_LABEL: &str = "- Confiança:";
+const BRIEF_LABEL: &str = "- Achados do scan:";
+
 /// Placeholder used when the model answered nothing for a section.
 const EMPTY_FIELD: &str = "—";
 
@@ -68,6 +73,30 @@ pub enum EpisodeTarget {
 #[must_use]
 pub fn page_for(item_id: i32) -> String {
     format!("bugs/{item_id}")
+}
+
+/// Parses back the MOST RECENT episode of a page (PR35, cache de raciocínio).
+///
+/// "Most recent" = the last episode block in document order — `record` appends
+/// the new block at the end, so the last one is the latest conclusion the page
+/// carries. Absent fields come back as empty strings (the [`Episode::is_empty`]
+/// contract treats them as no content). `None` when the page has no parseable
+/// episode block (empty page, decayed-only page, unknown item id).
+///
+/// Pure function over the page text: the cache decision (triage.rs) consumes it
+/// without touching the wiki.
+#[must_use]
+pub fn latest(content: &str) -> Option<Episode> {
+    let lines: Vec<&str> = content.lines().collect();
+    let block = episode_blocks(&lines).pop()?;
+    let item_id = block.item.parse::<i32>().ok()?;
+    Some(Episode {
+        item_id,
+        root_cause: block.cause,
+        files: block.files,
+        confidence: block.confidence,
+        findings_brief: (!block.brief.is_empty()).then_some(block.brief),
+    })
 }
 
 impl Episode {
@@ -241,6 +270,12 @@ struct EpisodeBlock {
     item: String,
     /// Predicted root cause, flattened to one line.
     cause: String,
+    /// Likely files, flattened to one line (empty when the field is absent).
+    files: String,
+    /// Confidence, flattened to one line (empty when the field is absent).
+    confidence: String,
+    /// Scan brief, flattened to one line (empty when the field is absent).
+    brief: String,
 }
 
 /// Splits the content into episode blocks: a block starts at an episode heading
@@ -257,6 +292,9 @@ fn episode_blocks(lines: &[&str]) -> Vec<EpisodeBlock> {
         let start = index;
         index += 1;
         let mut cause = String::new();
+        let mut files = String::new();
+        let mut confidence = String::new();
+        let mut brief = String::new();
         while index < lines.len() {
             let line = lines[index].trim();
             if line.starts_with(EPISODE_HEADING)
@@ -265,10 +303,25 @@ fn episode_blocks(lines: &[&str]) -> Vec<EpisodeBlock> {
             {
                 break;
             }
+            // Cada campo é capturado uma única vez (o primeiro valor vence):
+            // a página é escrita pelo `record`, que nunca repete campo, e uma
+            // repetição estranha não pode fundir dois valores numa linha.
             if cause.is_empty()
                 && let Some(value) = line.strip_prefix(CAUSE_LABEL)
             {
                 cause = one_line(value);
+            } else if files.is_empty()
+                && let Some(value) = line.strip_prefix(FILES_LABEL)
+            {
+                files = one_line(value);
+            } else if confidence.is_empty()
+                && let Some(value) = line.strip_prefix(CONFIDENCE_LABEL)
+            {
+                confidence = one_line(value);
+            } else if brief.is_empty()
+                && let Some(value) = line.strip_prefix(BRIEF_LABEL)
+            {
+                brief = one_line(value);
             }
             index += 1;
         }
@@ -278,6 +331,9 @@ fn episode_blocks(lines: &[&str]) -> Vec<EpisodeBlock> {
             at,
             item,
             cause,
+            files,
+            confidence,
+            brief,
         });
     }
     blocks
@@ -615,5 +671,58 @@ mod tests {
             "ADR-0013: ciclo autônomo nunca escreve em .kira/wiki"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR35 (cache de raciocínio): a página é lida de volta pelo cache.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn latest_parses_back_the_fields_of_the_last_block() {
+        let content = format!(
+            "# Bug 4821\n\n{}\n{}",
+            episode("causa antiga").render("2026-11-09T10:00:00Z"),
+            episode("TTL do token muito curto").render("2026-11-10T22:18:00Z"),
+        );
+        let parsed = latest(&content)
+            .unwrap_or_else(|| panic!("página com episódios deve parsear de volta"));
+        assert_eq!(parsed.item_id, 4821, "{parsed:?}");
+        assert_eq!(parsed.root_cause, "TTL do token muito curto");
+        assert_eq!(parsed.files, "src/auth/session.rs");
+        assert_eq!(parsed.confidence, "média");
+        assert_eq!(parsed.findings_brief.as_deref(), Some("high 2, moderate 1"));
+    }
+
+    #[test]
+    fn latest_returns_none_without_a_parseable_episode() {
+        assert!(latest("").is_none(), "página vazia: nada a servir");
+        assert!(
+            latest("# Bug 4821\n\nsó prosa\n").is_none(),
+            "prosa não é episódio"
+        );
+        // Só linhas colapsadas: nenhum bloco inteiro restante.
+        assert!(
+            latest(
+                "# Bug 4821\n\n## Histórico colapsado\n- 2026-08-01 triage #4821: x (colapsado)\n"
+            )
+            .is_none(),
+            "página decaindo inteira não é episódio"
+        );
+        // Bloco sem id parseável no heading não vira episódio.
+        let sem_id =
+            format!("{EPISODE_HEADING}sem carimbo · item desconhecido\n{CAUSE_LABEL} causa\n");
+        assert!(latest(&sem_id).is_none(), "id do item é obrigatório");
+    }
+
+    #[test]
+    fn latest_tolerates_absent_fields_as_empty_strings() {
+        let content = format!(
+            "{EPISODE_HEADING}2026-11-10T22:18:00Z · item 4821\n{CAUSE_LABEL} causa isolada\n"
+        );
+        let parsed = latest(&content).unwrap_or_else(|| panic!("bloco com causa deve parsear"));
+        assert_eq!(parsed.root_cause, "causa isolada");
+        assert_eq!(parsed.files, "", "campo ausente volta vazio");
+        assert_eq!(parsed.confidence, "");
+        assert!(parsed.findings_brief.is_none());
     }
 }
