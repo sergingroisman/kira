@@ -219,8 +219,16 @@
   **Aceite:** nenhum doc promete comportamento que o código não tem.
 
 ### F3 — provedores e hardware
-- [ ] **PR20** tuning local: detecção de VRAM/backend, escolha de modelo por
+- [x] **PR20** tuning local: detecção de VRAM/backend, escolha de modelo por
       perfil (2060 6 GB / M1 / CPU), `kira doctor` reportando o perfil efetivo.
+      *Entregue (14/Nov, ciclo único): `src/hwprofile.rs` — VRAM via
+      `nvidia-smi` resolvido no PATH (binresolve, override
+      `KIRA_NVIDIA_SMI_BIN`; query `csv,noheader,nounits`, parse de inteiro
+      puro, locale-proof); tabela 8 GB/Metal ⇒ 7 B Q4 ctx menor, 6–8 GB ⇒
+      `qwen3.5:4b` + `KIRA_NUM_CTX=4096`, <6 GB/CPU ⇒ 1–2 B com aviso de
+      triage lento. RECOMENDAÇÃO apenas — doctor read-only (e2e prova
+      config.toml byte-idêntico). Sem GPU/ilegível ⇒ CPU com a causa.
+      Piso Ollama ≥ 0.17.1 (HF-5) intocado.*
 - [x] **PR11** backend "caro" atrás de flag/env: **spawn do CLI** do Copilot
       (`--llm copilot` / `KIRA_LLM=copilot`, ADR-0019, PR #34) — módulo isolado
       `src/llm/copilot.rs`, binário resolvido por `KIRA_COPILOT_BIN`/PATH, erro

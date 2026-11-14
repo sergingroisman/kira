@@ -127,12 +127,16 @@ não treina com ele, porém ele *sai* da máquina).
 > valor) e por tag `*:cloud` no routing HF-5. Fonte única da classificação em
 > `src/endpoint.rs` (puro, fora da camada LLM — allowlist do ADR-0016).
 
-**PR20 promovido (perfil de hardware, acaba com o chute de modelo)**: detectar
-VRAM via `nvidia-smi` resolvido no PATH (mesmo estilo `binresolve` das
-ferramentas de scan; ausente ⇒ perfil CPU) e recomendar tag por perfil:
-6 GB ⇒ `qwen3.5:4b` Q4_K_M com `KIRA_NUM_CTX=4096`; 8 GB ⇒ 7 B Q4 com ctx
-menor; CPU ⇒ 1–2 B. `kira doctor` imprime o perfil efetivo (VRAM, modelo,
-ctx) — é o PR20 do BUILD-PROGRAM subindo de prioridade por decisão do dono.
+**PR20 promovido (perfil de hardware, acaba com o chute de modelo) — ✅
+entregue (14/Nov/2026, `feat/pr20-hardware-profile`, PR #114, merge
+`eea002d`)**: `kira doctor` imprime o perfil efetivo (VRAM via `nvidia-smi`
+resolvido no PATH, mesmo estilo `binresolve`; ausente/ilegível ⇒ CPU com a
+causa) e recomenda tag/ctx por perfil: GPU ≥8 GB e M1 Metal (8 GB unificada)
+⇒ 7 B Q4 com ctx menor; 6–8 GB ⇒ `qwen3.5:4b` Q4_K_M com `KIRA_NUM_CTX=4096`;
+CPU/VRAM curta ⇒ 1–2 B. RECOMENDAÇÃO apenas — o doctor nunca muda config.
+Nota: a nota do BUILD-PROGRAM (decisão 10/Nov #8, "M1 = mesmo modelo da
+2060") foi superada pelo escopo do PR20 promovido (M1 = 7 B Q4/ctx menor),
+seguindo o escopo mais recente do dono.
 
 **"Melhor output com o pior modelo" — a pilha de compensação (é isso que o
 KIRA é)**: modelo fraco não produz ouro sozinho; produz texto confiante. O que
