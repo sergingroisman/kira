@@ -27,6 +27,7 @@ use thiserror::Error;
 use crate::credentials;
 
 pub mod admission;
+pub mod economy;
 pub mod posts;
 
 /// Name of the single central DB file inside the store directory.
@@ -36,7 +37,9 @@ pub const DB_FILE: &str = "store.db";
 pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 
 /// Current schema version, recorded in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 12;
+///
+/// v13 (onda TE, PR34): `session_economy` — ledger de economia por sessão.
+const SCHEMA_VERSION: i64 = 13;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -229,7 +232,8 @@ impl Store {
         Ok(project)
     }
 
-    /// Records one finished session (ok or failed) for the project.
+    /// Records one finished session (ok or failed) for the project and
+    /// returns the new session id — the key the economy ledger (PR34) uses.
     ///
     /// `summary` is capped at [`SUMMARY_MAX_CHARS`] and is always caller-side
     /// command output — never env vars, never the PAT, never the full work
@@ -246,7 +250,7 @@ impl Store {
         ok: bool,
         summary: &str,
         item_id: Option<i32>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<i64, StoreError> {
         self.conn
             .execute(
                 "INSERT INTO sessions (project_id, command, args, model, started_at, \
@@ -265,7 +269,78 @@ impl Store {
                 ],
             )
             .map_err(StoreError::Sql)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Records the economy ledger (PR34) for a session — the same connection
+    /// that wrote the session row owns the row, so `session_id` is exact.
+    ///
+    /// Measurement, never enforcement: the daily cap keeps living in
+    /// `llm_calls`. A missing row (older sessions, commands without a pack)
+    /// is data — readers display `—`, never a zero.
+    pub fn record_economy(
+        &self,
+        session_id: i64,
+        row: &economy::EconomyRow,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO session_economy \
+                 (session_id, pack_chars, budget_chars, tokens_est, llm_calls, route, pack_idle) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    session_id,
+                    row.pack_chars,
+                    row.budget_chars,
+                    row.tokens_est,
+                    row.llm_calls,
+                    row.route,
+                    i64::from(row.pack_idle),
+                ],
+            )
+            .map_err(StoreError::Sql)?;
         Ok(())
+    }
+
+    /// Economy rows for the given session ids, keyed by session — sessions
+    /// without a ledger row are simply absent (display `—` + causa).
+    pub fn economy_for_sessions(
+        &self,
+        session_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, economy::EconomyRow>, StoreError> {
+        let mut map = std::collections::HashMap::new();
+        if session_ids.is_empty() {
+            return Ok(map);
+        }
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT session_id, pack_chars, budget_chars, tokens_est, llm_calls, route, \
+                 pack_idle FROM session_economy",
+            )
+            .map_err(StoreError::Sql)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    economy::EconomyRow {
+                        pack_chars: row.get(1)?,
+                        budget_chars: row.get(2)?,
+                        tokens_est: row.get(3)?,
+                        llm_calls: row.get(4)?,
+                        route: row.get(5)?,
+                        pack_idle: row.get::<_, i64>(6)? != 0,
+                    },
+                ))
+            })
+            .map_err(StoreError::Sql)?;
+        for row in rows {
+            let (id, economy) = row.map_err(StoreError::Sql)?;
+            if session_ids.contains(&id) {
+                map.insert(id, economy);
+            }
+        }
+        Ok(map)
     }
 
     /// Local-time display convention, one SQL line: converts a stored RFC 3339
@@ -1312,6 +1387,26 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
         .map_err(schema_error)?;
     }
 
+    // v13 — ledger de economia (onda TE, PR34): o retrato de UMA sessão —
+    // pack vs teto, chamadas de LLM, rota e o sinal de pack ocioso (D9).
+    // Uma linha por sessão que grava trilha (`INSERT` direto do `record`):
+    // `last_insert_rowid()` da sessão é a chave. Migração aditiva e
+    // idempotente (`CREATE TABLE IF NOT EXISTS`): dado antigo preservado.
+    if current < 13 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_economy (
+                session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+                pack_chars INTEGER NOT NULL,
+                budget_chars INTEGER NOT NULL,
+                tokens_est INTEGER NOT NULL,
+                llm_calls INTEGER NOT NULL,
+                route TEXT NOT NULL DEFAULT 'llm',
+                pack_idle INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .map_err(schema_error)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(schema_error)
 }
@@ -1959,6 +2054,106 @@ mod tests {
             .model_admission_get("hf.co/bartowski/X-GGUF:Q4_K_M")
             .unwrap_or_else(|err| panic!("admission_get: {err}"));
         assert!(got.is_some(), "admissão sobrevive à migração: {got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migração v12 → v13 (onda TE, PR34): o store da versão anterior ganha a
+    /// tabela `session_economy` sem perder linha nenhuma — migração aditiva
+    /// (`CREATE TABLE IF NOT EXISTS`), e a sessão antiga continua legível.
+    #[test]
+    fn migration_from_v12_adds_session_economy_and_keeps_data() {
+        let dir = temp_dir("migrate-v12-economy");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        let path = dir.join("store.db");
+        let session_id;
+        {
+            let conn =
+                rusqlite::Connection::open(&path).unwrap_or_else(|err| panic!("abrir v12: {err}"));
+            conn.execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, root_path TEXT NOT NULL, \
+                 name TEXT NOT NULL, first_seen_at TEXT NOT NULL);
+                 CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, \
+                 command TEXT NOT NULL, args TEXT NOT NULL DEFAULT '', model TEXT, started_at TEXT NOT NULL, \
+                 duration_ms INTEGER NOT NULL, ok INTEGER NOT NULL, summary TEXT NOT NULL DEFAULT '');
+                 INSERT INTO projects VALUES ('p1', '/tmp/p1', 'p1', '2026-11-01T00:00:00Z');
+                 INSERT INTO sessions (project_id, command, args, started_at, duration_ms, ok, summary) \
+                 VALUES ('p1', 'triage', '4821', '2026-11-01T00:00:00Z', 10, 1, 'antiga');
+                 PRAGMA user_version = 12;",
+            )
+            .unwrap_or_else(|err| panic!("criar v12: {err}"));
+            session_id = conn
+                .query_row("SELECT id FROM sessions", [], |row| row.get::<_, i64>(0))
+                .unwrap_or_else(|err| panic!("ler sessão antiga: {err}"));
+        }
+        let store = Store::open_at(&path).unwrap_or_else(|err| panic!("abrir v13: {err}"));
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or_else(|err| panic!("user_version: {err}"));
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "migração deveria subir para a versão atual"
+        );
+        // A sessão ANTIGA continua lá — migração nunca perde dado.
+        let kept: String = store
+            .conn
+            .query_row(
+                "SELECT summary FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|err| panic!("sessão antiga sumiu: {err}"));
+        assert_eq!(kept, "antiga");
+        // A tabela nova funciona: registrar e ler uma linha do ledger.
+        let row = economy::EconomyRow {
+            pack_chars: 4096,
+            budget_chars: 12_288,
+            tokens_est: 1365,
+            llm_calls: 1,
+            route: "llm".to_string(),
+            pack_idle: false,
+        };
+        store
+            .record_economy(session_id, &row)
+            .unwrap_or_else(|err| panic!("record_economy: {err}"));
+        let got = store
+            .economy_for_sessions(&[session_id])
+            .unwrap_or_else(|err| panic!("economy_for_sessions: {err}"));
+        assert_eq!(
+            got.get(&session_id),
+            Some(&row),
+            "ledger sobrevive à migração: {got:?}"
+        );
+        // Sessão SEM linha do ledger simplesmente não está no mapa (— na tela).
+        let absent = store
+            .economy_for_sessions(&[session_id + 999])
+            .unwrap_or_else(|err| panic!("economy_for_sessions: {err}"));
+        assert!(absent.is_empty(), "sessão sem ledger não inventa dado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O `record` devolve o id da sessão que acabou de nascer — é a chave que
+    /// amarra a sessão à linha do ledger (PR34).
+    #[test]
+    fn record_returns_the_new_session_id() {
+        let (store, dir) = open_temp_store("record-id");
+        let project = store
+            .ensure_project(&dir)
+            .unwrap_or_else(|err| panic!("ensure_project: {err}"));
+        let id = store
+            .record(
+                &project,
+                "triage",
+                "4821",
+                None,
+                "2026-11-14T12:00:00Z",
+                1,
+                true,
+                "ok",
+                None,
+            )
+            .unwrap_or_else(|err| panic!("record: {err}"));
+        assert!(id > 0, "id da sessão nasce positivo: {id}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -131,6 +131,13 @@ padrão vigente).
 **Fixtures**: nenhum novo arquivo de ferramenta; teste de schema v3→v4 em
 `tests/store_e2e.rs` (DB velho abre e ganha a tabela).
 
+> **Renumbering real (PR34 executada):** quando a PR entrou, o store já estava
+> na **v12** (`llm_calls` v9, `model_admission` v12 do HF-5 entraram antes) —
+> a tabela `session_economy` nasceu como **schema v13**, mesmo desenho do
+> plano (migração idempotente aditiva + pin do `trust_e2e` no mesmo PR). O
+> limiar de pack ocioso (D9, proposta default consumida) é a const
+> `context::PACK_IDLE_MIN_PCT = 25`.
+
 **Testes de aceite**:
 
 - Duas execuções no mesmo estado ⇒ **header do pack byte-idêntico** e campos

@@ -159,6 +159,11 @@ pub struct ContextPack {
     pub repo_source: RepoSource,
 }
 
+/// Limiar de **pack ocioso** (PR34, decisão aberta D9 — proposta default da
+/// PR34 do plano TE): pack abaixo de 25% do teto é suspeita de furo de coleta
+/// (índice ausente/vazio?). Const e não env: ajustável em PR, nunca em runtime.
+pub const PACK_IDLE_MIN_PCT: u64 = 25;
+
 impl ContextPack {
     /// True when there is nothing to add to the prompt.
     #[must_use]
@@ -171,6 +176,33 @@ impl ContextPack {
             && self.knowledge.is_empty()
     }
 
+    /// Percentual do teto que o pack consumiu (inteiro, piso) — o número do
+    /// aviso de pack ocioso e do ledger. Ordem inteira de propósito: sem
+    /// float, o aviso é determinístico byte a byte.
+    #[must_use]
+    pub fn used_pct_of_budget(&self) -> u64 {
+        if self.budget_chars == 0 {
+            return 0;
+        }
+        u64::try_from(self.used_chars).unwrap_or(0) * 100
+            / u64::try_from(self.budget_chars).unwrap_or(1)
+    }
+
+    /// Sinal de pack ocioso (PR34, D9): abaixo do limiar, o orçamento foi
+    /// desperdiçado — provável furo de coleta (índice ausente/vazio?). A
+    /// mensagem vai para o stderr do comando; o LEDGER registra a flag
+    /// separadamente, nunca como chamada.
+    #[must_use]
+    pub fn idle_warning(&self) -> Option<String> {
+        if self.used_pct_of_budget() >= PACK_IDLE_MIN_PCT {
+            return None;
+        }
+        Some(format!(
+            "aviso: pack ocioso ({}% do teto) — provável furo de coleta (índice ausente/vazio?)",
+            self.used_pct_of_budget()
+        ))
+    }
+
     /// Markdown block to append to the user prompt; empty when the pack is empty.
     ///
     /// The section order is the budget priority (SK-3): brief → findings →
@@ -181,8 +213,24 @@ impl ContextPack {
         if self.is_empty() {
             return String::new();
         }
-        let mut out = String::from(
-            "\nContexto do projeto (conhecimento já registrado — use como evidência e \
+        // Header de 1 linha (PR34, onda TE): os números que a sessão vai
+        // registrar no ledger de economia — derivados dos mesmos chars, então
+        // mesmo estado ⇒ mesmo header (o gate M1 continua valendo).
+        // Fonte: a proveniência dos trechos do repositório; sem trechos, `—`.
+        let source = if self.code.is_empty() {
+            "—"
+        } else {
+            self.repo_source.as_str()
+        };
+        let mut out = format!(
+            "~{} tokens (chars {} / {}) dentro do teto {} (fonte: {source})\n",
+            self.used_chars / CHARS_PER_TOKEN,
+            self.used_chars,
+            CHARS_PER_TOKEN,
+            self.budget_chars
+        );
+        out.push_str(
+            "Contexto do projeto (conhecimento já registrado — use como evidência e \
              cite o caminho quando concluir; idade indica se ainda vale):\n",
         );
         if let Some(brief) = &self.findings_brief {
@@ -279,6 +327,12 @@ pub struct ContextReport<'a> {
     pub tokens_estimate: usize,
     /// The chars-per-token constant used (3).
     pub chars_per_token: usize,
+    /// The teto the pack was allowed (PR34: o `--json` exporta o mesmo
+    /// par pack/teto que o header do pack e o ledger registram).
+    pub budget_chars: usize,
+    /// Where the repository excerpts came from (`index`/`grep`) — o mesmo
+    /// valor do header do pack (PR34).
+    pub repo_source: RepoSource,
     /// The pack that would reach the prompt.
     pub pack: &'a ContextPack,
 }
@@ -366,6 +420,8 @@ pub fn report_json(pack: &ContextPack, item_id: i32) -> Result<String, serde_jso
         item_id,
         tokens_estimate: pack.used_chars / CHARS_PER_TOKEN,
         chars_per_token: CHARS_PER_TOKEN,
+        budget_chars: pack.budget_chars,
+        repo_source: pack.repo_source,
         pack,
     })
 }
@@ -928,6 +984,94 @@ mod tests {
     use crate::store::Store;
     use std::fs;
     use std::path::PathBuf;
+
+    /// Pack mínimo de teste: teto e uma fonte — o resto fica no default.
+    /// (Nome distinto do `pack_with` público, que os outros testes usam.)
+    fn ledger_pack(used_chars: usize, budget_chars: usize, code: usize) -> ContextPack {
+        ContextPack {
+            used_chars,
+            budget_chars,
+            code: (0..code)
+                .map(|_| CodeExcerpt {
+                    path: "src/a.rs".to_string(),
+                    line: 1,
+                    text: "x".to_string(),
+                    rank: None,
+                    priority: false,
+                })
+                .collect(),
+            ..ContextPack::default()
+        }
+    }
+
+    /// PR34: o header do pack é a MESMA conta que o ledger registra — chars,
+    /// estimativa (chars/3) e teto, byte a byte determinístico no mesmo estado.
+    #[test]
+    fn render_has_the_economy_header_with_the_budget_and_the_source() {
+        let pack = ledger_pack(612, 12_288, 1);
+        let rendered = pack.render();
+        assert!(
+            rendered
+                .starts_with("~204 tokens (chars 612 / 3) dentro do teto 12288 (fonte: grep)\n"),
+            "header de economia ausente/diferente: {rendered}"
+        );
+        // Fonte = index quando os trechos vieram do FTS5.
+        let indexed = ContextPack {
+            repo_source: RepoSource::Index,
+            ..ledger_pack(612, 12_288, 1)
+        };
+        assert!(
+            indexed
+                .render()
+                .starts_with("~204 tokens (chars 612 / 3) dentro do teto 12288 (fonte: index)\n"),
+            "fonte index no header: {}",
+            indexed.render()
+        );
+        // Sem trechos de repositório, a fonte não existe — `—`, nunca mentira.
+        // (Pack não vazio: um findings brief dá conteúdo sem code.)
+        let no_code = ContextPack {
+            findings_brief: Some("high 1".to_string()),
+            ..ledger_pack(612, 12_288, 0)
+        };
+        assert!(
+            no_code
+                .render()
+                .starts_with("~204 tokens (chars 612 / 3) dentro do teto 12288 (fonte: —)\n"),
+            "fonte — sem trechos: {}",
+            no_code.render()
+        );
+        // Pack vazio NÃO imprime header (não há economia para medir).
+        assert_eq!(ContextPack::default().render(), String::new());
+    }
+
+    /// PR34 (D9): pack abaixo de 25% do teto é ocioso; no limiar ou acima,
+    /// não. Mensagem determinística com o percentual inteiro (piso).
+    #[test]
+    fn idle_warning_flags_packs_below_the_quarter_threshold() {
+        // 0% do teto — ocioso (furo de coleta total).
+        let idle = ledger_pack(0, 12_288, 0);
+        assert_eq!(
+            idle.idle_warning(),
+            Some(
+                "aviso: pack ocioso (0% do teto) — provável furo de coleta (índice ausente/vazio?)"
+                    .to_string()
+            ),
+            "pack vazio é ocioso"
+        );
+        // 24% — ocioso.
+        let below = ledger_pack(2950, 12_288, 0); // 24.02% → piso 24
+        assert_eq!(below.used_pct_of_budget(), 24, "piso inteiro");
+        assert!(below.idle_warning().is_some(), "24% < 25%: ocioso");
+        // 25% — NO limiar já não é ocioso (o desperdício aceitável).
+        let edge = ledger_pack(3072, 12_288, 0); // exatamente 25%
+        assert_eq!(edge.used_pct_of_budget(), 25);
+        assert!(edge.idle_warning().is_none(), "25% não é ocioso");
+        // 50% — longe do limiar.
+        let healthy = ledger_pack(6144, 12_288, 0);
+        assert!(healthy.idle_warning().is_none());
+        // Teto zero não pode dividir por zero.
+        assert_eq!(ledger_pack(0, 0, 0).used_pct_of_budget(), 0);
+    }
 
     fn temp_project(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kira-ctx-{tag}-{}", std::process::id()));

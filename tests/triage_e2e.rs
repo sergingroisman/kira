@@ -840,6 +840,121 @@ fn daily_llm_budget_blocks_the_second_call_with_an_actionable_error() {
     );
 }
 
+// ===========================================================================
+// PR34 (onda TE) — ledger de economia por sessão
+// ===========================================================================
+
+/// PR34: o triage grava o ledger de economia da sessão — pack vs teto, a
+/// chamada de LLM que custou e a rota — e o `kira history` mostra os números.
+/// O ollama falso é o mesmo do restante do arquivo: nada de rede real.
+#[test]
+fn triage_records_the_economy_ledger_and_history_shows_it() {
+    let sandbox = Sandbox::new("economy-ledger");
+    let (code, _stdout, stderr) = sandbox.run(&[
+        "triage",
+        "--file",
+        &sandbox.fixture(),
+        "--model",
+        "qwen3.5:4b",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    // O aviso de pack ocioso (D9) fica visível no stderr — o sandbox não tem
+    // repositório nenhum, então o orçamento foi praticamente desperdiçado.
+    assert!(
+        stderr.contains("aviso: pack ocioso ("),
+        "o pack ocioso deve virar nota no stderr: {stderr}"
+    );
+
+    // A linha do ledger existe e os números são coerentes entre si.
+    let db_path = sandbox.store.join("store.db");
+    let conn = rusqlite::Connection::open(&db_path)
+        .unwrap_or_else(|err| panic!("abrir {db_path:?}: {err}"));
+    let row: (i64, i64, i64, i64, i64, String, i64) = conn
+        .query_row(
+            "SELECT s.id, e.pack_chars, e.budget_chars, e.tokens_est, e.llm_calls, e.route, \
+             e.pack_idle FROM sessions s JOIN session_economy e ON e.session_id = s.id \
+             ORDER BY s.id DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap_or_else(|err| panic!("ledger ausente para a sessão do triage: {err}"));
+    let (session_id, pack_chars, budget_chars, tokens_est, llm_calls, ref route, pack_idle) = row;
+    assert!(session_id > 0, "sessão amarrada ao ledger");
+    assert_eq!(llm_calls, 1, "UMA chamada de julgamento: {row:?}");
+    assert_eq!(route, "llm", "rota do PR34 é sempre llm: {row:?}");
+    assert_eq!(
+        budget_chars, 12_288,
+        "teto default (KIRA_NUM_CTX 4096 × 3): {row:?}"
+    );
+    assert_eq!(
+        tokens_est,
+        pack_chars / 3,
+        "tokens_est é a mesma conta do packer: {row:?}"
+    );
+    assert_eq!(
+        pack_idle,
+        i64::from(pack_chars * 100 < budget_chars * (kira::context::PACK_IDLE_MIN_PCT as i64),),
+        "flag ociosa é a comparação do limiar D9: {row:?}"
+    );
+    let idle: i64 = conn
+        .query_row(
+            "SELECT pack_idle FROM session_economy WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|err| panic!("ler pack_idle: {err}"));
+    assert_eq!(idle, 1, "sandbox sem repositório ⇒ pack ocioso: {row:?}");
+
+    // O history mostra os números — e a causa quando não há ledger.
+    let (code, stdout, stderr) = sandbox.run(&["history"]);
+    assert_eq!(code, 0, "history: {stderr}");
+    assert!(
+        stdout.contains("economia: ~") && stdout.contains("rota: llm"),
+        "history mostra pack/teto e rota: {stdout}"
+    );
+    assert!(
+        stdout.contains("chamadas de LLM: 1"),
+        "history mostra a chamada: {stdout}"
+    );
+    assert!(
+        stdout.contains("pack ocioso"),
+        "history mostra o sinal de pack ocioso: {stdout}"
+    );
+}
+
+/// PR34: sessão SEM ledger (comando que não constrói pack — `kira profile`
+/// registra trilha sem economia) aparece com `—` e a causa, nunca com zero
+/// inventado. A sessão do triage anterior continua com os números.
+#[test]
+fn history_shows_a_dash_with_the_cause_for_sessions_without_ledger() {
+    let sandbox = Sandbox::new("economy-missing");
+    // `kira profile` consulta e NÃO grava sessão — nada aqui. `kira scan` em
+    // sandbox vazio falha (nenhum stack) mas REGISTRA a sessão na trilha —
+    // sem pack, sem ledger: exatamente o caso do `—` com a causa.
+    let (_code, _stdout, _stderr) = sandbox.run(&["scan"]);
+    let (code, stdout, stderr) = sandbox.run(&["history"]);
+    assert_eq!(code, 0, "history: {stderr}");
+    assert!(
+        stdout.contains("scan") && stdout.contains("economia: — (sem registro nesta sessão"),
+        "sessão sem ledger é — com a causa: {stdout}"
+    );
+    assert!(
+        !stdout.contains("chamadas de LLM: 0"),
+        "zero inventado é proibido — ausência é —: {stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // PR11b / ADR-0020 — backend foundry (`--llm foundry`, envs KIRA_FOUNDRY_*)
 // ---------------------------------------------------------------------------
