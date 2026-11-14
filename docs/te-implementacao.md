@@ -422,6 +422,22 @@ linhas por arquivo; caminhos só.
 `- <caminho>` (um por linha). Alternativa: entrar na seção de trechos
 (recusada — gastaria orçamento de evidência).
 
+**Como ficou (implementação, PR39):** o mapa é derivado do inventory do
+`kira ingest` (`.kira/ingest/inventory.json`), não de nova caminhada —
+zero I/O de conteúdo e zero LLM. Ranking implementado:
+`citado` (path citado em findings) > `termo` (termo do work item no CAMINHO,
+não no conteúdo) > `entrada` (entrypoint) > `config` > `topo`, desempate por
+profundidade (rasa primeiro) e caminho — ordenação total, então embaralhar a
+ordem de entrada do inventory não muda o mapa byte a byte. Notas do escopo:
+(1) o §9 acima dizia "termos casados" como nos excerpts; no mapa o casamento
+é no caminho, porque ler conteúdo para ranquear violaria a derivação do
+inventory; (2) o formato por linha virou `- <caminho> (<papel>)` com papel em
+uma palavra (`citado`/`termo`/`entrada`/`config`/`topo`) — o papel é a
+evidência que ranqueou, e cabe no teto de 600 chars; (3) sem inventory
+(fail-open) vira nota `rode kira ingest`, e repo vazio continua sem nota
+(pack byte-idêntico ao de hoje); (4) o mapa entra no pack mesmo com work item
+sem termos (o early-return de termos vem depois dele).
+
 ---
 
 ## 10. PR40 — `token_profile` em `config.toml`

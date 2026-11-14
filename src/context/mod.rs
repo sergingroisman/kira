@@ -10,7 +10,7 @@
 //! Every failure here is **fail-open**: a missing store, an unindexed wiki or a
 //! stale index yields an empty pack with a note, never a failed `triage`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use crate::scan::Finding;
@@ -24,11 +24,13 @@ pub mod gitignore;
 pub mod ignore;
 pub mod index;
 mod repo;
+pub mod repo_map;
 
 pub use dedup::{DEDUP_MIN_CUT_PCT, omitted_marker};
 pub use evidence::{EvidenceState, state_for_anchor};
 pub use index::{ContextError, IndexStats, reindex};
 pub use repo::{CodeExcerpt, RepoGrep, grep_text};
+pub use repo_map::{MAX_MAP_CHARS, MAX_MAP_FILES};
 
 /// Characters reserved per context token. Conservative on purpose: Portuguese
 /// prose runs ~3.5 chars/token, and under-filling the window is cheaper than a
@@ -167,6 +169,12 @@ pub struct ContextPack {
     /// (`session_economy.dedup_chars_saved`, schema v14) registra este número.
     #[serde(default)]
     pub dedup_chars_saved: usize,
+    /// PR39: mapa determinístico do repo (≤20 arquivos / ≤600 chars), derivado
+    /// do inventory do `kira ingest` — apêndice do brief. `None` = sem
+    /// inventory (fail-open: a nota explica); serde default mantém payloads
+    /// antigos válidos.
+    #[serde(default)]
+    pub repo_map: Option<String>,
 }
 
 /// Limiar de **pack ocioso** (PR34, decisão aberta D9 — proposta default da
@@ -184,6 +192,7 @@ impl ContextPack {
             && self.findings.is_empty()
             && self.skills.is_empty()
             && self.knowledge.is_empty()
+            && self.repo_map.is_none()
     }
 
     /// Percentual do teto que o pack consumiu (inteiro, piso) — o número do
@@ -248,6 +257,12 @@ impl ContextPack {
         }
         for finding in &self.findings {
             out.push_str(&format!("- achado: {finding}\n"));
+        }
+        // PR39: o mapa é apêndice do brief — sai logo depois dos achados,
+        // antes das cartas (skills), para o modelo saber o que existe no repo
+        // sem gastar trecho. O bloco já vem truncado dentro dos tetos.
+        if let Some(map) = &self.repo_map {
+            out.push_str(map);
         }
         for skill in &self.skills {
             out.push_str(&format!("\n### {}\n{}\n", skill.anchor(), skill.snippet));
@@ -317,6 +332,11 @@ impl ContextPack {
         }
         if !self.sections.is_empty() {
             sources.push(format!("{} página(s) da wiki", self.sections.len()));
+        }
+        // PR39: o mapa é fonte própria — o número de arquivos mapeados conta.
+        if let Some(map) = &self.repo_map {
+            let files = map.lines().filter(|line| line.starts_with("- ")).count();
+            sources.push(format!("mapa do repo ({files} arquivo(s))"));
         }
         if !self.code.is_empty() {
             sources.push(format!("{} trecho(s) de repositório", self.code.len()));
@@ -568,6 +588,48 @@ pub fn pack_partial(
         item.description.as_deref().unwrap_or_default()
     );
     let terms = keywords(&haystack, 6);
+
+    // 1b. PR39 — mapa determinístico do repo, apêndice do brief: vem do
+    //     inventory do `kira ingest`, função pura de (caminhos, findings,
+    //     termos) — zero LLM, zero I/O de conteúdo (ADR-0016). Falha é
+    //     fail-open: nota acionável, nunca erro do comando. O mapa independe
+    //     dos termos (eles só ranqueiam), então entra mesmo com work item
+    //     sem termos — o early-return de termos vazios vem DEPOIS dele.
+    let skip: HashSet<String> = skip_paths
+        .iter()
+        .filter_map(|raw| repo::normalize_rel(raw))
+        .collect();
+    let priority: BTreeSet<String> = finding_paths(findings.as_deref().unwrap_or_default())
+        .into_iter()
+        .collect();
+    match repo_map::build(root, &priority, &terms, &skip) {
+        repo_map::MapOutcome::Ready(map) => {
+            if map.only_top_of_tree {
+                pack.notes.push(
+                    "mapa do repo: sem findings e sem entrypoint — os do topo da árvore"
+                        .to_string(),
+                );
+            }
+            let cost = map.block.chars().count();
+            if pack.used_chars + cost > budget_chars {
+                pack.notes.push(format!(
+                    "orçamento de contexto esgotado em {budget_chars} caracteres; mapa do repo ficou de fora"
+                ));
+            } else {
+                pack.used_chars += cost;
+                pack.repo_map = Some(map.block);
+            }
+        }
+        repo_map::MapOutcome::NoInventory => pack.notes.push(
+            "mapa do repo: `.kira/ingest/inventory.json` ausente — rode `kira ingest`".to_string(),
+        ),
+        repo_map::MapOutcome::BadInventory => pack.notes.push(
+            "mapa do repo: inventory ilegível/corrompido — rode `kira ingest` de novo".to_string(),
+        ),
+        // Repo vazio: bloco omitido, sem nota (pack byte-idêntico ao de hoje).
+        repo_map::MapOutcome::EmptyRepo => {}
+    }
+
     if terms.is_empty() {
         pack.notes
             .push("work item sem termos úteis para buscar no repositório".to_string());
@@ -692,7 +754,9 @@ pub fn pack_partial(
     //    and has no 400-file alphabetical ceiling — and the grep walk is the
     //    fail-open fallback for a missing or empty index. Files named by a
     //    finding come first in either source.
-    let priority = finding_paths(findings.as_deref().unwrap_or_default());
+    // PR39: a prioridade já foi computada para o mapa (1b) — reusar, nunca
+    // rederivar (mesmo estado ⇒ mesma lista).
+    let priority: Vec<String> = priority.into_iter().collect();
     let mut grep = RepoGrep::default();
     let mut repo_source = RepoSource::Grep;
     if let Some(store) = store
