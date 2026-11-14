@@ -11,8 +11,8 @@ use std::process::Output;
 use serde_json::Value;
 
 use super::{
-    Finding, ScanError, ToolKind, decode, exit_code_label, relative_path, spawn_error, stderr_hint,
-    tool_command,
+    Finding, ScanError, ToolKind, decode, exit_code_label, raw, relative_path, spawn_error,
+    stderr_hint, tool_command,
 };
 
 /// The exact command executed on each detected .NET scope.
@@ -28,7 +28,11 @@ pub const DOTNET_ARGS: [&str; 6] = [
 /// Runs the command in `dir` and parses the JSON into findings. The binary is
 /// RESOLVED first (which-style) — absence never reaches the spawn, and the
 /// resolved full path is what runs.
-pub fn scan_dir(dir: &Path) -> Result<Vec<Finding>, ScanError> {
+///
+/// Devolve TAMBÉM o `RawRun` (exit + stdout decodificado) para o digest bruto
+/// do PR37: quem parseia é quem tem o texto em mãos — o raw sai daqui, não é
+/// relido de lugar nenhum (uma só fonte de verdade).
+pub fn scan_dir(dir: &Path) -> Result<(Vec<Finding>, raw::RawRun), ScanError> {
     let mut command = tool_command(ToolKind::Dotnet, &DOTNET_ARGS)?;
     command.current_dir(dir);
     let output = command
@@ -44,7 +48,10 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<Finding>, ScanError> {
             hint: stderr_hint(&stderr_text),
         });
     }
-    parse_output(&output_stdout(&output), dir)
+    let stdout = output_stdout(&output);
+    let findings = parse_output(&stdout, dir)?;
+    let exit = output.status.code().unwrap_or(-1);
+    Ok((findings, raw::RawRun { exit, stdout }))
 }
 
 /// Decoded stdout of the tool run (M7/P1: BOM/UTF-16 tolerant — PowerShell

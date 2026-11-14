@@ -12,7 +12,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    Finding, ScanError, ToolKind, decode, exit_code_label, spawn_error, stderr_hint, tool_command,
+    Finding, ScanError, ToolKind, decode, exit_code_label, raw, spawn_error, stderr_hint,
+    tool_command,
 };
 
 /// Which package manager audit to run: choice made in the stack detection
@@ -36,7 +37,11 @@ impl NodeAuditTool {
 /// Runs `<pnpm|npm> audit --json` in `dir` and parses the JSON into findings.
 /// The binary is RESOLVED first (which-style) — absence never reaches the
 /// spawn, and the resolved full path is what runs.
-pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanError> {
+///
+/// Devolve TAMBÉM o `RawRun` (exit + stdout decodificado) para o digest bruto
+/// do PR37 — a escrita do raw fica no chamador (`scan_stack`), porque o path
+/// é ancorado na RAIZ do scan, não no escopo onde o comando rodou.
+pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<(Vec<Finding>, raw::RawRun), ScanError> {
     let kind = tool.kind();
     let mut command = tool_command(kind, &["audit", "--json"])?;
     command.current_dir(dir);
@@ -47,28 +52,33 @@ pub fn scan_dir(tool: NodeAuditTool, dir: &Path) -> Result<Vec<Finding>, ScanErr
     // chegar UTF-16 no Windows (redirecionamento/wrapper); lossy puro viraria
     // mojibake e o JSON bom não parsearia.
     let stdout = decode::decode_tool_output(&output.stdout);
+    let exit = output.status.code().unwrap_or(-1);
+    let run = raw::RawRun { exit, stdout };
     let parsed = match tool {
-        NodeAuditTool::Npm => parse_npm_output(&stdout),
-        NodeAuditTool::Pnpm => parse_pnpm_output(&stdout),
+        NodeAuditTool::Npm => parse_npm_output(&run.stdout),
+        NodeAuditTool::Pnpm => parse_pnpm_output(&run.stdout),
     };
     let stderr_text = String::from_utf8_lossy(&output.stderr);
-    match parsed {
-        Ok(findings) => Ok(findings),
+    let findings = match parsed {
+        Ok(findings) => findings,
         // Audit CLIs exit non-zero exactly when vulnerabilities exist: the
         // JSON parse has already been tried — if it failed, the compact error
         // (never the raw body) carries at most one stderr line as a hint.
         // Absence was already handled by the RESOLUTION (no spawn), so a
         // non-zero exit here is a plain tool failure — no OS text parsing.
-        Err(_source) if !output.status.success() => Err(ScanError::ToolFailure {
-            tool: match tool {
-                NodeAuditTool::Npm => "npm audit",
-                NodeAuditTool::Pnpm => "pnpm audit",
-            },
-            exit: exit_code_label(output.status.code()),
-            hint: stderr_hint(&stderr_text),
-        }),
-        Err(source) => Err(source),
-    }
+        Err(_source) if !output.status.success() => {
+            return Err(ScanError::ToolFailure {
+                tool: match tool {
+                    NodeAuditTool::Npm => "npm audit",
+                    NodeAuditTool::Pnpm => "pnpm audit",
+                },
+                exit: exit_code_label(output.status.code()),
+                hint: stderr_hint(&stderr_text),
+            });
+        }
+        Err(source) => return Err(source),
+    };
+    Ok((findings, run))
 }
 
 /// Pure parse of `npm audit --json`: one finding per advisor registered in
