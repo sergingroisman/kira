@@ -149,6 +149,6 @@ engenharia de skill/prompt (`docs/rtk-gsd-rea-openclaude-vale-trazer.md`).
 | P2 | **PR15 `kira loop`** (turno do binário) | coração mínimo sobre a fila que já existe | 2 ciclos seguidos = estado idêntico no store |
 | P3 | **PR16-18** (agenda, budget no ciclo, approve) | autonomia com guarda | escrita sem approve é impossível por construção |
 | P4 | **Docker** (§6) | casa do organismo | `docker run` varre repo de fixture offline |
-| P5 | **SK** (skills + knowledge + Getting Started/storytelling) | RAG do dono + decisão apoiada | textos do dono recuperáveis no pack com âncora |
+| P5 | **SK** (skills + knowledge + Getting Started/storytelling) — **SK-1 entregue (13/Nov, `feat/sk1-skills-catalogo`)**: catálogo de skills (bundled + `.kira/skills/`, FTS5 derivado, CLI `skills list/show/add/search/reindex`); **SK-2 (knowledge) e SK-3 (injeção no packer) pendentes** | RAG do dono + decisão apoiada | textos do dono recuperáveis no pack com âncora |
 | P6 | **TL** (piso + veredito + custódia de prompt, PR44-48) | pele grossa antes de escrever no mundo | recusa nomeia `rule=`; prompt com hash na sessão |
 | P7 | **gold do triage** (dono) | o número que promove autonomia | 20 bugs rotulados; `--eval` ≥70% |

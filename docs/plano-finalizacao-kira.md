@@ -190,10 +190,11 @@ Brain, gold antes de declarar autonomia.
   (F3). *Nota: o plano dizia `.kiraignore`; foi entregue como `.gitignore` (o
   aceite literal do M7 no BUILD-PROGRAM); o matcher é reaproveitável se o dono
   quiser um arquivo próprio depois.*
-- **SK**: skills bundled + `.kira/skills/` com frontmatter (trigger/anti-trigger,
-  semver, autor — formato do agent-skills reimplementado) + **trigger evals** no
-  aceite; `~/.config/kira/knowledge/` para os textos do dono (`knowledge_fts`);
-  prioridade do pack `brief → findings → skills → knowledge → wiki → repo`;
+- **SK** (onda em andamento): skills bundled + `.kira/skills/` com frontmatter
+  (trigger/anti-trigger, semver, autor — formato do agent-skills reimplementado) +
+  **trigger evals** no aceite ✅ **SK-1 entregue (13/Nov)**; `~/.config/kira/knowledge/`
+  para os textos do dono (`knowledge_fts`) — **SK-2 pendente**; prioridade do pack
+  `brief → findings → skills → knowledge → wiki → repo` — **SK-3 pendente**;
   **caveman** entra como compressão do que já foi recuperado (camada
   complementar, ADR-0038); **rtk** fica como referência de engenharia de
   prompt/skill; kind de post **`getting-started`** com tom de storytelling
