@@ -138,6 +138,14 @@ pub enum Error {
     )]
     LlmRequest(String),
 
+    /// OC-1 (Ollama Cloud direto): URL não-local sem chave — o request
+    /// anônimo falharia de forma confusa; o erro é acionável ANTES de
+    /// qualquer request, e a chave nunca aparece aqui (só onde buscá-la).
+    #[error(
+        "Ollama não-local ({url}) exige autenticação — defina a env OLLAMA_API_KEY (ou salve no keyring do OS, entrada `ollama-api-key`), ou volte ao local: KIRA_OLLAMA_URL=http://localhost:11434"
+    )]
+    OllamaKeyMissing { url: String },
+
     /// `KIRA_FOUNDRY_API_KEY` is unset or empty (PR11b, ADR-0020).
     #[error(
         "chave do Foundry ausente — defina a variável de ambiente KIRA_FOUNDRY_API_KEY com uma das chaves do recurso (portal do Foundry → recurso → Keys and Endpoints; ex.: export KIRA_FOUNDRY_API_KEY=...)"

@@ -1899,11 +1899,21 @@ async fn digest_command(
     // FÁBRICA de backend por (kind, tag): a DECISÃO de tag acontece dentro do
     // `post::run` (routing de especialistas, HF-5) — aqui só o wiring da URL.
     let base_url = ollama::base_url_from_env();
-    match kira::post::run(&options, &|_kind: &str, tag: &str| {
-        ollama::OllamaBackend::new(&base_url, tag)
-    })
-    .await
-    {
+    // OC-1: validação URL × chave ANTES de qualquer request — URL não-local
+    // sem chave é erro acionável, nunca request anônimo que falha confuso.
+    let template = match ollama::OllamaBackend::for_base_url(&base_url, ollama::DEFAULT_MODEL) {
+        Ok(template) => template,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
+    // OC-1: aviso de egresso (aviso ≠ erro) — URL não-local significa que o
+    // prompt SAI da máquina; o dev precisa saber antes do run.
+    if let Some(reason) = kira::endpoint::egress_reason_for_url(&base_url) {
+        eprintln!("aviso: egresso de dados neste run ({reason})");
+    }
+    match kira::post::run(&options, &|_kind: &str, tag: &str| template.with_model(tag)).await {
         Ok(report) => {
             if json {
                 match serde_json::to_string_pretty(&report_json(&report)) {

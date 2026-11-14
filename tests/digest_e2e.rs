@@ -93,6 +93,7 @@ impl Sandbox {
             .env("KIRA_SECRET_STORE", "off")
             .env("KIRA_OLLAMA_URL", &self.ollama)
             .env("KIRA_MODEL", "fake")
+            .env_remove("OLLAMA_API_KEY")
             .env_remove("AZURE_DEVOPS_PAT")
             .env_remove("AZURE_DEVOPS_ORG")
             .env_remove("AZURE_DEVOPS_PROJECT")
@@ -118,6 +119,7 @@ impl Sandbox {
             .env("KIRA_OLLAMA_URL", &self.ollama)
             .env("KIRA_MODEL", "fake")
             .env(key, value)
+            .env_remove("OLLAMA_API_KEY")
             .env_remove("AZURE_DEVOPS_PAT")
             .env_remove("AZURE_DEVOPS_ORG")
             .env_remove("AZURE_DEVOPS_PROJECT")
@@ -144,6 +146,7 @@ impl Sandbox {
             .env("KIRA_SECRET_STORE", "off")
             .env("KIRA_OLLAMA_URL", &self.ollama)
             .env_remove("KIRA_MODEL")
+            .env_remove("OLLAMA_API_KEY")
             .env_remove("AZURE_DEVOPS_PAT")
             .env_remove("AZURE_DEVOPS_ORG")
             .env_remove("AZURE_DEVOPS_PROJECT")
@@ -594,5 +597,48 @@ fn unknown_kind_is_an_actionable_error() {
     assert!(
         stderr.contains("kind desconhecido: security") && stderr.contains("intro, c4-container"),
         "erro lista os válidos: {stderr}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// OC-1 — Ollama Cloud direto: URL não-local × chave, egresso
+// -----------------------------------------------------------------------
+
+/// URL NÃO-local SEM chave: erro acionável, exit != 0, NADA gerado — o
+/// request anônimo que falharia confuso nunca é feito (validação na
+/// construção do backend, antes de qualquer rede).
+#[test]
+fn non_local_url_without_key_refuses_with_an_actionable_error() {
+    let sandbox = Sandbox::new("oc1-sem-chave");
+    sandbox.prepare();
+    let (code, stdout, stderr) = sandbox.run_env(
+        &["digest", "--lang", "pt-BR"],
+        "KIRA_OLLAMA_URL",
+        "https://kira-oc1-e2e.invalid", // TLD .invalid: nunca resolve
+    );
+    assert_ne!(code, 0, "sem chave em host não-local é erro: {stdout}");
+    assert!(
+        stderr.contains("OLLAMA_API_KEY") && stderr.contains("não-local"),
+        "erro deve dizer onde definir a chave: {stderr}"
+    );
+    assert!(
+        !sandbox.cwd.join(".kira/drafts").exists(),
+        "nenhum rascunho é gerado sem autenticação"
+    );
+}
+
+/// Tag `*:cloud` (aqui `fake:cloud`) com URL LOCAL: o egresso continua
+/// acontecendo — o prompt sai da máquina pelo cloud. O aviso entra na nota
+/// do resumo do digest; aviso ≠ erro, o run segue até o fim (exit 0).
+#[test]
+fn cloud_tag_triggers_the_egress_note_even_on_a_local_url() {
+    let sandbox = Sandbox::new("oc1-cloud-tag");
+    sandbox.prepare();
+    let (code, stdout, stderr) =
+        sandbox.run_env(&["digest", "--lang", "pt-BR"], "KIRA_MODEL", "fake:cloud");
+    assert_eq!(code, 0, "aviso não é erro — o run segue: {stderr}");
+    assert!(
+        stdout.contains("egresso de dados neste run") && stdout.contains("fake:cloud"),
+        "a nota cita a tag e o egresso: {stdout}"
     );
 }

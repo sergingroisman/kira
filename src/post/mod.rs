@@ -209,6 +209,8 @@ pub async fn run<B: LlmBackend>(
         planned.retain(|post| &post.kind == kind);
     }
     report.planned = planned.len();
+    // OC-1: o aviso de egresso por tag aparece UMA vez por run (nota, não erro).
+    let mut egress_warned = false;
     for post in &planned {
         let tag = model_map
             .entry(post.kind.clone())
@@ -223,6 +225,10 @@ pub async fn run<B: LlmBackend>(
                 routing.tag
             })
             .clone();
+        if !egress_warned && let Some(note) = cloud_tag_note(&tag) {
+            egress_warned = true;
+            report.notes.push(note);
+        }
         let outcome = store
             .post_enqueue(
                 &project_id,
@@ -309,6 +315,12 @@ pub async fn run<B: LlmBackend>(
                 .tag
             })
             .clone();
+        // OC-1: tag `*:cloud` roteada na hora (kind fora do plano) também
+        // avisa — o egresso é do run inteiro, não do planejamento.
+        if !egress_warned && let Some(note) = cloud_tag_note(&tag) {
+            egress_warned = true;
+            report.notes.push(note);
+        }
         // LLM porque: traduzir fatos determinísticos (digest) em prosa e diagrama C4
         // é julgamento — nenhum parser ou comando de linha produz esse texto, e o
         // ADR-0038 confina a chamada a este módulo, atrás de trust e de orçamento.
@@ -499,6 +511,19 @@ pub fn estimate_tokens(prompt: &str, answer: &str) -> u64 {
     chars / CHARS_PER_TOKEN
 }
 
+/// Nota de egresso para tag `*:cloud` (OC-1, PURA): o routing pode mandar o
+/// prompt para o cloud MESMO com a URL local (matriz de escalonamento do
+/// HF-5). `None` para tag local — localhost nunca é egresso.
+fn cloud_tag_note(tag: &str) -> Option<String> {
+    if crate::endpoint::is_cloud_tag(tag) {
+        Some(format!(
+            "aviso: egresso de dados neste run (tag `{tag}` é cloud — o prompt sai da máquina; o cloud processa, não treina com ele, porém ele sai)"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Teto de chars do rascunho pronto (front-matter + corpo): o MESMO teto do
 /// prompt por post (`PER_POST_TOKENS` × `CHARS_PER_TOKEN`). Saída acima do
 /// teto é RECUSADA, nunca truncada — cortar texto do modelo no meio é
@@ -657,6 +682,25 @@ mod tests {
     fn estimate_tokens_uses_three_chars_per_token() {
         assert_eq!(estimate_tokens("123", "456"), 2);
         assert_eq!(estimate_tokens("", ""), 0);
+    }
+
+    #[test]
+    fn cloud_tag_note_warns_only_for_cloud_tags() {
+        // Tag cloud (local OU não-local): o aviso vale dos dois jeitos — o
+        // prompt sai da máquina mesmo que a URL aponte para localhost.
+        let note = cloud_tag_note("fake:cloud").expect("tag cloud tem aviso");
+        assert!(
+            note.contains("egresso de dados neste run") && note.contains("sai da máquina"),
+            "nota acionável: {note}"
+        );
+        let note = cloud_tag_note("qwen3-coder:480b-cloud").expect("-cloud também");
+        assert!(
+            note.contains("qwen3-coder:480b-cloud"),
+            "nota cita a tag: {note}"
+        );
+        // Tag local: sem aviso (comportamento de hoje).
+        assert!(cloud_tag_note("qwen3.5:4b").is_none());
+        assert!(cloud_tag_note("hf.co/bartowski/X:Q4_K_M").is_none());
     }
 
     #[test]

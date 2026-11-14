@@ -144,8 +144,19 @@ pub async fn tick(options: &LoopOptions) -> Result<TickReport, LoopError> {
         // `// LLM porque:` e o routing de especialistas por kind, HF-5). O
         // modelo do loop é explícito (`LoopOptions.model`) — vence o routing.
         let base_url = ollama::base_url_from_env();
+        // OC-1: validação URL × chave ANTES de qualquer request — host
+        // não-local sem chave é erro acionável, nunca request anônimo.
+        let template = ollama::OllamaBackend::for_base_url(&base_url, ollama::DEFAULT_MODEL)
+            .map_err(|err| LoopError::Digest(err.to_string()))?;
+        // OC-1: aviso de egresso entra na nota do tick — o relatório do ciclo
+        // é onde o dono lê o que aconteceu.
+        if let Some(reason) = crate::endpoint::egress_reason_for_url(&base_url) {
+            report
+                .notes
+                .push(format!("aviso: egresso de dados neste run ({reason})"));
+        }
         match post::run(&digest_options, &|_kind: &str, tag: &str| {
-            ollama::OllamaBackend::new(&base_url, tag)
+            template.with_model(tag)
         })
         .await
         {

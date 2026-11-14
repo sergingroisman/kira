@@ -38,6 +38,14 @@ pub const CRED_KEY_PAT: &str = "azure-devops-pat";
 /// exportar nada.
 pub const CRED_KEY_FOUNDRY_API_KEY: &str = "foundry-api-key";
 
+/// Env com a chave da API do Ollama para hosts NÃO-locais (OC-1 — Ollama
+/// Cloud direto). Em localhost a chave nunca é exigida nem enviada.
+pub const OLLAMA_API_KEY_ENV: &str = "OLLAMA_API_KEY";
+
+/// Entrada no keyring do OS (service `kira`) para a chave do Ollama — o
+/// caminho para quem não quer exportar a env a cada shell.
+pub const CRED_KEY_OLLAMA_API_KEY: &str = "ollama-api-key";
+
 /// Config keys stored in `config.toml`.
 pub const CONFIG_KEY_ORG: &str = "organization";
 pub const CONFIG_KEY_PROJECT: &str = "project";
@@ -49,6 +57,12 @@ pub const CONFIG_KEY_DEV_NAME: &str = "dev_name";
 pub const CONFIG_KEY_FOUNDRY_ENDPOINT: &str = "foundry_endpoint";
 /// Deployment/modelo do Foundry (público) em `config.toml`.
 pub const CONFIG_KEY_FOUNDRY_DEPLOYMENT: &str = "foundry_deployment";
+
+/// Prefixo das chaves de override de routing no `config.toml`
+/// (`model_role.<kind> = tag`, HF-5/ADR-0040). A constante mora aqui (e é
+/// reexportada por `llm::roles`) porque `doctor` também lê a tabela e não
+/// pode importar `llm::*` (allowlist do ADR-0016).
+pub const CONFIG_MODEL_ROLE_PREFIX: &str = "model_role.";
 
 /// Where a resolved value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,6 +487,48 @@ pub fn resolve_pat_with_source() -> Result<Resolved, Error> {
     resolve_pat_parts(env_value, store.as_deref())
 }
 
+/// Core da resolução da chave do Ollama (OC-1): env > keyring, `None` sem
+/// chave. Pura de propósito — quem lê env/store real é
+/// [`resolve_ollama_api_key_with_source`]; teste não muta env global.
+///
+/// Falha de leitura do store conta como AUSENTE (não é erro): a resposta da
+/// camada de cima para "não-local sem chave" é o erro acionável que pede a
+/// env `OLLAMA_API_KEY` — nunca um pânico de keyring em máquina headless.
+#[must_use]
+fn resolve_ollama_api_key_parts(
+    env_value: Option<String>,
+    store: Option<&dyn CredStore>,
+) -> Option<Resolved> {
+    if let Some(value) = env_value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(Resolved {
+            value,
+            source: Source::Env,
+        });
+    }
+    let value = store?.get(CRED_KEY_OLLAMA_API_KEY).ok().flatten()?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    Some(Resolved {
+        value,
+        source: Source::Keyring,
+    })
+}
+
+/// Resolve a chave da API do Ollama: `OLLAMA_API_KEY` env > keyring do OS
+/// (entrada `ollama-api-key`). `None` quando não há chave em lugar nenhum —
+/// normal em localhost; a EXIGÊNCIA da chave decide a camada do backend
+/// (o construtor `for_base_url` do backend Ollama), não a credencial.
+#[must_use]
+pub fn resolve_ollama_api_key_with_source() -> Option<Resolved> {
+    let env_value = std::env::var(OLLAMA_API_KEY_ENV).ok();
+    let store = open_default_store().ok();
+    resolve_ollama_api_key_parts(env_value, store.as_deref())
+}
+
 /// Core of a plain setting resolution: flag > env > config.toml.
 fn resolve_setting_parts(
     flag: Option<String>,
@@ -557,6 +613,55 @@ pub fn resolve_azure_config(project_override: Option<&str>) -> Result<AzureConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_api_key_prefers_env_over_the_store() {
+        use super::*;
+        let store = InMemory::new();
+        store
+            .set(CRED_KEY_OLLAMA_API_KEY, "do-keyring")
+            .expect("set");
+        let resolved = resolve_ollama_api_key_parts(Some("da-env".into()), Some(&store))
+            .expect("env presente deve resolver");
+        assert_eq!(resolved.value, "da-env");
+        assert_eq!(resolved.source, Source::Env);
+    }
+
+    #[test]
+    fn ollama_api_key_falls_back_to_the_store() {
+        use super::*;
+        let store = InMemory::new();
+        store
+            .set(CRED_KEY_OLLAMA_API_KEY, "do-keyring")
+            .expect("set");
+        let resolved = resolve_ollama_api_key_parts(None, Some(&store)).expect("keyring presente");
+        assert_eq!(resolved.value, "do-keyring");
+        assert_eq!(resolved.source, Source::Keyring);
+    }
+
+    #[test]
+    fn ollama_api_key_absent_store_or_entry_is_none_not_error() {
+        use super::*;
+        // Sem env e sem store (máquina headless): ausente, nunca pânico.
+        assert!(resolve_ollama_api_key_parts(None, None).is_none());
+        // Store vazio e entrada em branco: mesma conduta.
+        let store = InMemory::new();
+        assert!(resolve_ollama_api_key_parts(None, Some(&store)).is_none());
+        store
+            .set(CRED_KEY_OLLAMA_API_KEY, "   ")
+            .expect("set em branco");
+        assert!(
+            resolve_ollama_api_key_parts(None, Some(&store)).is_none(),
+            "entrada em branco não conta como chave"
+        );
+    }
+
+    #[test]
+    fn model_role_prefix_is_the_single_source() {
+        // A fonte única evita divergência entre o routing e o doctor — os
+        // dois têm que ler a MESMA tabela do config.toml.
+        assert_eq!(CONFIG_MODEL_ROLE_PREFIX, "model_role.");
+    }
 
     #[test]
     fn foundry_public_keys_and_the_key_never_share_a_slot() {
