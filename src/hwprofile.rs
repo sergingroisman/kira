@@ -383,6 +383,9 @@ mod tests {
     /// um `.cmd` (o wrapper `cmd /C` já está no caminho de produção). O
     /// `name` distingue shims no MESMO diretório (sobrescrever um pelo
     /// outro faria o assert do spawn direto ler o conteúdo errado).
+    /// No macOS os callers somem (perfil é Metal, cfg dos testes), então a
+    /// função fica morta LÁ — o allow fica atrás do mesmo cfg.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn write_smi_shim(dir: &Path, name: &str, body_mb: &str) -> PathBuf {
         #[cfg(unix)]
         {

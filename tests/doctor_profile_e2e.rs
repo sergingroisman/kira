@@ -46,7 +46,9 @@ impl Sandbox {
     }
 
     /// Shim do `nvidia-smi`: script shell no Unix, `.cmd` no Windows (o
-    /// wrapper `cmd /C` da produção lida com isso).
+    /// wrapper `cmd /C` da produção lida com isso). No macOS o único caller
+    /// (GPU pelo shim) é cfg(not(macos)) — função morta lá, allow no mesmo cfg.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn write_smi_shim(&self, body_mb: &str) -> PathBuf {
         #[cfg(unix)]
         {
