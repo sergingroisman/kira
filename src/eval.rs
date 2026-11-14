@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::EvidenceState;
 use crate::error::Error;
 use crate::llm::LlmKind;
 use crate::triage;
@@ -101,8 +102,11 @@ pub fn causa_score(prevista: &str, gold: &str) -> f64 {
 /// Extrai os basenames dos arquivos citados na seção "Arquivos prováveis":
 /// um caminho (ou nome) por token, separados por espaço/vírgula/ponto-e-
 /// vírgula/quebra de linha. O placeholder "—" (seção vazia) e o
-/// `não identificado` exigido do prompt não viram basename. Comparação
-/// fica em minúsculas (Windows é insensível a caixa).
+/// `não identificado` exigido do prompt não viram basename. PR36: a tag de
+/// evidência — `(CONFIRMADA)`/`(INFERIDA)` que o prompt v3 manda preservar —
+/// também não é basename (o eval compara ARQUIVOS, não estados); o caminho
+/// citado antes da tag continua entrando. Comparação fica em minúsculas
+/// (Windows é insensível a caixa).
 #[must_use]
 pub fn file_basenames(texto: &str) -> Vec<String> {
     texto
@@ -117,6 +121,12 @@ pub fn file_basenames(texto: &str) -> Vec<String> {
         })
         .filter(|caminho| !caminho.is_empty())
         .filter(|caminho| caminho != "—" && caminho != crate::llm::prompts::TRIAGE_FILES_UNKNOWN)
+        // PR36: o rótulo da tag, isolado depois do split, nunca vira basename.
+        .filter(|caminho| {
+            !EvidenceState::LABELS
+                .iter()
+                .any(|tag| tag.eq_ignore_ascii_case(caminho))
+        })
         .map(|caminho| {
             let nome = caminho
                 .rsplit('/')
@@ -642,6 +652,21 @@ mod tests {
         // Vários arquivos numa linha, separados por vírgula.
         let previstos = file_basenames("src/a/session.rs, src/b/token.rs");
         assert_eq!(previstos, vec!["session.rs", "token.rs"]);
+    }
+
+    #[test]
+    fn file_basenames_ignora_as_tags_de_evidencia_pr36() {
+        // A tag NÃO é basename — e o caminho citado com tag continua entrando.
+        let previstos =
+            file_basenames("src/auth/session.rs (CONFIRMADA), src/db/token.rs (INFERIDA)");
+        assert_eq!(previstos, vec!["session.rs", "token.rs"], "{previstos:?}");
+        // files_ok continua batendo com a tag preservada na citação.
+        assert!(files_ok(
+            "src/auth/session.rs (CONFIRMADA)",
+            &["src/Auth/session.rs".to_string()]
+        ));
+        // Placeholder + tag não existe: AUSENTE é o estado do "não identificado".
+        assert!(!files_ok("não identificado", &["session.rs".to_string()]));
     }
 
     #[test]

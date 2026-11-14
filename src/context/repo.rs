@@ -15,6 +15,8 @@ use std::path::Path;
 
 use walkdir::WalkDir;
 
+use super::evidence::EvidenceState;
+
 /// Text file bigger than this is skipped: a lockfile or a bundle is noise, and
 /// reading it would spend the token budget on nothing.
 pub(crate) const MAX_FILE_BYTES: u64 = 128 * 1024;
@@ -52,6 +54,14 @@ pub struct CodeExcerpt {
     /// explain view shows it, and the ranking gives it the bonus.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub priority: bool,
+    /// Estado da evidência do trecho (PR36): `CONFIRMADA` quando o arquivo
+    /// da âncora existe no repositório AGORA, `INFERIDA` quando não pôde ser
+    /// verificado (arquivo saiu do disco / caminho inválido). É calculado
+    /// ONDE A RAIZ EXISTE (`context::pack_partial`); construtores sem raiz
+    /// (`grep_text`, índice) ficam com o default INFERIDA — nunca
+    /// CONFIRMADA de graça.
+    #[serde(default)]
+    pub evidence: crate::context::evidence::EvidenceState,
 }
 
 impl CodeExcerpt {
@@ -125,6 +135,9 @@ fn scored_text(path: &str, content: &str, terms: &[String]) -> Vec<(usize, CodeE
                 text: clean_line(line),
                 rank: None,
                 priority: false,
+                // Sem raiz aqui, não há verificação: o default INFERIDA é
+                // corrigido em `pack_partial`, onde a raiz existe.
+                evidence: EvidenceState::default(),
             },
         ));
         if found.len() == MAX_HITS_PER_FILE {

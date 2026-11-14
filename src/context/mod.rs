@@ -18,11 +18,13 @@ use crate::store::Store;
 use crate::wiki::Wiki;
 use crate::work_item::WorkItem;
 
+pub mod evidence;
 pub mod gitignore;
 pub mod ignore;
 pub mod index;
 mod repo;
 
+pub use evidence::{EvidenceState, state_for_anchor};
 pub use index::{ContextError, IndexStats, reindex};
 pub use repo::{CodeExcerpt, RepoGrep, grep_text};
 
@@ -266,7 +268,15 @@ impl ContextPack {
         if !self.code.is_empty() {
             out.push_str("\n### Trechos do repositório (caminho:linha)\n");
             for excerpt in &self.code {
-                out.push_str(&format!("{} — {}\n", excerpt.anchor(), excerpt.text));
+                // PR36: cada trecho sai tagueado — (CONFIRMADA) = o arquivo
+                // existe no repositório, (INFERIDA) = não pôde ser verificado.
+                // O prompt v3 manda o modelo PRESERVAR a tag ao citar.
+                out.push_str(&format!(
+                    "{} — {} ({})\n",
+                    excerpt.anchor(),
+                    excerpt.text,
+                    excerpt.evidence.as_str()
+                ));
             }
         }
         out
@@ -378,7 +388,12 @@ pub fn explain_report(pack: &ContextPack, item_id: i32, explain: bool) -> String
     if !pack.code.is_empty() {
         out.push_str(&format!("trechos do repositório ({}):\n", pack.code.len()));
         for excerpt in &pack.code {
-            out.push_str(&format!("  - {} — {}\n", excerpt.anchor(), excerpt.text));
+            out.push_str(&format!(
+                "  - {} — {} ({})\n",
+                excerpt.anchor(),
+                excerpt.text,
+                excerpt.evidence.as_str()
+            ));
             if explain {
                 let rank = excerpt
                     .rank
@@ -686,8 +701,18 @@ pub fn pack_partial(
         grep = repo::grep(root, &terms, &priority, skip_paths, MAX_CODE_EXCERPTS);
     }
     pack.repo_source = repo_source;
-    for excerpt in grep.excerpts {
-        let cost = excerpt.text.chars().count() + excerpt.path.chars().count() + 12;
+    for mut excerpt in grep.excerpts {
+        // PR36: a tag de evidência é calculada AQUI — o único ponto que
+        // conhece a raiz. Trecho do grep ⇒ arquivo acabou de ser lido
+        // (CONFIRMADA); trecho de índice velho (arquivo saiu do disco) ⇒
+        // INFERIDA. Função pura de (raiz, âncora): mesmo estado ⇒ mesma tag.
+        excerpt.evidence = state_for_anchor(root, &excerpt.path);
+        // A tag entra no prompt, então entra na conta do orçamento
+        // (ledger honesto: o custo é o que o prompt carrega).
+        let cost = excerpt.text.chars().count()
+            + excerpt.path.chars().count()
+            + excerpt.evidence.as_str().len()
+            + 15;
         if pack.used_chars + cost > budget_chars {
             pack.notes.push(format!(
                 "orçamento de contexto esgotado em {budget_chars} caracteres; trechos do repositório ficaram de fora"
@@ -998,6 +1023,7 @@ mod tests {
                     text: "x".to_string(),
                     rank: None,
                     priority: false,
+                    evidence: EvidenceState::Confirmed,
                 })
                 .collect(),
             ..ContextPack::default()
@@ -1406,6 +1432,89 @@ mod tests {
                 with_index.used_chars / CHARS_PER_TOKEN
             )
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR36 — evidência em 3 estados: o packer marca cada trecho por arquivo.
+    // -----------------------------------------------------------------------
+
+    /// Aceite do PR36: âncora que existe no disco = CONFIRMADA, e a tag sai
+    /// no render (o prompt v3 manda o modelo preservá-la).
+    #[test]
+    fn packer_tags_an_existing_anchor_as_confirmed() {
+        let dir = temp_project("evidence-confirmed");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        write_file(
+            &dir,
+            "src/auth/session.rs",
+            "pub fn check_token() -> bool {\n",
+        );
+
+        let pack = pack_with(
+            &dir,
+            &store,
+            &wiki,
+            &item_with("Sessão expirada", "o check_token falhou no refresh"),
+            12_000,
+        );
+        assert_eq!(pack.repo_source, RepoSource::Grep, "{:?}", pack.notes);
+        assert!(
+            pack.code
+                .iter()
+                .all(|excerpt| excerpt.evidence == EvidenceState::Confirmed),
+            "todo trecho do grep veio do disco: {:?}",
+            pack.code
+        );
+        let rendered = pack.render();
+        assert!(rendered.contains("(CONFIRMADA)"), "{rendered}");
+        // Âncora intacta: a tag entra DEPOIS do texto, nunca no caminho:linha.
+        assert!(
+            rendered
+                .contains("src/auth/session.rs:1 — pub fn check_token() -> bool { (CONFIRMADA)"),
+            "{rendered}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Aceite do PR36: trecho de índice cujo arquivo saiu do disco =
+    /// INFERIDA — o índice é derivado (ADR-0021) e a tag é honesta.
+    #[test]
+    fn packer_tags_a_stale_index_excerpt_as_inferred() {
+        let dir = temp_project("evidence-inferred");
+        let store =
+            Store::open_in_dir(&dir.join("store")).unwrap_or_else(|err| panic!("store: {err}"));
+        let wiki = Wiki::open(&dir).unwrap_or_else(|err| panic!("wiki: {err}"));
+        write_file(
+            &dir,
+            "src/auth/session.rs",
+            "pub fn check_token() -> bool {\n",
+        );
+        let project_id = crate::store::project_id_for_root(&dir)
+            .unwrap_or_else(|err| panic!("project id: {err}"));
+        index::reindex(&dir, &store, &project_id).unwrap_or_else(|err| panic!("reindex: {err}"));
+        // O disco manda: arquivo saiu, índice derivado ainda tem a linha.
+        fs::remove_file(dir.join("src/auth/session.rs"))
+            .unwrap_or_else(|err| panic!("remover: {err}"));
+
+        let pack = pack_with(
+            &dir,
+            &store,
+            &wiki,
+            &item_with("Sessão expirada", "token inválido"),
+            12_000,
+        );
+        assert_eq!(pack.repo_source, RepoSource::Index, "{:?}", pack.notes);
+        assert!(
+            pack.code
+                .iter()
+                .all(|excerpt| excerpt.evidence == EvidenceState::Inferred),
+            "índice velho não é CONFIRMADA: {:?}",
+            pack.code
+        );
+        assert!(pack.render().contains("(INFERIDA)"), "{}", pack.render());
         let _ = fs::remove_dir_all(&dir);
     }
 

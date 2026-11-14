@@ -52,6 +52,12 @@ Qualquer outro módulo (`scan`, `store`, `board`, `ado`, `guard`, `format`, `tui
 `doctor`, `scheduler`) **não** importa `llm::*`. Isso é verificado por teste
 (PR33), não por disciplina.
 
+Exceção de REFERÊNCIA (sem chamada, PR36/onda TE): `src/context/evidence.rs`
+importa apenas `TRIAGE_FILES_UNKNOWN` — o vocabulário do placeholder — para
+classificar âncora vazia/`não identificado` como estado `AUSENTE`. É cálculo
+puro (camada 3), sem backend e sem rede, registrado na allowlist do teste de
+admissão com a mesma justificativa do `eval.rs`.
+
 ### Consequências operacionais
 
 - **Budget de 50 chamadas/dia mede LLM, não trabalho.** Comando de CLI não consome

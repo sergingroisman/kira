@@ -24,6 +24,7 @@ use std::path::Path;
 use thiserror::Error;
 use walkdir::WalkDir;
 
+use super::evidence::EvidenceState;
 use super::repo::{self, CodeExcerpt, RepoGrep};
 use crate::store::Store;
 
@@ -260,6 +261,9 @@ pub fn search(
                     text: row.text,
                     rank: Some(row.rank),
                     priority: is_priority,
+                    // Sem raiz aqui, não há verificação: o default INFERIDA
+                    // é corrigido em `pack_partial`, onde a raiz existe.
+                    evidence: EvidenceState::default(),
                 },
             )
         })

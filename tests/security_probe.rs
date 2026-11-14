@@ -238,12 +238,13 @@ fn injection_payload_stays_inside_the_untrusted_block() {
         "o fechamento é o último byte do prompt: {prompt}"
     );
 
-    // O system prompt (v2) declara a regra anti-instrução: o bloco é dado,
-    // comandos — inclusive invisíveis — são ignorados e reportados.
+    // O system prompt (v3) declara a regra anti-instrução: o bloco é dado,
+    // comandos — inclusive invisíveis — são ignorados e reportados. A v3
+    // (PR36) só ACRESCENTA a regra de preservar a tag de evidência.
     assert_eq!(
         prompts::TRIAGE_PROMPT_VERSION,
-        "v2",
-        "a geração vigente do prompt é a v2 (W7.2)"
+        "v3",
+        "a geração vigente do prompt é a v3 (PR36)"
     );
     assert!(
         prompts::TRIAGE_SYSTEM_PROMPT.contains("<<<CONTEÚDO NÃO CONFIÁVEL")

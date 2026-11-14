@@ -669,6 +669,7 @@ mod tests {
                 text: "let ttl = Duration::minutes(5);".to_string(),
                 rank: None,
                 priority: false,
+                evidence: crate::context::EvidenceState::Confirmed,
             }],
             findings_brief: Some("high 1".to_string()),
             findings: vec!["high · Newtonsoft.Json 12.0.1 (src/App.csproj)".to_string()],
@@ -785,6 +786,28 @@ mod tests {
             !empty_third.contains("Arquivos prováveis:\n—"),
             "{empty_third}"
         );
+    }
+
+    /// PR36 (v3): a saída com tag de evidência — que o prompt agora exige do
+    /// modelo — continua parseável por `sections_of` (episódio, `--eval`, pr
+    /// draft, painel), sem tratamento especial.
+    #[test]
+    fn format_triage_tolerates_the_evidence_tags() {
+        let out = format(
+            "Causa raiz provável:\nTTL do token muito curto.\nArquivos prováveis:\n\
+             src/auth/session.rs (CONFIRMADA)\nConfiança:\nmédia",
+        );
+        assert!(
+            out.contains("Arquivos prováveis:\nsrc/auth/session.rs (CONFIRMADA)"),
+            "a tag passa pelo formatador intacta: {out}"
+        );
+        let sections = sections_of(&out);
+        assert_eq!(sections[1], "src/auth/session.rs (CONFIRMADA)");
+        // A tag vinda do cache/wiki (episódio gravado com tag) também parseia.
+        let cached = sections_of(&format(
+            "Causa raiz provável:\nx\nArquivos prováveis:\nsrc/a.rs (INFERIDA)\nConfiança:\nbaixa",
+        ));
+        assert_eq!(cached[1], "src/a.rs (INFERIDA)");
     }
 
     #[test]
