@@ -143,6 +143,9 @@
       agendamento pela TUI, com opt-in e aviso de que só roda com o KIRA vivo.
 - [ ] **PR17** budget `max_llm_calls_per_day = 50` + política de falha:
       stale-ok, 429 → 5 min de silêncio, cache atômico.
+      *Contador+enforcement já entregues no P0 (`llm_calls` v9, teto
+      checado antes de cada chamada, linha no doctor); falta a política
+      de quota/stale e o gauge do dashboard.*
 - [ ] **PR18** `kira approve <id>` + `awaiting_approval` no ciclo (guarda da
       autonomia) — **pré-requisito de qualquer escrita autônoma**.
 - [ ] **PR19** `kira audit --weekly` (sem blog).

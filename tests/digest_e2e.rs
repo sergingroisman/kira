@@ -97,6 +97,31 @@ impl Sandbox {
         )
     }
 
+    /// `run` com UMA variável extra — o teto diário de chamadas (P0) precisa
+    /// de `KIRA_MAX_LLM_CALLS_PER_DAY` por execução, sem tocar as outras.
+    fn run_env(&self, args: &[&str], key: &str, value: &str) -> (i32, String, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_kira"))
+            .args(args)
+            .current_dir(&self.cwd)
+            .env("KIRA_STORE_DIR", &self.store)
+            .env("KIRA_CONFIG", self.store.join("absent-config.toml"))
+            .env("KIRA_SECRET_STORE", "off")
+            .env("KIRA_OLLAMA_URL", &self.ollama)
+            .env("KIRA_MODEL", "fake")
+            .env(key, value)
+            .env_remove("AZURE_DEVOPS_PAT")
+            .env_remove("AZURE_DEVOPS_ORG")
+            .env_remove("AZURE_DEVOPS_PROJECT")
+            .env_remove("KIRA_BOARD")
+            .output()
+            .unwrap_or_else(|err| panic!("rodar kira {args:?}: {err}"));
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
     /// Estado de partida: fatos ingeridos e repositório aceito.
     fn prepare(&self) {
         let (code, stdout, stderr) = self.run(&["ingest", "--skip-scan"]);
@@ -215,6 +240,64 @@ fn budget_zero_stops_with_a_note_and_exit_zero() {
     assert!(
         briefing.contains("kira digest --resume"),
         "com fila pendente o próximo passo é resume: {briefing}"
+    );
+}
+
+#[test]
+fn daily_llm_budget_stops_the_turn_before_claiming_with_a_note() {
+    let sandbox = Sandbox::new("budget-chamadas");
+    sandbox.prepare();
+
+    // Teto 1: o turno gera a primeira carta, entra no ledger e para ANTES do
+    // próximo claim — a nota diz o conserto (budget checado antes de cada
+    // chamada, mandato P0/auditoria F2).
+    let (code, stdout, stderr) = sandbox.run_env(
+        &["digest", "--lang", "pt-BR"],
+        "KIRA_MAX_LLM_CALLS_PER_DAY",
+        "1",
+    );
+    assert_eq!(code, 0, "teto de chamadas não é erro do comando: {stderr}");
+    assert!(
+        stdout.contains("limite diário"),
+        "nota do teto precisa aparecer: {stdout}"
+    );
+    // A ordem de claim é `created_at, slug` — este teste não depende de qual
+    // slug saiu primeiro: exatamente UMA carta nasceu antes do teto.
+    let drafts = || {
+        std::fs::read_dir(sandbox.cwd.join(".kira").join("drafts"))
+            .unwrap_or_else(|err| panic!("ler drafts: {err}"))
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    let antes = drafts();
+    assert_eq!(
+        antes.len(),
+        1,
+        "exatamente uma carta antes do teto: {antes:?}"
+    );
+    let primeira = sandbox.read(&format!(".kira/drafts/{}", antes[0]));
+    assert!(
+        primeira.contains("lang: pt-BR"),
+        "a carta nasceu no idioma do run: {primeira}"
+    );
+
+    // Run seguinte: nem claim acontece — a fila fica intacta para amanhã e o
+    // exit continua 0 (nota, não erro: o mesmo contrato do budget de tokens).
+    let (code, stdout, stderr) = sandbox.run_env(
+        &["digest", "--lang", "pt-BR"],
+        "KIRA_MAX_LLM_CALLS_PER_DAY",
+        "1",
+    );
+    assert_eq!(code, 0, "segunda rodada não é erro: {stderr}");
+    assert!(
+        stdout.contains("limite diário"),
+        "segunda rodada para no teto: {stdout}"
+    );
+    assert_eq!(
+        drafts(),
+        antes,
+        "nenhuma carta nova após o teto (nada regenerado)"
     );
 }
 

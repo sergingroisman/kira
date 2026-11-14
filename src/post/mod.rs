@@ -196,6 +196,26 @@ pub async fn run<B: LlmBackend>(
             ));
             break;
         }
+        // P0 (auditoria F2): o teto diário de CHAMADAS é checado antes do
+        // claim — nunca retirar uma carta que não dá para gerar (o lease
+        // venceria e a devolveria de qualquer jeito). O budget de tokens
+        // acima limita tamanho; este limita quantas vezes o turno fala com
+        // o modelo (mandato: 50/dia, env/config).
+        match store.ensure_llm_budget(crate::credentials::max_llm_calls_per_day(), "digest") {
+            Ok(()) => {}
+            Err(crate::store::StoreError::BudgetExhausted {
+                today,
+                max,
+                command,
+            }) => {
+                report.budget_hit = true;
+                report.notes.push(format!(
+                    "limite diário de chamadas de LLM atingido ({today}/{max} hoje em `{command}`) — retome amanhã ou aumente max_llm_calls_per_day"
+                ));
+                break;
+            }
+            Err(err) => return Err(DigestError::Store(err.to_string())),
+        }
         let claimed = match store.post_claim(&project_id, now(), LEASE_SECONDS) {
             Ok(Some(row)) => row,
             Ok(None) => break,
@@ -213,6 +233,21 @@ pub async fn run<B: LlmBackend>(
         // é julgamento — nenhum parser ou comando de linha produz esse texto, e o
         // ADR-0038 confina a chamada a este módulo, atrás de trust e de orçamento.
         let answer = backend.complete(&system, &prompt).await;
+
+        // P0 (auditoria F2): a chamada entra no ledger do mandato, venha boa,
+        // vazia ou falha — o custo aconteceu. Best-effort: falha de store vira
+        // nota, nunca quebra o turno. O backend do digest é Ollama hoje
+        // (main.rs constrói só ele); quando virar plugável, o kind vem junto.
+        if let Err(err) = store.record_llm_call(
+            "ollama",
+            &options.model,
+            "digest",
+            estimate_tokens(&prompt, answer.as_deref().unwrap_or("")),
+        ) {
+            report
+                .notes
+                .push(format!("chamada LLM não registrada no ledger ({err})"));
+        }
 
         match answer {
             Ok(text) if !text.trim().is_empty() => {

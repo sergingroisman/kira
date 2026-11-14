@@ -144,7 +144,7 @@ engenharia de skill/prompt (`docs/rtk-gsd-rea-openclaude-vale-trazer.md`).
 
 | # | Item | Por que nesta posição | Aceite |
 |---|---|---|---|
-| P0 | **contador de chamadas LLM** (`llm_calls` + cheque no digest/triage + doctor/dashboard) | F2: autonomia e observabilidade dependem dele; é pequeno | 51ª chamada do dia recusa com mensagem acionável; dashboard mostra `chamadas hoje: N/50` |
+| P0 | ✅ **implementado (13/Nov, `feat/p0-llm-call-counter`)**: tabela `llm_calls` (schema v9) + ledger dentro do `triage_item` (cobre id/`--file`/`--eval`) + teto checado antes de cada claim no `digest` + linha `chamadas LLM hoje: N/50` no doctor; teto por `KIRA_MAX_LLM_CALLS_PER_DAY` > `max_llm_calls_per_day` (config) > 50. E2e: 2ª chamada com teto 1 falha acionável; digest para antes do claim com nota. **Falta só o dashboard** (`chamadas hoje: N/50` no gauge — PR17 segue para política 429/stale) | F2: autonomia e observabilidade dependem dele; é pequeno | 51ª chamada do dia recusa com mensagem acionável; dashboard mostra `chamadas hoje: N/50` |
 | P1 | **scan paralelo** (dotnet + audit) | 1º multithread, ganho medido, risco baixo | wall-time do scan cai; findings byte-idênticos (ordem por fingerprint) |
 | P2 | **PR15 `kira loop`** (turno do binário) | coração mínimo sobre a fila que já existe | 2 ciclos seguidos = estado idêntico no store |
 | P3 | **PR16-18** (agenda, budget no ciclo, approve) | autonomia com guarda | escrita sem approve é impossível por construção |
