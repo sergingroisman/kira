@@ -195,7 +195,11 @@ Brain, gold antes de declarar autonomia.
   **trigger evals** no aceite ✅ **SK-1 entregue (13/Nov)**; `~/.config/kira/knowledge/`
   para os textos do dono (`knowledge_fts`) — ✅ **SK-2 entregue (14/Nov, PR #109)**;
   prioridade do pack
-  `brief → findings → skills → knowledge → wiki → repo` — **SK-3 pendente**;
+  `brief → findings → skills → knowledge → wiki → repo` — ✅ **SK-3 entregue
+  (14/Nov, PR #110)**: o packer gasta o orçamento nessa ordem, com skills (SK-1)
+  e conhecimento do dono (SK-2) entrando entre findings e wiki — top-k por fonte
+  com caminho+idade, teto `KIRA_NUM_CTX` honrado com nota de corte, índices
+  derivados refrescados fail-open antes do pack, sem LLM e sem migração;
   **caveman** entra como compressão do que já foi recuperado (camada
   complementar, ADR-0038); **rtk** fica como referência de engenharia de
   prompt/skill; kind de post **`getting-started`** com tom de storytelling
