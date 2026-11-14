@@ -224,6 +224,22 @@ Rótulos do dono em `tests/fixtures/triage_gold/` (20 itens) validam a métrica
 
 ## 6. PR36 — Evidência em 3 estados (observado/inferido/desconhecido)
 
+> **Executada (14/Nov — branch `feat/te-pr36-evidence-states`, PR registrada no
+> roadmap):** os
+> três estados entraram como **`CONFIRMADA`/`INFERIDA`/`AUSENTE`** (rótulos do
+> item na execução, não o default `(observado)`/`(inferido)` de D4 — o cron do
+> dono pediu determinismo ANTES do prompt). **Desvio do escopo fechado acima,
+> a pedido do mesmo item:** o packer PASSOU a marcar cada trecho — módulo novo
+> `src/context/evidence.rs` (`EvidenceState` + `state_for_anchor`: existe o
+> arquivo no disco = CONFIRMADA; índice velho/fora da raiz = INFERIDA; vazio/
+> `não identificado` = AUSENTE), tag calculada em `pack_partial` (único ponto
+> com a raiz), render `caminho:linha — texto (TAG)`, custo da tag entra no
+> `used_chars` do ledger. `TRIAGE_PROMPT_VERSION` → **v3**
+> (`87978b64e44ef387`), regra 3 do system prompt manda PRESERVAR a tag,
+> dourado `triage-system.txt` regenerado no mesmo PR, `file_basenames` não
+> come a tag, saída tagueada parseável por `sections_of`. Cache da PR35 sem
+> regressão (e2e verde).
+
 **Objetivo**: cada arquivo citado no output e no episódio carrega o estado da
 evidência (lição do rea, AGENTS.md deles: "distinguish observations,
 derivations, inferences, and unknowns") — o leitor humano (e o dono) sabe o

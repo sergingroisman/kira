@@ -206,14 +206,14 @@ fn embedded_marker_does_not_close_the_block_early() {
     );
 }
 
-/// (d) A geração vigente é a v2 — é o id que sai no stderr do `kira triage` e no
-/// relatório do `--eval`: nenhum teste ou doc pode continuar apontando a v1.
+/// (d) A geração vigente é a v3 — é o id que sai no stderr do `kira triage` e no
+/// relatório do `--eval`: nenhum teste ou doc pode continuar apontando a v2.
 #[test]
-fn the_current_generation_is_v2() {
+fn the_current_generation_is_v3() {
     let id = prompts::triage_prompt_id();
     assert!(
-        id.starts_with("triage v2 (fnv1a "),
-        "geração vigente deve ser v2: {id}"
+        id.starts_with("triage v3 (fnv1a "),
+        "geração vigente deve ser v3: {id}"
     );
 }
 

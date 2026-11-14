@@ -25,7 +25,11 @@ const COMPOSITION_ROOT: &str = "main.rs";
 /// `post/` entra por ADR-0038: o `digest` transforma os fatos determinísticos do
 /// `ingest` em prosa e diagrama C4 — é a decisão com o modelo que a onda M existe
 /// para fazer, atrás de trust, orçamento e cache.
-const ALLOWED_EXACT: [&str; 3] = ["triage.rs", "eval.rs", "setup.rs"];
+/// `context/evidence.rs` entra por PR36 (onda TE): lê SÓ a constante de
+/// vocabulário `TRIAGE_FILES_UNKNOWN` (o mesmo consumo do `eval.rs`) para
+/// classificar âncora vazia/`não identificado` como AUSENTE — o módulo é
+/// cálculo puro (camada 3, ADR-0016), sem backend e sem chamada.
+const ALLOWED_EXACT: [&str; 4] = ["triage.rs", "eval.rs", "setup.rs", "context/evidence.rs"];
 const ALLOWED_PREFIXES: [&str; 3] = ["llm/", "loop/", "post/"];
 
 /// Modules allowed *and* required to justify each decision with the model.

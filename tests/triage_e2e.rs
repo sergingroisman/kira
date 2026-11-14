@@ -526,7 +526,7 @@ fn triage_command_reports_the_prompt_generation() {
         "a impressão digital não contamina a saída pipeável: {stdout}"
     );
     assert!(
-        stderr.contains("prompt: triage v2 (fnv1a "),
+        stderr.contains("prompt: triage v3 (fnv1a "),
         "o stderr identifica a geração do prompt: {stderr}"
     );
 }
@@ -1196,7 +1196,7 @@ fn no_cache_always_runs_the_llm_route() {
         "nenhum hit com o cache desligado: {stderr}"
     );
     assert!(
-        stderr.contains("prompt: triage v2"),
+        stderr.contains("prompt: triage v3"),
         "a rota LLM segue identificando a geração do prompt: {stderr}"
     );
 }
@@ -1229,5 +1229,5 @@ fn cache_miss_runs_the_llm_route_byte_identical_to_before() {
         !stderr.contains("cache-wiki"),
         "miss não anuncia cache: {stderr}"
     );
-    assert!(stderr.contains("prompt: triage v2"), "{stderr}");
+    assert!(stderr.contains("prompt: triage v3"), "{stderr}");
 }
