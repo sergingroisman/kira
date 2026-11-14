@@ -257,3 +257,165 @@ fn the_pack_is_deterministic_across_runs() {
     // O JSON precisa ser byte-idêntico entre duas execuções no mesmo estado.
     assert_eq!(first.1, second.1, "mesmo estado ⇒ mesmo pack");
 }
+
+// PR39 — repo map determinístico no brief (docs/te-implementacao.md §9).
+//
+// Fixture do aceite (a): 30 arquivos no inventory do `kira ingest` — um
+// citado em findings, um entrypoint, um config e 27 do topo da árvore. O mapa
+// tem que ter EXATAMENTE os 20 esperados, na ordem do ranking, byte a byte,
+// dentro do teto de 600 chars.
+
+/// Inventory com 30 arquivos: 3 com papel + 27 do topo (p00..p26).
+fn write_map_fixture(sandbox: &Sandbox) {
+    sandbox.write(".kira/ingest/inventory.json", &map_inventory_json());
+    sandbox.write(
+        ".kira/findings.json",
+        r#"{"findings":[{"tool":"dotnet","rule":"vulnerable","package":"Newtonsoft.Json","version":"12.0.1","severity":"High","path":"src/lib/cool.rs","message":"advisory","fingerprint":"0000000000000009"}],"stacks":[]}"#,
+    );
+    write_item(sandbox);
+    // Os arquivos existem no repo também — o `context` indexa o repositório
+    // e o pack traz trechos; o mapa é derivado só do inventory.
+    for n in 0..27 {
+        sandbox.write(&format!("p{n:02}/file.rs"), "pub fn nada() {}\n");
+    }
+    sandbox.write("src/lib/cool.rs", "pub fn cool() {}\n");
+    sandbox.write("src/main.rs", "fn main() {}\n");
+    sandbox.write("Cargo.toml", "[package]\nname = \"x\"\n");
+}
+
+fn map_inventory_json() -> String {
+    let mut paths: Vec<String> = vec![
+        "Cargo.toml".to_string(),
+        "src/main.rs".to_string(),
+        "src/lib/cool.rs".to_string(),
+    ];
+    paths.extend((0..27).map(|n| format!("p{n:02}/file.rs")));
+    let files: Vec<String> = paths
+        .iter()
+        .map(|path| format!("  {{\n    \"path\": \"{path}\",\n    \"bytes\": 10,\n    \"truncated\": false\n  }}"))
+        .collect();
+    format!(
+        "{{\n  \"project_name\": \"x\",\n  \"files\": [\n{}\n  ],\n  \"by_extension\": {{\"rs\": 29, \"toml\": 1}},\n  \"total_bytes\": 300,\n  \"notes\": []\n}}",
+        files.join(",\n")
+    )
+}
+
+/// O mapa esperado do fixture: citado → entrada → config → topo (rasa
+/// primeiro), 20 linhas, marcador com os 10 de fora, ≤600 chars.
+fn expected_map_block() -> String {
+    let mut block = String::from("MAPA do repo (ingest, 30 arquivos):\n");
+    block.push_str("- src/lib/cool.rs (citado)\n");
+    block.push_str("- src/main.rs (entrada)\n");
+    block.push_str("- Cargo.toml (config)\n");
+    for n in 0..17 {
+        block.push_str(&format!("- p{n:02}/file.rs (topo)\n"));
+    }
+    block.push_str("... (+10 arquivos)\n");
+    block
+}
+
+#[test]
+fn the_repo_map_has_exactly_the_expected_files_and_honors_the_caps() {
+    let sandbox = Sandbox::new("repo-map");
+    write_map_fixture(&sandbox);
+    let first = sandbox.run(&["context", "--file", "item.json", "--json"]);
+    assert_eq!(first.0, 0, "{}", first.2);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&first.1).unwrap_or_else(|err| panic!("JSON inválido: {err}"));
+    let map = parsed["pack"]["repo_map"]
+        .as_str()
+        .unwrap_or_else(|| panic!("repo_map ausente: {parsed}"));
+    // (a) byte a byte: os 20 esperados, na ordem do ranking.
+    assert_eq!(map, expected_map_block(), "mapa: {map}");
+    assert!(
+        map.chars().count() <= 600,
+        "teto de 600 chars: {} chars",
+        map.chars().count()
+    );
+    // (d) o teto do orçamento é honrado: o mapa é cobrado no used_chars.
+    let used = parsed["pack"]["used_chars"].as_u64().unwrap_or(0);
+    assert!(used >= map.chars().count() as u64, "used_chars: {used}");
+    // Mesmo estado ⇒ mesmo mapa byte a byte (extensão do gate M1).
+    let second = sandbox.run(&["context", "--file", "item.json", "--json"]);
+    let parsed2: serde_json::Value =
+        serde_json::from_str(&second.1).unwrap_or_else(|err| panic!("JSON inválido: {err}"));
+    assert_eq!(
+        parsed2["pack"]["repo_map"], parsed["pack"]["repo_map"],
+        "mesmo estado ⇒ mesmo mapa"
+    );
+}
+
+#[test]
+fn without_findings_or_entrypoint_the_map_says_top_of_tree() {
+    let sandbox = Sandbox::new("repo-map-topo");
+    write_item(&sandbox);
+    // Inventory sem citado e sem entrypoint — só arquivos rasos/profundos.
+    sandbox.write(
+        ".kira/ingest/inventory.json",
+        r#"{
+  "project_name": "x",
+  "files": [
+    {"path": "readme.md", "bytes": 10, "truncated": false},
+    {"path": "lib/other.rs", "bytes": 10, "truncated": false},
+    {"path": "src/deep/leaf.rs", "bytes": 10, "truncated": false}
+  ],
+  "by_extension": {"md": 1, "rs": 2},
+  "total_bytes": 30,
+  "notes": []
+}"#,
+    );
+    sandbox.write("readme.md", "projeto\n");
+    sandbox.write("lib/other.rs", "pub fn other() {}\n");
+    sandbox.write("src/deep/leaf.rs", "pub fn leaf() {}\n");
+    let (code, stdout, stderr) = sandbox.run(&["context", "--file", "item.json", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|err| panic!("JSON inválido: {err}"));
+    let map = parsed["pack"]["repo_map"]
+        .as_str()
+        .unwrap_or_else(|| panic!("repo_map ausente: {parsed}"));
+    // (c) não é vazio silencioso: nota + mapa do topo da árvore (rasa
+    // primeiro), todos com papel `topo`.
+    let notes: Vec<String> = parsed["pack"]["notes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notes: {parsed}"))
+        .iter()
+        .filter_map(|note| note.as_str().map(String::from))
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("sem findings e sem entrypoint")),
+        "nota (c): {notes:?}"
+    );
+    assert_eq!(
+        map,
+        "MAPA do repo (ingest, 3 arquivos):\n- readme.md (topo)\n- lib/other.rs (topo)\n- src/deep/leaf.rs (topo)\n",
+        "mapa do topo: {map}"
+    );
+}
+
+#[test]
+fn a_missing_inventory_degrades_to_an_actionable_note() {
+    let sandbox = Sandbox::new("repo-map-missing");
+    write_item(&sandbox);
+    sandbox.write("src/queue/fila.rs", "pub fn cooldown() -> u32 { 30 }\n");
+    let (code, stdout, stderr) = sandbox.run(&["context", "--file", "item.json", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|err| panic!("JSON inválido: {err}"));
+    assert!(
+        parsed["pack"]["repo_map"].is_null(),
+        "sem inventory, sem mapa: {parsed}"
+    );
+    let notes: Vec<String> = parsed["pack"]["notes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notes: {parsed}"))
+        .iter()
+        .filter_map(|note| note.as_str().map(String::from))
+        .collect();
+    assert!(
+        notes.iter().any(|note| note.contains("rode `kira ingest`")),
+        "nota acionável: {notes:?}"
+    );
+}
