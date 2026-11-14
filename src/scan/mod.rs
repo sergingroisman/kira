@@ -14,6 +14,7 @@ mod decode;
 mod dotnet;
 mod finding;
 mod node;
+mod raw;
 
 pub use finding::Finding;
 pub use finding::severity_brief;
@@ -327,7 +328,7 @@ pub(crate) fn stderr_hint(stderr: &str) -> String {
 pub fn run(path_flag: Option<&Path>) -> Result<String, ScanError> {
     let root = resolve_root(path_flag)?;
     let stacks = detect_stacks(&root)?;
-    let raw_findings = scan_stacks(&stacks, &root)?;
+    let (raw_findings, notes) = scan_stacks(&stacks, &root)?;
     let findings = finding::finalize(raw_findings);
     let file_path = write_findings_file(&root, &findings, &stacks)?;
     let stacks_text = stack_lines(&root, &stacks);
@@ -340,24 +341,47 @@ pub fn run(path_flag: Option<&Path>) -> Result<String, ScanError> {
         .join(", ");
     // First line = session trail summary (stacks + counts), also useful
     // standalone (the history shows only it).
-    Ok(format!(
+    let mut summary = format!(
         "kira scan em '{}' — stacks: {} | achados: {} ({}) | arquivo: {}\n{stacks_text}\nachados por severidade (contagem por ferramenta):\n{counts_text}",
         display_path(&root),
         stack_labels,
         findings.len(),
         counts_brief,
         display_path(&file_path)
-    ))
+    );
+    // Notas do digest bruto (truncamento/falha do raw) por ÚLTIMO: não são
+    // achados nem stacks — avisos que o dono lê depois do resumo.
+    for note in notes {
+        summary.push('\n');
+        summary.push_str(&note);
+    }
+    Ok(summary)
 }
 
 /// Audita um stack (processo externo: dotnet/npm/pnpm) num escopo de diretório.
-fn scan_stack(stack: &Stack, root: &Path) -> Result<Vec<Finding>, ScanError> {
+///
+/// Devolve os findings E as notas do digest bruto (`raw::write_raw`): gravado
+/// ok/truncado/falhou são estados normais do PR37 — truncamento e falha viram
+/// nota acionável no resumo (fail-open), o scan nunca morre pelo raw.
+fn scan_stack(stack: &Stack, root: &Path) -> Result<(Vec<Finding>, Vec<String>), ScanError> {
     let scope = stack.scope_of(root);
-    match stack.kind {
-        StackKind::Dotnet => dotnet::scan_dir(&scope),
-        StackKind::Pnpm => node::scan_dir(node::NodeAuditTool::Pnpm, &scope),
-        StackKind::Npm => node::scan_dir(node::NodeAuditTool::Npm, &scope),
+    // Slug do raw = o mesmo label que a trilha já usa (`dotnet`/`pnpm`/`npm`):
+    // uma fonte única para o nome no resumo e no arquivo.
+    let slug = stack.kind.label();
+    let (findings, run) = match stack.kind {
+        StackKind::Dotnet => dotnet::scan_dir(&scope)?,
+        StackKind::Pnpm => node::scan_dir(node::NodeAuditTool::Pnpm, &scope)?,
+        StackKind::Npm => node::scan_dir(node::NodeAuditTool::Npm, &scope)?,
+    };
+    let mut notes = Vec::new();
+    match raw::write_raw(root, slug, &run) {
+        Ok(None) => {}
+        Ok(Some(note)) => notes.push(note),
+        // Fail-open (PR37): o raw é evidência secundária — a causa já sai
+        // acionável do `write_raw`, o scan segue e findings.json não muda.
+        Err(cause) => notes.push(format!("aviso: raw de {slug} não foi gravado ({cause})")),
     }
+    Ok((findings, notes))
 }
 
 /// Audita todos os stacks detectados.
@@ -372,15 +396,24 @@ fn scan_stack(stack: &Stack, root: &Path) -> Result<Vec<Finding>, ScanError> {
 /// (que já é ordenada em `detect_stacks`) e o `finding::finalize` reordena por
 /// fingerprint — mesma entrada ⇒ mesmos bytes em `findings.json`. O primeiro
 /// erro na ordem das stacks vence, o mesmo contrato do antigo loop sequencial.
-fn scan_stacks(stacks: &[Stack], root: &Path) -> Result<Vec<Finding>, ScanError> {
+/// Resposta de UM stack: findings + notas acionáveis do digest bruto.
+/// Por que o alias existe: o `Vec<Result<(...), _>>` do caminho paralelo
+/// estoura o limite de complexidade do clippy — e dar nome ao par evita
+/// inverter findings/notas num call site futuro.
+type StackScan = (Vec<Finding>, Vec<String>);
+
+fn scan_stacks(stacks: &[Stack], root: &Path) -> Result<StackScan, ScanError> {
     if stacks.len() < 2 {
         let mut out = Vec::new();
+        let mut notes = Vec::new();
         for stack in stacks {
-            out.extend(scan_stack(stack, root)?);
+            let (found, stack_notes) = scan_stack(stack, root)?;
+            out.extend(found);
+            notes.extend(stack_notes);
         }
-        return Ok(out);
+        return Ok((out, notes));
     }
-    let results: Vec<Result<Vec<Finding>, ScanError>> = std::thread::scope(|scope| {
+    let results: Vec<Result<StackScan, ScanError>> = std::thread::scope(|scope| {
         let handles: Vec<_> = stacks
             .iter()
             .map(|stack| scope.spawn(move || scan_stack(stack, root)))
@@ -391,10 +424,15 @@ fn scan_stacks(stacks: &[Stack], root: &Path) -> Result<Vec<Finding>, ScanError>
             .collect()
     });
     let mut out = Vec::new();
+    let mut notes = Vec::new();
     for result in results {
-        out.extend(result?);
+        let (found, stack_notes) = result?;
+        out.extend(found);
+        // Notas NA ORDEM das stacks: o resumo continua determinístico mesmo
+        // com os scans rodando em paralelo (o join já devolve na ordem).
+        notes.extend(stack_notes);
     }
-    Ok(out)
+    Ok((out, notes))
 }
 
 /// Contagem de achados LIDA de volta do summary que o próprio `kira scan`

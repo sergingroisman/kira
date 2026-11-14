@@ -519,6 +519,104 @@ fn pnpm_workspace_scans_once_at_the_root_and_never_runs_npm() {
 /// npm audit sem achados, no formato real capturado (fixture).
 const NPM_NONE_OUTPUT: &str = include_str!("fixtures/scan/scan_npm_audit_none.json");
 
+/// Saída com um bearer token NO MEIO do JSON válido (PR37): o parse tem que
+/// passar e o raw em disco tem que sair `[REDACTED]` — segredo nunca dorme
+/// em arquivo, nem no artefato de debug.
+const NPM_TOKEN_OUTPUT: &str =
+    r#"{"message":"Authorization: Bearer AbC123XyZ789QqQ","vulnerabilities":{}}"#;
+
+/// PR37 (digest bruto): o output decodificado da ferramenta é gravado em
+/// `.kira/raw/<tool>.json` com header de proveniência, REDAÇÃO na escrita
+/// (token vira `[REDACTED]` NO ARQUIVO EM DISCO) e determinismo de bytes
+/// (duas execuções no mesmo estado ⇒ raw byte-idêntico, igual ao findings).
+#[test]
+fn raw_digest_is_written_redacted_and_byte_identical() {
+    let sandbox = Sandbox::new("raw-digest");
+    sandbox.prepare_npm_project();
+    let npm_shim = sandbox.install_fake_tool("npm", NPM_TOKEN_OUTPUT, "npm_token.json");
+    let envs = [("KIRA_SCAN_NPM_BIN", npm_shim.as_path())];
+
+    let (code, out, err) = run_kira(&sandbox, None, &envs, &["scan"]);
+    assert_eq!(code, 0, "{out}{err}");
+
+    let raw_path = sandbox.cwd.join(".kira").join("raw").join("npm.json");
+    let first =
+        std::fs::read_to_string(&raw_path).unwrap_or_else(|err| panic!("ler raw npm: {err}"));
+    assert!(
+        first.starts_with("# tool: npm\n# exit: 0\n# lines: 1\n"),
+        "header de proveniência no lugar: {first}"
+    );
+    // Redação na ESCRITA: a prova é contra o arquivo, não contra a memória.
+    assert!(
+        !first.contains("AbC123XyZ789QqQ"),
+        "segredo vazou para o disco: {first}"
+    );
+    assert!(first.contains("[REDACTED]"), "{first}");
+    // O JSON (a parte inocente) continua lá — o raw é o digest, não um resumo.
+    assert!(first.contains("\"vulnerabilities\""), "{first}");
+
+    // Duas execuções no mesmo estado ⇒ raw byte-idêntico (gate do M1 estendido).
+    let (code, _, _) = run_kira(&sandbox, None, &envs, &["scan"]);
+    assert_eq!(code, 0);
+    let second =
+        std::fs::read_to_string(&raw_path).unwrap_or_else(|err| panic!("reler raw npm: {err}"));
+    assert_eq!(first, second, "determinismo do digest bruto");
+}
+
+/// Fake tool que despeja BYTES crus (UTF-16LE com BOM, o caso real do `>` do
+/// PowerShell): o `echo` não passa binário limpo, então o shim faz `type`/`cat`
+/// de um arquivo gravado pelo próprio teste.
+impl Sandbox {
+    fn install_binary_tool(&self, tool: &str, bytes: &[u8], file_name: &str) -> PathBuf {
+        let output_file = self.base.join(file_name);
+        std::fs::write(&output_file, bytes)
+            .unwrap_or_else(|err| panic!("escrever binário {output_file:?}: {err}"));
+        self.write_shim(
+            tool,
+            &format!("@type \"{}\"\r\n", output_file.display()),
+            &format!("#!/bin/sh\ncat \"{}\"\n", output_file.display()),
+        )
+    }
+}
+
+/// PR37 (aceite BOM): entrada UTF-16LE com BOM ⇒ parse passa (M7) e o raw em
+/// disco é UTF-8 VÁLIDO (`read_to_string` não falha) com o JSON decodificado.
+#[test]
+fn utf16_output_lands_as_valid_utf8_raw() {
+    let sandbox = Sandbox::new("raw-utf16");
+    sandbox.prepare_npm_project();
+    // A MESMA fixture UTF-16LE do M7, agora atravessando até o disco.
+    let utf16_bytes = include_bytes!("fixtures/scan/scan_npm_audit_utf16le.json");
+    let npm_shim = sandbox.install_binary_tool("npm", utf16_bytes, "npm_utf16.bin");
+    let envs = [("KIRA_SCAN_NPM_BIN", npm_shim.as_path())];
+
+    let (code, out, err) = run_kira(&sandbox, None, &envs, &["scan"]);
+    assert_eq!(code, 0, "parse UTF-16 não pode falhar: {out}{err}");
+
+    let raw_path = sandbox.cwd.join(".kira").join("raw").join("npm.json");
+    let on_disk =
+        std::fs::read_to_string(&raw_path).unwrap_or_else(|err| panic!("raw UTF-8 válido: {err}"));
+    assert!(
+        on_disk.starts_with("# tool: npm\n"),
+        "header no lugar: {on_disk}"
+    );
+    // O conteúdo decodificado (package lodash do M7) está lá, já em UTF-8.
+    assert!(on_disk.contains("lodash"), "{on_disk}");
+    assert!(!on_disk.contains("\u{FFFD}"), "mojibake no raw: {on_disk}");
+}
+
+/// PR37 (mecanismo `.kira/`): o `.gitignore` DO REPO cobre `.kira/` inteiro —
+/// teste de texto (padrão docs-only), porque o mecanismo é do repositório, não
+/// do runtime: `git add .kira/` tem que estar coberto antes de existir.
+#[test]
+fn repo_gitignore_covers_the_whole_kira_dir() {
+    let gitignore = include_str!("../.gitignore");
+    assert!(
+        gitignore.lines().any(|line| line.trim() == ".kira/"),
+        ".kira/ tem que ter linha própria no .gitignore (não basta padrão parcial): {gitignore:?}"
+    );
+}
+
 /// P1 (auditoria): com 2 stacks, os audits rodam EM PARALELO — cada shim só
 /// responde depois de ver o marker do OUTRO (rendezvous): se o scan voltasse a
 /// ser sequencial, o primeiro shim esperaria até o timeout e sairia 1, falhando
