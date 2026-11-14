@@ -1,0 +1,100 @@
+{
+  "item_id": 4821,
+  "tokens_estimate": <N>,
+  "chars_per_token": 3,
+  "budget_chars": 12288,
+  "repo_source": "index",
+  "token_profile": "balanced",
+  "pack": {
+    "sections": [
+      {
+        "page": "bugs/p0",
+        "path": "<ROOT>/.kira/wiki/bugs/p0.md",
+        "age_days": 0,
+        "excerpt": "<!-- kira-wiki page=bugs/p0 updated_at=<STAMP> --> # Cooldown do reprocesso A fila do reprocesso nunca recomeça depois do erro; o cooldown expirou. O reprocesso de cada item da fila depende do cooldown anterior; sem o recomeço do cooldown o reprocesso para e a fila cresce. Fila cresce até o cooldown voltar; o reprocesso recomeça tarde. Cooldown longo atrasa o reprocesso e a fila inteira do dia. Reprocesso em lote quebra quando o cooldown da fila não recomeça. O cooldown expira; o reprocesso recomeça só no dia seguinte. Fila de reprocesso empacada: cooldown sem recomeço"
+      },
+      {
+        "page": "bugs/p1",
+        "path": "<ROOT>/.kira/wiki/bugs/p1.md",
+        "age_days": 0,
+        "excerpt": "<!-- kira-wiki page=bugs/p1 updated_at=<STAMP> --> # Cooldown do reprocesso A fila do reprocesso nunca recomeça depois do erro; o cooldown expirou. O reprocesso de cada item da fila depende do cooldown anterior; sem o recomeço do cooldown o reprocesso para e a fila cresce. Fila cresce até o cooldown voltar; o reprocesso recomeça tarde. Cooldown longo atrasa o reprocesso e a fila inteira do dia. Reprocesso em lote quebra quando o cooldown da fila não recomeça. O cooldown expira; o reprocesso recomeça só no dia seguinte. Fila de reprocesso empacada: cooldown sem recomeço"
+      },
+      {
+        "page": "bugs/p2",
+        "path": "<ROOT>/.kira/wiki/bugs/p2.md",
+        "age_days": 0,
+        "excerpt": "<!-- kira-wiki page=bugs/p2 updated_at=<STAMP> --> # Cooldown do reprocesso A fila do reprocesso nunca recomeça depois do erro; o cooldown expirou. O reprocesso de cada item da fila depende do cooldown anterior; sem o recomeço do cooldown o reprocesso para e a fila cresce. Fila cresce até o cooldown voltar; o reprocesso recomeça tarde. Cooldown longo atrasa o reprocesso e a fila inteira do dia. Reprocesso em lote quebra quando o cooldown da fila não recomeça. O cooldown expira; o reprocesso recomeça só no dia seguinte. Fila de reprocesso empacada: cooldown sem recomeço"
+      }
+    ],
+    "code": [
+      {
+        "path": "src/mod_00.rs",
+        "line": 1,
+        "text": "pub fn cooldown_0() -> u32 { 0 }",
+        "rank": -8.838923700700334e-7,
+        "priority": true,
+        "evidence": "confirmed",
+        "omitted": 0
+      },
+      {
+        "path": "src/mod_01.rs",
+        "line": 1,
+        "text": "pub fn cooldown_1() -> u32 { 1 }",
+        "rank": -8.838923700700334e-7,
+        "priority": true,
+        "evidence": "confirmed",
+        "omitted": 0
+      },
+      {
+        "path": "src/mod_02.rs",
+        "line": 1,
+        "text": "pub fn cooldown_2() -> u32 { 2 }",
+        "rank": -8.838923700700334e-7,
+        "priority": true,
+        "evidence": "confirmed",
+        "omitted": 0
+      },
+      {
+        "path": "src/mod_03.rs",
+        "line": 1,
+        "text": "pub fn cooldown_3() -> u32 { 3 }",
+        "rank": -8.838923700700334e-7,
+        "priority": true,
+        "evidence": "confirmed",
+        "omitted": 0
+      },
+      {
+        "path": "src/mod_04.rs",
+        "line": 1,
+        "text": "pub fn cooldown_4() -> u32 { 4 }",
+        "rank": -8.838923700700334e-7,
+        "evidence": "confirmed",
+        "omitted": 0
+      },
+      {
+        "path": "src/mod_05.rs",
+        "line": 1,
+        "text": "pub fn cooldown_5() -> u32 { 5 }",
+        "rank": -8.838923700700334e-7,
+        "evidence": "confirmed",
+        "omitted": 0
+      }
+    ],
+    "findings_brief": "critical 1, high 1, low 1, moderate 1",
+    "findings": [
+      "critical · Pkg.One 1.0.0 (src/mod_00.rs)",
+      "high · Pkg.Two 2.0.0 (src/mod_01.rs)",
+      "moderate · Pkg.Three 3.0.0 (src/mod_02.rs)"
+    ],
+    "skills": [],
+    "knowledge": [],
+    "used_chars": <N>,
+    "budget_chars": 12288,
+    "notes": [
+      "mapa do repo: `.kira/ingest/inventory.json` ausente — rode `kira ingest`"
+    ],
+    "repo_source": "index",
+    "dedup_chars_saved": 0,
+    "repo_map": null
+  }
+}

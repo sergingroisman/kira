@@ -450,7 +450,9 @@ cita mais).
 **Escopo fechado**: perfil coordena **caps**, não o teto de janela
 (`KIRA_NUM_CTX` continua mandando no `budget_chars()` L182); sem env nova
 (flag `--profile` > chave `token_profile` em `config.toml` > default
-`balanced`); inválido ⇒ `balanced` + `aviso:` (nunca erro).
+`balanced`); **como ficou (14/Nov, PR #121)**: inválido ⇒ **erro acionável**
+(`Error::TokenProfile` listando os válidos) — instrução do ciclo venceu o
+"balanced + aviso" original (recusa explícita > fallback silencioso).
 
 **Arquivos**:
 
@@ -467,7 +469,9 @@ cita mais).
 **Testes de aceite**:
 
 - Três estados ⇒ três packs distintos e reprodutíveis (gate M1 ×3).
-- `token_profile: "esquisito"` ⇒ `balanced` + `aviso:` no stderr.
+- `token_profile: "esquisito"` ⇒ erro acionável com a lista dos válidos
+  (`budget, balanced, quality`) — como ficou (PR #121); o "balanced + aviso"
+  original foi substituído.
 - Sem chave em `config.toml` ⇒ comportamento byte-idêntico ao de hoje
   (`balanced`).
 

@@ -367,6 +367,26 @@ pub fn format_dev_check(name: Option<&str>) -> String {
     }
 }
 
+/// Linha do perfil de token (PR40) no `kira doctor`: o ativo e a fonte —
+/// `perfil de token: budget (config.toml)`, `— (default balanced)` sem chave,
+/// ou a mensagem acionável com o valor inválido (listagem de config não
+/// esconde erro: fallback silencioso é proibido). Read-only por natureza.
+pub fn format_token_profile_check() -> String {
+    let raw = crate::credentials::read_config().ok().and_then(|config| {
+        config
+            .iter()
+            .find(|(key, _)| key == crate::context::caps::CONFIG_KEY_TOKEN_PROFILE)
+            .map(|(_, value)| value.clone())
+    });
+    match raw {
+        None => "perfil de token: — (default balanced)".to_string(),
+        Some(value) => match crate::context::caps::TokenProfile::parse(&value) {
+            Ok(profile) => format!("perfil de token: {} (config.toml)", profile.as_str()),
+            Err(err) => format!("perfil de token: {err}"),
+        },
+    }
+}
+
 /// Finds a project by name, case-insensitively, returning the exact name.
 pub fn find_project_case_insensitive<'a>(wanted: &str, available: &'a [String]) -> Option<&'a str> {
     let wanted = wanted.trim().to_lowercase();
@@ -480,6 +500,11 @@ pub async fn run() -> (bool, String) {
         &mut out,
         &format!("   {}", format_dev_check(dev_name.as_deref())),
     );
+
+    // PR40: o perfil de token ativo — é listagem de config, então um valor
+    // inválido aparece com o erro acionável (nunca fallback silencioso) e a
+    // ausência da chave mostra o default, que é o que de fato governa o pack.
+    emit(&mut out, &format!("   {}", format_token_profile_check()));
 
     // Capacidades (ADR-0030): o que está conectado PARA ESTE PROJETO, lido
     // na mesma fonte do gating — ou o aviso de modo local, que é o estado

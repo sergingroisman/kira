@@ -72,6 +72,12 @@ enum Command {
         /// trades the economy for a fresh model answer
         #[arg(long)]
         no_cache: bool,
+        /// Token profile of the pack (PR40): `budget` | `balanced` | `quality`.
+        /// Overrides `token_profile` in config.toml; default `balanced` (= the
+        /// pre-PR40 caps). An invalid value fails with the actionable list —
+        /// never a silent fallback
+        #[arg(long)]
+        profile: Option<String>,
         /// Measure the M2 gate (ADR-0018) against a directory of gold labels:
         /// each item is a folder with `item.json` + `gold.json`. Runs triage
         /// offline (`--file` mode) on the chosen backend and compares the
@@ -262,6 +268,12 @@ enum Command {
         /// Emit the pack as JSON (recall evaluation)
         #[arg(long)]
         json: bool,
+        /// Token profile of the pack (PR40): `budget` | `balanced` | `quality`.
+        /// Overrides `token_profile` in config.toml; default `balanced` (= the
+        /// pre-PR40 caps). An invalid value fails with the actionable list —
+        /// never a silent fallback
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Open the terminal dashboard (ADR-0033: leitura por padrão, ação confirmada)
     ///
@@ -616,7 +628,8 @@ async fn run(command: Command) -> Outcome {
             json,
             seed,
             no_cache,
-        } => triage_command(id, file, model, llm, eval, json, seed, no_cache).await,
+            profile,
+        } => triage_command(id, file, model, llm, eval, json, seed, no_cache, profile).await,
         Command::Setup {
             org,
             project,
@@ -673,7 +686,8 @@ async fn run(command: Command) -> Outcome {
             file,
             explain,
             json,
-        } => context_command(id, file, explain, json),
+            profile,
+        } => context_command(id, file, explain, json, profile),
         Command::Dashboard {
             snapshot,
             read_only,
@@ -940,6 +954,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             json,
             seed,
             no_cache,
+            profile,
         } => {
             // O `--eval` é outra origem (uma pasta de gold), exclusiva do id
             // e do `--file`; a trilha registra exatamente como foi chamado.
@@ -969,6 +984,11 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                     // `pr draft` e a auditoria sabem que o cache foi pulado.
                     args.push_str(" --no-cache");
                 }
+            }
+            if let Some(profile) = profile {
+                // PR40: o perfil entra na trilha — é identidade do cache e do
+                // pack, e a auditoria precisa saber com qual se executou.
+                args.push_str(&format!(" --profile {profile}"));
             }
             (
                 "triage".to_string(),
@@ -1097,8 +1117,12 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             file,
             explain,
             json,
+            profile,
         } => {
             let mut args = String::new();
+            if let Some(profile) = profile {
+                args.push_str(&format!(" --profile {profile}"));
+            }
             if let Some(id) = id {
                 args.push_str(&id.to_string());
             }
@@ -2237,7 +2261,13 @@ fn forget_index(page: &str) -> String {
 /// would reach the triage prompt: source (index/grep), sections, every excerpt
 /// as `path:linha — trecho truncado`, and the `contexto: ...` summary. 100%
 /// local: no model, no network (ADR-0021). Does not write a session row.
-fn context_command(id: Option<i32>, file: Option<PathBuf>, explain: bool, json: bool) -> Outcome {
+fn context_command(
+    id: Option<i32>,
+    file: Option<PathBuf>,
+    explain: bool,
+    json: bool,
+    profile_flag: Option<String>,
+) -> Outcome {
     let source = match context_source(id, file) {
         Ok(source) => source,
         Err(message) => {
@@ -2246,7 +2276,16 @@ fn context_command(id: Option<i32>, file: Option<PathBuf>, explain: bool, json: 
             return Outcome::failure(message);
         }
     };
-    match context_output(&source, explain, json) {
+    // PR40: o perfil é da própria sessão do pack — inválido falha antes de
+    // qualquer coleta, com a lista dos válidos (nunca fallback silencioso).
+    let profile = match kira::context::resolve_profile(profile_flag.as_deref()) {
+        Ok(profile) => profile,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
+    match context_output(&source, explain, json, profile) {
         Ok(text) => {
             print!("{text}");
             Outcome {
@@ -2291,16 +2330,22 @@ fn context_source(id: Option<i32>, file: Option<PathBuf>) -> Result<PathBuf, Str
 
 /// Body of `kira context`: detect the project root, parse the work item file,
 /// refresh the index (inside `pack_excluding`, fail-open) and render the report.
-fn context_output(file: &Path, explain: bool, json: bool) -> Result<String, Error> {
+fn context_output(
+    file: &Path,
+    explain: bool,
+    json: bool,
+    profile: kira::context::TokenProfile,
+) -> Result<String, Error> {
     let root = store::detect_project_root().unwrap_or_else(|| PathBuf::from("."));
     let body = std::fs::read_to_string(file).map_err(|source| Error::Io {
         path: file.display().to_string(),
         source,
     })?;
     let item = kira::work_item::WorkItem::from_api_json(&body)?;
-    let pack = kira::context::pack_excluding(&root, &item, Some(file));
+    let pack = kira::context::pack_excluding(&root, &item, Some(file), profile.caps());
     if json {
-        return kira::context::report_json(&pack, item.id).map_err(Error::ContextReportJson);
+        return kira::context::report_json(&pack, item.id, profile)
+            .map_err(Error::ContextReportJson);
     }
     Ok(kira::context::explain_report(&pack, item.id, explain))
 }
@@ -2485,6 +2530,7 @@ async fn triage_command(
     json: bool,
     seed: bool,
     no_cache: bool,
+    profile_flag: Option<String>,
 ) -> Outcome {
     // W2-bis (ADR-0018): o `--eval` mede o gate M2 e é exclusivo das demais
     // origens — um erro de composição aqui é acionável, nunca implícito.
@@ -2495,7 +2541,7 @@ async fn triage_command(
             eprintln!("erro: {message}");
             return Outcome::failure(message);
         }
-        return eval_command(eval, json, seed, model_flag, llm_flag).await;
+        return eval_command(eval, json, seed, model_flag, llm_flag, profile_flag).await;
     }
     if json {
         let message = "--json só faz sentido com --eval (a medição do gate M2)".to_string();
@@ -2524,6 +2570,16 @@ async fn triage_command(
     // silent Ollama fallback.
     let kind = match kira::llm::LlmKind::from_flag_and_env(llm_flag.as_deref()) {
         Ok(kind) => kind,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
+    // PR40: o perfil é resolvido ANTES de tudo (flag > config.toml > balanced)
+    // e é ÚNICO para a execução: os caps do pack, o gate do cache e o episódio
+    // gravado usam o mesmo valor. Inválido = erro acionável, exit ≠ 0.
+    let profile = match kira::context::resolve_profile(profile_flag.as_deref()) {
+        Ok(profile) => profile,
         Err(err) => {
             print_error(&err);
             return Outcome::failure(err.to_string());
@@ -2566,6 +2622,7 @@ async fn triage_command(
                     // a rota LLM roda sempre, byte a byte como antes.
                     !no_cache,
                     budget_store.as_ref(),
+                    profile,
                 )
                 .await
             }
@@ -2579,6 +2636,7 @@ async fn triage_command(
                 &path,
                 !no_cache,
                 budget_store.as_ref(),
+                profile,
             )
             .await
         }
@@ -2659,7 +2717,9 @@ async fn triage_command(
             let (episode_note, episode_failed) = if cache_hit {
                 (None, false)
             } else {
-                record_triage_episode(&report)
+                // PR40: o episódio carrega o perfil que produziu a conclusão —
+                // é a identidade do cache de raciocínio (cache_serves).
+                record_triage_episode(&report, profile.as_str())
             };
             if let Some(note) = episode_note {
                 eprint!("{note}");
@@ -2703,6 +2763,7 @@ async fn eval_command(
     seed: bool,
     model_flag: Option<String>,
     llm_flag: Option<String>,
+    profile_flag: Option<String>,
 ) -> Outcome {
     let Some(dir) = eval else {
         let message = "--seed precisa de --eval <pasta-de-gold>".to_string();
@@ -2711,6 +2772,15 @@ async fn eval_command(
     };
     let kind = match kira::llm::LlmKind::from_flag_and_env(llm_flag.as_deref()) {
         Ok(kind) => kind,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
+    // PR40: mesmo contrato do triage — o perfil único da medição vale para o
+    // pack dos itens medidos. Inválido = erro acionável, medição nem começa.
+    let profile = match kira::context::resolve_profile(profile_flag.as_deref()) {
+        Ok(profile) => profile,
         Err(err) => {
             print_error(&err);
             return Outcome::failure(err.to_string());
@@ -2747,7 +2817,16 @@ async fn eval_command(
     // HF-5: o `--eval` roda POR MODELO — `--model <tag>` mede aquela tag; sem
     // escolha explícita, o routing decide a tag do julgamento (mesma tabela).
     let model = resolve_task_model("triage", model_flag.as_deref(), budget_store.as_ref());
-    match kira::eval::run(&dir, kind, &base_url, &model, budget_store.as_ref()).await {
+    match kira::eval::run(
+        &dir,
+        kind,
+        &base_url,
+        &model,
+        budget_store.as_ref(),
+        profile,
+    )
+    .await
+    {
         Ok((itens, gate)) => {
             if json {
                 let report = kira::eval::report(&itens, &gate);
@@ -2790,8 +2869,8 @@ async fn eval_command(
 /// trail). Returns the stderr note (if any) plus whether the episode failed to
 /// capture for *content* reasons — an empty triage writes nothing to the wiki
 /// and only shows up on the trail (W2-fix PR-F3).
-fn record_triage_episode(report: &triage::TriageReport) -> (Option<String>, bool) {
-    match record_triage_episode_inner(report) {
+fn record_triage_episode(report: &triage::TriageReport, profile: &str) -> (Option<String>, bool) {
+    match record_triage_episode_inner(report, profile) {
         EpisodeCapture::Recorded(path) => (
             Some(format!(
                 "wiki: episódio do item {} registrado em {}\n",
@@ -2831,7 +2910,7 @@ enum EpisodeCapture {
 /// Builds the episode from what the command already produced and writes it to
 /// the main wiki — a human ran `kira triage` (ADR-0013). An unattended
 /// cycle must use [`episode::EpisodeTarget::Staging`] instead (PR15).
-fn record_triage_episode_inner(report: &triage::TriageReport) -> EpisodeCapture {
+fn record_triage_episode_inner(report: &triage::TriageReport, profile: &str) -> EpisodeCapture {
     let Some(root) = store::detect_project_root() else {
         return EpisodeCapture::Skipped;
     };
@@ -2851,6 +2930,10 @@ fn record_triage_episode_inner(report: &triage::TriageReport) -> EpisodeCapture 
         files: sections[1].clone(),
         confidence: sections[2].clone(),
         findings_brief,
+        // PR40: perfil gravado na página = identidade do cache. Episódio
+        // repetido sob o MESMO perfil não duplica (linhas iguais); trocar de
+        // perfil gera bloco novo — o conhecimento fica honesto por perfil.
+        profile: (!profile.trim().is_empty()).then(|| profile.trim().to_string()),
     };
     // W2-fix PR-F3 (bug 529511): an episode whose three sections carry nothing
     // is not knowledge — writing it would plant an empty page inside the
