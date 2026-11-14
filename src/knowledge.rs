@@ -254,11 +254,15 @@ mod tests {
         }
         let (docs, notes) = load_from(&dir);
         assert!(docs.is_empty());
+        // No Windows não há chmod 000 efetivo, então a nota só é exigível no
+        // unix; a leitura ter batido não é defeito ali, é semântica do FS.
         #[cfg(unix)]
         assert!(
             notes.len() == 1 && notes[0].contains("ilegível"),
             "falha de leitura vira nota: {notes:?}"
         );
+        #[cfg(not(unix))]
+        let _ = notes;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
