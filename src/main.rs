@@ -1365,7 +1365,8 @@ fn history_output(last: Option<usize>) -> Result<String, StoreError> {
 }
 
 /// One `kira history` economy line (PR34): pack vs teto em chars, a estimativa
-/// de tokens (chars/3), as chamadas de LLM e a rota. Números do ledger, nunca
+/// de tokens (chars/3), as chamadas de LLM e a rota. PR38 acrescenta a
+/// economia do dedup contíguo quando ela existiu. Números do ledger, nunca
 /// estimados na exibição.
 fn format_economy_line(economy: &store::economy::EconomyRow) -> String {
     let idle = if economy.pack_idle {
@@ -1373,13 +1374,21 @@ fn format_economy_line(economy: &store::economy::EconomyRow) -> String {
     } else {
         ""
     };
+    // A categoria do PR38 só aparece quando mediu algo: linha antiga (v13) e
+    // sessão sem repetição nenhuma não ganham rufo de zero.
+    let dedup = if economy.dedup_chars_saved > 0 {
+        format!(" · dedup −{} chars", economy.dedup_chars_saved)
+    } else {
+        String::new()
+    };
     format!(
-        "   economia: ~{} tok (pack {}/{} chars) · chamadas de LLM: {} · rota: {}{}\n",
+        "   economia: ~{} tok (pack {}/{} chars) · chamadas de LLM: {} · rota: {}{}{}\n",
         economy.tokens_est,
         economy.pack_chars,
         economy.budget_chars,
         economy.llm_calls,
         economy.route,
+        dedup,
         idle
     )
 }
@@ -2599,14 +2608,16 @@ async fn triage_command(
             for note in &report.context.notes {
                 eprintln!("aviso: contexto — {note}");
             }
-            // Ledger de economia (PR34/PR35, onda TE): o pack que a sessão
+            // Ledger de economia (PR34/PR35/PR38, onda TE): o pack que a sessão
             // REALMENTE enviou, o teto e a chamada de julgamento que ela
             // custou. No hit do cache NADA foi enviado: pack 0, ZERO chamadas
             // (determinístico não consome budget, ADR-0016) e rota
             // `cache-wiki` — a economia que o ledger existe para provar.
             // O sinal de pack ocioso (D9) fica visível no stderr — é nota,
-            // nunca erro, e nunca conta como chamada. As constantes espelham
-            // o schema v13 (`store::economy`).
+            // nunca erro, e nunca conta como chamada. A economia do dedup
+            // contíguo (PR38) é categoria própria (schema v14) e, no hit,
+            // é zero junto com o pack (nada enviado = nada deduplicado).
+            // As constantes espelham o schema v14 (`store::economy`).
             let cache_hit = report.cache.is_some();
             let economy = store::economy::EconomyRow {
                 pack_chars: if cache_hit {
@@ -2629,6 +2640,13 @@ async fn triage_command(
                 // No hit o pack ocioso é o OBJETIVO (não houve coleta a furar):
                 // a flag D9 só sinaliza furo de coleta na rota LLM.
                 pack_idle: !cache_hit && report.context.idle_warning().is_some(),
+                // PR38: a economia medida pelo dedup contíguo na montagem do
+                // pack (o packer já calcula; aqui só vai para o ledger).
+                dedup_chars_saved: if cache_hit {
+                    0
+                } else {
+                    i64::try_from(report.context.dedup_chars_saved).unwrap_or(0)
+                },
             };
             if !cache_hit && let Some(aviso) = report.context.idle_warning() {
                 eprintln!("{aviso}");

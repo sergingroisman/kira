@@ -18,12 +18,14 @@ use crate::store::Store;
 use crate::wiki::Wiki;
 use crate::work_item::WorkItem;
 
+pub mod dedup;
 pub mod evidence;
 pub mod gitignore;
 pub mod ignore;
 pub mod index;
 mod repo;
 
+pub use dedup::{DEDUP_MIN_CUT_PCT, omitted_marker};
 pub use evidence::{EvidenceState, state_for_anchor};
 pub use index::{ContextError, IndexStats, reindex};
 pub use repo::{CodeExcerpt, RepoGrep, grep_text};
@@ -159,6 +161,12 @@ pub struct ContextPack {
     /// walk. New field (ADR-0021); serde default keeps old payloads valid.
     #[serde(default)]
     pub repo_source: RepoSource,
+    /// PR38: chars de prompt que o dedup contíguo economizou na montagem dos
+    /// trechos (medido na lista ANTES do teto — o teto corta por prioridade;
+    /// o dedup não é teto). 0 = nada a deduplicar. O ledger de economia
+    /// (`session_economy.dedup_chars_saved`, schema v14) registra este número.
+    #[serde(default)]
+    pub dedup_chars_saved: usize,
 }
 
 /// Limiar de **pack ocioso** (PR34, decisão aberta D9 — proposta default da
@@ -271,8 +279,15 @@ impl ContextPack {
                 // PR36: cada trecho sai tagueado — (CONFIRMADA) = o arquivo
                 // existe no repositório, (INFERIDA) = não pôde ser verificado.
                 // O prompt v3 manda o modelo PRESERVAR a tag ao citar.
+                // PR38: repetidas do dedup saem contadas no marcador — a
+                // âncora continua sendo da primeira ocorrência.
+                let marker = if excerpt.omitted > 0 {
+                    dedup::omitted_marker(excerpt.omitted)
+                } else {
+                    String::new()
+                };
                 out.push_str(&format!(
-                    "{} — {} ({})\n",
+                    "{} — {} ({}){marker}\n",
                     excerpt.anchor(),
                     excerpt.text,
                     excerpt.evidence.as_str()
@@ -388,8 +403,15 @@ pub fn explain_report(pack: &ContextPack, item_id: i32, explain: bool) -> String
     if !pack.code.is_empty() {
         out.push_str(&format!("trechos do repositório ({}):\n", pack.code.len()));
         for excerpt in &pack.code {
+            // PR38: o marcador contável aparece também na leitura humana —
+            // o que o dev vê é o que o prompt carrega (mesmo colapso).
+            let marker = if excerpt.omitted > 0 {
+                dedup::omitted_marker(excerpt.omitted)
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "  - {} — {} ({})\n",
+                "  - {} — {} ({}){marker}\n",
                 excerpt.anchor(),
                 excerpt.text,
                 excerpt.evidence.as_str()
@@ -701,18 +723,24 @@ pub fn pack_partial(
         grep = repo::grep(root, &terms, &priority, skip_paths, MAX_CODE_EXCERPTS);
     }
     pack.repo_source = repo_source;
-    for mut excerpt in grep.excerpts {
-        // PR36: a tag de evidência é calculada AQUI — o único ponto que
-        // conhece a raiz. Trecho do grep ⇒ arquivo acabou de ser lido
-        // (CONFIRMADA); trecho de índice velho (arquivo saiu do disco) ⇒
-        // INFERIDA. Função pura de (raiz, âncora): mesmo estado ⇒ mesma tag.
+    // PR36: a tag de evidência é calculada AQUI — o único ponto que conhece
+    // a raiz. Trecho do grep ⇒ arquivo acabou de ser lido (CONFIRMADA);
+    // trecho de índice velho (arquivo saiu do disco) ⇒ INFERIDA. Função pura
+    // de (raiz, âncora): mesmo estado ⇒ mesma tag.
+    for excerpt in &mut grep.excerpts {
         excerpt.evidence = state_for_anchor(root, &excerpt.path);
+    }
+    // PR38: dedup contíguo — primeira ocorrência fica, repetidas do MESMO
+    // arquivo saem contadas no marcador. Depois da ordenação final e DEPOIS
+    // da tag (a economia medida usa o custo real do trecho no prompt), antes
+    // do orçamento: o pack que sobra é menor e o número vai para o ledger
+    // (schema v14). Função pura da lista ⇒ mesmo estado ⇒ mesmo pack (M1).
+    let deduped = dedup::same_file(&grep.excerpts);
+    pack.dedup_chars_saved = deduped.chars_saved;
+    for excerpt in deduped.excerpts {
         // A tag entra no prompt, então entra na conta do orçamento
         // (ledger honesto: o custo é o que o prompt carrega).
-        let cost = excerpt.text.chars().count()
-            + excerpt.path.chars().count()
-            + excerpt.evidence.as_str().len()
-            + 15;
+        let cost = dedup::cost_of_excerpt(&excerpt);
         if pack.used_chars + cost > budget_chars {
             pack.notes.push(format!(
                 "orçamento de contexto esgotado em {budget_chars} caracteres; trechos do repositório ficaram de fora"
@@ -1024,6 +1052,7 @@ mod tests {
                     rank: None,
                     priority: false,
                     evidence: EvidenceState::Confirmed,
+                    omitted: 0,
                 })
                 .collect(),
             ..ContextPack::default()

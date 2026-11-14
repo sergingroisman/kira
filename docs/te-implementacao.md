@@ -337,6 +337,30 @@ passa com strip) + fixture de output truncado (>512 KiB sintético).
 
 ## 8. PR38 — Dedup + agrupamento nos trechos do pack
 
+> **Executada (14/Nov — PR da onda TE, branch `feat/te-pr38-dedup`):** o dedup
+> entrou como módulo `src/context/dedup.rs` — colapso de repetições de texto
+> restritas ao MESMO arquivo (run contíguo no pack e repetições espalhadas no
+> mesmo arquivo caem no mesmo caso), primeira ocorrência fica com a âncora e a
+> tag de evidência intactas e as omitidas viram o marcador contável
+> ` ... ×N` (D7, formato do item do dono: contável, nunca inventa conteúdo) no
+> render E no explain. A economia medida usa a MESMA função de custo do
+> orçamento (`cost_of_excerpt`) e vai para o ledger como categoria própria:
+> **schema v14**, coluna `session_economy.dedup_chars_saved` (`ALTER` guardado
+> por `column_exists`, padrão da v5; pin do `trust_e2e` atualizado no mesmo
+> PR). Fixture dourado em `tests/fixtures/context/dedup/`
+> (`boilerplate.rs` + `distinto.rs`): a estratégia adotada mede corte
+> **≥ 20%** com o número no assert (barra `DEDUP_MIN_CUT_PCT`); o candidato de
+> dedup ENTRE arquivos é medido na mesma lista e fica FORA por não bater a
+> barra — além de quebrar a semântica de âncora (recusa do plano base,
+> agora também medida). Diferenças honestas do escopo fechado acima: (1) o
+> trecho do packer é UMA linha (`CodeExcerpt`), então "dentro do trecho" e
+> "entre trechos do mesmo arquivo" são o mesmo caso de colapso — a função é
+> uma só; (2) o guard "grupo que não paga o marcador" da primeira versão era
+> matematicamente inatingível (piso do custo de trecho ≥ 23 > qualquer
+> marcador) e saiu — o teste prova o piso com o menor trecho possível;
+> (3) dourados de prompt (`triage_prompt_fixtures`) não mudaram um byte: os
+> fixtures não têm repositório, logo pack sem trechos repetidos.
+
 **Objetivo**: cortar token repetido dos excerpts (barra do RTK: cada filtro só
 entra se cortar ≥ 20%). Linhas idênticas **contíguas** colapsam com contador;
 âncora `caminho:linha` da primeira ocorrência preservada.

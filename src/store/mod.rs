@@ -39,7 +39,9 @@ pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 /// Current schema version, recorded in `PRAGMA user_version`.
 ///
 /// v13 (onda TE, PR34): `session_economy` — ledger de economia por sessão.
-const SCHEMA_VERSION: i64 = 13;
+/// v14 (onda TE, PR38): coluna `dedup_chars_saved` na `session_economy` — a
+/// categoria própria do dedup contíguo dos trechos.
+const SCHEMA_VERSION: i64 = 14;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -286,8 +288,8 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO session_economy \
-                 (session_id, pack_chars, budget_chars, tokens_est, llm_calls, route, pack_idle) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (session_id, pack_chars, budget_chars, tokens_est, llm_calls, route, pack_idle, dedup_chars_saved) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     session_id,
                     row.pack_chars,
@@ -296,6 +298,7 @@ impl Store {
                     row.llm_calls,
                     row.route,
                     i64::from(row.pack_idle),
+                    row.dedup_chars_saved,
                 ],
             )
             .map_err(StoreError::Sql)?;
@@ -316,7 +319,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT session_id, pack_chars, budget_chars, tokens_est, llm_calls, route, \
-                 pack_idle FROM session_economy",
+                 pack_idle, dedup_chars_saved FROM session_economy",
             )
             .map_err(StoreError::Sql)?;
         let rows = statement
@@ -330,6 +333,7 @@ impl Store {
                         llm_calls: row.get(4)?,
                         route: row.get(5)?,
                         pack_idle: row.get::<_, i64>(6)? != 0,
+                        dedup_chars_saved: row.get(7)?,
                     },
                 ))
             })
@@ -1407,6 +1411,20 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
         .map_err(schema_error)?;
     }
 
+    // v14 — onda TE, PR38: a economia do dedup contíguo dos trechos ganha
+    // categoria PRÓPRIA no ledger (o PR34 não a previu; o PR38 a mede).
+    // `ALTER TABLE` aditivo, GUARDADO por `column_exists` (padrão da v5): um
+    // store rebaixado que já tem a coluna não pode falhar ao reabrir. A
+    // coluna nasce com DEFAULT 0 — dado antigo preservado, leitura nova
+    // nunca quebra.
+    if current < 14 && !column_exists(conn, "session_economy", "dedup_chars_saved")? {
+        conn.execute_batch(
+            "ALTER TABLE session_economy \
+             ADD COLUMN dedup_chars_saved INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(schema_error)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(schema_error)
 }
@@ -2112,6 +2130,7 @@ mod tests {
             llm_calls: 1,
             route: "llm".to_string(),
             pack_idle: false,
+            dedup_chars_saved: 0,
         };
         store
             .record_economy(session_id, &row)
@@ -2129,6 +2148,111 @@ mod tests {
             .economy_for_sessions(&[session_id + 999])
             .unwrap_or_else(|err| panic!("economy_for_sessions: {err}"));
         assert!(absent.is_empty(), "sessão sem ledger não inventa dado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migração v13 → v14 (onda TE, PR38): o ledger da versão anterior ganha
+    /// a coluna `dedup_chars_saved` sem perder linha nenhuma — `ALTER TABLE`
+    /// aditivo, e a linha antiga nasce com 0 (nada medido ≠ economia de zero
+    /// inventada: a leitura mostra o número que o pack daquele dia tinha).
+    #[test]
+    fn migration_from_v13_adds_the_dedup_column_and_keeps_data() {
+        let dir = temp_dir("migrate-v13-dedup");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        let path = dir.join("store.db");
+        let session_id;
+        {
+            let conn =
+                rusqlite::Connection::open(&path).unwrap_or_else(|err| panic!("abrir v13: {err}"));
+            conn.execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, root_path TEXT NOT NULL, \
+                 name TEXT NOT NULL, first_seen_at TEXT NOT NULL);
+                 CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL, \
+                 command TEXT NOT NULL, args TEXT NOT NULL DEFAULT '', model TEXT, started_at TEXT NOT NULL, \
+                 duration_ms INTEGER NOT NULL, ok INTEGER NOT NULL, summary TEXT NOT NULL DEFAULT '');
+                 CREATE TABLE session_economy (
+                    session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+                    pack_chars INTEGER NOT NULL,
+                    budget_chars INTEGER NOT NULL,
+                    tokens_est INTEGER NOT NULL,
+                    llm_calls INTEGER NOT NULL,
+                    route TEXT NOT NULL DEFAULT 'llm',
+                    pack_idle INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO projects VALUES ('p1', '/tmp/p1', 'p1', '2026-11-01T00:00:00Z');
+                 INSERT INTO sessions (project_id, command, args, started_at, duration_ms, ok, summary) \
+                 VALUES ('p1', 'triage', '4821', '2026-11-01T00:00:00Z', 10, 1, 'antiga');
+                 INSERT INTO session_economy (session_id, pack_chars, budget_chars, tokens_est, llm_calls, route, pack_idle) \
+                 VALUES (1, 4096, 12288, 1365, 1, 'llm', 0);
+                 PRAGMA user_version = 13;",
+            )
+            .unwrap_or_else(|err| panic!("criar v13: {err}"));
+            session_id = conn
+                .query_row("SELECT id FROM sessions", [], |row| row.get::<_, i64>(0))
+                .unwrap_or_else(|err| panic!("ler sessão antiga: {err}"));
+        }
+        let store = Store::open_at(&path).unwrap_or_else(|err| panic!("abrir v14: {err}"));
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or_else(|err| panic!("user_version: {err}"));
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "migração deveria subir para a versão atual"
+        );
+        let got = store
+            .economy_for_sessions(&[session_id])
+            .unwrap_or_else(|err| panic!("economy_for_sessions: {err}"));
+        let row = got
+            .get(&session_id)
+            .unwrap_or_else(|| panic!("ledger antigo sumiu: {got:?}"));
+        assert_eq!(row.pack_chars, 4096, "dado antigo preservado: {row:?}");
+        assert_eq!(
+            row.dedup_chars_saved, 0,
+            "linha da v13 nasce com 0 na coluna nova: {row:?}"
+        );
+        // A coluna nova aceita escrever por cima do caminho normal — em uma
+        // sessão NOVA (`record_economy` é INSERT: a linha antiga é dado, não
+        // rascunho).
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (project_id, command, args, started_at, duration_ms, ok, summary) \
+                 VALUES ('p1', 'triage', '4821', '2026-11-02T00:00:00Z', 10, 1, 'nova')",
+                [],
+            )
+            .unwrap_or_else(|err| panic!("sessão nova: {err}"));
+        let new_session = store
+            .conn
+            .query_row("SELECT max(id) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or_else(|err| panic!("ler sessão nova: {err}"));
+        let fresh = economy::EconomyRow {
+            pack_chars: 2048,
+            budget_chars: 12_288,
+            tokens_est: 682,
+            llm_calls: 1,
+            route: "llm".to_string(),
+            pack_idle: false,
+            dedup_chars_saved: 73,
+        };
+        store
+            .record_economy(new_session, &fresh)
+            .unwrap_or_else(|err| panic!("record_economy: {err}"));
+        let after = store
+            .economy_for_sessions(&[session_id, new_session])
+            .unwrap_or_else(|err| panic!("economy_for_sessions: {err}"));
+        assert_eq!(
+            after.get(&session_id),
+            got.get(&session_id),
+            "antiga intacta"
+        );
+        assert_eq!(
+            after.get(&new_session),
+            Some(&fresh),
+            "ledger v14 round trip: {after:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
