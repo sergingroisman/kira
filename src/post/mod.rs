@@ -60,10 +60,15 @@ pub enum DigestError {
 #[derive(Debug, Clone)]
 pub struct DigestOptions {
     pub root: PathBuf,
-    /// Etiqueta do modelo que entra no `cache_key` (`ollama:qwen3.5:4b`).
+    /// Etiqueta do modelo. Valor explícito (`--model`/`KIRA_MODEL`) vem como
+    /// `ollama:<tag>` e vence TUDO; o sentinela `ollama` liga o ROUTING de
+    /// especialistas (HF-5, ADR-0040): cada kind resolve a própria tag pela
+    /// tabela `model_role` com o gate de admissão.
     pub model: String,
     /// Idioma do **artefato** (o post). O prompt é sempre inglês.
     pub lang: String,
+    /// Gera SÓ este kind (`kira digest --kind <kind>`); `None` = todos.
+    pub kind_filter: Option<String>,
     pub budget_tokens: u64,
     pub per_post_tokens: u64,
     /// Para depois de N posts entregues — o `--pause` do dev.
@@ -78,6 +83,7 @@ impl DigestOptions {
             root: root.into(),
             model: "ollama".to_string(),
             lang: "en".to_string(),
+            kind_filter: None,
             budget_tokens: DEFAULT_BUDGET_TOKENS,
             per_post_tokens: PER_POST_TOKENS,
             pause_after: None,
@@ -127,9 +133,14 @@ impl DigestReport {
 }
 
 /// Executa uma rodada do turno.
+///
+/// `build_backend` é a FÁBRICA de backend por `(kind, tag)` — o routing de
+/// especialistas (HF-5) decide a tag por kind (com o gate de admissão no
+/// store) e a fábrica constrói quem executa. A DECISÃO com o modelo continua
+/// aqui dentro, atrás de trust e orçamento (`// LLM porque:` no claim).
 pub async fn run<B: LlmBackend>(
     options: &DigestOptions,
-    backend: &B,
+    build_backend: &dyn Fn(&str, &str) -> B,
 ) -> Result<DigestReport, DigestError> {
     let root = &options.root;
     if !trust::is_trusted(root) {
@@ -157,12 +168,66 @@ pub async fn run<B: LlmBackend>(
         }
     }
 
+    // HF-5 (routing): config lido uma vez (fail-open com nota — config
+    // ilegível degrada para os defaults, nunca quebra o turno).
+    let config_pairs = match crate::credentials::read_config() {
+        Ok(pairs) => pairs,
+        Err(err) => {
+            report.notes.push(format!(
+                "config ilegível ({err}) — routing segue nos defaults"
+            ));
+            Vec::new()
+        }
+    };
+    // Tag explícita (`--model`/`KIRA_MODEL`, no formato `ollama:<tag>`) vence
+    // o routing; o sentinela `ollama` liga a resolução por kind.
+    let explicit_tag = if options.model == "ollama" {
+        None
+    } else {
+        Some(
+            options
+                .model
+                .strip_prefix("ollama:")
+                .map_or_else(|| options.model.clone(), std::borrow::ToOwned::to_owned),
+        )
+    };
+    // A consulta de admissão no store: Some(true/false) quando a trilha
+    // respondeu, None quando falhou (o resolver falha aberto com nota).
+    let admitted = |candidate: &str| match store.model_admission_get(candidate) {
+        Ok(Some(_)) => Some(true),
+        Ok(None) => Some(false),
+        Err(_) => None,
+    };
+    // Tag resolvida UMA VEZ por kind — o `cache_key` da linha herda a tag
+    // (`model` entra no cache: trocar de especialista regenera, nunca serve
+    // cache errado).
+    let mut model_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
     // 1. Plano puro → fila idempotente.
-    let planned = plan::plan(&digest);
+    let mut planned = plan::plan(&digest);
+    if let Some(kind) = &options.kind_filter {
+        planned.retain(|post| &post.kind == kind);
+    }
     report.planned = planned.len();
     for post in &planned {
+        let tag = model_map
+            .entry(post.kind.clone())
+            .or_insert_with(|| {
+                let routing = crate::llm::roles::resolve_tag(
+                    &post.kind,
+                    &config_pairs,
+                    explicit_tag.as_deref(),
+                    &admitted,
+                );
+                report.notes.extend(routing.notes);
+                routing.tag
+            })
+            .clone();
         let outcome = store
-            .post_enqueue(&project_id, &new_post(post, options))
+            .post_enqueue(
+                &project_id,
+                &new_post(post, options, &format!("ollama:{tag}")),
+            )
             .map_err(|err| DigestError::Store(err.to_string()))?;
         if outcome == EnqueueOutcome::Unchanged {
             report.cached += 1;
@@ -229,18 +294,36 @@ pub async fn run<B: LlmBackend>(
             options.per_post_tokens,
         );
 
+        // HF-5: tag do kind (resolvida no planejamento; kind fora do plano
+        // resolve na hora, mesmo mecanismo). O `cache_key` da linha gravada
+        // já carrega esta tag — especialista trocado regenera.
+        let tag = model_map
+            .entry(claimed.kind.clone())
+            .or_insert_with(|| {
+                crate::llm::roles::resolve_tag(
+                    &claimed.kind,
+                    &config_pairs,
+                    explicit_tag.as_deref(),
+                    &admitted,
+                )
+                .tag
+            })
+            .clone();
         // LLM porque: traduzir fatos determinísticos (digest) em prosa e diagrama C4
         // é julgamento — nenhum parser ou comando de linha produz esse texto, e o
         // ADR-0038 confina a chamada a este módulo, atrás de trust e de orçamento.
+        // A tag vem do routing de especialistas (HF-5); a fábrica constrói o
+        // backend com ela — o modelo continua sendo decisão deste módulo.
+        let backend = build_backend(&claimed.kind, &tag);
         let answer = backend.complete(&system, &prompt).await;
 
         // P0 (auditoria F2): a chamada entra no ledger do mandato, venha boa,
-        // vazia ou falha — o custo aconteceu. Best-effort: falha de store vira
-        // nota, nunca quebra o turno. O backend do digest é Ollama hoje
-        // (main.rs constrói só ele); quando virar plugável, o kind vem junto.
+        // vazia ou falha — o custo aconteceu. O budget é o MESMO para qualquer
+        // especialista (HF-5: chamada de modelo conta em `llm_calls` igual).
+        // Best-effort: falha de store vira nota, nunca quebra o turno.
         if let Err(err) = store.record_llm_call(
             "ollama",
-            &options.model,
+            &format!("ollama:{tag}"),
             "digest",
             estimate_tokens(&prompt, answer.as_deref().unwrap_or("")),
         ) {
@@ -335,7 +418,14 @@ pub async fn run<B: LlmBackend>(
         .iter()
         .filter(|p| p.state == PostState::Failed)
         .count();
-    let briefing = render_briefing(options, &report, sealed, delivered, failed);
+    let briefing = render_briefing(
+        options,
+        &report,
+        &briefing_model_lines(options, &model_map),
+        sealed,
+        delivered,
+        failed,
+    );
     let briefing_path = root.join(".kira").join("briefing.md");
     write_text(&briefing_path, &briefing).map_err(|source| DigestError::Write {
         path: briefing_path.display().to_string(),
@@ -345,7 +435,7 @@ pub async fn run<B: LlmBackend>(
     Ok(report)
 }
 
-fn new_post(planned: &PlannedPost, options: &DigestOptions) -> NewPost {
+fn new_post(planned: &PlannedPost, options: &DigestOptions, model_display: &str) -> NewPost {
     NewPost {
         id: format!("{}-{}", planned.slug, &planned.source_hash[..12]),
         slug: planned.slug.clone(),
@@ -353,7 +443,7 @@ fn new_post(planned: &PlannedPost, options: &DigestOptions) -> NewPost {
         lang: options.lang.clone(),
         source_hash: planned.source_hash.clone(),
         prompt_version: prompts::PROMPT_VERSION.to_string(),
-        model: options.model.clone(),
+        model: model_display.to_string(),
     }
 }
 
@@ -495,9 +585,28 @@ fn relative(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
+/// Linhas de modelo do briefing (HF-5): com escolha explícita, a linha única
+/// de sempre; com routing, uma linha por kind (ordem determinística — o
+/// briefing é byte-reprodutível). `models` é o mapa kind → tag cru.
+fn briefing_model_lines(
+    options: &DigestOptions,
+    models: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    if options.model != "ollama" {
+        return vec![format!("- modelo: {}", options.model)];
+    }
+    let mut kinds: Vec<(&String, &String)> = models.iter().collect();
+    kinds.sort();
+    kinds
+        .iter()
+        .map(|(kind, tag)| format!("- modelo ({kind}): ollama:{tag}"))
+        .collect()
+}
+
 fn render_briefing(
     options: &DigestOptions,
     report: &DigestReport,
+    models: &[String],
     sealed: usize,
     delivered: usize,
     failed: usize,
@@ -508,7 +617,12 @@ fn render_briefing(
         "<!-- estado da fila em `.kira/briefing.md`. É o que um run novo lê primeiro. -->\n\n",
     );
     out.push_str(&format!("- idioma dos posts: {}\n", options.lang));
-    out.push_str(&format!("- modelo: {}\n", options.model));
+    // HF-5: com routing, cada kind mostra a própria tag (a decisão fica
+    // visível); com escolha explícita, a linha única de sempre.
+    for line in models {
+        out.push_str(line);
+        out.push('\n');
+    }
     out.push_str(&format!("- plano: {} post(s)\n", report.planned));
     out.push_str(&format!("- entregues nesta rodada: {}\n", report.generated));
     out.push_str(&format!("- no cache (sem trabalho): {}\n", report.cached));
@@ -658,15 +772,46 @@ mod tests {
             generated: 2,
             ..DigestReport::default()
         };
-        let text = render_briefing(&options, &report, 0, 2, 0);
+        let text = render_briefing(&options, &report, &[], 0, 2, 0);
         assert!(
             text.contains("kira publish"),
             "fila vazia deve apontar o publish:\n{text}"
         );
-        let pending = render_briefing(&options, &report, 1, 1, 0);
+        let pending = render_briefing(&options, &report, &[], 1, 1, 0);
         assert!(
             pending.contains("kira digest --resume"),
-            "fila com pendente deve pedir resume"
+            "fila com pendente deve pedir resume: {pending}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HF-5 — routing de especialistas: a decisão de tag fica visível
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn briefing_shows_one_model_line_per_kind_when_routing() {
+        let mut options = DigestOptions::at("/tmp");
+        options.model = "ollama".to_string(); // sentinela: routing por kind
+        let mut models = std::collections::HashMap::new();
+        models.insert("intro".to_string(), "qwen3.5:4b".to_string());
+        models.insert(
+            "c4-container".to_string(),
+            "hf.co/bartowski/X-GGUF:Q4_K_M".to_string(),
+        );
+        let lines = briefing_model_lines(&options, &models);
+        assert_eq!(
+            lines,
+            vec![
+                "- modelo (c4-container): ollama:hf.co/bartowski/X-GGUF:Q4_K_M".to_string(),
+                "- modelo (intro): ollama:qwen3.5:4b".to_string(),
+            ],
+            "uma linha por kind, em ordem determinística: {lines:?}"
+        );
+        // Escolha explícita volta à linha única (o dono pediu, o dono vê a tag).
+        options.model = "ollama:fake".to_string();
+        assert_eq!(
+            briefing_model_lines(&options, &models),
+            vec!["- modelo: ollama:fake".to_string()]
         );
     }
 }

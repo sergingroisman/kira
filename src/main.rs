@@ -191,9 +191,14 @@ enum Command {
         /// Project folder (defaults to the project root detected like in the store)
         #[arg(long)]
         path: Option<PathBuf>,
-        /// Ollama model tag (overrides KIRA_MODEL); goes into the cache key
+        /// Ollama model tag (overrides KIRA_MODEL); goes into the cache key.
+        /// Explicit choice wins over the specialist routing (HF-5)
         #[arg(long)]
         model: Option<String>,
+        /// Generate ONLY this post kind (intro, c4-container); the kind's
+        /// mapped tag from model_role is used when no explicit model is given
+        #[arg(long)]
+        kind: Option<String>,
         /// Language of the generated posts (pt-BR, en, ...); overrides KIRA_LANG
         #[arg(long)]
         lang: Option<String>,
@@ -310,7 +315,7 @@ enum Command {
     /// Catálogo local de modelos via Ollama (HF-2, ADR-0040: HF é catálogo
     /// de GGUF, nunca runtime — quem baixa e executa é o Ollama)
     #[command(
-        after_help = "Exemplos:\n  kira model list                            # catálogo local (leitura, sempre livre)\n  kira model pull hf.co/<repo>:Q4_K_M        # baixa via ollama pull (pergunta em TTY)\n  kira model pull hf.co/<repo>:Q4_K_M --yes  # sem pergunta (não-interativo)\n\nPiso da casa: Q4_K_M — Q2_K é proibido por política (gate de admissão, ADR-0040)"
+        after_help = "Exemplos:\n  kira model list                            # catálogo local (leitura, sempre livre)\n  kira model pull hf.co/<repo>:Q4_K_M        # baixa via ollama pull (pergunta em TTY)\n  kira model pull hf.co/<repo>:Q4_K_M --yes  # sem pergunta (não-interativo)\n  kira model admit hf.co/<repo>:Q4_K_M --sha256 <64-hex> --probes-ok\n                                             # admite no routing de especialistas\n\nPiso da casa: Q4_K_M — Q2_K é proibido por política (gate de admissão, ADR-0040)"
     )]
     Model {
         #[command(subcommand)]
@@ -415,6 +420,25 @@ enum ModelAction {
         /// Confirma o download sem perguntar (em TTY a flag vence o prompt)
         #[arg(long)]
         yes: bool,
+    },
+    /// Registra que a tag passou NO GATE DE ADMISSÃO (HF-5, ADR-0040) e entra
+    /// no routing de especialistas: política de quant (piso Q4_K_M, Q2_K
+    /// proibido), proveniência conhecida, SHA-256 conferido contra o model
+    /// card e probes rodados no GGUF quantizado
+    Admit {
+        /// Modelo no formato do Ollama (`hf.co/<repo>:Q4_K_M` ou `qwen3.5:4b`)
+        tag: String,
+        /// SHA-256 conferido PELO DONO contra o model card do repositório
+        #[arg(long)]
+        sha256: Option<String>,
+        /// Atesta que `security_probe` + `--eval` do kind rodaram NO GGUF
+        /// quantizado que vai pro ar (medir no FP16 não prova o quant)
+        #[arg(long)]
+        probes_ok: bool,
+        /// Re-admite conferindo um template que mudou (reconfira no model
+        /// card antes — o drift pode ser substituição de modelo)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -606,12 +630,25 @@ async fn run(command: Command) -> Outcome {
         Command::Digest {
             path,
             model,
+            kind,
             lang,
             budget,
             pause,
             resume,
             json,
-        } => digest_command(path.as_deref(), model, lang, budget, pause, resume, json).await,
+        } => {
+            digest_command(
+                path.as_deref(),
+                model,
+                kind,
+                lang,
+                budget,
+                pause,
+                resume,
+                json,
+            )
+            .await
+        }
         Command::Wiki { action, path } => wiki_command(action, path.as_deref()),
         Command::Context {
             id,
@@ -630,6 +667,12 @@ async fn run(command: Command) -> Outcome {
         Command::Model { action } => match action {
             ModelAction::List => model_list_command(),
             ModelAction::Pull { repo, yes } => model_pull_command(repo.as_str(), yes),
+            ModelAction::Admit {
+                tag,
+                sha256,
+                probes_ok,
+                force,
+            } => model_admit_command(&tag, sha256.as_deref(), probes_ok, force),
         },
         Command::Loop {
             once,
@@ -951,6 +994,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
         Command::Digest {
             path,
             model,
+            kind,
             lang,
             budget,
             pause,
@@ -963,6 +1007,9 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             }
             if let Some(model) = model {
                 args.push_str(&format!(" --model {model}"));
+            }
+            if let Some(kind) = kind {
+                args.push_str(&format!(" --kind {kind}"));
             }
             if let Some(lang) = lang {
                 args.push_str(&format!(" --lang {lang}"));
@@ -1113,6 +1160,28 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 format!("pull {repo}{}", if *yes { " --yes" } else { "" }),
                 None,
             ),
+            ModelAction::Admit {
+                tag,
+                sha256,
+                probes_ok,
+                force,
+            } => {
+                let mut args = format!("admit {tag}");
+                if let Some(sha) = sha256 {
+                    // O SHA vai à trilha com o valor MASCARADO (8 primeiros
+                    // chars): hash conferido é dado de auditoria, não segredo —
+                    // mas a regra dura da casa não ecoa valor longo de nada.
+                    let prefix: String = sha.chars().take(8).collect();
+                    args.push_str(&format!(" --sha256 {prefix}…"));
+                }
+                if *probes_ok {
+                    args.push_str(" --probes-ok");
+                }
+                if *force {
+                    args.push_str(" --force");
+                }
+                ("model".to_string(), args, None)
+            }
         },
         Command::Loop {
             once,
@@ -1666,6 +1735,22 @@ fn model_pull_command(repo: &str, yes: bool) -> Outcome {
     }
 }
 
+/// `kira model admit <tag>` (HF-5, ADR-0040): registra o gate de admissão.
+/// Escrita no STORE local (trilha), nunca no mundo — sem `--apply`; não é
+/// chamada de LLM (não toca o contador). Recusa acionável por critério.
+fn model_admit_command(tag: &str, sha256: Option<&str>, probes_ok: bool, force: bool) -> Outcome {
+    match kira::model::admit(tag, sha256, probes_ok, force) {
+        Ok(text) => {
+            println!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
 /// `kira ingest` — fatos do projeto, sem LLM (ADR-0038, M1).
 ///
 /// Determinístico: mesma árvore ⇒ mesmo `.kira/facts.md`. Rede só se `--skip-scan`
@@ -1756,6 +1841,7 @@ fn trust_command(path: Option<&Path>, revoke: bool) -> Outcome {
 async fn digest_command(
     path: Option<&Path>,
     model: Option<String>,
+    kind: Option<String>,
     lang: Option<String>,
     budget: Option<u64>,
     pause: Option<usize>,
@@ -1766,12 +1852,43 @@ async fn digest_command(
         || store::detect_project_root().unwrap_or_else(|| PathBuf::from(".")),
         Path::to_path_buf,
     );
-    let model_tag = model.unwrap_or_else(ollama::model_from_env);
+    // HF-5: `--kind` gera SÓ um kind — recusa acionável ANTES de qualquer
+    // trabalho quando o kind não existe no plano (a tabela `model_role` fala
+    // de kind de post real, não de desejo futuro).
+    let kind_filter = match kind.as_deref() {
+        Some(kind) => {
+            if !kira::post::plan::KINDS.contains(&kind) {
+                let valid = kira::post::plan::KINDS.join(", ");
+                let message = format!("kind desconhecido: {kind} — kinds válidos: {valid}");
+                eprintln!("erro: {message}");
+                return Outcome::failure(message);
+            }
+            Some(kind.to_string())
+        }
+        None => None,
+    };
+    // HF-5 (routing): tag EXPLÍCITA (--model ou KIRA_MODEL presente) vence o
+    // routing; sem escolha explícita, o sentinela `ollama` liga a resolução
+    // por kind dentro do `post::run` (tabela `model_role` + gate de admissão).
+    let explicit_env = std::env::var("KIRA_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let explicit_tag = model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or(explicit_env);
     let lang = lang
         .or_else(|| std::env::var("KIRA_LANG").ok())
         .unwrap_or_else(|| "en".to_string());
     let mut options = kira::post::DigestOptions::at(root);
-    options.model = format!("ollama:{model_tag}");
+    options.model = match &explicit_tag {
+        Some(tag) => format!("ollama:{tag}"),
+        None => "ollama".to_string(), // sentinela: routing por kind (HF-5)
+    };
+    options.kind_filter = kind_filter;
     options.lang = lang;
     if let Some(budget) = budget {
         options.budget_tokens = budget;
@@ -1779,8 +1896,14 @@ async fn digest_command(
     options.pause_after = pause;
     options.resume = resume;
 
-    let backend = ollama::OllamaBackend::new(ollama::base_url_from_env(), model_tag);
-    match kira::post::run(&options, &backend).await {
+    // FÁBRICA de backend por (kind, tag): a DECISÃO de tag acontece dentro do
+    // `post::run` (routing de especialistas, HF-5) — aqui só o wiring da URL.
+    let base_url = ollama::base_url_from_env();
+    match kira::post::run(&options, &|_kind: &str, tag: &str| {
+        ollama::OllamaBackend::new(&base_url, tag)
+    })
+    .await
+    {
         Ok(report) => {
             if json {
                 match serde_json::to_string_pretty(&report_json(&report)) {
@@ -2209,6 +2332,47 @@ fn triage_source(id: Option<i32>, file: Option<PathBuf>) -> Result<TriageSource,
     }
 }
 
+/// HF-5 (routing de especialistas, ADR-0040): tag de uma tarefa/kind.
+/// Escolha explícita (`--model`/`KIRA_MODEL`) vence; sem ela, override
+/// `model_role.<task>` do config com o GATE DE ADMISSÃO no store — tag não
+/// admitida não roteia: cai no default da casa com nota no stderr (nunca
+/// silêncio, nunca roteamento cego).
+fn resolve_task_model(
+    task: &str,
+    flag: Option<&str>,
+    budget_store: Option<&kira::store::Store>,
+) -> String {
+    if let Some(tag) = flag.map(str::trim).filter(|value| !value.is_empty()) {
+        return tag.to_string();
+    }
+    if let Some(tag) = std::env::var("KIRA_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return tag;
+    }
+    let config = match kira::credentials::read_config() {
+        Ok(pairs) => pairs,
+        Err(err) => {
+            eprintln!("aviso: config ilegível ({err}) — routing segue no default");
+            Vec::new()
+        }
+    };
+    let routing =
+        kira::llm::roles::resolve_tag(task, &config, None, &|candidate| match budget_store
+            .map(|store| store.model_admission_get(candidate))
+        {
+            Some(Ok(Some(_))) => Some(true),
+            Some(Ok(None)) => Some(false),
+            _ => None,
+        });
+    for note in &routing.notes {
+        eprintln!("nota: routing — {note}");
+    }
+    routing.tag
+}
+
 async fn triage_command(
     id: Option<i32>,
     file: Option<PathBuf>,
@@ -2262,7 +2426,6 @@ async fn triage_command(
         }
     };
     let base_url = ollama::base_url_from_env();
-    let model = model_flag.unwrap_or_else(ollama::model_from_env);
     // Budget diário (mandato/auditoria P0): checado ANTES da chamada. Store
     // indisponível = fail-open com aviso VISÍVEL (regra dura da trilha), nunca
     // bypass silencioso; teto atingido = erro acionável, exit ≠ 0. O mesmo
@@ -2282,6 +2445,10 @@ async fn triage_command(
             None
         }
     };
+    // HF-5 (routing de especialistas, ADR-0040): tag da tarefa de triage —
+    // flag/env explícitos vencem; sem eles, tabela `model_role` com o gate
+    // de admissão (nota no stderr quando cai no default; nunca silêncio).
+    let model = resolve_task_model("triage", model_flag.as_deref(), budget_store.as_ref());
     let result = match source {
         TriageSource::Id(id) => match resolve_board(None) {
             Ok(board) => {
@@ -2363,7 +2530,6 @@ async fn eval_command(
         }
     };
     let base_url = ollama::base_url_from_env();
-    let model = model_flag.unwrap_or_else(ollama::model_from_env);
     // `--seed` copia as 3 fixtures sintéticas num diretório vazio e segue para
     // a medição: o dono vê a mecânica do gate antes de rotular os 20 reais.
     if seed {
@@ -2391,6 +2557,9 @@ async fn eval_command(
             None
         }
     };
+    // HF-5: o `--eval` roda POR MODELO — `--model <tag>` mede aquela tag; sem
+    // escolha explícita, o routing decide a tag do julgamento (mesma tabela).
+    let model = resolve_task_model("triage", model_flag.as_deref(), budget_store.as_ref());
     match kira::eval::run(&dir, kind, &base_url, &model, budget_store.as_ref()).await {
         Ok((itens, gate)) => {
             if json {

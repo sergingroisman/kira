@@ -131,6 +131,42 @@ impl Sandbox {
         )
     }
 
+    /// `run` SEM `KIRA_MODEL` (HF-5): o routing de especialistas por kind só
+    /// liga sem escolha explícita de modelo — estes testes exercitam a
+    /// decisão da tabela `model_role`, então a env explícita sai.
+    fn run_routed(&self, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, String) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
+        command
+            .args(args)
+            .current_dir(&self.cwd)
+            .env("KIRA_STORE_DIR", &self.store)
+            .env("KIRA_CONFIG", self.store.join("absent-config.toml"))
+            .env("KIRA_SECRET_STORE", "off")
+            .env("KIRA_OLLAMA_URL", &self.ollama)
+            .env_remove("KIRA_MODEL")
+            .env_remove("AZURE_DEVOPS_PAT")
+            .env_remove("AZURE_DEVOPS_ORG")
+            .env_remove("AZURE_DEVOPS_PROJECT")
+            .env_remove("KIRA_BOARD");
+        for (key, value) in extra {
+            command.env(key, value);
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|err| panic!("rodar kira {args:?}: {err}"));
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+
+    /// Escreve a tabela `model_role` no config do sandbox (a mesma env
+    /// `KIRA_CONFIG` que o `run` aponta).
+    fn write_config(&self, body: &str) {
+        std::fs::write(self.store.join("absent-config.toml"), body).expect("config");
+    }
+
     /// Estado de partida: fatos ingeridos e repositório aceito.
     fn prepare(&self) {
         let (code, stdout, stderr) = self.run(&["ingest", "--skip-scan"]);
@@ -393,5 +429,170 @@ fn draft_masks_a_fake_token_before_writing() {
     assert!(
         draft.starts_with("---\n"),
         "front-matter obrigatório no rascunho: {draft}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HF-5 — routing de especialistas + gate de admissão (ADR-0040)
+// ---------------------------------------------------------------------------
+
+/// Especialista coder do plano (quantizer conhecido, piso Q4_K_M) e um SHA
+/// fake mas BEM-FORMADO: a conferência contra o model card é humana — o e2e
+/// prova a PLUMBARIA do gate (recusas, registro, routing), não o valor.
+const CODER_TAG: &str = "hf.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M";
+const FAKE_SHA: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+const TEMPLATE_SEAM: &str = "KIRA_MODEL_TEMPLATE";
+
+fn config_with_coder() -> String {
+    format!("model_role.c4-container = \"{CODER_TAG}\"\n")
+}
+
+/// O aceite do item: `kira digest --kind <seguro>` usa a tag mapeada na
+/// tabela `model_role` (com o Ollama FALSO — a tag é do cache/trilha, o
+/// servidor responde o canned body de qualquer modelo).
+#[test]
+fn digest_kind_uses_the_admitted_mapped_tag() {
+    let sandbox = Sandbox::new("hf5-routing");
+    sandbox.write_config(&config_with_coder());
+    // Gate de admissão: o seam do template evita spawn de ollama no e2e
+    // (nenhum fluxo de produto define `KIRA_MODEL_TEMPLATE`).
+    let (code, stdout, stderr) = sandbox.run_env(
+        &[
+            "model",
+            "admit",
+            CODER_TAG,
+            "--sha256",
+            FAKE_SHA,
+            "--probes-ok",
+        ],
+        TEMPLATE_SEAM,
+        "{{ .Prompt }}",
+    );
+    assert_eq!(code, 0, "admit: {stdout}\n{stderr}");
+    assert!(stdout.contains("admitido"), "admit: {stdout}");
+
+    sandbox.prepare();
+    let (code, stdout, stderr) = sandbox.run_routed(
+        &["digest", "--lang", "pt-BR", "--kind", "c4-container"],
+        &[],
+    );
+    assert_eq!(code, 0, "digest --kind: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("1 post(s) novo(s)"),
+        "só o kind pedido é gerado: {stdout}"
+    );
+    // A tag mapeada é a que roda — visível no briefing (a decisão fica
+    // registrada em disco, não só no stdout).
+    let briefing = sandbox.read(".kira/briefing.md");
+    assert!(
+        briefing.contains(&format!("modelo (c4-container): ollama:{CODER_TAG}")),
+        "briefing precisa mostrar a tag do especialista: {briefing}"
+    );
+    assert!(
+        sandbox
+            .read(".kira/drafts/c4-container.md")
+            .contains("What this is")
+    );
+    assert!(
+        sandbox.read(".kira/drafts/intro.md").is_empty(),
+        "--kind não pode gerar o outro kind"
+    );
+
+    // Cache correto por especialista: rerun com a MESMA tag = cache, e a
+    // linha gravada leva a tag (trocar de especialista regeneraria).
+    let (code, stdout, stderr) = sandbox.run_routed(
+        &["digest", "--lang", "pt-BR", "--kind", "c4-container"],
+        &[],
+    );
+    assert_eq!(code, 0, "rerun: {stderr}");
+    assert!(
+        stdout.contains("0 post(s) novo(s)") && stdout.contains("1 no cache"),
+        "cache por especialista: {stdout}"
+    );
+}
+
+/// O gate: tag SEM admissão não entra no routing — o run segue com o default
+/// da casa e a nota acionável diz o comando que admite.
+#[test]
+fn unadmitted_tag_falls_back_to_the_default_with_an_actionable_note() {
+    let sandbox = Sandbox::new("hf5-gate");
+    sandbox.write_config(&config_with_coder());
+    sandbox.prepare();
+    let (code, stdout, stderr) = sandbox.run_routed(
+        &["digest", "--lang", "pt-BR", "--kind", "c4-container"],
+        &[],
+    );
+    assert_eq!(code, 0, "fallback não é erro: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("não entrou no routing") && stdout.contains("kira model admit"),
+        "nota acionável do gate: {stdout}"
+    );
+    let briefing = sandbox.read(".kira/briefing.md");
+    assert!(
+        briefing.contains("modelo (c4-container): ollama:qwen3.5:4b"),
+        "o run seguiu com o default da casa: {briefing}"
+    );
+}
+
+/// Política dura: Q2_K é RECUSADO por política com erro acionável — antes de
+/// qualquer spawn (não há ollama no sandbox e o recusa vem da função pura).
+#[test]
+fn q2_k_is_refused_by_policy() {
+    let sandbox = Sandbox::new("hf5-q2");
+    let (code, stdout, stderr) = sandbox.run_env(
+        &[
+            "model",
+            "admit",
+            "hf.co/bartowski/Qwen2.5-1.5B-GGUF:Q2_K",
+            "--sha256",
+            FAKE_SHA,
+            "--probes-ok",
+        ],
+        TEMPLATE_SEAM,
+        "{{ .Prompt }}",
+    );
+    assert_ne!(code, 0, "Q2_K não pode ser admitido: {stdout}");
+    assert!(
+        stderr.contains("proibido por política") && stderr.contains("Q4_K_M"),
+        "mensagem acionável: {stderr}"
+    );
+}
+
+/// O gate é fechado: sem SHA-256 conferido ou sem probes no GGUF, NADA é
+/// registrado — mesmo com quant e proveniência ok.
+#[test]
+fn admit_requires_the_sha256_and_the_probes_attestation() {
+    let sandbox = Sandbox::new("hf5-gate-fechado");
+    let (code, stdout, stderr) = sandbox.run_env(
+        &["model", "admit", CODER_TAG, "--probes-ok"],
+        TEMPLATE_SEAM,
+        "{{ .Prompt }}",
+    );
+    assert_ne!(code, 0, "sem SHA não admite: {stdout}");
+    assert!(stderr.contains("SHA-256"), "acionável: {stderr}");
+
+    let (code, stdout, stderr) = sandbox.run_env(
+        &["model", "admit", CODER_TAG, "--sha256", FAKE_SHA],
+        TEMPLATE_SEAM,
+        "{{ .Prompt }}",
+    );
+    assert_ne!(code, 0, "sem probes não admite: {stdout}");
+    assert!(
+        stderr.contains("probes pendentes") && stderr.contains("--probes-ok"),
+        "acionável: {stderr}"
+    );
+}
+
+/// `--kind` com kind inexistente é erro acionável listando os válidos —
+/// nunca "0 posts" silencioso (a tabela fala de kind real, não desejo).
+#[test]
+fn unknown_kind_is_an_actionable_error() {
+    let sandbox = Sandbox::new("hf5-kind");
+    sandbox.prepare();
+    let (code, stdout, stderr) = sandbox.run(&["digest", "--lang", "pt-BR", "--kind", "security"]);
+    assert_ne!(code, 0, "kind desconhecido é erro: {stdout}");
+    assert!(
+        stderr.contains("kind desconhecido: security") && stderr.contains("intro, c4-container"),
+        "erro lista os válidos: {stderr}"
     );
 }

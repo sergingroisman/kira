@@ -131,6 +131,41 @@ pub fn format_llm_lines() -> Vec<String> {
     }
 }
 
+/// HF-5 (ADR-0040): linhas do piso do Ollama no `doctor` — a versão vem do
+/// binário (nunca inventada); abaixo do piso 0.17.1 vira aviso com a causa
+/// (CVE-2026-7482). Fail-open: sem ollama ou com saída ilegível, a linha
+/// diz o que aconteceu e o doctor segue.
+#[must_use]
+pub fn format_ollama_lines(version: Option<&str>) -> Vec<String> {
+    let Some(raw) = version else {
+        return vec![
+            "ollama: — (binário ausente no PATH nem override; instale em \
+             https://ollama.com)"
+                .to_string(),
+        ];
+    };
+    let Some(parsed) = crate::model::parse_ollama_version(raw) else {
+        return vec![
+            "ollama: — (saída de `ollama --version` ilegível; confira a versão \
+             com `ollama --version` direto)"
+                .to_string(),
+        ];
+    };
+    let display = format!("{}.{}.{}", parsed.0, parsed.1, parsed.2);
+    let min = crate::model::MIN_OLLAMA_VERSION;
+    if crate::model::version_at_least(parsed, min) {
+        vec![format!(
+            "ollama: {display} (ok — piso 0.17.1 por CVE-2026-7482)"
+        )]
+    } else {
+        vec![format!(
+            "aviso: ollama {display} está abaixo do piso {}.{}.{}, exigido por \
+             CVE-2026-7482 (Bleeding Llama) — atualize em https://ollama.com",
+            min.0, min.1, min.2
+        )]
+    }
+}
+
 /// Linhas da onda M (ADR-0038): o que foi ingerido e o estado da fila de posts.
 ///
 /// Fail-open: qualquer dado ausente vira uma frase com a causa e o comando que
@@ -409,6 +444,16 @@ pub async fn run() -> (bool, String) {
         emit(&mut out, &line);
     }
 
+    // HF-5 (ADR-0040): piso do servidor que executa os modelos — Ollama
+    // ≥ 0.17.1 (CVE-2026-7482 "Bleeding Llama": GGUF craftado vazava heap via
+    // /api/create; o KIRA nunca sobe blob por essa rota, mas o piso vale para
+    // o servidor todo). Linha informativa, fail-open: sem ollama, a linha diz
+    // a causa — nunca inventa versão.
+    let version = crate::model::version().ok();
+    for line in format_ollama_lines(version.as_deref()) {
+        emit(&mut out, &line);
+    }
+
     if !missing.is_empty() {
         emit(&mut out, "2. Conexão com a organização");
         emit(&mut out, "   - ignorada: corrija os itens ✗ acima");
@@ -487,6 +532,31 @@ pub async fn run() -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_lines_report_the_floor_or_the_cause() {
+        // Ausente/ilegível: causa na linha, nunca versão inventada.
+        assert!(format_ollama_lines(None)[0].contains("instale em https://ollama.com"));
+        assert!(
+            format_ollama_lines(Some("formato estranho"))[0].contains("ilegível"),
+            "saída ilegível vira causa: {:?}",
+            format_ollama_lines(Some("formato estranho"))
+        );
+        // No piso ou acima: linha informativa.
+        assert!(
+            format_ollama_lines(Some("ollama version is 0.17.1"))[0].contains("0.17.1 (ok"),
+            "{:?}",
+            format_ollama_lines(Some("ollama version is 0.17.1"))
+        );
+        // Abaixo do piso: aviso com a causa (CVE) — o número é o lido.
+        let lines = format_ollama_lines(Some("ollama version is 0.16.9"));
+        assert!(lines[0].contains("aviso"), "{lines:?}");
+        assert!(
+            lines[0].contains("0.16.9") && lines[0].contains("CVE-2026-7482"),
+            "aviso com versão e causa: {:?}",
+            lines
+        );
+    }
 
     #[test]
     fn pat_line_shows_at_most_four_chars_and_length() {
