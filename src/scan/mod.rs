@@ -10,6 +10,7 @@
 //! tested with captured-format fixtures; the CLI tests only touch the
 //! "tool missing" and "no findings found" paths plus the deterministic file.
 
+mod decode;
 mod dotnet;
 mod finding;
 mod node;

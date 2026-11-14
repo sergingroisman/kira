@@ -194,11 +194,16 @@
   `Enter = ingerir / n = pular`; efeito todo em `setup::run` (ADR-0034). `--skip` aceita
   `pat|ia|ingest`; resumo troca o próximo passo de `kira scan` para `kira connect azure`.
   **Aceite:** `setup_e2e` com `--yes` (digest criado) e `--skip ingest` (nada criado).
-- [ ] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
+- [x] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
   com UTF-8/UTF-16 LE/BE nos call sites de `node.rs`/`dotnet.rs` + fixture) e **P5 `.gitignore`**
   (`src/context/gitignore.rs`, subset gitwildmatch, aninhado, sem dependência).
   **Aceite:** fixture BOM parseia; `.gitignore` aninhado com negação honrado no índice e no grep;
   repo sem `.gitignore` inalterado.
+  *Entregue (13/Nov, onda IG): decode nos dois call sites + fixture
+  `scan_npm_audit_utf16le.json` parseando pelo extrator real do npm; matcher
+  gitwildmatch subset (negação, ancoragem, dir-only, `**`, ancestral excluído
+  não re-incluível) honrado no `reindex` e no `grep`; 18 testes novos
+  (6 decode + 12 matcher) + 2 de integração.*
 - [ ] **M8** docs da onda M: `docs/ux-setup-jornada.md` (trilha real de 5 etapas),
   `docs/kira-jornadas.md` (remover a promessa de "parse tolerante BOM/UTF-16" até M7;
   registrar ingest/digest/emit/trust), `docs/gitingest-vale-trazer.md` (P1/P3/P4/P5),

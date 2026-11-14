@@ -200,12 +200,22 @@ pub fn grep(
         }
     }
 
+    // M7/P5: `.gitignore` aninhado vale também no grep (mesmo matcher do
+    // índice — o pack nunca cita arquivo que o git excluiria). Repo sem
+    // `.gitignore`: conjunto vazio, nada muda.
+    let gitignore = super::gitignore::GitIgnore::load(root);
     let walker = WalkDir::new(root)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
             if entry.file_type().is_dir() {
-                !is_skipped_dir(entry.path(), entry.depth())
+                if is_skipped_dir(entry.path(), entry.depth()) {
+                    return false;
+                }
+                match relative_path(root, entry.path()) {
+                    Some(rel) => !gitignore.is_ignored(&rel, true),
+                    None => true,
+                }
             } else {
                 true
             }
@@ -230,7 +240,11 @@ pub fn grep(
         // would send the same knowledge twice and burn the budget. W2-fix
         // PR-F3: the wiki lives inside the dot-directory `.kira/wiki/`, which
         // the leading-dot rule already skips — no special case left here.
-        if skipped.contains(&rel) || !is_source_file(&rel) || !seen.insert(rel.clone()) {
+        if skipped.contains(&rel)
+            || gitignore.is_ignored(&rel, false)
+            || !is_source_file(&rel)
+            || !seen.insert(rel.clone())
+        {
             continue;
         }
         let Some(content) = read_text_file(entry.path()) else {
@@ -462,6 +476,30 @@ mod tests {
             found.excerpts[0].path, "src/App.csproj",
             "{:?}",
             found.excerpts
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// M7/P5 (aceite): o grep honra o mesmo `.gitignore` do índice — termo
+    /// que só existe em arquivo ignorado nunca vira excerpt do pack.
+    #[test]
+    fn grep_skips_gitignored_files() {
+        let dir = temp_tree("gitignore");
+        write(&dir, ".gitignore", "secret.rs\nvendor/\n");
+        write(&dir, "secret.rs", "fn tokensecret() {}\n");
+        write(&dir, "vendor/lib.rs", "fn tokensecret() {}\n");
+        write(&dir, "public.rs", "fn tokensecret() {}\n");
+
+        let found = grep(&dir, &terms(&["tokensecret"]), &[], &[], 10);
+        let paths: Vec<&str> = found
+            .excerpts
+            .iter()
+            .map(|excerpt| excerpt.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["public.rs"],
+            "só o arquivo não-ignorado entra no grep: {paths:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

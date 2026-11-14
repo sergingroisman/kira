@@ -11,7 +11,7 @@ use std::process::Output;
 use serde_json::Value;
 
 use super::{
-    Finding, ScanError, ToolKind, exit_code_label, relative_path, spawn_error, stderr_hint,
+    Finding, ScanError, ToolKind, decode, exit_code_label, relative_path, spawn_error, stderr_hint,
     tool_command,
 };
 
@@ -47,9 +47,11 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<Finding>, ScanError> {
     parse_output(&output_stdout(&output), dir)
 }
 
-/// Decoded stdout of the tool run (lossy keeps the parse testable).
+/// Decoded stdout of the tool run (M7/P1: BOM/UTF-16 tolerant — PowerShell
+/// redirection and `.cmd` wrappers can hand back UTF-16; lossy UTF-8 alone
+/// would mojibake the JSON and the parse would fail on good output).
 fn output_stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    decode::decode_tool_output(&output.stdout)
 }
 
 /// Pure parse of the `dotnet list package --format json` output (v2 of the
