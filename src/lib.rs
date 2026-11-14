@@ -19,6 +19,7 @@ pub mod eval;
 pub mod format;
 pub mod guard;
 pub mod html;
+pub mod hwprofile;
 pub mod ingest;
 pub mod knowledge;
 pub mod llm;

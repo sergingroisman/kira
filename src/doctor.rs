@@ -522,6 +522,19 @@ pub async fn run() -> (bool, String) {
         emit(&mut out, &line);
     }
 
+    // PR20 (plano-finalizacao §3): perfil de hardware EFETIVO — VRAM via
+    // `nvidia-smi` resolvido no PATH (binresolve) e RECOMENDAÇÃO de tag/ctx.
+    // Recomendação apenas: o doctor é read-only e aqui NADA é gravado
+    // (config.toml, env e store ficam como estavam). O piso do Ollama já
+    // vem na linha anterior e não muda com o perfil.
+    emit(
+        &mut out,
+        &format!(
+            "   {}",
+            crate::hwprofile::profile_line(&crate::hwprofile::doctor_profile())
+        ),
+    );
+
     if !missing.is_empty() {
         emit(&mut out, "2. Conexão com a organização");
         emit(&mut out, "   - ignorada: corrija os itens ✗ acima");
