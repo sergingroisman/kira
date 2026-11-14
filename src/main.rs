@@ -512,6 +512,10 @@ struct Outcome {
     /// the store commands and `setup` do not).
     records: bool,
     summary: String,
+    /// Ledger de economia (PR34) quando o comando construiu pack de contexto
+    /// — hoje só o `triage`. `None` é a regra: os demais comandos passam
+    /// `..none()` e o history exibe `—` com a causa.
+    economy: Option<store::economy::EconomyRow>,
 }
 
 impl Outcome {
@@ -521,6 +525,7 @@ impl Outcome {
             ok: true,
             records: true,
             summary: summary.into(),
+            economy: None,
         }
     }
 
@@ -530,6 +535,7 @@ impl Outcome {
             ok: false,
             records: true,
             summary: summary.into(),
+            economy: None,
         }
     }
 }
@@ -558,6 +564,9 @@ async fn main() -> ExitCode {
             ok: outcome.ok,
             summary: &outcome.summary,
             item_id,
+            // O ledger de economia viaja com o outcome (PR34): quem construiu
+            // pack é que o tem — o trail só grava.
+            economy: outcome.economy.clone(),
         });
     }
     outcome.code
@@ -589,6 +598,7 @@ async fn run(command: Command) -> Outcome {
                 ok,
                 records: true,
                 summary,
+                economy: None,
             }
         }
         Command::Triage {
@@ -615,6 +625,7 @@ async fn run(command: Command) -> Outcome {
             ok: true,
             records: false,
             summary: String::new(),
+            economy: None,
         },
         Command::History { last } => store_command(history_output(last)),
         Command::Note { text, remove } => store_command(note_output(text, remove)),
@@ -750,6 +761,7 @@ async fn connect_command(provider: &str, yes: bool) -> Outcome {
             ok: false,
             records: false,
             summary: message,
+            economy: None,
         };
     }
     connect_azure_command(yes).await
@@ -815,6 +827,7 @@ async fn connect_azure_command(yes: bool) -> Outcome {
             "connect azure: conexão não concluída — veja a saída"
         }
         .to_string(),
+        economy: None,
     }
 }
 
@@ -839,6 +852,7 @@ fn store_command(outcome: Result<String, StoreError>) -> Outcome {
                 ok: true,
                 records: false,
                 summary: text,
+                economy: None,
             }
         }
         Err(err) => {
@@ -848,6 +862,7 @@ fn store_command(outcome: Result<String, StoreError>) -> Outcome {
                 ok: false,
                 records: false,
                 summary: err.to_string(),
+                economy: None,
             }
         }
     }
@@ -1239,6 +1254,10 @@ struct SessionRun<'a> {
     summary: &'a str,
     /// Item da jornada, quando houver (issue #78) — gravado na trilha.
     item_id: Option<i32>,
+    /// Ledger de economia (PR34): pack vs teto, chamadas, rota. `None` para
+    /// comandos que não constroem pack (inspect/doctor) — o history mostra
+    /// `—` com a causa, nunca um zero inventado.
+    economy: Option<store::economy::EconomyRow>,
 }
 
 /// Records the session trail, FIRST-CLASS fail-open: every store problem is
@@ -1257,7 +1276,7 @@ fn record_session_inner(run: &SessionRun<'_>) -> Result<(), String> {
     let project = store
         .ensure_project(&root)
         .map_err(|error| error.to_string())?;
-    store
+    let session_id = store
         .record(
             &project,
             run.command,
@@ -1269,7 +1288,16 @@ fn record_session_inner(run: &SessionRun<'_>) -> Result<(), String> {
             run.summary,
             run.item_id,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    // O ledger entra NA MESMA trilha, mesmo store e mesmo fail-open: falha
+    // aqui vira o `aviso:` de trilha do `record_session`, nunca erro do
+    // comando (PR34 — a sessão existe, a economia é dado irmão).
+    if let Some(economy) = &run.economy {
+        store
+            .record_economy(session_id, economy)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,10 +1333,42 @@ fn history_output(last: Option<usize>) -> Result<String, StoreError> {
         "história do projeto '{}' — mais recentes primeiro:\n",
         project.name
     );
+    // Ledger de economia (PR34): busca em lote as linhas das sessões listadas —
+    // sessão sem linha não é erro, é `—` com a causa (dado ausente nunca é
+    // inventado, regra da casa).
+    let ids: Vec<i64> = sessions.iter().map(|session| session.id).collect();
+    let economies = store.economy_for_sessions(&ids)?;
     for session in &sessions {
         text.push_str(&format_session_line(session));
+        match economies.get(&session.id) {
+            Some(economy) => text.push_str(&format_economy_line(economy)),
+            None => text.push_str(
+                "   economia: — (sem registro nesta sessão — comando sem pack de contexto \
+                 ou sessão anterior à v13)\n",
+            ),
+        }
     }
     Ok(text)
+}
+
+/// One `kira history` economy line (PR34): pack vs teto em chars, a estimativa
+/// de tokens (chars/3), as chamadas de LLM e a rota. Números do ledger, nunca
+/// estimados na exibição.
+fn format_economy_line(economy: &store::economy::EconomyRow) -> String {
+    let idle = if economy.pack_idle {
+        " · pack ocioso"
+    } else {
+        ""
+    };
+    format!(
+        "   economia: ~{} tok (pack {}/{} chars) · chamadas de LLM: {} · rota: {}{}\n",
+        economy.tokens_est,
+        economy.pack_chars,
+        economy.budget_chars,
+        economy.llm_calls,
+        economy.route,
+        idle
+    )
 }
 
 /// One `kira history` line: `#id  ✓/✗  data local  comando  duração  modelo?`.
@@ -2015,6 +2075,7 @@ fn wiki_command(action: WikiAction, path: Option<&Path>) -> Outcome {
                 ok: true,
                 records: false,
                 summary: text,
+                economy: None,
             }
         }
         Err(err) => {
@@ -2024,6 +2085,7 @@ fn wiki_command(action: WikiAction, path: Option<&Path>) -> Outcome {
                 ok: false,
                 records: false,
                 summary: err.to_string(),
+                economy: None,
             }
         }
     }
@@ -2170,6 +2232,7 @@ fn context_command(id: Option<i32>, file: Option<PathBuf>, explain: bool, json: 
                 ok: true,
                 records: false,
                 summary: first_line(&text, HISTORY_SUMMARY_LINE_CHARS),
+                economy: None,
             }
         }
         Err(err) => {
@@ -2179,6 +2242,7 @@ fn context_command(id: Option<i32>, file: Option<PathBuf>, explain: bool, json: 
                 ok: false,
                 records: false,
                 summary: err.to_string(),
+                economy: None,
             }
         }
     }
@@ -2243,6 +2307,7 @@ fn dashboard_command(snapshot: bool, read_only: bool) -> Outcome {
             // aqui — é o que o teste de hash do `store.db` verifica.
             records: false,
             summary: text,
+            economy: None,
         }
     } else {
         let options = kira::tui::app::RunOptions { read_only };
@@ -2252,6 +2317,7 @@ fn dashboard_command(snapshot: bool, read_only: bool) -> Outcome {
                 ok: true,
                 records: false,
                 summary: "dashboard fechado pelo usuário".to_string(),
+                economy: None,
             },
             Err(message) => {
                 eprintln!("erro: {message}");
@@ -2260,6 +2326,7 @@ fn dashboard_command(snapshot: bool, read_only: bool) -> Outcome {
                     ok: false,
                     records: false,
                     summary: message,
+                    economy: None,
                 }
             }
         }
@@ -2297,6 +2364,7 @@ fn pr_command(action: PrAction) -> Outcome {
                 ok: true,
                 records: false,
                 summary: first_line(&text, HISTORY_SUMMARY_LINE_CHARS),
+                economy: None,
             }
         }
         Err(err) => {
@@ -2492,6 +2560,24 @@ async fn triage_command(
             for note in &report.context.notes {
                 eprintln!("aviso: contexto — {note}");
             }
+            // Ledger de economia (PR34, onda TE): o pack que a sessão REALMENTE
+            // enviou, o teto e a chamada de julgamento que ela custou. O sinal
+            // de pack ocioso (D9) fica visível no stderr — é nota, nunca
+            // erro, e nunca conta como chamada (determinístico não consome
+            // budget, ADR-0016). As constantes espelham o schema v13
+            // (`store::economy`); a rota é `llm` — o PR35 acrescentará
+            // `cache-wiki` sem nova migração.
+            let economy = store::economy::EconomyRow {
+                pack_chars: i64::try_from(report.context.used_chars).unwrap_or(0),
+                budget_chars: i64::try_from(report.context.budget_chars).unwrap_or(0),
+                tokens_est: i64::try_from(report.context.used_chars / 3).unwrap_or(0),
+                llm_calls: 1,
+                route: "llm".to_string(),
+                pack_idle: report.context.idle_warning().is_some(),
+            };
+            if let Some(aviso) = report.context.idle_warning() {
+                eprintln!("{aviso}");
+            }
             // Episodic capture (ADR-0013, PR30): fail-open, never changes the
             // output or the exit code. A capture failure also prefixes the
             // session-trail summary (W2-fix PR-F3) so `kira history` shows it.
@@ -2500,12 +2586,24 @@ async fn triage_command(
                 eprint!("{note}");
             }
             if episode_failed {
-                Outcome::success(format!(
-                    "wikipage: episódio failed (triage sem conteúdo nas 3 seções)\n{}",
-                    report.output
-                ))
+                Outcome {
+                    code: ExitCode::SUCCESS,
+                    ok: true,
+                    records: true,
+                    summary: format!(
+                        "wikipage: episódio failed (triage sem conteúdo nas 3 seções)\n{}",
+                        report.output
+                    ),
+                    economy: Some(economy),
+                }
             } else {
-                Outcome::success(report.output)
+                Outcome {
+                    code: ExitCode::SUCCESS,
+                    ok: true,
+                    records: true,
+                    summary: report.output,
+                    economy: Some(economy),
+                }
             }
         }
         Err(err) => {
@@ -2598,6 +2696,7 @@ async fn eval_command(
                 ok: gate.passou,
                 records: true,
                 summary: format!("triage --eval: {linha}"),
+                economy: None,
             }
         }
         Err(err) => {
