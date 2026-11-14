@@ -17,19 +17,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const FAKE_BODY: &str = "{\"model\":\"fake\",\"message\":{\"role\":\"assistant\",\"content\":\"What this is\\nKIRA e um CLI.\\n\"},\"done\":true}";
 
-/// Ollama falso: aceita quantas conexões vierem, uma resposta por chamada.
-fn spawn_fake_ollama() -> String {
+/// Ollama falso com corpo customizado (HF-3: o teste do teto precisa de uma
+/// resposta gigante e o do segredo, de um token fake no corpo).
+fn spawn_fake_ollama_body(fake_body: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
+    let fake_body = fake_body.to_string();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
+            let fake_body = fake_body.clone();
             std::thread::spawn(move || {
                 let mut buffer = [0u8; 8192];
                 let _ = stream.read(&mut buffer);
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{FAKE_BODY}",
-                    FAKE_BODY.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fake_body}",
+                    fake_body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
@@ -48,6 +51,12 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(tag: &str) -> Self {
+        Self::new_with_body(tag, FAKE_BODY)
+    }
+
+    /// Sandbox cujo Ollama falso responde um corpo específico (HF-3: teto e
+    /// segredo precisam de respostas diferentes da padrão).
+    fn new_with_body(tag: &str, fake_body: &str) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -71,7 +80,7 @@ impl Sandbox {
             base,
             cwd,
             store,
-            ollama: spawn_fake_ollama(),
+            ollama: spawn_fake_ollama_body(fake_body),
         }
     }
 
@@ -244,4 +253,62 @@ fn pause_after_one_post_leaves_the_rest_in_the_queue() {
         "o resume entrega só o que faltava: {stdout}"
     );
     assert!(!sandbox.read(".kira/drafts/c4-container.md").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// HF-3 — guardrail determinístico de saída (front-matter + teto + redact)
+// ---------------------------------------------------------------------------
+
+/// Resposta do modelo acima do teto do post: o guardrail recusa com nota
+/// acionável e NADA é gravado — truncar texto do modelo seria publicar meia
+/// frase com cara de inteira.
+#[test]
+fn draft_over_the_cap_is_refused_with_a_note_and_nothing_is_written() {
+    // Conteúdo do tamanho exato do teto: com o front-matter somado, o
+    // rascunho passa do limite e a recusa é inevitável (sem número mágico:
+    // o teto é a constante pública do módulo).
+    let huge = "a".repeat(kira::post::DRAFT_CHAR_CAP);
+    let body = format!(
+        "{{\"model\":\"fake\",\"message\":{{\"role\":\"assistant\",\"content\":\"{huge}\"}},\"done\":true}}"
+    );
+    let sandbox = Sandbox::new_with_body("teto", &body);
+    sandbox.prepare();
+    let (code, stdout, stderr) = sandbox.run(&["digest", "--lang", "pt-BR"]);
+    assert_eq!(code, 0, "recusa do guardrail é nota, não erro: {stderr}");
+    assert!(
+        stdout.contains("guardrail de saída recusou") && stdout.contains("acima do teto"),
+        "nota acionável do teto: {stdout}"
+    );
+    let drafts = std::fs::read_dir(sandbox.cwd.join(".kira").join("drafts"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(drafts, 0, "nada pode ser gravado acima do teto");
+}
+
+/// Token fake na resposta do modelo: o rascunho gravado já sai mascarado —
+/// segredo nunca chega ao disco, nem em dado derivado (regra dura da casa).
+#[test]
+fn draft_masks_a_fake_token_before_writing() {
+    let body = "{\"model\":\"fake\",\"message\":{\"role\":\"assistant\",\"content\":\"Setup: token=AbC123XyZ789QqQ e ghp_0123456789abcdefghijABCDEFGHIJ012345\\nTexto normal.\\n\"},\"done\":true}";
+    let sandbox = Sandbox::new_with_body("segredo", body);
+    sandbox.prepare();
+    let (code, _, stderr) = sandbox.run(&["digest", "--lang", "pt-BR"]);
+    assert_eq!(code, 0, "digest feliz: {stderr}");
+    // A ordem de claim é (created_at, slug): `c4-container` vem antes de
+    // `intro` — o teste não depende de qual slug, só do primeiro gravado.
+    let draft = sandbox.read(".kira/drafts/c4-container.md");
+    assert!(!draft.is_empty(), "o rascunho foi gravado");
+    assert!(
+        !draft.contains("AbC123XyZ789QqQ"),
+        "token de atribuição vazou no rascunho: {draft}"
+    );
+    assert!(
+        !draft.contains("ghp_0123456789abcdefghijABCDEFGHIJ012345"),
+        "token em formato conhecido vazou: {draft}"
+    );
+    assert!(draft.contains("Texto normal."), "corpo preservado: {draft}");
+    assert!(
+        draft.starts_with("---\n"),
+        "front-matter obrigatório no rascunho: {draft}"
+    );
 }
