@@ -588,6 +588,17 @@ pub async fn run(
     }
 
     // ------------------------------------------------------------------
+    // Passo rea (TE PR41, D11): teaching-only. A aula vem ANTES da pergunta
+    // (ADR-0025: o setup ensina, nunca executa por baixo) e NADA é gravado —
+    // não existe chave de config para o rea; se o binário está no PATH (ou
+    // KIRA_REA_BIN), `kira rea` funciona. Só em TTY; `--yes`/wizard nunca
+    // bloqueiam (EOF/vazio ⇒ pular, que é o default).
+    // ------------------------------------------------------------------
+    if options.interactive && !options.yes {
+        teach_rea(input, output);
+    }
+
+    // ------------------------------------------------------------------
     // Resumo final: o que ficou pronto, o que funciona AGORA (sem credencial
     // nenhuma), o que fica desativado até uma capacidade conectar e o
     // PRÓXIMO comando — nunca "configuração concluída".
@@ -777,6 +788,77 @@ pub fn pat_lesson_lines(url: &str) -> Vec<String> {
         "4. Clique Create e copie o valor agora — ele aparece uma única vez.".to_string(),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Passo rea (TE PR41, D11 = teaching-only): o setup ensina o `kira rea` e
+// NUNCA grava config para ele (nenhuma chave existe — se o binário está no
+// PATH ou em KIRA_REA_BIN, o comando funciona por si). Opt-out claro: o
+// default da pergunta é "pular", Enter/EOF pulam, e nenhuma opção executa
+// coisa alguma — a aula é o único efeito.
+// ---------------------------------------------------------------------------
+
+/// A aula curta impressa ANTES da pergunta (o que é, por que perguntamos, o
+/// que acontece se pular) — ADR-0025: aula primeiro, pergunta depois.
+pub fn rea_intro_lines() -> Vec<String> {
+    vec![
+        String::new(),
+        "Revisor de código (rea)".to_string(),
+        "O KIRA também empacota um revisor externo, o rea: você chama `kira rea <args>` e o"
+            .to_string(),
+        "KIRA só resolve o binário no PATH (ou o caminho em KIRA_REA_BIN), roda e imprime a"
+            .to_string(),
+        "saída redigida e capada em 8 KiB — nada cru do rea chega ao seu terminal.".to_string(),
+        "Perguntamos aqui porque o setup ensina comandos; executar é sempre por sua conta."
+            .to_string(),
+        "Se pular: nada muda. `kira rea` só funciona quando o binário está instalado.".to_string(),
+    ]
+}
+
+/// A aula completa da opção "ensinar o comando agora" — como usar, o que o
+/// KIRA garante e o que fazer quando o binário não existe.
+pub fn rea_usage_lines() -> Vec<String> {
+    vec![
+        String::new(),
+        "Como usar o `kira rea`".to_string(),
+        "1. Instale o binário `rea` desta máquina (ele é um revisor de código externo ao KIRA)."
+            .to_string(),
+        "2. Rode `kira rea --help` para ver os argumentos do próprio rea — o KIRA não os"
+            .to_string(),
+        "   interpreta: tudo o que vem depois de `kira rea` é passado direto ao binário."
+            .to_string(),
+        "3. O que o KIRA garante em toda execução:".to_string(),
+        "   - o binário é RESOLVIDO antes de rodar: sem `rea` no PATH, você vê \"instale o rea\""
+            .to_string(),
+        "     e a dica de KIRA_REA_BIN — nunca uma execução às cegas;".to_string(),
+        "   - a saída sai sempre redigida (PAT/token/e-mail mascarados) e capada em 8 KiB;"
+            .to_string(),
+        "   - o rea falhou? Você vê \"a ferramenta rea falhou (exit N)\" com a primeira linha"
+            .to_string(),
+        "     do erro como dica — corpo cru nunca.".to_string(),
+        "4. Caminho alternativo: KIRA_REA_BIN=/caminho/do/rea (mesma convenção de".to_string(),
+        "   KIRA_SCAN_<TOOL>_BIN; o valor aponta o arquivo que roda, como veio).".to_string(),
+    ]
+}
+
+/// A pergunta teaching-only do rea: menu 1/2 com default "pular". Usa o
+/// [`ask_menu_choice`] da casa (inválida no máx. 2x ⇒ default com aviso,
+/// mesmo contrato do passo PAT). Nada aqui executa o rea nem grava estado.
+fn teach_rea(input: &mut dyn BufRead, output: &mut dyn Write) {
+    let _ = writeln!(output, "{}", rea_intro_lines().join("\n"));
+    let _ = output.flush();
+    let answer = ask_menu_choice(REA_MENU, &["1", "2"], "2", input, output);
+    if answer == "1" {
+        let _ = writeln!(output, "{}", rea_usage_lines().join("\n"));
+    } else {
+        let _ = writeln!(output, "ok — `kira rea --help` ensina quando quiser.");
+    }
+    let _ = output.flush();
+}
+
+/// Menu do passo rea: default é PULAR (2) — ensinar é oferta, não obrigação.
+pub const REA_MENU: &str = "Quer aprender a usar o `kira rea` agora?\n\
+     1) ensinar o comando agora\n\
+     2) pular\n";
 
 /// Menu do backend de IA (texto exato da spec; o default depende da máquina:
 /// com Ollama ausente, `4` — "nenhuma" — é o default; o caro nunca é
@@ -1574,6 +1656,71 @@ fn connect_secret_input(
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    // ------------------------------------------------------------------
+    // Passo rea (TE PR41, D11): teaching-only — nada grava, nada executa.
+    // ------------------------------------------------------------------
+    #[test]
+    fn rea_intro_and_usage_teach_without_promising_execution() {
+        let intro = rea_intro_lines().join("\n");
+        assert!(intro.contains("kira rea <args>"), "{intro}");
+        assert!(intro.contains("8 KiB"), "{intro}");
+        assert!(intro.contains("Se pular"), "{intro}");
+        let usage = rea_usage_lines().join("\n");
+        assert!(usage.contains("kira rea --help"), "{usage}");
+        assert!(usage.contains("KIRA_REA_BIN"), "{usage}");
+        assert!(usage.contains("instale o rea"), "{usage}");
+        // Ensinar nunca executa: nenhuma linha promete rodar o rea agora.
+        assert!(!usage.contains("rodando o rea"), "{usage}");
+    }
+
+    #[test]
+    fn rea_menu_default_is_skip() {
+        assert!(
+            REA_MENU.contains("1) ensinar o comando agora"),
+            "{REA_MENU}"
+        );
+        assert!(REA_MENU.contains("2) pular"), "{REA_MENU}");
+    }
+
+    #[test]
+    fn rea_question_option_1_prints_the_lesson_and_records_nothing() {
+        // stdin "1" = ensinar: a aula completa aparece e o output NÃO contém
+        // promessa de execução — e não existe gravação (a função não retorna
+        // estado: o único efeito é o texto).
+        let mut input = BufReader::new(std::io::Cursor::new("1\n"));
+        let mut output: Vec<u8> = Vec::new();
+        teach_rea(&mut input, &mut output);
+        let text = String::from_utf8_lossy(&output).to_string();
+        assert!(text.contains("Como usar o `kira rea`"), "{text}");
+        // Opt-out segue visível para quem chegou aqui por engano.
+        assert!(text.contains("2) pular"), "{text}");
+    }
+
+    #[test]
+    fn rea_question_default_skip_and_eof_skip() {
+        for stdin_text in ["\n", "", "3\n"] {
+            let mut input = BufReader::new(std::io::Cursor::new(stdin_text));
+            let mut output: Vec<u8> = Vec::new();
+            teach_rea(&mut input, &mut output);
+            let text = String::from_utf8_lossy(&output).to_string();
+            // Enter/EOF/opção inválida repetida ⇒ pular (default), nunca aula.
+            assert!(text.contains("kira rea --help"), "{text}");
+            assert!(!text.contains("Como usar o `kira rea`"), "{text}");
+        }
+    }
+
+    #[test]
+    fn rea_question_invalid_twice_falls_back_to_skip() {
+        // Duas respostas inválidas: o contrato do passo PAT — assume o
+        // default com aviso, nunca trava.
+        let mut input = BufReader::new(std::io::Cursor::new("9\n9\n"));
+        let mut output: Vec<u8> = Vec::new();
+        teach_rea(&mut input, &mut output);
+        let text = String::from_utf8_lossy(&output).to_string();
+        assert!(text.contains("resposta inválida"), "{text}");
+        assert!(text.contains("assumindo '2'"), "{text}");
+    }
 
     fn env_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |name: &str| {

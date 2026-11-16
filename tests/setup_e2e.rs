@@ -34,6 +34,14 @@ use kira::store::Store;
 /// Two visible projects for the happy path (usado só pelos testes de `--pat`).
 const PROJECTS_BODY: &str = r#"{"count":2,"value":[{"id":"a","name":"Kira","state":"wellFormed","visibility":"private"},{"id":"b","name":"Outro","state":"wellFormed","visibility":"private"}]}"#;
 
+/// O contrato local-first proíbe a CREDENCIAL PAT na saída do setup. A
+/// variável de ambiente `PATH` (citada de propósito pelo passo do rea, que
+/// ensina o `kira rea`) contém a substring "PAT" — removida antes da
+/// checagem para o assert medir credencial, não nome de env var.
+fn mentions_pat(out: &str) -> bool {
+    out.replace("PATH", "").contains("PAT")
+}
+
 /// Canned work item in the shape of the Azure DevOps REST API.
 const WORK_ITEM_BODY: &str = r#"{"id":4821,"url":"https://dev.azure.com/minha-org/_apis/wit/workItems/4821","fields":{"System.Title":"Sessão expirada com token válido","System.State":"Active","System.WorkItemType":"Bug","System.AreaPath":"Kira\\Backend","System.AssignedTo":{"displayName":"Maria Souza"},"System.Description":"<div>Usuário relata sessão expirada após 5 minutos.</div>"}}"#;
 
@@ -383,7 +391,7 @@ async fn setup_interactive_local_first_asks_name_project_and_ia_without_pat() {
     assert!(out.contains("próximo passo:   kira scan"), "{out}");
     // O setup local-first NUNCA fala de PAT (nem pergunta, nem ensina).
     assert!(
-        !out.contains("PAT"),
+        !mentions_pat(&out),
         "a palavra PAT não pode aparecer no fluxo interativo: {out}"
     );
     assert!(
@@ -668,7 +676,7 @@ async fn setup_yes_clean_env_prints_the_three_blocks_and_never_mentions_pat() {
     // CONTRATO CENTRAL do MVP-2: a palavra PAT NÃO aparece na saída do
     // setup não-interativo.
     assert!(
-        !out.contains("PAT"),
+        !mentions_pat(&out),
         "a palavra PAT não pode aparecer no setup --yes: {out}"
     );
     assert!(
@@ -713,7 +721,7 @@ async fn setup_yes_never_uses_a_pat_from_env_or_keyring() {
 
     assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
     assert!(
-        !out.contains("PAT"),
+        !mentions_pat(&out),
         "env com PAT não é usada nem mencionada pelo setup: {out}"
     );
     assert_eq!(
@@ -748,7 +756,7 @@ async fn setup_yes_never_uses_a_pat_from_env_or_keyring() {
 
     assert_eq!(code, ExitCode::SUCCESS, "saída: {out}");
     assert!(
-        !out.contains("PAT"),
+        !mentions_pat(&out),
         "keyring não é usado implicitamente: {out}"
     );
     assert!(!out.contains("Aa2xTOKENCOMPLETO"), "{out}");
@@ -2329,7 +2337,7 @@ async fn setup_uses_flags_and_env_before_prompting() {
         "não deve pedir projeto quando veio do env: {out}"
     );
     assert!(
-        !out.contains("PAT"),
+        !mentions_pat(&out),
         "o PAT da env não é usado nem mencionado: {out}"
     );
     assert_eq!(

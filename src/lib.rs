@@ -28,6 +28,7 @@ pub mod model;
 pub mod post;
 pub mod prdraft;
 pub mod publish;
+pub mod rea;
 pub mod redact;
 pub mod scan;
 pub mod setup;

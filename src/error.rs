@@ -97,6 +97,33 @@ pub enum Error {
     )]
     Api(#[from] serde_json::Error),
 
+    /// PR41: o binário `rea` (revisor externo) não existe nesta máquina —
+    /// nem o override `KIRA_REA_BIN` aponta para um arquivo, nem um `rea`
+    /// executável está no PATH. A resolução acontece ANTES de qualquer spawn
+    /// (padrão do scan): ausência nunca vira tentativa de execução.
+    #[error(
+        "o revisor `rea` não foi encontrado — instale o rea e confirme que o comando `rea` está no PATH, ou defina KIRA_REA_BIN com o caminho completo do binário (o KIRA nunca executa sem resolver antes)"
+    )]
+    ReaMissing,
+
+    /// PR41: o rea não pôde ser executado (permissão, formato do arquivo).
+    /// A mensagem aponta o que conferir — nunca o erro cru do OS.
+    #[error(
+        "não foi possível executar o rea: {source} — confira a permissão de execução do binário apontado por KIRA_REA_BIN (ou do `rea` no PATH) e rode kira rea de novo"
+    )]
+    ReaSpawn {
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// PR41: o rea rodou e saiu != 0. Compacto e acionável: no máximo a
+    /// PRIMEIRA linha de stderr (trimada, ≤200 chars) como dica — o corpo
+    /// cru da ferramenta nunca é exibido (mesma régua do scan).
+    #[error(
+        "a ferramenta rea falhou (exit {exit}) — rode o comando à mão para ver o erro completo{hint}"
+    )]
+    ReaFailed { exit: String, hint: String },
+
     /// A conferência de capacidades (ADR-0030) falhou ao ler o store local.
     /// Fail-closed (decisão 6 do ADR-0030): sem prova do estado, o comando de
     /// board não executa — o erro é do store, nunca uma tentativa de rede.
@@ -587,6 +614,20 @@ mod tests {
                 Error::Guard(crate::guard::path::GuardError::ParentTraversal {
                     candidate: "../escape.txt".to_string(),
                 }),
+            ),
+            ("ReaMissing", Error::ReaMissing),
+            (
+                "ReaSpawn",
+                Error::ReaSpawn {
+                    source: std::io::Error::other("permissão negada"),
+                },
+            ),
+            (
+                "ReaFailed",
+                Error::ReaFailed {
+                    exit: "1".to_string(),
+                    hint: " (dica: runtime inválido)".to_string(),
+                },
             ),
         ];
 
