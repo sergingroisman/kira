@@ -14,7 +14,7 @@ use crate::tui::state::{self, Snapshot};
 use crate::tui::theme::Palette;
 
 /// Rótulos das quatro fontes, na ordem do ciclo de `Tab`/`1–4`.
-pub const SCREEN_LABELS: [&str; 4] = ["Resumo", "Achados", "Sessões", "Wiki"];
+pub const SCREEN_LABELS: [&str; 5] = ["Resumo", "Achados", "Sessões", "Wiki", "Agenda"];
 
 /// Linha de status: projeto, dev, PAT mascarado, backend e idade do scan.
 pub fn status_line(snapshot: &Snapshot) -> String {
@@ -41,6 +41,7 @@ fn tab_text(snapshot: &Snapshot, index: usize) -> String {
         },
         2 => format!("3 Sessões {}", snapshot.session_rows.len()),
         3 => format!("4 Wiki {}", snapshot.wiki_rows.len()),
+        4 => format!("5 Agenda {}", snapshot.agenda_rows.len()),
         _ => "1 Resumo".to_string(),
     }
 }
