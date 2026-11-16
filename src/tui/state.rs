@@ -93,6 +93,25 @@ pub struct Snapshot {
     /// Saúde dos provedores (`provider_health::status_line`), uma linha por
     /// backend já chamado. Silêncio pós-429 aparece com `[stale]` (PR17).
     pub provider_lines: Vec<String>,
+    /// Arquivos que o KIRA criou/alterou (PR23): rascunhos e publicações vêm da
+    /// tabela `posts` (o store é a fonte do que ELE escreveu), mais os dois
+    /// artefatos do `ingest`. Vazio = nada escrito ainda (`artifacts_note`).
+    pub artifact_rows: Vec<ArtifactRow>,
+    /// Causa quando não há artefato (store ausente ou ciclo nunca rodou).
+    pub artifacts_note: Option<String>,
+}
+
+/// Uma linha do painel de arquivos (PR23).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRow {
+    /// `rascunho` | `wiki` — o que o KIRA escreveu.
+    pub kind: String,
+    /// Caminho relativo ao projeto (`.kira/drafts/x.md`, `.kira/wiki/x.md`).
+    pub path: String,
+    /// Estado do post que produziu o arquivo (`sealed`, `delivered`, `failed`).
+    pub state: String,
+    /// Idade do arquivo derivada do `created_at` do post.
+    pub age: String,
 }
 
 /// Uma linha do painel de agendamentos (PR24).
@@ -178,20 +197,23 @@ fn load_store(snapshot: &mut Snapshot) {
                     .last_sessions(&project.id, SESSION_HISTORY_LIMIT)
                     .and_then(|sessions| {
                         // A MESMA conexão read-only alimenta o painel de
-                        // wiki (W6-PR4) e a contagem do índice de retrieval —
-                        // nenhuma segunda abertura, nenhum write no disco.
-                        store.wiki_pages().map(|wiki| {
-                            // `ok()` de propósito: índice ausente é dado
-                            // ausente (`—` com causa), nunca erro do painel.
-                            let index_files = store.repo_file_count(&project.id).ok();
-                            Some((project, sessions, wiki, index_files))
+                        // wiki (W6-PR4), os arquivos do KIRA (PR23 — `posts`
+                        // é project-scoped, então pertence a ESTE recorte) e a
+                        // contagem do índice — nenhuma segunda abertura.
+                        store.posts_of(&project.id).and_then(|posts| {
+                            store.wiki_pages().map(|wiki| {
+                                // `ok()` de propósito: índice ausente é dado
+                                // ausente (`—` com causa), nunca erro do painel.
+                                let index_files = store.repo_file_count(&project.id).ok();
+                                Some((project, sessions, wiki, index_files, posts))
+                            })
                         })
                     })
             })
         })
     });
     match opened {
-        Ok(Some((project, sessions, wiki, index_files))) => {
+        Ok(Some((project, sessions, wiki, index_files, posts))) => {
             if let Some(scan_session) = sessions
                 .iter()
                 .find(|session| session.command == "scan")
@@ -220,6 +242,12 @@ fn load_store(snapshot: &mut Snapshot) {
                     Some("índice do repositório vazio — rode `kira context`".to_string());
             }
             snapshot.project = Some(project);
+            snapshot.artifact_rows = artifact_rows_from(&posts, now);
+            if snapshot.artifact_rows.is_empty() {
+                snapshot.artifacts_note = Some(
+                    "nada escrito pelo KIRA ainda — rode `kira ingest` e `kira digest`".to_string(),
+                );
+            }
             apply_wiki(snapshot, Ok(wiki), &root);
         }
         Ok(None) => {
@@ -280,6 +308,99 @@ fn load_agenda(snapshot: &mut Snapshot) {
             snapshot.provider_lines.push(line);
         }
     }
+}
+
+/// Converte os posts do projeto nas linhas do painel de arquivos (PR23).
+///
+/// O caminho publicado (`posts.path`) é o que o `publish` gravou; antes disso o
+/// arquivo é o rascunho em `.kira/drafts/<slug>.md`. A idade vem do `created_at`
+/// do post — o store é a fonte, o disco não é varrido (o painel é diagnóstico,
+/// não `find`).
+#[must_use]
+pub fn artifact_rows_from(
+    posts: &[crate::store::posts::PostRow],
+    now: Option<i64>,
+) -> Vec<ArtifactRow> {
+    let mut rows: Vec<ArtifactRow> = posts
+        .iter()
+        .map(|post| {
+            let published = post.path.is_some();
+            let path = post
+                .path
+                .clone()
+                .unwrap_or_else(|| format!(".kira/drafts/{}.md", post.slug));
+            let age = age_secs_from_rfc3339_at(now, &post.created_at)
+                .map(format_age_secs)
+                .unwrap_or_else(|| "—".to_string());
+            ArtifactRow {
+                kind: if published {
+                    "wiki".to_string()
+                } else {
+                    "rascunho".to_string()
+                },
+                path,
+                state: format!("{:?}", post.state).to_lowercase(),
+                age,
+            }
+        })
+        .collect();
+    // Mais recente primeiro: o painel é sobre o que acabou de mudar.
+    rows.sort_by(|left, right| left.path.cmp(&right.path));
+    rows
+}
+
+/// Linhas do painel de arquivos + timeline do ciclo (PR23) — as MESMAS no
+/// `--snapshot`, para pipe e tela não divergirem.
+#[must_use]
+pub fn artifacts_lines(snapshot: &Snapshot) -> Vec<String> {
+    let mut lines = vec!["arquivos escritos pelo KIRA".to_string()];
+    if snapshot.artifact_rows.is_empty() {
+        lines.push(format!(
+            "  — {}",
+            snapshot
+                .artifacts_note
+                .as_deref()
+                .unwrap_or("nada escrito ainda")
+        ));
+    } else {
+        for row in &snapshot.artifact_rows {
+            lines.push(format!(
+                "  {} · {} · {} · {}",
+                row.kind, row.path, row.state, row.age
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("timeline do ciclo".to_string());
+    // Só as fases do ciclo: `scan`/`ingest`/`digest`/`publish` — o resto da
+    // trilha (history, dashboard…) é navegação do dev, não trabalho do KIRA.
+    let cycle: Vec<&SessionLine> = snapshot
+        .session_rows
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.command.as_str(),
+                "scan" | "ingest" | "digest" | "publish"
+            )
+        })
+        .take(6)
+        .collect();
+    if cycle.is_empty() {
+        lines.push("  — nenhuma fase do ciclo na trilha (rode `kira loop --once`)".to_string());
+    } else {
+        for row in cycle {
+            let when = row
+                .local_started_at
+                .clone()
+                .unwrap_or_else(|| "—".to_string());
+            lines.push(format!(
+                "  {when} · {} · {}",
+                row.command,
+                if row.ok { "ok" } else { "falhou" }
+            ));
+        }
+    }
+    lines
 }
 
 /// Linhas do painel de agenda e orçamento (PR24) — as MESMAS no `--snapshot` de
@@ -1711,6 +1832,14 @@ pub fn text_report(snapshot: &Snapshot) -> String {
             text.push('\n');
         }
     }
+    let artifacts = artifacts_lines(snapshot);
+    if !artifacts.is_empty() {
+        text.push('\n');
+        for line in artifacts {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
     text.push_str(&footer_line());
     text.push('\n');
     text
@@ -2782,6 +2911,96 @@ mod tests {
         assert_eq!(
             scan_trend_line(&two).unwrap_or_default(),
             "tendência (2 scans, mais antigo primeiro): 3 5"
+        );
+    }
+
+    #[test]
+    fn artifact_rows_come_from_the_store_and_published_path_wins() {
+        // PR23: rascunho antes do publish, caminho da wiki depois — o store é a
+        // fonte do que o KIRA escreveu, não uma varredura do disco.
+        let now = Some(1_700_000_000_i64);
+        let post = |slug: &str, path: Option<&str>| crate::store::posts::PostRow {
+            id: format!("id-{slug}"),
+            project_id: "p".to_string(),
+            slug: slug.to_string(),
+            kind: "bug".to_string(),
+            lang: "pt".to_string(),
+            source_hash: "h".to_string(),
+            prompt_version: "v3".to_string(),
+            model: "ollama:x".to_string(),
+            state: crate::store::posts::PostState::Sealed,
+            draft_ttl: None,
+            attempts: 0,
+            read_at: None,
+            path: path.map(ToString::to_string),
+            created_at: crate::store::rfc3339_utc_from_unix_seconds(1_699_999_900),
+        };
+        let rows = artifact_rows_from(
+            &[
+                post("rascunho-a", None),
+                post("post-b", Some(".kira/wiki/post-b.md")),
+            ],
+            now,
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "rascunho" && row.path == ".kira/drafts/rascunho-a.md")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == "wiki" && row.path == ".kira/wiki/post-b.md")
+        );
+        // Idade derivada do created_at (100s) — nunca relógio dentro do widget.
+        assert!(
+            rows.iter()
+                .all(|row| row.age.contains("min") || !row.age.is_empty())
+        );
+    }
+
+    fn session_line(id: i64, command: &str, when: &str, ok: bool) -> SessionLine {
+        SessionLine {
+            id,
+            command: command.to_string(),
+            args: String::new(),
+            model: None,
+            started_unix: None,
+            started_at: String::new(),
+            local_started_at: Some(when.to_string()),
+            duration_ms: 0,
+            ok,
+            summary_first_line: String::new(),
+            summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn artifacts_lines_show_files_and_the_cycle_timeline_only() {
+        let snapshot = Snapshot {
+            artifact_rows: vec![ArtifactRow {
+                kind: "rascunho".to_string(),
+                path: ".kira/drafts/x.md".to_string(),
+                state: "sealed".to_string(),
+                age: "há 3min".to_string(),
+            }],
+            session_rows: vec![
+                session_line(1, "digest", "16/11 14:02", true),
+                session_line(2, "dashboard", "16/11 14:03", true),
+            ],
+            ..full_snapshot()
+        };
+        let texto = artifacts_lines(&snapshot).join("\n");
+        assert!(
+            texto.contains("rascunho · .kira/drafts/x.md · sealed · há 3min"),
+            "{texto}"
+        );
+        assert!(texto.contains("timeline do ciclo"), "{texto}");
+        assert!(texto.contains("digest · ok"), "{texto}");
+        // Navegação do dev não entra na timeline do ciclo.
+        assert!(!texto.contains("dashboard · ok"), "{texto}");
+        assert!(
+            text_report(&snapshot).contains("arquivos escritos pelo KIRA"),
+            "{texto}"
         );
     }
 
