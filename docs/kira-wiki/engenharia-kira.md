@@ -207,15 +207,22 @@ credencial — a matriz de capacidades é contrato de teste
 ## Ferramentas resolvidas no PATH, nunca classificadas por texto
 
 O binário spawna ferramentas externas (`dotnet`, `npm`/`pnpm`, `copilot`,
-`ollama`) sempre pelo caminho resolvido `which`-style (`src/binresolve.rs`):
+`ollama`, `rea`) sempre pelo caminho resolvido `which`-style (`src/binresolve.rs`):
 Windows é `PATH × PATHEXT` (case-insensitive como o NTFS), Unix é bit de
 execução. Ausente ⇒ "instale o X" **sem spawn** — nenhuma mensagem localizada
 do OS é interpretada (o cmd é localizado e pode chegar em mojibake).
 `.cmd`/`.bat` no Windows passam por wrapper `cmd /C` com `chcp 65001` (mantém
 o stderr da ferramenta legível). Override por env (`KIRA_SCAN_*_BIN`,
-`KIRA_COPILOT_BIN`, `KIRA_MODEL_OLLAMA_BIN`): valor presente é contrato do
-usuário — inexistente cai no mesmo "instale o X". Ferramenta ausente e
-ferramenta que falhou são erros distintos.
+`KIRA_COPILOT_BIN`, `KIRA_MODEL_OLLAMA_BIN`, `KIRA_REA_BIN`): valor presente é
+contrato do usuário — inexistente cai no mesmo "instale o X". Ferramenta
+ausente e ferramenta que falhou são erros distintos.
+
+O `kira rea` é o caso onde a regra é visível no output: a ferramenta imprime o
+que quiser (é dado não-confiável), então o wrapper redige linha a linha e corta
+a saída num teto de **8 KiB** (`OUTPUT_CAP_BYTES`, em char boundary — acento e
+emoji nunca partido no meio) com marcador explícito de truncamento; falha vira
+`a ferramenta rea falhou (exit N)` + primeira linha de stderr como dica, nunca
+o corpo cru.
 
 ## O doctor como espelho da verdade
 
@@ -241,6 +248,7 @@ credencial é assunto de `kira connect`. Com 429 acumulado, mostra a idade do
 | `KIRA_STORE_DIR` | sobrescreve o diretório do store (testes/portáveis) |
 | `KIRA_INDEX_MAX_FILES` | teto do índice de retrieval (default 5000) |
 | `KIRA_MAX_LLM_CALLS_PER_DAY` | teto diário de chamadas de LLM |
+| `KIRA_REA_BIN` | caminho do binário `rea` (mesma convenção de `KIRA_SCAN_*_BIN`) |
 | `KIRA_FOUNDRY_*` | endpoint, deployment, chave e tuning do backend BYOK |
 
 Envs novas só entram com justificativa no PR — regra do AGENTS.md.
@@ -249,5 +257,5 @@ Envs novas só entram com justificativa no PR — regra do AGENTS.md.
 
 `inspect`, `doctor`, `triage`, `setup`, `connect`, `scan`, `ingest`, `trust`,
 `digest`, `publish`, `skills`, `model`, `context`, `dashboard`, `loop`,
-`history`, `note`, `profile`, `wiki`, `pr draft`. Cada um com o contrato
+`history`, `note`, `profile`, `wiki`, `rea`, `pr draft`. Cada um com o contrato
 detalhado no README do repo; a jornada de uso está em [[getting-started]].
