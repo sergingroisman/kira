@@ -146,6 +146,14 @@ pub enum Error {
     )]
     ScheduleNotFound { id: i64 },
 
+    /// PR19: o relógio do sistema não pôde ser lido, então uma janela de tempo
+    /// (auditoria) não pode ser calculada. Melhor dizer do que escolher uma
+    /// janela inventada.
+    #[error(
+        "não foi possível ler o relógio do sistema — sem data confiável não há janela de auditoria; rode de novo ou confira o relógio da máquina"
+    )]
+    ClockUnreadable,
+
     /// PR17: o backend está em silêncio depois de um 429 (watchdog 2 da spec
     /// W5). Não é falha do KIRA nem do item: é quota do provedor, com o tempo
     /// que falta na mensagem.

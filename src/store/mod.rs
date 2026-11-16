@@ -736,6 +736,88 @@ impl Store {
         }
     }
 
+    /// PR19 (`kira audit`): sessões desde `since` (RFC-3339 UTC), agregadas por
+    /// comando — `(comando, total, ok, soma_duration_ms)`, mais usado primeiro.
+    pub fn sessions_since(
+        &self,
+        since: &str,
+    ) -> Result<Vec<(String, usize, usize, i64)>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT command, COUNT(*), SUM(ok), SUM(duration_ms) FROM sessions \
+             WHERE started_at >= ?1 GROUP BY command ORDER BY COUNT(*) DESC, command",
+        )?;
+        let rows = statement
+            .query_map(rusqlite::params![since], |row| {
+                let total: i64 = row.get(1)?;
+                let ok: i64 = row.get(2)?;
+                let duration: i64 = row.get(3)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    usize::try_from(total).unwrap_or(0),
+                    usize::try_from(ok).unwrap_or(0),
+                    duration,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// PR19: quantas chamadas de LLM desde `since` (o mesmo ledger do `doctor`,
+    /// com janela em vez de "hoje").
+    pub fn llm_calls_since(&self, since: &str) -> Result<usize, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM llm_calls WHERE at >= ?1",
+                [since],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
+            .map_err(StoreError::from)
+    }
+
+    /// PR19: a fila de posts por estado — a foto do que espera, saiu ou falhou.
+    pub fn post_state_counts(&self) -> Result<Vec<(String, usize)>, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT state, COUNT(*) FROM posts GROUP BY state ORDER BY state")?;
+        let rows = statement
+            .query_map([], |row| {
+                let count: i64 = row.get(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    usize::try_from(count).unwrap_or(0),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// PR19: economia medida no período (PR34) — tokens estimados, chamadas,
+    /// pack vs teto. `(tokens, chamadas, pack_chars, budget_chars)`.
+    pub fn economy_since(&self, since: &str) -> Result<(u64, usize, u64, u64), StoreError> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(e.tokens_est), 0), COALESCE(SUM(e.llm_calls), 0), \
+                        COALESCE(SUM(e.pack_chars), 0), COALESCE(SUM(e.budget_chars), 0) \
+                 FROM session_economy e JOIN sessions s ON s.id = e.session_id \
+                 WHERE s.started_at >= ?1",
+                [since],
+                |row| {
+                    let tokens: i64 = row.get(0)?;
+                    let calls: i64 = row.get(1)?;
+                    let pack: i64 = row.get(2)?;
+                    let budget: i64 = row.get(3)?;
+                    Ok((
+                        u64::try_from(tokens).unwrap_or(0),
+                        usize::try_from(calls).unwrap_or(0),
+                        u64::try_from(pack).unwrap_or(0),
+                        u64::try_from(budget).unwrap_or(0),
+                    ))
+                },
+            )
+            .map_err(StoreError::from)
+    }
+
     /// Records one judgment call (triage/digest/eval). `tokens_est` is an
     /// estimate (3 chars/token) — a ledger number, not billing.
     pub fn record_llm_call(

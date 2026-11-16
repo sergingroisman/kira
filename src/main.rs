@@ -374,6 +374,16 @@ enum Command {
         #[arg(long)]
         by: Option<String>,
     },
+    /// Exame de rotina do ciclo (F2, PR19): sessões, fila de posts, aprovações
+    /// e orçamento na janela — leitura pura do store, sem LLM e sem rede.
+    #[command(
+        after_help = "Exemplos:\n  kira audit                     # últimos 7 dias (padrão)\n  kira audit --days 30           # janela maior\n\nSó lê o store: nada é publicado (o blog saiu do escopo)."
+    )]
+    Audit {
+        /// Janela em dias (default 7, o "weekly")
+        #[arg(long)]
+        days: Option<i64>,
+    },
     /// Lista os pedidos de escrita no mundo (default: só os pendentes)
     Approvals {
         /// Mostra também os já decididos
@@ -737,6 +747,7 @@ async fn run(command: Command) -> Outcome {
         Command::Schedule { action } => schedule_command(action),
         Command::Approve { id, reject, by } => approve_command(id, reject, by.as_deref()),
         Command::Approvals { all } => approvals_command(all),
+        Command::Audit { days } => audit_command(days),
         Command::Ingest {
             path,
             json,
@@ -1119,6 +1130,13 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                     .map(|who| format!(" by={who}"))
                     .unwrap_or_default()
             ),
+            None,
+        ),
+        Command::Audit { days } => (
+            "audit".to_string(),
+            days.as_ref()
+                .map(|d| format!("--days {d}"))
+                .unwrap_or_default(),
             None,
         ),
         Command::Approvals { all } => (
@@ -1865,6 +1883,26 @@ fn approve_command(id: i64, reject: bool, by: Option<&str>) -> Outcome {
             if reject { "recusado" } else { "aprovado" },
             who
         ))
+    })();
+    match result {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// Relatório do período (`kira audit`): leitura pura do store.
+fn audit_command(days: Option<i64>) -> Outcome {
+    let result = (|| -> Result<String, kira::error::Error> {
+        let store = kira::store::Store::open_default()?;
+        let window = days.unwrap_or(kira::audit::DEFAULT_WINDOW_DAYS);
+        let audit = kira::audit::collect_now(&store, window)?;
+        Ok(kira::audit::render(&audit))
     })();
     match result {
         Ok(text) => {
