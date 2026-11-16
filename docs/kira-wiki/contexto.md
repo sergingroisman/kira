@@ -60,7 +60,7 @@ A autonomia do KIRA é uma escada, e cada degrau tem custo declarado:
 | loop | o ciclo que repete sozinho | `kira loop` (PR15) |
 | graph | grafo de estados do orquestrador interno | `brain` (desenhado, `src/brain/`) |
 | harness | guarda com piso + veredito tipado | proposta (PR44–51) |
-| system design | o **conhecimento de projeto** que o KIRA acumula e devolve ao modelo: wiki interna, decisões, padrões, skills e knowledge. Ele nasce das respostas do LLM (digest/triage), é promovido com gate humano e **volta para dentro do prompt**, enviesando a próxima resposta para o modelo delirar menos | `.kira/` — `.kira/wiki/` + `.kira/skills/` + knowledge entram no context packer (`skills → knowledge → wiki → repo`); é o degrau que faz o KIRA ficar mais preciso a cada rodada. Esta página do GitHub é a explicação HUMANA do projeto, não o degrau |
+| system design | o conhecimento que o próprio KIRA **emite e mantém no projeto**: wiki interna, decisões, padrões, skills — tudo gerado a partir das respostas do LLM e promovido com gate humano | `.kira/` (`.kira/wiki/`, drafts do `digest`, posts) — esta página é a explicação HUMANA do projeto, não o degrau |
 
 ## Onde o KIRA está hoje
 

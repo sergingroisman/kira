@@ -15,7 +15,7 @@ faz hoje.
 | loop | "repita sem que eu peça" | `kira loop` (PR15) |
 | graph | "vá além do loop com estados" | `brain` (orquestrador interno, desenhado — `kira-brain.md`) |
 | harness | "não faça o que não pode" | piso de guardas proposto (PR44–51, ADR-0027) |
-| system design | "tudo isso junto é um produto" | o conhecimento de projeto que o KIRA gera e REINJETA: `.kira/wiki/`, skills e knowledge entram no context packer e enviesam o modelo para delirar menos — saída de julgamento do LLM, promovida com gate humano (esta página do GitHub é a explicação do projeto, não o degrau) |
+| system design | "tudo isso junto é um produto" | os artefatos que o KIRA gera dentro do projeto e mantém sozinho: `.kira/wiki/` (wiki interna), decisões, padrões, skills e posts — saída de julgamento do LLM, promovida com `kira wiki promote` (esta página do GitHub é a explicação do projeto, não o degrau) |
 
 ## O turno do binário: `kira loop`
 

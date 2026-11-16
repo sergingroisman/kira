@@ -45,9 +45,7 @@ pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 /// sem daemon: o próximo tick é derivado, nunca gravado.
 /// v16 (F2, PR18): `approvals` — o círculo de aprovação humana: toda escrita
 /// no mundo passa por um pedido `pending` que só `kira approve` resolve.
-/// v17 (F2, PR17): `provider_state` — silêncio de 5 min após 429 e o último
-/// sucesso por backend (a base do `stale-ok`).
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -164,19 +162,6 @@ pub struct ApprovalRow {
     pub created_at: String,
     pub decided_at: Option<String>,
     pub decided_by: Option<String>,
-}
-
-/// One row of `provider_state` (schema v17, PR17): saúde de UM backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderState {
-    pub backend: String,
-    /// Fim do silêncio pós-429 (RFC-3339 UTC); `None` = pode chamar.
-    pub cooldown_until: Option<String>,
-    /// Último sucesso — o que o `doctor` marca `stale` quando o provedor cala.
-    pub last_ok_at: Option<String>,
-    /// Último erro (redigido), para o humano saber o que aconteceu.
-    pub last_error: Option<String>,
-    pub consecutive_failures: i64,
 }
 
 impl Store {
@@ -685,55 +670,6 @@ impl Store {
             rusqlite::params![id, state, now_rfc3339_utc(), by],
         )?;
         Ok(updated > 0)
-    }
-
-    /// Registra um sucesso do backend: limpa o silêncio, zera a sequência de
-    /// falhas e marca o horário do último resultado bom.
-    pub fn record_provider_success(&self, backend: &str, at: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO provider_state (backend, cooldown_until, last_ok_at, last_error, consecutive_failures) \
-             VALUES (?1, NULL, ?2, NULL, 0) \
-             ON CONFLICT(backend) DO UPDATE SET cooldown_until = NULL, last_ok_at = ?2, last_error = NULL, consecutive_failures = 0",
-            rusqlite::params![backend, at],
-        )?;
-        Ok(())
-    }
-
-    /// Abre (ou estende) o silêncio do backend e conta a falha.
-    pub fn record_provider_cooldown(
-        &self,
-        backend: &str,
-        until: &str,
-        error: &str,
-    ) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO provider_state (backend, cooldown_until, last_ok_at, last_error, consecutive_failures) \
-             VALUES (?1, ?2, NULL, ?3, 1) \
-             ON CONFLICT(backend) DO UPDATE SET cooldown_until = ?2, last_error = ?3, consecutive_failures = consecutive_failures + 1",
-            rusqlite::params![backend, until, error],
-        )?;
-        Ok(())
-    }
-
-    /// Lê a saúde de um backend. `None` = nunca chamado (nem sucesso, nem 429).
-    pub fn provider_state(&self, backend: &str) -> Result<Option<ProviderState>, StoreError> {
-        let mut statement = self.conn.prepare(
-            "SELECT backend, cooldown_until, last_ok_at, last_error, consecutive_failures \
-             FROM provider_state WHERE backend = ?1",
-        )?;
-        let mut rows = statement.query_map(rusqlite::params![backend], |row| {
-            Ok(ProviderState {
-                backend: row.get(0)?,
-                cooldown_until: row.get(1)?,
-                last_ok_at: row.get(2)?,
-                last_error: row.get(3)?,
-                consecutive_failures: row.get(4)?,
-            })
-        })?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
-        }
     }
 
     /// Records one judgment call (triage/digest/eval). `tokens_est` is an
@@ -1716,23 +1652,6 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
                 created_at TEXT NOT NULL,
                 decided_at TEXT,
                 decided_by TEXT
-            );",
-        )
-        .map_err(schema_error)?;
-    }
-
-    // v17 — F2, PR17: saúde do provedor por backend. `cooldown_until` é o
-    // silêncio pós-429 (o watchdog 2 da spec W5) e `last_ok_at` é a base do
-    // `stale-ok`: quando o provedor está em silêncio, o dado antigo continua
-    // VISÍVEL e marcado, em vez de virar erro ou desaparecer.
-    if current < 17 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS provider_state (
-                backend TEXT PRIMARY KEY,
-                cooldown_until TEXT,
-                last_ok_at TEXT,
-                last_error TEXT,
-                consecutive_failures INTEGER NOT NULL DEFAULT 0
             );",
         )
         .map_err(schema_error)?;

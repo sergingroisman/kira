@@ -28,7 +28,6 @@ pub mod r#loop;
 pub mod model;
 pub mod post;
 pub mod prdraft;
-pub mod provider_health;
 pub mod publish;
 pub mod rea;
 pub mod redact;

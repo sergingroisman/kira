@@ -146,14 +146,6 @@ pub enum Error {
     )]
     ScheduleNotFound { id: i64 },
 
-    /// PR17: o backend está em silêncio depois de um 429 (watchdog 2 da spec
-    /// W5). Não é falha do KIRA nem do item: é quota do provedor, com o tempo
-    /// que falta na mensagem.
-    #[error(
-        "{0} — nada foi chamado; rode de novo quando o silêncio acabar ou use outro backend (`--llm`)"
-    )]
-    LlmSilenced(String),
-
     /// PR18: pedido de aprovação inexistente. Fail-closed: id errado nunca
     /// vira "aprovado" por omissão.
     #[error("não há pedido de aprovação com id {id} — rode `kira approvals` para ver os pendentes")]

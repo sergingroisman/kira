@@ -131,35 +131,6 @@ pub fn format_llm_lines() -> Vec<String> {
     }
 }
 
-/// PR17 (watchdog 2): saúde de cada backend — silêncio pós-429 e a idade do
-/// último sucesso. É o `stale-ok` visível: provedor calado aparece com
-/// `[stale]` em vez de sumir do relatório. Fail-open: sem store, uma linha
-/// explica a ausência em vez de inventar estado.
-#[must_use]
-pub fn format_provider_lines() -> Vec<String> {
-    let Ok(store) = crate::store::Store::open_default() else {
-        return vec!["provedores: — (store indisponível)".to_string()];
-    };
-    let now = crate::scheduler::parse_unix_seconds(&crate::store::now_rfc3339_utc()).unwrap_or(0);
-    let mut lines = Vec::new();
-    for backend in ["ollama", "copilot", "foundry"] {
-        match store.provider_state(backend) {
-            Ok(state) => {
-                if let Some(line) = crate::provider_health::status_line(state.as_ref(), now) {
-                    lines.push(format!("provedor {line}"));
-                }
-            }
-            Err(_) => lines.push(format!("provedor {backend}: — (estado ilegível)")),
-        }
-    }
-    if lines.is_empty() {
-        lines.push(
-            "provedores: nenhum chamado ainda (sem 429 e sem sucesso registrado)".to_string(),
-        );
-    }
-    lines
-}
-
 /// OC-1: linhas de egresso do Ollama no `doctor` — URL não-local ou tag
 /// `*:cloud` no routing significam que o prompt SAI da máquina. Aviso, não
 /// erro. A chave NUNCA aparece em valor: só a ORIGEM (env/keyring) — o mesmo
@@ -552,12 +523,6 @@ pub async fn run() -> (bool, String) {
     // P0 (auditoria F2): o contador de chamadas de LLM do mandato — o número
     // que o dono precisa ver antes do teto cortar o ciclo em silêncio.
     for line in format_llm_lines() {
-        emit(&mut out, &line);
-    }
-
-    // PR17 (watchdog 2): saúde dos provedores — 429 recente aparece aqui com o
-    // silêncio restante; é o que explica um ciclo que "não chamou nada".
-    for line in format_provider_lines() {
         emit(&mut out, &line);
     }
 

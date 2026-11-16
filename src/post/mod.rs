@@ -326,20 +326,6 @@ pub async fn run<B: LlmBackend>(
         // ADR-0038 confina a chamada a este módulo, atrás de trust e de orçamento.
         // A tag vem do routing de especialistas (HF-5); a fábrica constrói o
         // backend com ela — o modelo continua sendo decisão deste módulo.
-        // PR17 (watchdog 2 da spec W5): backend em silêncio pós-429 não é
-        // chamado. O ciclo ADIA a fase (nota) em vez de insistir — insistir em
-        // 429 gasta tentativa e piora a fila do provedor.
-        match crate::llm::quota::silence_reason(&store, &claimed.kind) {
-            Ok(Some(reason)) => {
-                report.notes.push(reason);
-                break;
-            }
-            Ok(None) => {}
-            // Estado ilegível não pode travar o digest: avisa e segue.
-            Err(err) => report
-                .notes
-                .push(format!("saúde do provedor ilegível ({err}); seguindo")),
-        }
         let backend = build_backend(&claimed.kind, &tag);
         let answer = backend.complete(&system, &prompt).await;
 
@@ -360,13 +346,6 @@ pub async fn run<B: LlmBackend>(
 
         match answer {
             Ok(text) if !text.trim().is_empty() => {
-                // PR17: sucesso limpa o silêncio e marca o último resultado bom
-                // (é dele que o `doctor` tira o "stale" quando o provedor cala).
-                if let Err(err) = crate::llm::quota::record_success(&store, &claimed.kind) {
-                    report
-                        .notes
-                        .push(format!("saúde do provedor não registrada ({err})"));
-                }
                 report.tokens_used = report
                     .tokens_used
                     .saturating_add(estimate_tokens(&prompt, &text));
@@ -420,25 +399,6 @@ pub async fn run<B: LlmBackend>(
                 ));
             }
             Err(err) => {
-                // PR17: 429 abre (ou estende) o silêncio do backend — 5 min ou
-                // o `retry-after` do servidor, o que for maior.
-                if crate::llm::quota::is_rate_limited(&err) {
-                    match crate::llm::quota::record_rate_limit(
-                        &store,
-                        &claimed.kind,
-                        None,
-                        &err.to_string(),
-                    ) {
-                        Ok(seconds) => report.notes.push(format!(
-                            "429 do backend `{}`: silêncio de {} min",
-                            claimed.kind,
-                            (seconds + 59) / 60
-                        )),
-                        Err(store_err) => report
-                            .notes
-                            .push(format!("429 não registrado no store ({store_err})")),
-                    }
-                }
                 let state = store.post_fail(&claimed.id).unwrap_or(PostState::Sealed);
                 report.failed += 1;
                 report.notes.push(format!(
@@ -637,24 +597,11 @@ pub fn guard_draft(text: &str) -> Result<(), DraftViolation> {
     Ok(())
 }
 
-/// Escreve o rascunho de forma ATÔMICA (PR17): temp no MESMO diretório +
-/// `rename`. Um crash/energia no meio da escrita deixa o arquivo anterior
-/// intacto em vez de um rascunho pela metade — e o `publish` nunca lê um corpo
-/// truncado. O `rename` é atômico dentro do mesmo sistema de arquivos, por isso
-/// o temp nasce ao lado do destino (não em `/tmp`, que pode ser outro fs).
 fn write_text(path: &Path, body: &str) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temp, body)?;
-    match std::fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(err)
-        }
-    }
+    std::fs::write(path, body)
 }
 
 fn relative(root: &Path, path: &Path) -> String {
