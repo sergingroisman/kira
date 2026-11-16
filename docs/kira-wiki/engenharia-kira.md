@@ -224,6 +224,13 @@ possa discordar do primeiro. `kira loop --scheduled` roda só as fases vencidas;
 fase sem cadência declarada continua no default do ciclo (agendar restringe, não
 desliga) e um agendamento desligado impede a fase de rodar.
 
+O **círculo de aprovação** (PR18) é a outra ponta da mesma régua: escrita no
+mundo (board, repo do projeto, publicação remota) nasce como pedido `pending` na
+tabela `approvals` (schema v16) e só `kira approve <id>` a destrava. A guarda
+(`approvals::require_approved`) é **fail-closed** — id inexistente, `pending` e
+`rejected` devolvem erro acionável — e confere **ação + alvo**, então uma
+aprovação nunca cobre a escrita seguinte. O resumo gravado passa por `redact`.
+
 O `kira rea` é o caso onde a regra é visível no output: a ferramenta imprime o
 que quiser (é dado não-confiável), então o wrapper redige linha a linha e corta
 a saída num teto de **8 KiB** (`OUTPUT_CAP_BYTES`, em char boundary — acento e
@@ -264,5 +271,5 @@ Envs novas só entram com justificativa no PR — regra do AGENTS.md.
 
 `inspect`, `doctor`, `triage`, `setup`, `connect`, `scan`, `ingest`, `trust`,
 `digest`, `publish`, `skills`, `model`, `context`, `dashboard`, `loop`,
-`history`, `note`, `profile`, `wiki`, `rea`, `schedule`, `pr draft`. Cada um com o contrato
+`history`, `note`, `profile`, `wiki`, `rea`, `schedule`, `approve`, `approvals`, `pr draft`. Cada um com o contrato
 detalhado no README do repo; a jornada de uso está em [[getting-started]].
