@@ -82,6 +82,30 @@ pub struct Snapshot {
     pub index_cap: usize,
     /// Causa quando o índice não pôde ser contado.
     pub index_note: Option<String>,
+    /// Agendamentos do ciclo (PR24): cadência + próximo tick DERIVADO, lidos de
+    /// `schedule` (schema v15). Vazio = nenhum declarado (`agenda_note` diz).
+    pub agenda_rows: Vec<AgendaRow>,
+    /// Causa quando não há agendamento declarado (ou o store não abriu).
+    pub agenda_note: Option<String>,
+    /// Chamadas de LLM hoje e o teto do dia — o "gauge" do painel (PR24).
+    pub llm_today: Option<usize>,
+    pub llm_max: usize,
+    /// Saúde dos provedores (`provider_health::status_line`), uma linha por
+    /// backend já chamado. Silêncio pós-429 aparece com `[stale]` (PR17).
+    pub provider_lines: Vec<String>,
+}
+
+/// Uma linha do painel de agendamentos (PR24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgendaRow {
+    pub id: i64,
+    /// `scan` | `digest` | `publish`.
+    pub action: String,
+    /// Cadência em texto humano (`30m`, `2h`).
+    pub every: String,
+    /// Próximo tick DERIVADO (`em 12m`, `vencido`, `desligado`) — nunca gravado.
+    pub next: String,
+    pub enabled: bool,
 }
 
 /// Constante exibida como backend LLM default.
@@ -107,6 +131,10 @@ pub fn load() -> Snapshot {
     load_dev_name(&mut snapshot);
     load_pat(&mut snapshot);
     load_findings(&mut snapshot);
+    // PR24: agendamentos e quota são GLOBAIS (não têm `project_id`), então não
+    // entram no recorte por projeto do `load_store` — abrir read-only de novo
+    // aqui mantém o invariante "uma abertura por recorte" intacto.
+    load_agenda(&mut snapshot);
     snapshot
 }
 
@@ -206,6 +234,112 @@ fn load_store(snapshot: &mut Snapshot) {
             ));
         }
     }
+}
+
+/// Agendamentos (`schedule`), quota do dia (`llm_calls`) e saúde dos provedores
+/// — painel de agenda e orçamento (PR24). Leitura pura: tudo vira nota em erro.
+fn load_agenda(snapshot: &mut Snapshot) {
+    snapshot.llm_max = credentials::max_llm_calls_per_day();
+    let Some(db) = store::db_path() else {
+        snapshot.agenda_note = Some("sem diretório para o store".to_string());
+        return;
+    };
+    if !db.exists() {
+        snapshot.agenda_note = Some("store ainda não existe — rode `kira doctor`".to_string());
+        return;
+    }
+    let Ok(store) = Store::open_readonly_at(&db) else {
+        snapshot.agenda_note = Some(format!("store ilegível em {}", store::display_path(&db)));
+        return;
+    };
+    let now = snapshot.now_secs.unwrap_or(0);
+    match store.list_schedules() {
+        Ok(rows) if rows.is_empty() => {
+            snapshot.agenda_note =
+                Some("nenhum agendamento — crie com `kira schedule add`".to_string());
+        }
+        Ok(rows) => {
+            snapshot.agenda_rows = rows
+                .iter()
+                .map(|row| AgendaRow {
+                    id: row.id,
+                    action: row.action.clone(),
+                    every: crate::scheduler::format_every(row.every_seconds),
+                    next: crate::scheduler::next_run_text(row, now),
+                    enabled: row.enabled,
+                })
+                .collect();
+        }
+        Err(err) => snapshot.agenda_note = Some(format!("agendamentos ilegíveis ({err})")),
+    }
+    snapshot.llm_today = store.llm_calls_today().ok();
+    for backend in ["ollama", "copilot", "foundry"] {
+        if let Ok(state) = store.provider_state(backend)
+            && let Some(line) = crate::provider_health::status_line(state.as_ref(), now)
+        {
+            snapshot.provider_lines.push(line);
+        }
+    }
+}
+
+/// Linhas do painel de agenda e orçamento (PR24) — as MESMAS no `--snapshot` de
+/// texto e na tela, então número de pipe e número de tela nunca divergem.
+#[must_use]
+pub fn agenda_lines(snapshot: &Snapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("agendamentos".to_string());
+    if snapshot.agenda_rows.is_empty() {
+        lines.push(format!(
+            "  — {}",
+            snapshot
+                .agenda_note
+                .as_deref()
+                .unwrap_or("nenhum agendamento declarado")
+        ));
+    } else {
+        for row in &snapshot.agenda_rows {
+            // Desligado não repete "desligado" duas vezes: o estado já é o dado.
+            if row.enabled {
+                lines.push(format!(
+                    "  id {} · {} · a cada {} · {} · ativo",
+                    row.id, row.action, row.every, row.next
+                ));
+            } else {
+                lines.push(format!(
+                    "  id {} · {} · a cada {} · desligado",
+                    row.id, row.action, row.every
+                ));
+            }
+        }
+    }
+    lines.push(String::new());
+    lines.push("orçamento do dia".to_string());
+    match snapshot.llm_today {
+        Some(today) => {
+            // `checked_div`: teto 0 não é divisão por zero, é ausência de teto.
+            let pct = today
+                .saturating_mul(100)
+                .checked_div(snapshot.llm_max)
+                .unwrap_or(0)
+                .min(100);
+            lines.push(format!(
+                "  chamadas LLM: {today}/{} ({pct}%)",
+                snapshot.llm_max
+            ));
+        }
+        None => lines.push(format!(
+            "  chamadas LLM: — (sem leitura; teto {})",
+            snapshot.llm_max
+        )),
+    }
+    if !snapshot.provider_lines.is_empty() {
+        lines.push(String::new());
+        lines.push("provedores".to_string());
+        for line in &snapshot.provider_lines {
+            lines.push(format!("  {line}"));
+        }
+    }
+    lines
 }
 
 /// `dev_name` no config (opcional, escrita futura do `kira setup`).
@@ -1568,6 +1702,15 @@ pub fn text_report(snapshot: &Snapshot) -> String {
             text.push('\n');
         }
     }
+    // Painel de agenda e orçamento (PR24): mesmas linhas do painel da TUI.
+    let agenda = agenda_lines(snapshot);
+    if !agenda.is_empty() {
+        text.push('\n');
+        for line in agenda {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
     text.push_str(&footer_line());
     text.push('\n');
     text
@@ -2639,6 +2782,63 @@ mod tests {
         assert_eq!(
             scan_trend_line(&two).unwrap_or_default(),
             "tendência (2 scans, mais antigo primeiro): 3 5"
+        );
+    }
+
+    #[test]
+    fn agenda_lines_show_cadence_next_tick_and_the_daily_budget() {
+        // PR24: o painel lê o que o `kira schedule` gravou e o teto do dia.
+        let snapshot = Snapshot {
+            agenda_rows: vec![
+                AgendaRow {
+                    id: 1,
+                    action: "digest".to_string(),
+                    every: "2h".to_string(),
+                    next: "vencido (nunca rodou)".to_string(),
+                    enabled: true,
+                },
+                AgendaRow {
+                    id: 2,
+                    action: "scan".to_string(),
+                    every: "30m".to_string(),
+                    next: "desligado".to_string(),
+                    enabled: false,
+                },
+            ],
+            llm_today: Some(12),
+            llm_max: 50,
+            ..full_snapshot()
+        };
+        let texto = agenda_lines(&snapshot).join("\n");
+        assert!(
+            texto.contains("id 1 · digest · a cada 2h · vencido (nunca rodou) · ativo"),
+            "{texto}"
+        );
+        assert!(
+            texto.contains("id 2 · scan · a cada 30m · desligado"),
+            "{texto}"
+        );
+        assert!(!texto.contains("desligado · desligado"), "{texto}");
+        assert!(texto.contains("chamadas LLM: 12/50 (24%)"), "{texto}");
+        // E aparece no `--snapshot` de texto (a saída canônica de CI/pipe).
+        assert!(text_report(&snapshot).contains("agendamentos"), "{texto}");
+    }
+
+    #[test]
+    fn agenda_without_schedules_says_why_instead_of_faking_rows() {
+        let snapshot = Snapshot {
+            agenda_rows: Vec::new(),
+            agenda_note: Some("nenhum agendamento — crie com `kira schedule add`".to_string()),
+            llm_today: None,
+            llm_max: 50,
+            ..full_snapshot()
+        };
+        let texto = agenda_lines(&snapshot).join("\n");
+        assert!(texto.contains("crie com `kira schedule add`"), "{texto}");
+        // Sem leitura do ledger: `—` com a causa, nunca "0/50" inventado.
+        assert!(
+            texto.contains("chamadas LLM: — (sem leitura; teto 50)"),
+            "{texto}"
         );
     }
 
