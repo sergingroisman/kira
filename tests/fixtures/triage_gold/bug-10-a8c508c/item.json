@@ -1,0 +1,11 @@
+{
+  "id": 900110,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900110,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 10 — comando com quebra de linha quebra o spawn no Windows",
+    "System.State": "Closed",
+    "System.Description": "<div>Um prompt com aspas ou quebras de linha faz o cmd.exe interpretar partes como comandos separados.</div>"
+  }
+}

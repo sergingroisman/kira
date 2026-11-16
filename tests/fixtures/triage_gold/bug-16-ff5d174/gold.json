@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "package.json sem lockfile proprio sob workspace pnpm e MEMBRO do workspace: precisa dobrar em members em vez de spawnar auditoria propria.",
+  "arquivos": [
+    "src/scan/mod.rs"
+  ],
+  "confianca": "media",
+  "nota": "PROPOSTA gerada a partir do commit de correção ff5d174 — o dono confirma ou corrige antes de valer como rótulo"
+}

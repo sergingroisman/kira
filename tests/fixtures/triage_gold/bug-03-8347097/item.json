@@ -1,0 +1,11 @@
+{
+  "id": 900103,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900103,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 03 — CI intermitente: spawn do copilot falha com ETXTBSY",
+    "System.State": "Closed",
+    "System.Description": "<div>O job de copilot falha de forma intermitente ao criar o shim: o executavel esta em uso no momento do spawn.</div>"
+  }
+}

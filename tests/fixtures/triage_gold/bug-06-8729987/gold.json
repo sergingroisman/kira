@@ -1,0 +1,10 @@
+{
+  "causa_raiz": "A saida so existia no estado inicial e o Move nao era escopado pelo painel focado.",
+  "arquivos": [
+    "src/tui/app.rs",
+    "src/tui/keymap.rs",
+    "src/tui/state.rs"
+  ],
+  "confianca": "media",
+  "nota": "PROPOSTA gerada a partir do commit de correção 8729987 — o dono confirma ou corrige antes de valer como rótulo"
+}

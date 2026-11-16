@@ -1,0 +1,11 @@
+{
+  "id": 900116,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900116,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 16 — scan de workspace pnpm ignora os pacotes membros",
+    "System.State": "Closed",
+    "System.Description": "<div>Num monorepo pnpm, o scan reporta apenas a raiz e perde as dependencias dos pacotes membros.</div>"
+  }
+}

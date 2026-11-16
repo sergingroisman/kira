@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "O parser esperava o formato do npm e nao o do pnpm audit real (por advisory), entao colapsava tudo em um item.",
+  "arquivos": [
+    "src/scan/node.rs"
+  ],
+  "confianca": "media",
+  "nota": "PROPOSTA gerada a partir do commit de correção 7c55301 — o dono confirma ou corrige antes de valer como rótulo"
+}

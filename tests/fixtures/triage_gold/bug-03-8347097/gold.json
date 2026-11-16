@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "O shim era escrito direto no caminho final; gravar em temp e renomear atomicamente elimina a janela de arquivo em uso.",
+  "arquivos": [
+    "src/llm/copilot.rs"
+  ],
+  "confianca": "alta",
+  "nota": "PROPOSTA gerada a partir do commit de correção 8347097 — o dono confirma ou corrige antes de valer como rótulo"
+}

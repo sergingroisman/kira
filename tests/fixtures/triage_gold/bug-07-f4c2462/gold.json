@@ -1,0 +1,10 @@
+{
+  "causa_raiz": "Faltava disciplina de linha no cabecalho: cada campo precisa ser truncado em uma unica linha.",
+  "arquivos": [
+    "src/tui/app.rs",
+    "src/tui/state.rs",
+    "src/tui/widgets/header.rs"
+  ],
+  "confianca": "baixa",
+  "nota": "PROPOSTA gerada a partir do commit de correção f4c2462 — o dono confirma ou corrige antes de valer como rótulo"
+}

@@ -1,0 +1,11 @@
+{
+  "id": 900108,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900108,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 08 — build do binario falha fora do Windows",
+    "System.State": "Closed",
+    "System.Description": "<div>A compilacao falha em Linux e macOS por import nao utilizado do modulo de caminho.</div>"
+  }
+}

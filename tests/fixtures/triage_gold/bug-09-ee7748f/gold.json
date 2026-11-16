@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "O std recitava a linha passada ao cmd /C; o raw_arg evita a recitacao e as aspas internas precisam virar apostrofo.",
+  "arquivos": [
+    "src/llm/copilot.rs"
+  ],
+  "confianca": "media",
+  "nota": "PROPOSTA gerada a partir do commit de correção ee7748f — o dono confirma ou corrige antes de valer como rótulo"
+}

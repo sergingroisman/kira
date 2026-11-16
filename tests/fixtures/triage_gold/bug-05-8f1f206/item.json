@@ -1,0 +1,11 @@
+{
+  "id": 900105,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900105,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 05 — Esc nao volta de tela e Ctrl+C nao sai no dashboard",
+    "System.State": "Closed",
+    "System.Description": "<div>No dashboard, a tecla Esc nao retorna a tela anterior e Ctrl+C/q nao encerram o app; a unica saida e matar o processo.</div>"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "A linha do cmd /C precisa ser citada e escapada como um unico argumento antes do spawn.",
+  "arquivos": [
+    "src/llm/copilot.rs"
+  ],
+  "confianca": "media",
+  "nota": "PROPOSTA gerada a partir do commit de correção a8c508c — o dono confirma ou corrige antes de valer como rótulo"
+}

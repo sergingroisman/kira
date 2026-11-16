@@ -1,0 +1,11 @@
+{
+  "id": 900111,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900111,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 11 — scan reporta nome de ferramenta inexistente no Windows",
+    "System.State": "Closed",
+    "System.Description": "<div>No Windows o scan diz que a ferramenta nao foi encontrada mesmo com ela instalada, e cita um nome que nao existe no disco.</div>"
+  }
+}

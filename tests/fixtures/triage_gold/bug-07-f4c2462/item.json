@@ -1,0 +1,11 @@
+{
+  "id": 900107,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900107,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 07 — cabecalho do dashboard quebra a linha e desalinha os paineis",
+    "System.State": "Closed",
+    "System.Description": "<div>O cabecalho do dashboard ocupa duas linhas quando o nome do projeto e longo, empurrando os paineis e cortando o rodape.</div>"
+  }
+}

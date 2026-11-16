@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "A deteccao comparava a extensao com case-sensitivity, o que quebra no Windows onde o filesystem e case-insensitive.",
+  "arquivos": [
+    "src/scan/mod.rs"
+  ],
+  "confianca": "alta",
+  "nota": "PROPOSTA gerada a partir do commit de correção 7581854 — o dono confirma ou corrige antes de valer como rótulo"
+}

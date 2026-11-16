@@ -1,0 +1,10 @@
+{
+  "causa_raiz": "Faltava classificar o texto do wrapper cmd de ferramenta ausente e canonicalizar o caminho comparado no e2e.",
+  "arquivos": [
+    "src/scan/dotnet.rs",
+    "src/scan/mod.rs",
+    "src/scan/node.rs"
+  ],
+  "confianca": "baixa",
+  "nota": "PROPOSTA gerada a partir do commit de correção eaf6571 — o dono confirma ou corrige antes de valer como rótulo"
+}

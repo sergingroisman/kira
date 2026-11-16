@@ -1,0 +1,9 @@
+{
+  "causa_raiz": "O tratamento de teclas nao distinguia o modo de busca do modo de tela; Esc sem destino e saida sem rota ficavam sem efeito.",
+  "arquivos": [
+    "src/tui/app.rs",
+    "src/tui/state.rs"
+  ],
+  "confianca": "media",
+  "nota": "PROPOSTA gerada a partir do commit de correção 8f1f206 — o dono confirma ou corrige antes de valer como rótulo"
+}

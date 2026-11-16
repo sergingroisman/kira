@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "A busca no PATH resolvia case-insensitive (como o NTFS) mas devolvia o nome procurado em vez do nome real encontrado no disco.",
+  "arquivos": [
+    "src/scan/mod.rs"
+  ],
+  "confianca": "alta",
+  "nota": "PROPOSTA gerada a partir do commit de correção 6694772 — o dono confirma ou corrige antes de valer como rótulo"
+}

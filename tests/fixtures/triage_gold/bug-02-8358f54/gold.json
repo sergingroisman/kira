@@ -1,0 +1,11 @@
+{
+  "causa_raiz": "O wrapper cmd.exe recebia o chcp como argumento separado; precisa ser uma unica linha montada pelo shellline.",
+  "arquivos": [
+    "src/lib.rs",
+    "src/llm/copilot.rs",
+    "src/scan/dotnet.rs",
+    "src/scan/mod.rs"
+  ],
+  "confianca": "alta",
+  "nota": "PROPOSTA gerada a partir do commit de correção 8358f54 — o dono confirma ou corrige antes de valer como rótulo"
+}

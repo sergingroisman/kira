@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "O cast de usize para i64 no LIMIT podia enrolar para valor negativo; precisa saturar no maximo.",
+  "arquivos": [
+    "src/store/mod.rs"
+  ],
+  "confianca": "media",
+  "nota": "PROPOSTA gerada a partir do commit de correção 2734fab — o dono confirma ou corrige antes de valer como rótulo"
+}

@@ -1,0 +1,11 @@
+{
+  "id": 900120,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900120,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 20 — scan trata ferramenta ausente como falha generica de execucao",
+    "System.State": "Closed",
+    "System.Description": "<div>Com a ferramenta ausente, o scan registra falha de execucao generica e o e2e compara caminhos diferentes entre maquinas.</div>"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": 900112,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900112,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 12 — scan classifica ausencia de ferramenta como falha de execucao",
+    "System.State": "Closed",
+    "System.Description": "<div>Quando a ferramenta externa nao esta instalada, o scan trata como erro de execucao e mostra mensagem crua do sistema.</div>"
+  }
+}

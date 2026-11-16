@@ -1,0 +1,9 @@
+{
+  "causa_raiz": "Resposta sem nenhum dos tres cabecalhos obrigatorios precisa virar erro de formato acionavel (exit diferente de zero), nunca sucesso com placeholder.",
+  "arquivos": [
+    "src/error.rs",
+    "src/triage.rs"
+  ],
+  "confianca": "alta",
+  "nota": "PROPOSTA gerada a partir do commit de correção c3565dd — o dono confirma ou corrige antes de valer como rótulo"
+}

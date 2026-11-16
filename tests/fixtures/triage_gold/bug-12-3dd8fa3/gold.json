@@ -1,0 +1,10 @@
+{
+  "causa_raiz": "A ferramenta era spawnada pelo nome nu antes de qualquer resolucao; falta resolver o caminho which-style ANTES do spawn e tratar ausencia como erro proprio.",
+  "arquivos": [
+    "src/scan/dotnet.rs",
+    "src/scan/mod.rs",
+    "src/scan/node.rs"
+  ],
+  "confianca": "alta",
+  "nota": "PROPOSTA gerada a partir do commit de correção 3dd8fa3 — o dono confirma ou corrige antes de valer como rótulo"
+}
