@@ -1,0 +1,11 @@
+{
+  "id": 900109,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900109,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 09 — prompt com aspas internas chega corrompido ao copilot no Windows",
+    "System.State": "Closed",
+    "System.Description": "<div>O copilot recebe o prompt com trechos faltando ou recitados quando o texto contem aspas.</div>"
+  }
+}

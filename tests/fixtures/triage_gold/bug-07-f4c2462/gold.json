@@ -1,0 +1,10 @@
+{
+  "causa_raiz": "Faltava disciplina de linha no cabecalho: cada campo precisa ser truncado em uma unica linha.",
+  "arquivos": [
+    "src/tui/app.rs",
+    "src/tui/state.rs",
+    "src/tui/widgets/header.rs"
+  ],
+  "confianca": "baixa",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

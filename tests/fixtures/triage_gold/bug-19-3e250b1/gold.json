@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "O wrapper cmd nao forcava UTF-8 na saida, entao o texto localizado do sistema chegava em mojibake e nao era classificavel.",
+  "arquivos": [
+    "src/scan/mod.rs"
+  ],
+  "confianca": "media",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

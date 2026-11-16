@@ -1,0 +1,11 @@
+{
+  "id": 900104,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900104,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 04 — segredo em comentario escapa da mascara do redact",
+    "System.State": "Closed",
+    "System.Description": "<div>Um token colado em comentario de codigo passa para o log sem ser mascarado, mesmo com o redact ativo em outros campos.</div>"
+  }
+}

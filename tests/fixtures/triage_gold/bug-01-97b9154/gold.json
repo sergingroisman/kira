@@ -1,0 +1,11 @@
+{
+  "causa_raiz": "O rascunho recuperava o triage pela string dos argumentos do comando em vez do item gravado; com --file a chave nao casa e o lookup devolve vazio.",
+  "arquivos": [
+    "src/main.rs",
+    "src/prdraft.rs",
+    "src/store/mod.rs",
+    "src/tui/state.rs"
+  ],
+  "confianca": "alta",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

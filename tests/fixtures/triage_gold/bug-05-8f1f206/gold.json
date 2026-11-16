@@ -1,0 +1,9 @@
+{
+  "causa_raiz": "O tratamento de teclas nao distinguia o modo de busca do modo de tela; Esc sem destino e saida sem rota ficavam sem efeito.",
+  "arquivos": [
+    "src/tui/app.rs",
+    "src/tui/state.rs"
+  ],
+  "confianca": "media",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

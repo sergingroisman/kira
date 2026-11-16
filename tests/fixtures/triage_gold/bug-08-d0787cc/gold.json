@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "O import de Path so e usado dentro do bloco cfg(windows); fora dele vira erro de import nao utilizado com -D warnings.",
+  "arquivos": [
+    "src/llm/copilot.rs"
+  ],
+  "confianca": "alta",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

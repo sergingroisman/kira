@@ -1,0 +1,11 @@
+{
+  "id": 900106,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900106,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 06 — dashboard trava na tela de detalhe e Move ignora o painel focado",
+    "System.State": "Closed",
+    "System.Description": "<div>Depois de entrar no detalhe de um item, nenhuma tecla encerra o app, e as setas movem o painel errado.</div>"
+  }
+}

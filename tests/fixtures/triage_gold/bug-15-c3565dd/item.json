@@ -1,0 +1,11 @@
+{
+  "id": 900115,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900115,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 15 — triage responde sem os cabecalhos e o comando sai com sucesso",
+    "System.State": "Closed",
+    "System.Description": "<div>Quando o modelo responde fora do formato, o triage imprime tres secoes vazias com exit 0 e o dev acha que houve analise.</div>"
+  }
+}

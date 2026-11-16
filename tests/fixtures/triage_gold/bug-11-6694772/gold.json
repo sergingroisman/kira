@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "A busca no PATH resolvia case-insensitive (como o NTFS) mas devolvia o nome procurado em vez do nome real encontrado no disco.",
+  "arquivos": [
+    "src/scan/mod.rs"
+  ],
+  "confianca": "alta",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

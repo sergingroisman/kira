@@ -1,0 +1,11 @@
+{
+  "id": 900118,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900118,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 18 — projetos .NET nao sao detectados quando a extensao tem caixa diferente",
+    "System.State": "Closed",
+    "System.Description": "<div>Um projeto com extensao .CSPROJ ou .Sln minusculo nao e reconhecido como stack .NET.</div>"
+  }
+}

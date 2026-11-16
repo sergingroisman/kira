@@ -1,0 +1,11 @@
+{
+  "id": 900114,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900114,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 14 — wiki gravada no lugar errado e pagina vazia entra no indice",
+    "System.State": "Closed",
+    "System.Description": "<div>A wiki aparece fora da pasta do projeto, e um episodio sem conteudo cria pagina vazia no indice; o caminho exibido ainda vem com prefixo de escape do Windows.</div>"
+  }
+}

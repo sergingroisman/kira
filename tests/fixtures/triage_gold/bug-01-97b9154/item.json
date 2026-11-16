@@ -1,0 +1,11 @@
+{
+  "id": 900101,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900101,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 01 — pr draft sai oco quando o triage veio de --file",
+    "System.State": "Closed",
+    "System.Description": "<div>Ao rodar o pr draft depois de gerar um triage com --file, o rascunho sai sem o diagnostico: o texto de triage nao aparece, apenas o cabecalho.</div>"
+  }
+}

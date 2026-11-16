@@ -1,0 +1,10 @@
+{
+  "causa_raiz": "Faltava classificar o texto do wrapper cmd de ferramenta ausente e canonicalizar o caminho comparado no e2e.",
+  "arquivos": [
+    "src/scan/dotnet.rs",
+    "src/scan/mod.rs",
+    "src/scan/node.rs"
+  ],
+  "confianca": "baixa",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

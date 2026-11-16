@@ -1,0 +1,9 @@
+{
+  "causa_raiz": "Resposta sem nenhum dos tres cabecalhos obrigatorios precisa virar erro de formato acionavel (exit diferente de zero), nunca sucesso com placeholder.",
+  "arquivos": [
+    "src/error.rs",
+    "src/triage.rs"
+  ],
+  "confianca": "alta",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

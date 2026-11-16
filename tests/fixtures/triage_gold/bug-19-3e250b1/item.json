@@ -1,0 +1,11 @@
+{
+  "id": 900119,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900119,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 19 — mensagem de ferramenta ausente sai ilegivel no Windows",
+    "System.State": "Closed",
+    "System.Description": "<div>Quando a ferramenta falta no Windows, o scan imprime texto embaralhado em vez da instrucao de instalar.</div>"
+  }
+}

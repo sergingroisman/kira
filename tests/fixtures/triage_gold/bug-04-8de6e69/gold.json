@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "Caracteres invisiveis e de bidi (zero-width, RLO) antes do segredo quebram o padrao do regex; e preciso removê-los antes de mascarar.",
+  "arquivos": [
+    "src/redact.rs"
+  ],
+  "confianca": "media",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

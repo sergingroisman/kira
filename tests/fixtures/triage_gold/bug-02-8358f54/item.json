@@ -1,0 +1,11 @@
+{
+  "id": 900102,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900102,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 02 — kira scan falha no Windows com erro de linha de comando",
+    "System.State": "Closed",
+    "System.Description": "<div>No Windows, o scan de stacks .NET aborta com erro do cmd.exe em vez de retornar findings; o mesmo projeto funciona no Linux.</div>"
+  }
+}

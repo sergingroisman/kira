@@ -1,0 +1,8 @@
+{
+  "causa_raiz": "package.json sem lockfile proprio sob workspace pnpm e MEMBRO do workspace: precisa dobrar em members em vez de spawnar auditoria propria.",
+  "arquivos": [
+    "src/scan/mod.rs"
+  ],
+  "confianca": "media",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

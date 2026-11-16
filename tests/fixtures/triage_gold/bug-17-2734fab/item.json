@@ -1,0 +1,11 @@
+{
+  "id": 900117,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900117,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 17 — listagem de sessoes falha em maquinas com muitas sessoes",
+    "System.State": "Closed",
+    "System.Description": "<div>Em historicos grandes, o comando de sessoes retorna erro de SQL em vez da lista.</div>"
+  }
+}

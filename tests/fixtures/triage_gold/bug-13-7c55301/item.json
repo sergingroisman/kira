@@ -1,0 +1,11 @@
+{
+  "id": 900113,
+  "rev": 1,
+  "fields": {
+    "System.Id": 900113,
+    "System.WorkItemType": "Bug",
+    "System.Title": "bug 13 — pnpm audit gera um finding inutil em vez de um por advisory",
+    "System.State": "Closed",
+    "System.Description": "<div>O relatorio de scan mostra um unico achado agregado para o pnpm, sem severidade por advisory, diferente do npm.</div>"
+  }
+}

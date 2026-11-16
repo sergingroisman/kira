@@ -1,0 +1,10 @@
+{
+  "causa_raiz": "A saida so existia no estado inicial e o Move nao era escopado pelo painel focado.",
+  "arquivos": [
+    "src/tui/app.rs",
+    "src/tui/keymap.rs",
+    "src/tui/state.rs"
+  ],
+  "confianca": "media",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}

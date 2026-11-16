@@ -1,0 +1,11 @@
+{
+  "causa_raiz": "O wrapper cmd.exe recebia o chcp como argumento separado; precisa ser uma unica linha montada pelo shellline.",
+  "arquivos": [
+    "src/lib.rs",
+    "src/llm/copilot.rs",
+    "src/scan/dotnet.rs",
+    "src/scan/mod.rs"
+  ],
+  "confianca": "alta",
+  "nota": "rotulado pelo dono em 16/Nov/2026 (revisão do lote inicial; causa e arquivos confirmados)"
+}
