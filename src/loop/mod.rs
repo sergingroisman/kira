@@ -22,6 +22,8 @@ use crate::ingest::{self, IngestOptions};
 use crate::llm::ollama;
 use crate::post::{self, DigestError, DigestOptions};
 use crate::publish::{self, PublishOptions};
+use crate::scheduler::{ScheduleAction, SchedulePlan};
+use crate::store::{self, Store};
 use crate::trust;
 
 /// Erros do loop — todos acionáveis (a casa nunca ecoa body cru).
@@ -33,6 +35,8 @@ pub enum LoopError {
     Digest(String),
     #[error("o publish do ciclo falhou: {0}")]
     Publish(String),
+    #[error("o agendamento do ciclo falhou: {0}")]
+    Schedule(String),
 }
 
 /// Opções de um ciclo.
@@ -48,6 +52,9 @@ pub struct LoopOptions {
     /// O ingest roda o `scan` dentro do ciclo (default: sim — findings novos
     /// mudam o brief; em CI/fixture sem stacks o scan não spawna nada).
     pub run_scan: bool,
+    /// `--scheduled` (PR16): cada fase só roda se o agendamento dela venceu.
+    /// Desligado por default — sem a flag o ciclo ignora a tabela `schedule`.
+    pub scheduled: bool,
 }
 
 impl LoopOptions {
@@ -59,6 +66,7 @@ impl LoopOptions {
             lang: "en".to_string(),
             skip_digest: false,
             run_scan: true,
+            scheduled: false,
         }
     }
 }
@@ -113,24 +121,64 @@ pub async fn tick(options: &LoopOptions) -> Result<TickReport, LoopError> {
     let root = &options.root;
     let mut report = TickReport::default();
 
+    // 0. AGENDAMENTO (PR16): em `--scheduled`, cada fase só roda se o
+    //    agendamento dela venceu. A tabela `schedule` é lida UMA vez por tick:
+    //    as três fases decidem com a mesma fotografia de relógio (um tick que
+    //    atravessa a virada de minuto não pode ver "due" e "não due" juntos).
+    let scheduled = if options.scheduled {
+        let store = Store::open_default().map_err(|err| LoopError::Schedule(err.to_string()))?;
+        let now = crate::scheduler::parse_unix_seconds(&store::now_rfc3339_utc())
+            .ok_or_else(|| LoopError::Schedule("relógio do sistema ilegível".to_string()))?;
+        let plan =
+            SchedulePlan::load(&store, now).map_err(|err| LoopError::Schedule(err.to_string()))?;
+        if plan.is_empty() {
+            report.notes.push(
+                "nenhum agendamento declarado — crie um com `kira schedule add --action digest --every 2h`"
+                    .to_string(),
+            );
+        }
+        Some((store, plan))
+    } else {
+        None
+    };
+    // Fase vencida? Fora do modo agendado a resposta é sempre "sim" (o ciclo
+    // do PR15 roda tudo, como antes).
+    let due = |action: ScheduleAction| {
+        scheduled
+            .as_ref()
+            .is_none_or(|(_, plan)| plan.is_due(action))
+    };
+
     // 1. INGEST — sempre. Determinístico, sem LLM, sem rede (o scan dentro
     //    dele só spawna ferramenta se houver stack). A mudança é medida pelo
     //    conteúdo do facts.md antes/depois — nunca por timestamp.
     let facts_path = root.join(".kira").join("facts.md");
     let facts_before = std::fs::read(&facts_path).ok();
     let mut ingest_options = IngestOptions::at(root.clone());
-    ingest_options.run_scan = options.run_scan;
+    // O `scan` é a fase agendável mais barata: em modo agendado ele só entra
+    // quando vence, mas o INGEST em si continua rodando (é o que descobre que
+    // o repositório mudou — barato e determinístico).
+    let scan_due = due(ScheduleAction::Scan);
+    ingest_options.run_scan = options.run_scan && scan_due;
     let ingest = ingest::run(&ingest_options).map_err(|err| LoopError::Ingest(err.to_string()))?;
     let facts_after = std::fs::read(&facts_path).ok();
     report.facts_changed = facts_before != facts_after;
     report.notes.extend(ingest.notes.iter().cloned());
+    if scan_due {
+        mark(&scheduled, ScheduleAction::Scan)?;
+    }
 
     // 2. DIGEST — só com trust (ADR-0038 D2: sem aceite, nada sai da máquina).
     //    Sem trust não é erro do ciclo: é nota acionável (o dono decide).
+    let digest_due = due(ScheduleAction::Digest);
     if options.skip_digest {
         report
             .notes
             .push("digest pulado (--skip-digest)".to_string());
+    } else if !digest_due {
+        report
+            .notes
+            .push("digest pulado: agendamento não vencido — veja `kira schedule list`".to_string());
     } else if !trust::is_trusted(root) {
         report
             .notes
@@ -165,6 +213,7 @@ pub async fn tick(options: &LoopOptions) -> Result<TickReport, LoopError> {
                 report.digest_cached = digest.cached;
                 report.digest_failed = digest.failed;
                 report.notes.extend(digest.notes.iter().cloned());
+                mark(&scheduled, ScheduleAction::Digest)?;
             }
             // Trust revogado entre a checagem e o run (corrida rara): mesma
             // conduta de "sem trust" — nota, nunca erro do ciclo.
@@ -175,16 +224,41 @@ pub async fn tick(options: &LoopOptions) -> Result<TickReport, LoopError> {
         }
     }
 
-    // 3. PUBLISH — sempre. Local: publica os rascunhos entregues na wiki e
-    //    regenera o índice derivado. Sem rascunho novo, não muda nada.
-    let publish_options = PublishOptions::at(root.clone());
-    let publish =
-        publish::run(&publish_options).map_err(|err| LoopError::Publish(err.to_string()))?;
-    report.published = publish.published;
-    report.publish_unchanged = publish.unchanged;
-    report.notes.extend(publish.notes.iter().cloned());
+    // 3. PUBLISH — local: publica os rascunhos entregues na wiki e regenera o
+    //    índice derivado. Sem rascunho novo, não muda nada. Em modo agendado
+    //    respeita a cadência como as outras fases.
+    if due(ScheduleAction::Publish) {
+        let publish_options = PublishOptions::at(root.clone());
+        let publish =
+            publish::run(&publish_options).map_err(|err| LoopError::Publish(err.to_string()))?;
+        report.published = publish.published;
+        report.publish_unchanged = publish.unchanged;
+        report.notes.extend(publish.notes.iter().cloned());
+        mark(&scheduled, ScheduleAction::Publish)?;
+    } else {
+        report
+            .notes
+            .push("publish pulado: agendamento não vencido".to_string());
+    }
 
     Ok(report)
+}
+
+/// Registra no store que a fase rodou (só em modo agendado).
+///
+/// Chamado DEPOIS do sucesso da fase: falha não marca, senão o agendamento
+/// ficaria "feito" até a próxima cadência. Erro de escrita aqui é erro do
+/// ciclo — um agendamento que não consegue registrar o run dispararia em
+/// rajada no tick seguinte.
+fn mark(
+    scheduled: &Option<(Store, SchedulePlan)>,
+    action: ScheduleAction,
+) -> Result<(), LoopError> {
+    if let Some((store, plan)) = scheduled {
+        plan.mark_run(store, action, &store::now_rfc3339_utc())
+            .map_err(|err| LoopError::Schedule(err.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Driver do ciclo: `once` = um tick e sai (CI); senão roda até um tick não

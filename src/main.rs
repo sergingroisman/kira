@@ -348,6 +348,16 @@ enum Command {
         #[command(subcommand)]
         action: KnowledgeAction,
     },
+    /// Agendamentos do ciclo (F2, PR16): declara a cadência de `scan`,
+    /// `digest` ou `publish`; `kira loop --scheduled` executa só as fases
+    /// vencidas. Sem daemon/serviço: o agendamento só roda com o KIRA vivo.
+    #[command(
+        after_help = "Exemplos:\n  kira schedule add --action digest --every 2h\n  kira schedule add --action scan --every 30m\n  kira schedule list\n  kira schedule rm 1\n\nO agendamento NÃO vira serviço: ele só roda quando `kira loop --scheduled` roda."
+    )]
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
     /// Wrapper do revisor externo rea (TE PR41): resolve o binário no PATH
     /// (ou KIRA_REA_BIN) ANTES do spawn e imprime a saída sempre REDIGIDA e
     /// capada em 8 KiB — output cru da ferramenta nunca chega ao terminal.
@@ -389,6 +399,9 @@ enum Command {
         /// O ingest não roda o scan dentro do ciclo
         #[arg(long)]
         skip_scan: bool,
+        /// Roda só as fases com agendamento vencido (`kira schedule add`)
+        #[arg(long)]
+        scheduled: bool,
     },
 }
 
@@ -417,6 +430,40 @@ enum SkillsAction {
     },
     /// Reconstrói o índice derivado `skill`/`skill_fts`
     Reindex,
+}
+
+/// `kira schedule` actions (F2, PR16).
+#[derive(Debug, Subcommand)]
+enum ScheduleAction {
+    /// Declara a cadência de uma fase do ciclo
+    Add {
+        /// Fase agendada: `scan`, `digest` ou `publish`
+        #[arg(long)]
+        action: String,
+        /// Cadência legível: `30m`, `2h`, `1d` (mínimo 60s)
+        #[arg(long)]
+        every: String,
+        /// Cria desligado (para ligar depois com `kira schedule enable`)
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Lista os agendamentos com o próximo tick DERIVADO (nunca gravado)
+    List,
+    /// Remove um agendamento pelo id
+    Rm {
+        /// Id mostrado por `kira schedule list`
+        id: i64,
+    },
+    /// Liga um agendamento existente (preserva o histórico de execução)
+    Enable {
+        /// Id mostrado por `kira schedule list`
+        id: i64,
+    },
+    /// Desliga um agendamento sem apagar a linha
+    Disable {
+        /// Id mostrado por `kira schedule list`
+        id: i64,
+    },
 }
 
 /// Ações do `kira knowledge` (onda SK, SK-2).
@@ -665,6 +712,7 @@ async fn run(command: Command) -> Outcome {
         Command::Profile => store_command(profile_output()),
         Command::Scan { path } => scan_command(path.as_deref()),
         Command::Rea { args } => rea_command(&args),
+        Command::Schedule { action } => schedule_command(action),
         Command::Ingest {
             path,
             json,
@@ -728,6 +776,7 @@ async fn run(command: Command) -> Outcome {
             lang,
             skip_digest,
             skip_scan,
+            scheduled,
         } => {
             loop_command(
                 path.as_deref(),
@@ -737,6 +786,7 @@ async fn run(command: Command) -> Outcome {
                 lang,
                 skip_digest,
                 skip_scan,
+                scheduled,
             )
             .await
         }
@@ -1032,6 +1082,10 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             // passa por aqui — o KIRA não pede segredo ao rea).
             ("rea".to_string(), shellwords_join(args), None)
         }
+        Command::Schedule { action } => {
+            // A trilha registra a invocação (ação + id), nunca o conteúdo do store.
+            ("schedule".to_string(), schedule_args_text(action), None)
+        }
         Command::Ingest {
             path,
             json,
@@ -1263,6 +1317,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             lang,
             skip_digest,
             skip_scan,
+            scheduled,
         } => {
             let mut args = String::new();
             if *once {
@@ -1285,6 +1340,9 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             }
             if *skip_scan {
                 args.push_str(" --skip-scan");
+            }
+            if *scheduled {
+                args.push_str(" --scheduled");
             }
             ("loop".to_string(), args.trim().to_string(), model.clone())
         }
@@ -1640,6 +1698,120 @@ fn rea_command(args: &[String]) -> Outcome {
     }
 }
 
+/// `kira schedule` (F2, PR16). Todos os caminhos imprimem texto legível — o
+/// agendamento é configuração do dono, não saída de máquina.
+fn schedule_command(action: ScheduleAction) -> Outcome {
+    let result = match action {
+        ScheduleAction::Add {
+            action,
+            every,
+            disabled,
+        } => schedule_add(&action, &every, disabled),
+        ScheduleAction::List => schedule_list(),
+        ScheduleAction::Rm { id } => schedule_remove(id),
+        ScheduleAction::Enable { id } => schedule_set_enabled(id, true),
+        ScheduleAction::Disable { id } => schedule_set_enabled(id, false),
+    };
+    match result {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// Texto da invocação para a trilha de auditoria (nunca o conteúdo do store).
+fn schedule_args_text(action: &ScheduleAction) -> String {
+    match action {
+        ScheduleAction::Add {
+            action,
+            every,
+            disabled,
+        } => format!(
+            "add {action} {every}{}",
+            if *disabled { " disabled" } else { "" }
+        ),
+        ScheduleAction::List => "list".to_string(),
+        ScheduleAction::Rm { id } => format!("rm {id}"),
+        ScheduleAction::Enable { id } => format!("enable {id}"),
+        ScheduleAction::Disable { id } => format!("disable {id}"),
+    }
+}
+
+fn schedule_store() -> Result<kira::store::Store, kira::error::Error> {
+    Ok(kira::store::Store::open_default()?)
+}
+
+fn schedule_add(action: &str, every: &str, disabled: bool) -> Result<String, kira::error::Error> {
+    use kira::scheduler::{self, ScheduleAction as Phase};
+    let phase = Phase::parse(action)?;
+    let seconds = scheduler::parse_every(every)?;
+    let store = schedule_store()?;
+    let id = store.add_schedule(phase.as_str(), seconds, !disabled)?;
+    let mut out = format!(
+        "agendamento {id} criado: {} a cada {}\n",
+        phase.as_str(),
+        scheduler::format_every(seconds)
+    );
+    out.push_str(&format!(
+        "  estado: {}\n",
+        if disabled { "desligado" } else { "ativo" }
+    ));
+    out.push_str(
+        "  aviso: agendamento NÃO é serviço — só roda com o KIRA vivo (`kira loop --scheduled`)\n",
+    );
+    Ok(out)
+}
+
+fn schedule_list() -> Result<String, kira::error::Error> {
+    use kira::scheduler;
+    let store = schedule_store()?;
+    let rows = store.list_schedules()?;
+    if rows.is_empty() {
+        return Ok(
+            "nenhum agendamento — crie um com `kira schedule add --action digest --every 2h`\n"
+                .to_string(),
+        );
+    }
+    let now = scheduler::parse_unix_seconds(&kira::store::now_rfc3339_utc()).unwrap_or(0);
+    let mut out = format!("agendamentos ({})\n", rows.len());
+    for row in &rows {
+        out.push_str(&format!(
+            "  id {} · {} · a cada {} · {} · {}\n",
+            row.id,
+            row.action,
+            scheduler::format_every(row.every_seconds),
+            scheduler::next_run_text(row, now),
+            if row.enabled { "ativo" } else { "desligado" }
+        ));
+    }
+    out.push_str("  roda com: `kira loop --scheduled` (sem daemon/serviço)\n");
+    Ok(out)
+}
+
+fn schedule_remove(id: i64) -> Result<String, kira::error::Error> {
+    let store = schedule_store()?;
+    if !store.remove_schedule(id)? {
+        return Err(kira::error::Error::ScheduleNotFound { id });
+    }
+    Ok(format!("agendamento {id} removido\n"))
+}
+
+fn schedule_set_enabled(id: i64, enabled: bool) -> Result<String, kira::error::Error> {
+    let store = schedule_store()?;
+    if !store.set_schedule_enabled(id, enabled)? {
+        return Err(kira::error::Error::ScheduleNotFound { id });
+    }
+    Ok(format!(
+        "agendamento {id} {}\n",
+        if enabled { "ligado" } else { "desligado" }
+    ))
+}
+
 /// `kira skills` (onda SK, SK-1): catálogo de cartas de instrução.
 ///
 /// `list`/`show` leem o disco (bundled embutido + `.kira/skills/`) — leitura
@@ -1840,6 +2012,7 @@ async fn loop_command(
     lang: Option<String>,
     skip_digest: bool,
     skip_scan: bool,
+    scheduled: bool,
 ) -> Outcome {
     let root = kira::r#loop::resolve_root(path);
     let mut options = kira::r#loop::LoopOptions::at(root);
@@ -1853,6 +2026,7 @@ async fn loop_command(
     }
     options.skip_digest = skip_digest;
     options.run_scan = !skip_scan;
+    options.scheduled = scheduled;
     match kira::r#loop::run(&options, once, ticks.unwrap_or(16)).await {
         Ok(text) => {
             print!("{text}");

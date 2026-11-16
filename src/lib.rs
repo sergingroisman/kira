@@ -31,6 +31,7 @@ pub mod publish;
 pub mod rea;
 pub mod redact;
 pub mod scan;
+pub mod scheduler;
 pub mod setup;
 pub mod shellline;
 pub mod skills;

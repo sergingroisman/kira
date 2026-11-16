@@ -41,7 +41,9 @@ pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 /// v13 (onda TE, PR34): `session_economy` — ledger de economia por sessão.
 /// v14 (onda TE, PR38): coluna `dedup_chars_saved` na `session_economy` — a
 /// categoria própria do dedup contíguo dos trechos.
-const SCHEMA_VERSION: i64 = 14;
+/// v15 (F2, PR16): `schedule` — agendamentos do ciclo (cadência + último run),
+/// sem daemon: o próximo tick é derivado, nunca gravado.
+const SCHEMA_VERSION: i64 = 15;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -123,6 +125,23 @@ pub fn db_path() -> Option<PathBuf> {
 /// Connection-backed handle over the central store.
 pub struct Store {
     conn: Connection,
+}
+
+/// One row of `schedule` (schema v15, PR16): the cadence of one cyclic action
+/// and when it last ran. "Next due" is derived from these two fields — it is
+/// never stored, so the row can never disagree with itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleRow {
+    pub id: i64,
+    /// `scan` | `digest` | `publish` — the phase this schedule drives.
+    pub action: String,
+    /// Cadence in seconds (> 0 by construction: the CLI parser rejects 0).
+    pub every_seconds: i64,
+    /// Opt-out without losing the row (and its history).
+    pub enabled: bool,
+    /// RFC-3339 UTC of the last run; `None` = never ran (due immediately).
+    pub last_run_at: Option<String>,
+    pub created_at: String,
 }
 
 impl Store {
@@ -479,6 +498,76 @@ impl Store {
             )
             .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
             .map_err(StoreError::from)
+    }
+
+    /// Adds one schedule row (schema v15, PR16) and returns its id. The store
+    /// only persists: the cadence was already validated by
+    /// [`crate::scheduler::parse_every`] and the action by
+    /// [`crate::scheduler::ScheduleAction::parse`] — invalid input never
+    /// reaches here, so there is exactly one place that decides what is valid.
+    pub fn add_schedule(
+        &self,
+        action: &str,
+        every_seconds: i64,
+        enabled: bool,
+    ) -> Result<i64, StoreError> {
+        let now = now_rfc3339_utc();
+        self.conn.execute(
+            "INSERT INTO schedule (action, every_seconds, enabled, last_run_at, created_at) \
+             VALUES (?1, ?2, ?3, NULL, ?4)",
+            rusqlite::params![action, every_seconds, i64::from(enabled), now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every schedule, oldest first — the order the owner created them in.
+    pub fn list_schedules(&self) -> Result<Vec<ScheduleRow>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, action, every_seconds, enabled, last_run_at, created_at \
+             FROM schedule ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ScheduleRow {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    every_seconds: row.get(2)?,
+                    enabled: row.get::<_, i64>(3)? != 0,
+                    last_run_at: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Removes one schedule. `false` = there was no such id (the CLI turns
+    /// that into an actionable error instead of a silent success).
+    pub fn remove_schedule(&self, id: i64) -> Result<bool, StoreError> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM schedule WHERE id = ?1", rusqlite::params![id])?;
+        Ok(removed > 0)
+    }
+
+    /// Records that this schedule ran at `at` (RFC-3339 UTC). Written AFTER a
+    /// successful run: a failed phase must not look "done until tomorrow".
+    pub fn mark_schedule_run(&self, id: i64, at: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE schedule SET last_run_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Switches a schedule on/off without losing its `last_run_at` history:
+    /// re-enabling resumes from the real cadence instead of firing instantly.
+    pub fn set_schedule_enabled(&self, id: i64, enabled: bool) -> Result<bool, StoreError> {
+        let updated = self.conn.execute(
+            "UPDATE schedule SET enabled = ?2 WHERE id = ?1",
+            rusqlite::params![id, i64::from(enabled)],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Records one judgment call (triage/digest/eval). `tokens_est` is an
@@ -1421,6 +1510,25 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
         conn.execute_batch(
             "ALTER TABLE session_economy \
              ADD COLUMN dedup_chars_saved INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(schema_error)?;
+    }
+
+    // v15 — F2, PR16: agendamentos do ciclo (`kira schedule add|list|rm`).
+    // Cron interno, sem daemon: a linha guarda a CADÊNCIA (`every_seconds`) e
+    // quando o agendamento rodou por último; "próximo tick" é derivado, nunca
+    // gravado (derivar evita estado duplicado que mente). `enabled` existe
+    // para o opt-out explícito sem apagar o histórico do agendamento.
+    if current < 15 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schedule (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                every_seconds INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_run_at TEXT,
+                created_at TEXT NOT NULL
+            );",
         )
         .map_err(schema_error)?;
     }

@@ -124,6 +124,28 @@ pub enum Error {
     )]
     ReaFailed { exit: String, hint: String },
 
+    /// PR16: a ação pedida em `kira schedule add` não existe no ciclo. Listar
+    /// as válidas é o que torna o erro acionável — nunca um "valor inválido"
+    /// mudo.
+    #[error(
+        "ação de agendamento desconhecida: `{value}` — as válidas são `scan`, `digest` e `publish` (fases que o `kira loop` já roda)"
+    )]
+    ScheduleActionInvalid { value: String },
+
+    /// PR16: cadência ilegível ou abaixo do piso. O piso existe para o
+    /// agendamento não virar laço quente no PC do dono.
+    #[error(
+        "cadência `{value}` inválida — use `<n><s|m|h|d>` (ex.: `30m`, `2h`, `1d`) com no mínimo 60s"
+    )]
+    ScheduleEveryInvalid { value: String },
+
+    /// PR16: `kira schedule rm <id>` com id que não existe. Falhar aqui é
+    /// melhor que responder "removido" sem ter removido nada.
+    #[error(
+        "não há agendamento com id {id} — rode `kira schedule list` para ver os ids existentes"
+    )]
+    ScheduleNotFound { id: i64 },
+
     /// A conferência de capacidades (ADR-0030) falhou ao ler o store local.
     /// Fail-closed (decisão 6 do ADR-0030): sem prova do estado, o comando de
     /// board não executa — o erro é do store, nunca uma tentativa de rede.
