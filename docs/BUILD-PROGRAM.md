@@ -282,7 +282,10 @@
       *Entregue (W6-PR2, verificado em 16/Nov): `widgets/findings.rs` (24,9 KB) +
       `widgets/severity.rs` + `widgets/cards.rs`; a mensagem "novo achado" existe em
       `app.rs` e o snapshot mostra a contagem de achados.*
-- [ ] **PR23** painel de **arquivos criados/alterados pelo KIRA** (do store),
+- [x] **PR23** painel de **arquivos criados/alterados pelo KIRA** (do store),
+      *Entregue (16/Nov, **PR #133**): `src/tui/widgets/artifacts.rs` (novo) —
+      `Screen::Arquivos` com rascunhos/publicados + timeline do ciclo (scan/ingest/digest/publish).
+      Fonte: store (`posts`), não varredura de disco. Timeline só fases do ciclo.*
       timeline do ciclo.
 - [x] **PR24** painel de **agendamentos e orçamento** (jobs, próximo tick, quota).
       *Entregue (16/Nov, **PR #132**): quinta tela (`5`/Tab) — `Screen::Agenda` + `state::agenda_lines`
