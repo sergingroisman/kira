@@ -3354,6 +3354,10 @@ async fn setup_command(
         yes,
         backend,
         skip,
+        // M6: a etapa de ingestão roda por default; `--skip ingest` desliga e
+        // `--yes` ingere sem perguntar. O wizard de tela cheia sobrescreve com
+        // a decisão da própria etapa.
+        ingest: true,
         // Raiz do projeto DETECTADA (mesma regra do store): entra no passo
         // "projeto" do fluxo local-first.
         project_root: store::detect_project_root().map(|root| store::display_path(&root)),

@@ -88,8 +88,11 @@ pub struct SetupOptions {
     /// backend de IA (o caro nunca é default nem fallback silencioso).
     pub backend: Option<String>,
     /// `--skip <passo>` (repetível): pula um passo — `pat` (no-op, o passo
-    /// deixou de existir) ou `ia`.
+    /// deixou de existir), `ia` ou `ingest`.
     pub skip: Vec<String>,
+    /// M6: a etapa de ingestão roda no fim do `setup` (preview read-only +
+    /// consentimento). `--skip ingest` desliga; `--yes` ingere sem perguntar.
+    pub ingest: bool,
     /// Raiz do projeto detectada, injetada pelo binário real
     /// (`store::detect_project_root`); testes fixam o valor. `None` faz o
     /// motor detectar pelo cwd.
@@ -230,15 +233,15 @@ pub async fn run(
     let config_pairs = read_config(config_path, output);
 
     // Valores explícitos inválidos falham de cara, sem adivinhar: --skip só
-    // aceita 'pat'/'ia' ('pat' segue aceito por compatibilidade — virou no-op
-    // porque o passo deixou de existir) e --backend só os nomes conhecidos
-    // (nada de fallback silencioso).
+    // aceita 'pat'/'ia'/'ingest' ('pat' segue aceito por compatibilidade —
+    // virou no-op porque o passo deixou de existir) e --backend só os nomes
+    // conhecidos (nada de fallback silencioso).
     for skipped_step in &options.skip {
         let step = skipped_step.trim().to_ascii_lowercase();
-        if step != "pat" && step != "ia" {
+        if step != "pat" && step != "ia" && step != "ingest" {
             let _ = writeln!(
                 output,
-                "erro: --skip aceita 'pat' ou 'ia' (recebi '{skipped_step}')."
+                "erro: --skip aceita 'pat', 'ia' ou 'ingest' (recebi '{skipped_step}')."
             );
             return ExitCode::FAILURE;
         }
@@ -421,6 +424,64 @@ pub async fn run(
         detected_root
     };
     let _ = writeln!(output, "projeto: {project_root}");
+
+    // ------------------------------------------------------------------
+    // Passo I — INGESTÃO (M6): a etapa só MOSTRA o que será criado e coleta
+    // o consentimento; o efeito é todo daqui (ADR-0034: wizard não escreve).
+    // `--skip ingest` pula, `--yes` ingere sem perguntar (não-interativo
+    // honesto) e em TTY o default é ingerir — Enter avança.
+    // ------------------------------------------------------------------
+    let mut ingest_summary: Option<String> = None;
+    let skip_ingest = options
+        .skip
+        .iter()
+        .any(|item| item.trim().eq_ignore_ascii_case("ingest"));
+    if skip_ingest {
+        let _ = writeln!(
+            output,
+            "ingestão pulada (--skip) — rode `kira ingest` quando quiser."
+        );
+    } else if options.ingest {
+        let ask = options.interactive && !options.yes;
+        let run_now = if ask { ask_ingest(input, output) } else { true };
+        if run_now {
+            // Preview read-only ANTES do efeito: o dono vê o que vai nascer.
+            let _ = writeln!(
+                output,
+                "ingestão: cria .kira/facts.md + .kira/ingest/inventory.json (leitura do projeto; sem IA, sem rede)"
+            );
+            let mut ingest_options =
+                crate::ingest::IngestOptions::at(std::path::PathBuf::from(project_root.as_str()));
+            // O setup NÃO spawna `scan` (rede/lento): quem quer findings roda
+            // `kira scan` depois. O ingest em si é local e barato.
+            ingest_options.run_scan = false;
+            match crate::ingest::run(&ingest_options) {
+                Ok(report) => {
+                    let line = format!(
+                        "ingestão: {} arquivo(s) · {} stack(s) · facts em {}",
+                        report.files_ingested,
+                        report.stacks.len(),
+                        report.facts_path
+                    );
+                    let _ = writeln!(output, "{line}");
+                    ingest_summary = Some(line);
+                }
+                Err(err) => {
+                    // Falha de ingestão não derruba o setup: o dono roda
+                    // `kira ingest` depois com a mensagem à mão.
+                    let _ = writeln!(
+                        output,
+                        "ingestão não rodou ({err}) — rode `kira ingest` no projeto."
+                    );
+                }
+            }
+        } else {
+            let _ = writeln!(
+                output,
+                "ingestão pulada — rode `kira ingest` quando quiser."
+            );
+        }
+    }
 
     // ------------------------------------------------------------------
     // Passo 3 — backend de IA: 4 opções, com "nenhuma por agora" como default
@@ -610,7 +671,12 @@ pub async fn run(
     let _ = writeln!(
         output,
         "{}",
-        format_summary(&dev_name, ia_summary.as_deref(), &store_line)
+        format_summary(
+            &dev_name,
+            ia_summary.as_deref(),
+            &store_line,
+            ingest_summary.as_deref(),
+        )
     );
     ExitCode::SUCCESS
 }
@@ -1225,13 +1291,24 @@ pub fn resume_command(step: &str) -> &'static str {
 /// "desativado" (o que espera uma capacidade) e "ativar depois" (com a linha
 /// do backend de IA só quando ficou sem IA), e o próximo comando — nunca
 /// termina com "configuração concluída".
-pub fn format_summary(dev: &str, ia: Option<&str>, store_path: &str) -> String {
+pub fn format_summary(
+    dev: &str,
+    ia: Option<&str>,
+    store_path: &str,
+    ingest: Option<&str>,
+) -> String {
     let mut text = String::new();
     text.push_str("pronto:\n");
     text.push_str(&format!("  dev: {dev}\n"));
     let ia_line = ia.unwrap_or("nenhuma");
     text.push_str(&format!("  ia:  {ia_line}\n"));
     text.push_str(&format!("  store: {store_path}\n"));
+    // M6: a ingestão é a etapa que deixa o projeto LEGÍVEL pelo KIRA; o
+    // resumo diz o que aconteceu em vez de prometer o passo seguinte.
+    text.push_str(&format!(
+        "  ingestão: {}\n",
+        ingest.unwrap_or("pulada — rode `kira ingest`")
+    ));
     text.push('\n');
     text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard\n");
     text.push_str("desativado:      judge de item do board · read (board) · publicar PR\n");
@@ -1239,8 +1316,31 @@ pub fn format_summary(dev: &str, ia: Option<&str>, store_path: &str) -> String {
     if ia.is_none() {
         text.push_str(&format!("                 {}\n", resume_command("ia")));
     }
-    text.push_str("próximo passo:   kira scan");
+    // Ordem do plano: o `scan` deixou de ser o primeiro passo desde que a
+    // ingestão entrou no setup — agora o próximo é conectar o board.
+    text.push_str("próximo passo:   kira connect azure");
     text
+}
+
+/// Pergunta da etapa de ingestão (M6): **Enter = ingerir**, `n` = pular.
+///
+/// Default "ingerir" é deliberado: a ingestão é local, barata e é o que torna
+/// o projeto legível para o resto do KIRA — pular é a exceção, não o caminho.
+/// EOF (stdin fechado) também ingere, mesmo contrato do resto do setup.
+fn ask_ingest(input: &mut dyn BufRead, output: &mut dyn Write) -> bool {
+    let _ = writeln!(
+        output,
+        "ingerir o projeto agora? (Enter = ingerir / n = pular)"
+    );
+    let _ = output.flush();
+    let mut line = String::new();
+    if input.read_line(&mut line).is_err() {
+        return true;
+    }
+    !matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "n" | "nao" | "não"
+    )
 }
 
 /// Valida o nome do dev: 1..=40 caracteres, sem control chars (o que cobre
@@ -1887,6 +1987,7 @@ mod tests {
             "Sergin",
             Some("ollama (qwen3.5:4b)"),
             "/home/x/.config/kira/store.db",
+            Some("ingestão: 12 arquivo(s)"),
         );
         assert!(text.starts_with("pronto:\n  dev: Sergin\n"), "{text}");
         assert!(text.contains("  ia:  ollama (qwen3.5:4b)"));
@@ -1899,7 +2000,11 @@ mod tests {
         assert!(text.contains("ativar depois:   kira connect azure   (leitura de work items)"));
         // Com IA escolhida, a linha do backend não aparece em "ativar depois".
         assert!(!text.contains("kira setup --backend ollama"), "{text}");
-        assert!(text.contains("próximo passo:   kira scan"));
+        // M6: com a ingestão no setup, o próximo passo é conectar o board.
+        assert!(
+            text.contains("próximo passo:   kira connect azure"),
+            "{text}"
+        );
         assert!(
             !text.contains("configuração concluída"),
             "nunca termina com 'configuração concluída': {text}"
@@ -1910,7 +2015,7 @@ mod tests {
 
     #[test]
     fn summary_without_ia_marks_none_and_the_activation_command() {
-        let text = format_summary("dev", None, "store.db");
+        let text = format_summary("dev", None, "store.db", None);
         assert!(text.contains("  ia:  nenhuma"), "{text}");
         assert!(
             text.contains("                 kira setup --backend ollama"),

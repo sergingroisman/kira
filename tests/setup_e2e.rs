@@ -302,6 +302,9 @@ async fn run_setup(
         backend,
         skip: skip.iter().map(|item| (*item).to_string()).collect(),
         project_root,
+        // M6: a ingestão tem testes próprios (binary-level, abaixo); o helper
+        // in-process exercita o fluxo de TEXTO, sem escrever `.kira/`.
+        ingest: false,
         foundry: None,
         hidden_input: false,
     };
@@ -388,7 +391,7 @@ async fn setup_interactive_local_first_asks_name_project_and_ia_without_pat() {
         out.contains("ativar depois:   kira connect azure   (leitura de work items)"),
         "{out}"
     );
-    assert!(out.contains("próximo passo:   kira scan"), "{out}");
+    assert!(out.contains("próximo passo:   kira connect azure"), "{out}");
     // O setup local-first NUNCA fala de PAT (nem pergunta, nem ensina).
     assert!(
         !mentions_pat(&out),
@@ -669,7 +672,7 @@ async fn setup_yes_clean_env_prints_the_three_blocks_and_never_mentions_pat() {
         "sem IA, o ativar depois traz o backend: {out}"
     );
     // Bloco 3 — próximo passo.
-    assert!(out.contains("próximo passo:   kira scan"), "{out}");
+    assert!(out.contains("próximo passo:   kira connect azure"), "{out}");
     // O pulado é impresso com a causa (nunca silencioso).
     assert!(out.contains("ollama não encontrado nesta máquina"), "{out}");
     assert!(out.contains("ia: nenhuma por agora"), "{out}");
@@ -1514,7 +1517,7 @@ async fn setup_network_failure_saves_the_pat_and_continues() {
         "o PAT completo nunca pode aparecer na saída: {out}"
     );
     // O fluxo NÃO morre na falha de rede: o resumo local-first aparece.
-    assert!(out.contains("próximo passo:   kira scan"), "{out}");
+    assert!(out.contains("próximo passo:   kira connect azure"), "{out}");
     let _ = std::fs::remove_file(&config);
 }
 
@@ -1711,7 +1714,7 @@ async fn setup_unknown_skip_step_fails_with_actionable_error() {
 
     assert_eq!(code, ExitCode::FAILURE, "saída: {out}");
     assert!(
-        out.contains("--skip aceita 'pat' ou 'ia'"),
+        out.contains("--skip aceita 'pat', 'ia' ou 'ingest'"),
         "erro acionável: {out}"
     );
     let _ = std::fs::remove_file(&config);
@@ -2905,4 +2908,103 @@ async fn connect_azure_projeto_incorreto_nao_salva_nada() {
         "projeto errado não conecta"
     );
     drop_connect_dir(&root);
+}
+
+// ---------------------------------------------------------------------------
+// M6 — etapa de ingestão no `setup` (aceite do item)
+// ---------------------------------------------------------------------------
+
+/// Sandbox de projeto vazio + config/store isolados para rodar `kira setup`
+/// pelo BINÁRIO real. Devolve `(dir, store_dir, config)`; o `Drop` do teste
+/// limpa os três.
+struct IngestSandbox {
+    root: PathBuf,
+    store: PathBuf,
+    config: PathBuf,
+}
+
+impl IngestSandbox {
+    fn new(tag: &str) -> Self {
+        let root =
+            std::env::temp_dir().join(format!("kira-setup-ingest-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("README.md"), "# fixture\n").expect("readme");
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {}\n").expect("main");
+        let store = root.join(".store");
+        let config = root.join("config.toml");
+        IngestSandbox {
+            root,
+            store,
+            config,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_kira"))
+            .args(args)
+            .current_dir(&self.root)
+            .env("KIRA_CONFIG", &self.config)
+            .env("KIRA_STORE_DIR", &self.store)
+            .env("KIRA_SECRET_STORE", "off")
+            .env_remove("AZURE_DEVOPS_PAT")
+            .env_remove("AZURE_DEVOPS_ORG")
+            .env_remove("AZURE_DEVOPS_PROJECT")
+            .env_remove("KIRA_MODEL")
+            .env_remove("KIRA_LLM")
+            .output()
+            .unwrap_or_else(|err| panic!("executar kira {args:?}: {err}"));
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    }
+}
+
+impl Drop for IngestSandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn setup_yes_ingests_the_project_and_creates_facts() {
+    let sandbox = IngestSandbox::new("yes");
+    // O cwd do sandbox JÁ é a raiz do projeto (setup não tem `--path`).
+    let (code, out, err) = sandbox.run(&["setup", "--yes"]);
+    assert_eq!(code, 0, "setup --yes falhou: {out}\n{err}");
+    assert!(
+        out.contains("ingestão:"),
+        "a etapa de ingestão não rodou: {out}"
+    );
+    assert!(
+        sandbox.root.join(".kira").join("facts.md").is_file(),
+        "`--yes` deve criar .kira/facts.md: {out}"
+    );
+    assert!(
+        sandbox
+            .root
+            .join(".kira")
+            .join("ingest")
+            .join("inventory.json")
+            .is_file(),
+        "`--yes` deve criar o inventário: {out}"
+    );
+    assert!(
+        out.contains("próximo passo:   kira connect azure"),
+        "o resumo aponta o próximo passo do plano: {out}"
+    );
+}
+
+#[test]
+fn setup_skip_ingest_creates_nothing() {
+    let sandbox = IngestSandbox::new("skip");
+    let (code, out, err) = sandbox.run(&["setup", "--yes", "--skip", "ingest"]);
+    assert_eq!(code, 0, "setup --yes --skip ingest falhou: {out}\n{err}");
+    assert!(out.contains("ingestão pulada"), "{out}");
+    assert!(
+        !sandbox.root.join(".kira").join("facts.md").exists(),
+        "`--skip ingest` não pode criar .kira/facts.md: {out}"
+    );
 }
