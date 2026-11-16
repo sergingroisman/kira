@@ -123,16 +123,17 @@ fn migration_creates_posts_and_outbox_on_an_existing_store() {
     let (code, _, stderr) = sandbox.run(&["profile"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     // ADR-0039 (renames 4/6 e 5/6) + P0 (F2) + onda SK (SK-1 e SK-2) + HF-5
-    // + onda TE + F2: schema corrente é a v15 (v7 = coluna `draft_ttl`, v8 = estado
+    // + onda TE + F2: schema corrente é a v16 (v7 = coluna `draft_ttl`, v8 = estado
     // `failed`, v9 = `llm_calls`, v10 = `skill`/`skill_fts` — renumerado no
     // merge, v11 = `knowledge`/`knowledge_fts` para os textos do dono,
     // v12 = `model_admission` do gate de especialistas,
     // v13 = `session_economy` do ledger de economia — onda TE, PR34,
     // v14 = coluna `dedup_chars_saved` no ledger — onda TE, PR38,
-    // v15 = tabela `schedule` — F2, PR16).
+    // v15 = tabela `schedule` — F2, PR16,
+    // v16 = tabela `approvals` — F2, PR18).
     assert_eq!(
         user_version(&sandbox.db()),
-        15,
+        16,
         "migração não subiu para a versão corrente"
     );
 

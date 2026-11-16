@@ -137,6 +137,14 @@ pub async fn tick(options: &LoopOptions) -> Result<TickReport, LoopError> {
                     .to_string(),
             );
         }
+        // PR18: o ciclo agendado NUNCA passa por cima do círculo de aprovação.
+        // Não há escrita no mundo no ciclo de hoje; se houver pedido esperando
+        // decisão, ele é dito em voz alta em vez de ficar invisível no store.
+        if let Some(note) = crate::approvals::pending_note(&store)
+            .map_err(|err| LoopError::Schedule(err.to_string()))?
+        {
+            report.notes.push(note);
+        }
         Some((store, plan))
     } else {
         None

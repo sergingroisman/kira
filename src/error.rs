@@ -146,6 +146,25 @@ pub enum Error {
     )]
     ScheduleNotFound { id: i64 },
 
+    /// PR18: pedido de aprovação inexistente. Fail-closed: id errado nunca
+    /// vira "aprovado" por omissão.
+    #[error("não há pedido de aprovação com id {id} — rode `kira approvals` para ver os pendentes")]
+    ApprovalNotFound { id: i64 },
+
+    /// PR18: a escrita foi barrada porque o pedido não está `approved`
+    /// (`{state}` é o estado real). A mensagem mostra o caminho de saída.
+    #[error(
+        "a escrita no mundo exige aprovação humana: o pedido {id} está `{state}` — rode `kira approve {id}` depois de revisar"
+    )]
+    ApprovalNotApproved { id: i64, state: String },
+
+    /// PR18: o pedido aprovado é de OUTRA ação/alvo. Aprovar um alvo não
+    /// aprova o próximo: a guarda confere os dois campos.
+    #[error(
+        "o pedido {id} não cobre esta escrita (ação/alvo diferentes) — crie um pedido novo para o alvo certo"
+    )]
+    ApprovalTargetMismatch { id: i64 },
+
     /// A conferência de capacidades (ADR-0030) falhou ao ler o store local.
     /// Fail-closed (decisão 6 do ADR-0030): sem prova do estado, o comando de
     /// board não executa — o erro é do store, nunca uma tentativa de rede.
