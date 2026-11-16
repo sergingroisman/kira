@@ -14,7 +14,9 @@
 //! 2. **Raiz canonicalizada uma vez**, no [`Jail::new`]. Se a raiz for resolvida
 //!    de novo a cada checagem, um cwd trocado no meio muda o raio de explosão.
 //! 3. **rlimits são do FILHO**, aplicados em `pre_exec` (entre fork e exec) —
-//!    limitar o próprio KIRA mataria o agente que precisa reportar o erro.
+//!    limitar o próprio KIRA mataria o agente que precisa reportar o erro. O
+//!    teto de CPU é obrigatório (sem ele o `exec` aborta); AS e NPROC são
+//!    auxiliares e podem ser recusados pelo SO sem impedir o comando.
 //!
 //! Limite declarado no ADR-0011: **accident-prevention, não sandbox de
 //! segurança**. Um processo que já executa código arbitrário pode sair do
@@ -160,30 +162,46 @@ impl Jail {
     }
 
     /// Aplica os rlimits no processo filho (`pre_exec` = entre fork e exec).
+    ///
+    /// **Política por recurso, não "tudo ou nada":**
+    ///
+    /// - `RLIMIT_CPU` é a promessa do produto (um laço patológico morre em vez
+    ///   de queimar a máquina). Se ele não puder ser aplicado, o `exec` aborta —
+    ///   rodar sem o único limite que conta é justamente o que o jail existe
+    ///   para impedir.
+    /// - `RLIMIT_AS` e `RLIMIT_NPROC` são defesa em profundidade. Alguns SOs
+    ///   recusam esses tetos com `EINVAL`/`EAGAIN` (é o caso do macOS para o
+    ///   teto de processos/AS); insistir neles impediria o comando de rodar, o
+    ///   que é pior. A recusa é silenciosa de propósito: perder um teto
+    ///   auxiliar é aceitável, rodar sem jail não é.
+    ///
+    /// O `cfg(unix)` cobre Linux e macOS; no Windows não há `setrlimit` (o ADR
+    /// registra Job Objects como item futuro).
     #[cfg(unix)]
     fn apply_limits(&self, command: &mut Command) -> Result<(), GuardError> {
         use std::os::unix::process::CommandExt;
         let limits = self.limits;
-        // SAFETY: `pre_exec` roda no filho, logo após o fork. Os três
-        // `setrlimit` são async-signal-safe e não alocam — o que a doc do
-        // `pre_exec` exige. Erro volta como `io::Error` e aborta o exec, então
-        // um limite que não pode ser aplicado NUNCA vira execução sem limite.
+        // SAFETY: `pre_exec` roda no filho, logo após o fork. Os `setrlimit`
+        // são async-signal-safe e não alocam — o que a doc do `pre_exec` exige.
+        // O tipo do recurso (`__rlimit_resource_t`) é `u32` no Linux e `i32`
+        // no macOS: a macro evita nomear o tipo e mantém os três `setrlimit`
+        // idênticos nos dois alvos.
+        macro_rules! set_limit {
+            ($resource:expr, $value:expr) => {{
+                let limit = libc::rlimit {
+                    rlim_cur: $value,
+                    rlim_max: $value,
+                };
+                libc::setrlimit($resource, &limit)
+            }};
+        }
         unsafe {
             command.pre_exec(move || {
-                let pairs = [
-                    (libc::RLIMIT_CPU, limits.cpu_seconds),
-                    (libc::RLIMIT_AS, limits.address_space_bytes),
-                    (libc::RLIMIT_NPROC, limits.max_processes),
-                ];
-                for (resource, value) in pairs {
-                    let limit = libc::rlimit {
-                        rlim_cur: value,
-                        rlim_max: value,
-                    };
-                    if libc::setrlimit(resource, &limit) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                if set_limit!(libc::RLIMIT_CPU, limits.cpu_seconds) != 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
+                let _ = set_limit!(libc::RLIMIT_AS, limits.address_space_bytes);
+                let _ = set_limit!(libc::RLIMIT_NPROC, limits.max_processes);
                 Ok(())
             });
         }
