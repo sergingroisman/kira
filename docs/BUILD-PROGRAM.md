@@ -284,7 +284,11 @@
       `app.rs` e o snapshot mostra a contagem de achados.*
 - [ ] **PR23** painel de **arquivos criados/alterados pelo KIRA** (do store),
       timeline do ciclo.
-- [ ] **PR24** painel de **agendamentos e orçamento** (jobs, próximo tick, quota).
+- [x] **PR24** painel de **agendamentos e orçamento** (jobs, próximo tick, quota).
+      *Entregue (16/Nov, **PR #132**): quinta tela (`5`/Tab) — `Screen::Agenda` + `state::agenda_lines`
+      (pura, também no `--snapshot`). Cadência + próximo tick DERIVADO (`scheduler::next_run_text`),
+      `chamadas LLM: N/teto (%)`, e saúde dos provedores com `[stale]` (PR17). Leitura read-only;
+      segunda abertura do store justificada (agenda/quota são globais, sem `project_id`).*
 - [ ] **PR25** `kira --about` com o mascote em pixel art (asset versionado).
 - [ ] **PR26** criação de agendamento pela TUI (form) → grava no store.
 
