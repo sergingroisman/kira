@@ -275,8 +275,8 @@ fn ciclo_cru_offline_do_setup_ao_dashboard() {
         "o que precisa de capacidade fica EXPLÍCITO como desativado: {saida}"
     );
     assert!(
-        saida.contains("próximo passo:   kira scan"),
-        "o resumo termina apontando o próximo passo real: {saida}"
+        saida.contains("próximo passo:   kira connect azure"),
+        "o resumo termina apontando o próximo passo real (M6: a ingestão já rodou): {saida}"
     );
     assert!(
         saida.contains("ia:  nenhuma") && saida.contains("ollama não encontrado nesta máquina"),

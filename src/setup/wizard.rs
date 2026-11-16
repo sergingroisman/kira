@@ -70,17 +70,27 @@ pub fn mode(tty: bool, width: u16, height: u16, plain_flag: bool, explicit_flags
 pub enum Step {
     Ambiente,
     Projeto,
+    /// M6: a etapa que deixa o projeto legível — só mostra o preview e coleta
+    /// "ingerir/pular"; o efeito é do motor de texto (`setup::run`).
+    Ingestao,
     Ia,
     Resumo,
 }
 
 impl Step {
-    pub const ALL: [Step; 4] = [Step::Ambiente, Step::Projeto, Step::Ia, Step::Resumo];
+    pub const ALL: [Step; 5] = [
+        Step::Ambiente,
+        Step::Projeto,
+        Step::Ingestao,
+        Step::Ia,
+        Step::Resumo,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Step::Ambiente => "Ambiente",
             Step::Projeto => "Projeto",
+            Step::Ingestao => "Ingestão",
             Step::Ia => "IA",
             Step::Resumo => "Resumo",
         }
@@ -375,6 +385,9 @@ pub struct WizardState {
     pub foundry_form: bool,
     /// Aviso de uma linha (validação do próprio wizard, nunca de rede).
     pub notice: Option<String>,
+    /// M6: ingerir o projeto ao final? Default `true` — a etapa existe para
+    /// deixar o projeto legível, e pular é a exceção.
+    pub ingest: bool,
     pub env: EnvReport,
 }
 
@@ -430,6 +443,7 @@ impl WizardState {
             foundry_key: String::new(),
             foundry_form: false,
             notice: None,
+            ingest: true,
             env,
         }
     }
@@ -462,6 +476,9 @@ impl WizardState {
         let done = match step {
             Step::Ambiente => true,
             Step::Projeto => !self.env.root.trim().is_empty() && self.env.root != ".",
+            // A ingestão é uma DECISÃO com default; não depende de valor
+            // digitado, então já conta como resolvida ao ser visitada.
+            Step::Ingestao => true,
             // Foundry só conta como escolhido quando dá para usar: env
             // completa, config+keyring ou o formulário validado (ADR-0035).
             Step::Ia => match self.backend.as_deref() {
@@ -516,6 +533,18 @@ impl WizardState {
                     self.step = 2;
                 }
             }
+            Step::Ingestao => match key.code {
+                // Enter avança INGERINDO (o default); `n` avança pulando.
+                KeyCode::Enter | KeyCode::Tab => {
+                    self.ingest = true;
+                    self.step = 3;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.ingest = false;
+                    self.step = 3;
+                }
+                _ => {}
+            },
             Step::Ia => self.handle_ia(key),
             Step::Resumo => {
                 if key.code == KeyCode::Enter {
@@ -537,17 +566,17 @@ impl WizardState {
         match key.code {
             KeyCode::Char('1') => {
                 self.backend = Some("ollama".to_string());
-                self.step = 3;
+                self.step = 4;
             }
             KeyCode::Char('2') => {
                 self.backend = Some("copilot".to_string());
-                self.step = 3;
+                self.step = 4;
             }
             KeyCode::Char('3') => {
                 self.backend = Some("foundry".to_string());
                 if self.foundry_ready {
                     // Tudo já está no ambiente: nada a digitar.
-                    self.step = 3;
+                    self.step = 4;
                 } else {
                     // Formulário inline: endpoint/deployment pré-preenchidos
                     // da env; a chave nasce vazia (segredo só vem do teclado).
@@ -557,7 +586,7 @@ impl WizardState {
             }
             KeyCode::Char('4') => {
                 self.backend = Some("nenhuma".to_string());
-                self.step = 3;
+                self.step = 4;
             }
             KeyCode::Enter => {
                 // Enter com foundry escolhido e formulário incompleto reabre o
@@ -581,7 +610,7 @@ impl WizardState {
                         "nenhuma".to_string()
                     });
                 }
-                self.step = 3;
+                self.step = 4;
             }
             _ => {}
         }
@@ -604,7 +633,9 @@ impl WizardState {
                     self.notice = Some(message.to_string());
                 }
                 None => {
-                    self.step = 3;
+                    // Formulário validado: avança para o Resumo (step 4 — a
+                    // ingestão ocupa o 2 desde o M6).
+                    self.step = 4;
                     self.foundry_form = false;
                 }
             },
@@ -683,6 +714,8 @@ impl WizardState {
             ..SetupOptions::default()
         };
         options.backend = self.backend.clone();
+        // M6: a decisão da etapa de ingestão vai ao motor (que é quem escreve).
+        options.ingest = self.ingest;
         // Só o formulário (não o ambiente) vira `FoundryChoice`: assim o motor
         // testa exatamente o que foi digitado e grava depois do teste.
         options.foundry = self.foundry_choice();
@@ -765,7 +798,7 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
         Paragraph::new(Line::from(Span::styled(
             if narrow {
                 format!(
-                    "etapa {}/4 · {} · Enter Avança · Esc Volta · q Cancelar",
+                    "etapa {}/5 · {} · Enter Avança · Esc Volta · q Cancelar",
                     state.step + 1,
                     state.current().title()
                 )
@@ -881,6 +914,22 @@ pub fn render(frame: &mut Frame, state: &WizardState, palette: Palette) {
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
                 " Enter confirma e avança — o store registra o projeto por esta raiz",
+                Style::default().fg(palette.help),
+            )));
+        }
+        Step::Ingestao => {
+            body.push(Line::from(Span::styled(
+                "a ingestão deixa o projeto legível (sem IA, sem rede)",
+                Style::default().fg(palette.missing),
+            )));
+            body.push(Line::from(""));
+            body.push(Line::from(format!(" raiz         {}", state.env.root)));
+            body.push(Line::from(
+                " cria         .kira/facts.md + .kira/ingest/inventory.json",
+            ));
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                " Enter ingere agora — n pula (dá para rodar `kira ingest` depois)",
                 Style::default().fg(palette.help),
             )));
         }
@@ -1286,15 +1335,41 @@ mod tests {
         assert_eq!(state.env.root, r"C:\repo\kira");
         assert_eq!(state.step_status(Step::Projeto), '›');
         state.handle(key(KeyCode::Enter));
-        assert_eq!(state.current(), Step::Ia, "Enter confirma a raiz e avança");
+        assert_eq!(
+            state.current(),
+            Step::Ingestao,
+            "Enter confirma a raiz e cai na etapa de ingestão (M6)"
+        );
         // Depois de visitar, a etapa aparece como concluída na trilha.
         assert_eq!(state.step_status(Step::Projeto), '✓');
     }
 
     #[test]
+    fn ingest_step_defaults_to_ingesting_and_n_skips_it() {
+        // Enter = ingerir (o projeto fica legível); `n` = pular.
+        let mut ingere = state();
+        ingere.handle(key(KeyCode::Enter)); // Ambiente
+        ingere.handle(key(KeyCode::Enter)); // Projeto
+        assert_eq!(ingere.current(), Step::Ingestao);
+        ingere.handle(key(KeyCode::Enter));
+        assert!(ingere.ingest, "Enter ingere (default da etapa)");
+        assert_eq!(ingere.current(), Step::Ia);
+
+        let mut pula = state();
+        pula.handle(key(KeyCode::Enter));
+        pula.handle(key(KeyCode::Enter));
+        pula.handle(key(KeyCode::Char('n')));
+        assert!(!pula.ingest, "'n' pula a ingestão");
+        assert_eq!(pula.current(), Step::Ia);
+        // A decisão chega ao motor (é ele quem escreve).
+        let options = pula.finish().expect("resumo válido");
+        assert!(!options.ingest, "decisão de pular chega ao setup::run");
+    }
+
+    #[test]
     fn ia_choices_are_explicit_and_the_enter_default_is_honest() {
         let mut with_ollama = state();
-        with_ollama.step = 2; // IA
+        with_ollama.step = 3; // IA
         // Ollama PRESENTE no fixture: Enter = ollama (o barato da máquina).
         with_ollama.handle(key(KeyCode::Enter));
         assert_eq!(
@@ -1306,7 +1381,7 @@ mod tests {
 
         // Escolhas explícitas: 2 = copilot, 4 = nenhuma por agora.
         let mut none = with_ollama.clone();
-        none.step = 2;
+        none.step = 3;
         none.backend = None;
         none.handle(key(KeyCode::Char('4')));
         assert_eq!(none.backend.as_deref(), Some("nenhuma"));
@@ -1320,7 +1395,7 @@ mod tests {
         // inexistente: cai em "nenhuma" (default honesto).
         let mut sem_ollama = state();
         sem_ollama.env.tools = vec![("dotnet".to_string(), true), ("ollama".to_string(), false)];
-        sem_ollama.step = 2;
+        sem_ollama.step = 3;
         sem_ollama.handle(key(KeyCode::Enter));
         assert_eq!(
             sem_ollama.backend.as_deref(),
@@ -1332,9 +1407,9 @@ mod tests {
     #[test]
     fn esc_walks_back_one_step_and_never_writes() {
         let mut state = state();
-        state.step = 3;
+        state.step = 4;
         assert!(!state.handle(key(KeyCode::Esc)));
-        assert_eq!(state.step, 2);
+        assert_eq!(state.step, 3, "do Resumo volta para a IA");
         state.step = 0;
         assert!(
             !state.handle(key(KeyCode::Esc)),
@@ -1346,7 +1421,7 @@ mod tests {
     #[test]
     fn foundry_opens_the_inline_form_and_keeps_the_key_masked() {
         let mut state = state();
-        state.step = 2;
+        state.step = 3;
         state.handle(key(KeyCode::Char('3')));
         assert_eq!(state.current(), Step::Ia, "não avança sem os três valores");
         assert!(state.foundry_form, "o formulário abre inline");
@@ -1378,7 +1453,7 @@ mod tests {
 
         // Enter valida os três e avança; a escolha chega ao motor.
         state.handle(key(KeyCode::Enter));
-        assert_eq!(state.step, 3, "com os três válidos o wizard avança");
+        assert_eq!(state.step, 4, "com os três válidos o wizard avança");
         assert!(!state.foundry_form, "o formulário fecha ao avançar");
         let choice = state
             .foundry_choice()
@@ -1448,7 +1523,7 @@ mod tests {
                 ("KIRA_FOUNDRY_DEPLOYMENT", "gpt-4o-mini"),
             ]),
         );
-        state.step = 2;
+        state.step = 3;
         state.handle(key(KeyCode::Char('3')));
         assert!(state.foundry_form, "sem chave, o formulário abre");
         assert_eq!(
@@ -1472,7 +1547,7 @@ mod tests {
                 ("KIRA_FOUNDRY_API_KEY", "k"),
             ]),
         );
-        ready.step = 2;
+        ready.step = 3;
         ready.handle(key(KeyCode::Char('3')));
         assert_eq!(ready.current(), Step::Resumo, "env completa avança");
         assert_eq!(ready.backend.as_deref(), Some("foundry"));
@@ -1485,7 +1560,7 @@ mod tests {
     #[test]
     fn esc_closes_only_the_foundry_form_not_the_step() {
         let mut state = state();
-        state.step = 2;
+        state.step = 3;
         state.handle(key(KeyCode::Char('3')));
         assert!(state.foundry_form);
         state.handle(key(KeyCode::Esc));
@@ -1499,7 +1574,7 @@ mod tests {
     #[test]
     fn finish_has_no_required_field_and_the_resumo_enter_returns_options() {
         let mut state = state();
-        state.step = 3;
+        state.step = 4;
         // Local-first não tem campo obrigatório: org/projeto/credencial não
         // são pedidos (ADR-0030 #3), então o Resumo sempre entrega opções.
         let options = state.finish().unwrap_or_else(|| panic!("resumo válido"));
@@ -1561,7 +1636,7 @@ mod tests {
         );
         // O formulário do Foundry mostra o rótulo "chave", nunca o valor.
         let mut foundry = state.clone();
-        foundry.step = 2;
+        foundry.step = 3;
         foundry.handle(key(KeyCode::Char('3')));
         for value in "https://r.openai.azure.com/openai/v1".chars() {
             foundry.handle(key(KeyCode::Char(value)));
@@ -1616,7 +1691,7 @@ mod tests {
         assert_eq!(state.step_status(Step::Ambiente), '✓');
         assert_eq!(state.step_status(Step::Ia), '·');
         // Depois de passar pela IA, as etapas anteriores mostram seu estado.
-        state.step = 3;
+        state.step = 4;
         assert_eq!(state.step_status(Step::Projeto), '✓');
     }
 
@@ -1624,7 +1699,7 @@ mod tests {
     fn saved_foundry_with_the_key_in_the_keyring_skips_the_form_and_says_where() {
         let mut state = WizardState::new(&SetupOptions::default(), env_with_saved(), &no_env);
         assert_eq!(state.foundry_source, Some(FoundrySource::Stored));
-        state.step = 2;
+        state.step = 3;
         let text = screen_of(&state, 120, 40);
         assert!(
             text.contains("foundry já definido em config.toml + keyring do OS"),
@@ -1663,7 +1738,7 @@ mod tests {
         partial.saved.foundry_key = false;
         let mut state = WizardState::new(&SetupOptions::default(), partial, &no_env);
         assert_eq!(state.foundry_source, None);
-        state.step = 2;
+        state.step = 3;
         state.handle(key(KeyCode::Char('3')));
         assert!(state.foundry_form, "sem chave, o formulário abre");
         assert_eq!(
@@ -1680,12 +1755,12 @@ mod tests {
     #[test]
     fn narrow_terminal_trades_the_rail_for_the_step_counter_and_keeps_the_help() {
         let mut state = state();
-        state.step = 2;
+        state.step = 3;
         state.handle(key(KeyCode::Char('3')));
 
         let text = screen_of(&state, 80, 24);
         assert!(
-            text.contains("etapa 3/4"),
+            text.contains("etapa 4/5"),
             "a trilha vira contador em 80 colunas: {text}"
         );
         assert!(text.contains("IA"), "etapa nomeada: {text}");
