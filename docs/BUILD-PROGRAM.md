@@ -256,13 +256,20 @@
       Consumidor `fix --apply` ainda não existe; par da guarda do PR18.*
 
 ### F4 — dashboard Ratatui (estilo jogo, base = statui MIT · ADR-0014)
-- [ ] **PR21** vendor da casca do statui: copiar `app/keymap/theme/fx/state` +
+- [x] **PR21** vendor da casca do statui: copiar `app/keymap/theme/fx/state` +
       `widgets/{table,inspector,footer}` para `src/tui/`, **com atribuição**
       (`third_party/statui/{LICENSE,NOTICE.md}`, header em cada arquivo derivado),
       removendo `backend.rs`/config HTTP; adicionar `ratatui 0.29` (justificar no PR).
       Aceite: `kira tui` abre, renderiza um painel vazio e sai com `q`.
-- [ ] **PR22** painel de **bugs encontrados** (findings do `scan` + triage), com
+      *Entregue (W6-PR1, verificado em 16/Nov): `third_party/statui/{LICENSE,NOTICE.md}` com
+      atribuição, `ratatui 0.29` no Cargo.toml, casca em `src/tui/` (`app`/`keymap`/`theme`/
+      `chrome`/`layout`) e `kira dashboard` abre, alterna fontes e sai com `q`/Esc/Ctrl+C.
+      ADR-0039 renomeou o comando para `dashboard`.*
+- [x] **PR22** painel de **bugs encontrados** (findings do `scan` + triage), com
       contagem por severidade e animação de "novo achado".
+      *Entregue (W6-PR2, verificado em 16/Nov): `widgets/findings.rs` (24,9 KB) +
+      `widgets/severity.rs` + `widgets/cards.rs`; a mensagem "novo achado" existe em
+      `app.rs` e o snapshot mostra a contagem de achados.*
 - [ ] **PR23** painel de **arquivos criados/alterados pelo KIRA** (do store),
       timeline do ciclo.
 - [ ] **PR24** painel de **agendamentos e orçamento** (jobs, próximo tick, quota).
