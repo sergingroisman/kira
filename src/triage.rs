@@ -396,6 +396,18 @@ async fn triage_item(
             .push(format!("cache-wiki indisponível ({cause})"));
     }
     let prompt = build_prompt_with_context(item, &pack);
+    // PR17 (watchdog 2): silêncio pós-429 é respeitado também no triage — o
+    // comando devolve erro acionável em vez de insistir no provedor calado.
+    if let Some(store) = ledger {
+        match crate::llm::quota::silence_reason(store, crate::llm::quota::backend_name(kind)) {
+            Ok(Some(reason)) => return Err(Error::LlmSilenced(reason)),
+            Ok(None) => {}
+            Err(err) => {
+                // Estado ilegível não pode travar o julgamento: segue e tenta.
+                let _ = err;
+            }
+        }
+    }
     let answer = match &backend {
         TriageBackend::Ollama(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await,
         TriageBackend::Copilot(backend) => backend.complete(TRIAGE_SYSTEM_PROMPT, &prompt).await,
@@ -405,7 +417,31 @@ async fn triage_item(
     // falha — o custo para o dev aconteceu do mesmo jeito. O ENFORCE do teto
     // vive na camada de comando (checar ANTES de chamar); aqui é só registro.
     record_triage_call(ledger, kind, model, &prompt, &answer);
-    let text = answer?;
+    // PR17: sucesso limpa o silêncio; 429 o abre. Best-effort (sem ledger não
+    // há onde gravar) — o julgamento nunca quebra por causa do registro.
+    let text = match answer {
+        Ok(text) => {
+            if let Some(store) = ledger
+                && let Err(_err) =
+                    crate::llm::quota::record_success(store, crate::llm::quota::backend_name(kind))
+            {
+            }
+            text
+        }
+        Err(err) => {
+            if let Some(store) = ledger
+                && crate::llm::quota::is_rate_limited(&err)
+            {
+                let _ = crate::llm::quota::record_rate_limit(
+                    store,
+                    crate::llm::quota::backend_name(kind),
+                    None,
+                    &err.to_string(),
+                );
+            }
+            return Err(err);
+        }
+    };
     Ok(TriageReport {
         item_id: item.id,
         output: format_triage(&text)?,
