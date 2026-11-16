@@ -5,6 +5,7 @@
 //! in [`ado`].
 
 pub mod ado;
+pub mod approvals;
 pub mod binresolve;
 pub mod board;
 pub mod capabilities;

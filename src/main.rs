@@ -358,6 +358,28 @@ enum Command {
         #[command(subcommand)]
         action: ScheduleAction,
     },
+    /// Aprova (ou recusa) um pedido de escrita no mundo (F2, PR18). É a única
+    /// porta do círculo de aprovação: sem `approved`, nada escreve no Azure,
+    /// no repo do projeto ou no blog.
+    #[command(
+        after_help = "Exemplos:\n  kira approvals                 # o que espera decisão\n  kira approve 3                 # aprova o pedido 3\n  kira approve 3 --reject        # recusa (registra o motivo no estado)\n\nA aprovação vale para UM alvo (ação + alvo do pedido)."
+    )]
+    Approve {
+        /// Id do pedido mostrado por `kira approvals`
+        id: i64,
+        /// Recusa o pedido em vez de aprovar
+        #[arg(long)]
+        reject: bool,
+        /// Quem decidiu (default: `dono`; entra na trilha de auditoria)
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Lista os pedidos de escrita no mundo (default: só os pendentes)
+    Approvals {
+        /// Mostra também os já decididos
+        #[arg(long)]
+        all: bool,
+    },
     /// Wrapper do revisor externo rea (TE PR41): resolve o binário no PATH
     /// (ou KIRA_REA_BIN) ANTES do spawn e imprime a saída sempre REDIGIDA e
     /// capada em 8 KiB — output cru da ferramenta nunca chega ao terminal.
@@ -713,6 +735,8 @@ async fn run(command: Command) -> Outcome {
         Command::Scan { path } => scan_command(path.as_deref()),
         Command::Rea { args } => rea_command(&args),
         Command::Schedule { action } => schedule_command(action),
+        Command::Approve { id, reject, by } => approve_command(id, reject, by.as_deref()),
+        Command::Approvals { all } => approvals_command(all),
         Command::Ingest {
             path,
             json,
@@ -1086,6 +1110,26 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             // A trilha registra a invocação (ação + id), nunca o conteúdo do store.
             ("schedule".to_string(), schedule_args_text(action), None)
         }
+        Command::Approve { id, reject, by } => (
+            "approve".to_string(),
+            format!(
+                "{id}{}{}",
+                if *reject { " reject" } else { "" },
+                by.as_deref()
+                    .map(|who| format!(" by={who}"))
+                    .unwrap_or_default()
+            ),
+            None,
+        ),
+        Command::Approvals { all } => (
+            "approvals".to_string(),
+            if *all {
+                "all".to_string()
+            } else {
+                String::new()
+            },
+            None,
+        ),
         Command::Ingest {
             path,
             json,
@@ -1799,6 +1843,75 @@ fn schedule_remove(id: i64) -> Result<String, kira::error::Error> {
         return Err(kira::error::Error::ScheduleNotFound { id });
     }
     Ok(format!("agendamento {id} removido\n"))
+}
+
+/// Decisão humana sobre um pedido de escrita (`kira approve`).
+fn approve_command(id: i64, reject: bool, by: Option<&str>) -> Outcome {
+    let result = (|| -> Result<String, kira::error::Error> {
+        let store = kira::store::Store::open_default()?;
+        let who = by.unwrap_or("dono");
+        if !store.decide_approval(id, !reject, who)? {
+            // Ou não existe, ou já foi decidido: a mensagem certa importa.
+            return match store.get_approval(id)? {
+                None => Err(kira::error::Error::ApprovalNotFound { id }),
+                Some(row) => Ok(format!(
+                    "pedido {id} já estava `{}` ({}) — decisão anterior mantida\n",
+                    row.state, row.action
+                )),
+            };
+        }
+        Ok(format!(
+            "pedido {id} {} por {}\n",
+            if reject { "recusado" } else { "aprovado" },
+            who
+        ))
+    })();
+    match result {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// Lista os pedidos de escrita no mundo (`kira approvals`).
+fn approvals_command(all: bool) -> Outcome {
+    let result = (|| -> Result<String, kira::error::Error> {
+        let store = kira::store::Store::open_default()?;
+        let rows = store.list_approvals(!all)?;
+        if rows.is_empty() {
+            return Ok(if all {
+                "nenhum pedido de aprovação registrado\n".to_string()
+            } else {
+                "nenhuma escrita no mundo aguardando aprovação\n".to_string()
+            });
+        }
+        let mut out = format!("pedidos ({})\n", rows.len());
+        for row in &rows {
+            out.push_str(&format!(
+                "  id {} · {} · {} · [{}] · {}\n",
+                row.id, row.action, row.target, row.state, row.summary
+            ));
+        }
+        if !all {
+            out.push_str("  decidir: `kira approve <id>` (ou `kira approve <id> --reject`)\n");
+        }
+        Ok(out)
+    })();
+    match result {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
 }
 
 fn schedule_set_enabled(id: i64, enabled: bool) -> Result<String, kira::error::Error> {

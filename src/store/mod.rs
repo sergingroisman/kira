@@ -43,7 +43,9 @@ pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 /// categoria própria do dedup contíguo dos trechos.
 /// v15 (F2, PR16): `schedule` — agendamentos do ciclo (cadência + último run),
 /// sem daemon: o próximo tick é derivado, nunca gravado.
-const SCHEMA_VERSION: i64 = 15;
+/// v16 (F2, PR18): `approvals` — o círculo de aprovação humana: toda escrita
+/// no mundo passa por um pedido `pending` que só `kira approve` resolve.
+const SCHEMA_VERSION: i64 = 16;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -142,6 +144,24 @@ pub struct ScheduleRow {
     /// RFC-3339 UTC of the last run; `None` = never ran (due immediately).
     pub last_run_at: Option<String>,
     pub created_at: String,
+}
+
+/// One row of `approvals` (schema v16, PR18): a pedido de escrita no mundo
+/// esperando decisão humana. Só `pending` pode virar `approved`/`rejected`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRow {
+    pub id: i64,
+    /// Classe da escrita (`fix.apply`, `board.comment`, `publish.remote`…).
+    pub action: String,
+    /// Alvo concreto (id do item, caminho, repo#pr) — o que a guarda confere.
+    pub target: String,
+    /// Uma linha REDIGIDA descrevendo o efeito. Payload cru nunca entra aqui.
+    pub summary: String,
+    /// `pending` | `approved` | `rejected`.
+    pub state: String,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+    pub decided_by: Option<String>,
 }
 
 impl Store {
@@ -566,6 +586,88 @@ impl Store {
         let updated = self.conn.execute(
             "UPDATE schedule SET enabled = ?2 WHERE id = ?1",
             rusqlite::params![id, i64::from(enabled)],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Registra um pedido de escrita no mundo e devolve o id (schema v16,
+    /// PR18). Nasce `pending`: nada executa até uma decisão humana.
+    pub fn add_approval(
+        &self,
+        action: &str,
+        target: &str,
+        summary: &str,
+    ) -> Result<i64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO approvals (action, target, summary, state, created_at) \
+             VALUES (?1, ?2, ?3, 'pending', ?4)",
+            rusqlite::params![action, target, summary, now_rfc3339_utc()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Pedidos em ordem de criação; `only_pending` filtra o que ainda espera
+    /// decisão (o que o `kira approve` sem argumento mostra).
+    pub fn list_approvals(&self, only_pending: bool) -> Result<Vec<ApprovalRow>, StoreError> {
+        let sql = if only_pending {
+            "SELECT id, action, target, summary, state, created_at, decided_at, decided_by \
+             FROM approvals WHERE state = 'pending' ORDER BY id"
+        } else {
+            "SELECT id, action, target, summary, state, created_at, decided_at, decided_by \
+             FROM approvals ORDER BY id"
+        };
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ApprovalRow {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    target: row.get(2)?,
+                    summary: row.get(3)?,
+                    state: row.get(4)?,
+                    created_at: row.get(5)?,
+                    decided_at: row.get(6)?,
+                    decided_by: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Lê um pedido. `None` = id inexistente (o CLI transforma em erro
+    /// acionável, nunca em "aprovado" silencioso).
+    pub fn get_approval(&self, id: i64) -> Result<Option<ApprovalRow>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, action, target, summary, state, created_at, decided_at, decided_by \
+             FROM approvals WHERE id = ?1",
+        )?;
+        let mut rows = statement.query_map(rusqlite::params![id], |row| {
+            Ok(ApprovalRow {
+                id: row.get(0)?,
+                action: row.get(1)?,
+                target: row.get(2)?,
+                summary: row.get(3)?,
+                state: row.get(4)?,
+                created_at: row.get(5)?,
+                decided_at: row.get(6)?,
+                decided_by: row.get(7)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Decide um pedido. A transição é um `UPDATE … WHERE state = 'pending'`:
+    /// só a PRIMEIRA decisão vale (duas aprovações simultâneas não "vencem"
+    /// as duas). `false` = não havia pedido pendente com esse id.
+    pub fn decide_approval(&self, id: i64, approved: bool, by: &str) -> Result<bool, StoreError> {
+        let state = if approved { "approved" } else { "rejected" };
+        let updated = self.conn.execute(
+            "UPDATE approvals SET state = ?2, decided_at = ?3, decided_by = ?4 \
+             WHERE id = ?1 AND state = 'pending'",
+            rusqlite::params![id, state, now_rfc3339_utc(), by],
         )?;
         Ok(updated > 0)
     }
@@ -1528,6 +1630,28 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_run_at TEXT,
                 created_at TEXT NOT NULL
+            );",
+        )
+        .map_err(schema_error)?;
+    }
+
+    // v16 — F2, PR18: círculo de aprovação humana (guard da autonomia).
+    // `state` é a máquina de estados do pedido: `pending` → `approved` |
+    // `rejected`, e SÓ a partir de `pending` (a transição é um `UPDATE`
+    // condicionado, não uma checagem seguida de escrita — dois `kira approve`
+    // simultâneos não podem "vencer" os dois). `summary` guarda uma linha
+    // REDIGIDA: o payload cru nunca entra no store.
+    if current < 16 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS approvals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                target TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                decided_at TEXT,
+                decided_by TEXT
             );",
         )
         .map_err(schema_error)?;
