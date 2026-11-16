@@ -28,11 +28,11 @@ inteligência):
 
 | # | Ideia do gitingest | Onde cai no KIRA | Prioridade |
 |---|---|---|---|
-| P1 | **BOM-sniff antes de parsear JSON de ferramenta** (`EF BB BF`/`FF FE`/`FE FF`) | `src/scan/node.rs`, `src/scan/dotnet.rs` | **Bug real** — a captura `pnpm-audit-real.json` (redirect PowerShell) saiu UTF-16 LE com BOM; o `serde_json` quebraria |
+| P1 | **BOM-sniff antes de parsear JSON de ferramenta** (`EF BB BF`/`FF FE`/`FE FF`) | `src/scan/decode.rs` (consumido por `node.rs`/`dotnet.rs`) | ✅ **entregue (M7, 13/Nov)** — decode UTF-8/UTF-16 LE/BE nos dois call sites + fixture `scan_npm_audit_utf16le.json` parseando pelo extrator real |
 | P2 | ~~Sniff de binário (1 KB + decodificação)~~ | `src/context/repo.rs` | **Cortado (11/Nov)** — `read_text_file` já faz probe de NUL + `from_utf8` no arquivo inteiro; melhoria fantasma |
-| P3 | **Tabela `DEFAULT_IGNORE_PATTERNS`** (~150 padrões curados por linguagem) | `src/context/index.rs` + allowlist do grep | Alta — MIT, copiar tabela com atribuição, unificar numa única fonte |
-| P4 | **Orçamentos da caminhada**: profundidade máx. + total de bytes | `src/context/index.rs` (constantes fixas; env só com justificativa) | Média |
-| P5 | **Honrar `.gitignore`** (subconjunto gitwildmatch em Rust puro, com negação e `.gitignore` aninhado) | `src/context/index.rs`, `src/context/repo.rs` | Média — a fonte da precisão do gitingest |
+| P3 | **Tabela `DEFAULT_IGNORE_PATTERNS`** (~150 padrões curados por linguagem) | `src/context/index.rs` + allowlist do grep | **aberto** — MIT, copiar tabela com atribuição, unificar numa única fonte |
+| P4 | **Orçamentos da caminhada**: profundidade máx. + total de bytes | `src/context/index.rs` (constantes fixas; env só com justificativa) | **aberto** |
+| P5 | **Honrar `.gitignore`** (subconjunto gitwildmatch em Rust puro, com negação e `.gitignore` aninhado) | `src/context/gitignore.rs` (honrado no `reindex` e no `grep`) | ✅ **entregue (M7, 13/Nov)** — negação, ancoragem, dir-only, `**`, ancestral excluído não re-incluível; 12 testes |
 | P6 | **Estimativa de tokens no cabeçalho do pack** | `src/context/mod.rs` — chars/4 determinístico (tiktoken baixa BPE da rede = contra o CLI-first) | Opcional |
 
 ## O que NÃO vale

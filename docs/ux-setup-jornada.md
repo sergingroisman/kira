@@ -110,10 +110,13 @@ setup`; numa máquina já configurada, o dono vê o que o KIRA vai reaproveitar 
 | # | Etapa | O que o dono vê | O que ele decide | O que fica gravado |
 |---|---|---|---|---|
 | 1 | **Ambiente** | SO, arquitetura, shell, keyring, caminhos, ferramentas no PATH — cada `—` com a causa | nada (só Enter) | nada |
-| 2 | **Azure** | org e projeto já preenchidos (flag > env > config), campo focado marcado | corrigir/aceitar | `organization`, `project` no `config.toml` |
-| 3 | **Acesso** | aula curta (senha descartável, Work Items → Read, 30/90 dias, valor único) + menu colar/ambiente/pular + campo mascarado; se já existe PAT salvo, avisa e `Enter` o mantém | colar PAT, usar env, manter o do keyring ou pular | PAT no keyring (colado e validado, ou sem rede); o salvo é validado e não regravado; pulado ⇒ modo local |
-| 4 | **IA** | custo e dados de cada opção; Foundry abre o formulário inline | ollama / copilot / foundry (+ endpoint, deployment, chave) | `backend` na escolha; Foundry: endpoint/deployment no config e chave no keyring, **depois** do teste |
-| 5 | **Resumo** | o que será gravado, com PAT mascarado e origem de cada valor | Enter grava / Esc volta | resumo no formato `pronto: / pulado: / próximo passo:  kira scan` |
+| 2 | **Projeto** | a raiz DETECTADA (nunca perguntada do zero) | Enter confirma | o projeto no store (por esta raiz) |
+| 3 | **Ingestão** | preview read-only: a raiz e o que será criado (`.kira/facts.md` + `.kira/ingest/inventory.json`); sem IA, sem rede | **Enter ingere / `n` pula** | `.kira/facts.md` + inventário (feito pelo motor, não pelo wizard) |
+| 4 | **IA** | custo e dados de cada opção; Foundry abre o formulário inline | ollama / copilot / foundry (+ endpoint, deployment, chave) ou "nenhuma por agora" | `backend` na escolha; Foundry: endpoint/deployment no config e chave no keyring, **depois** do teste |
+| 5 | **Resumo** | o que será gravado, com a origem de cada valor | Enter encerra / Esc volta | resumo `pronto: / ingestão: / próximo passo:  kira connect azure` |
+
+Nenhuma etapa pede PAT: a credencial nasce em `kira connect azure` (ADR-0030 #4). As etapas
+"Azure" e "Acesso" que este documento descrevia deixaram de existir no wizard.
 
 ### 4.4 A etapa de IA com o formulário do Foundry (ADR-0035)
 
@@ -167,13 +170,14 @@ stateDiagram-v2
 O wizard não executa nada: ele devolve `SetupOptions` (`interactive: false`) e o motor de texto
 faz, nesta ordem:
 
-1. resolve e valida o PAT (leitura barata) — env > keyring > pulado; 401/403 param, sem rede
-   grava e avisa;
-2. pergunta/deriva o nome do dev e grava `config.toml` (org, projeto, `dev_name`);
+1. imprime/registra a raiz do projeto e, quando a etapa pediu, roda o **`ingest`** dela
+   (`.kira/facts.md` + inventário; `run_scan = false`, porque scan é rede/lento) — falha aqui é
+   nota acionável, nunca erro fatal;
+2. pergunta/deriva o nome do dev e grava `config.toml` (`dev_name`);
 3. verifica a IA escolhida (ollama list, copilot no PATH, ou UMA chamada do Foundry — resolvida
    por env > `config.toml` > keyring);
 4. grava o efeito do Foundry quando houve formulário e o teste passou;
-5. imprime o resumo `pronto: / pulado: / próximo passo:  kira scan`.
+5. imprime o resumo `pronto: / ingestão: / próximo passo:  kira connect azure`.
 
 Reaproveitar é a regra: nada é pedido de novo se já está guardado e resolvível. Isso vale para
 org/projeto/dev, para o par endpoint/deployment do Foundry e para o PAT (que é validado, não
