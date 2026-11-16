@@ -54,6 +54,30 @@ idle ──tick──▶ observe ──▶ decide ──▶ (leitura) ───�
 6. **Sem escrita por acidente**: qualquer ação que escreva exige `--apply` **e** passa por
    `awaiting_approval`; `kira approve <id>` é do humano, com registro de quem aprovou.
 
+### Watchdogs de budget (pressão antes do teto)
+
+O watchdog 1 é o corte final (`50/50` = só `observe`/`record`). Antes dele, o ciclo avisa
+em **três degraus numerados** — o objetivo é o humano decidir antes de o dia acabar sem
+orçamento, não descobrir no último ciclo:
+
+| Degrau | Chamadas do dia | O que o ciclo faz |
+|---|---|---|
+| **50%** | 25 / 50 | **nota** no output do ciclo (`budget: 25/50 chamadas hoje`) — informativo, o ciclo segue normal |
+| **75%** | 37 / 50 | **aviso** + sugestão explícita de reduzir os caps antes do próximo ciclo: `token_profile: budget` no `config.toml` (PR40) — o ciclo segue, mas o humano é avisado de que a folga está curta |
+| **90%** | 45 / 50 | **para** e registra pendência no store — **nunca** gasta a reserva dos 5 últimos |
+
+Regras que atravessam os degraus:
+
+- A contagem é a do dia corrente no ledger (`llm_calls`, schema v9) — o mesmo número que
+  `kira doctor` mostra; cache hit da wiki **não** consome (não é chamada de LLM).
+- Degrau atingido **não** é erro: o ciclo continua no degrau em que está; só o `90%` para.
+- **Budget estourado ≠ aprovação**: faltar orçamento nunca autoriza um `apply`
+  (`awaiting_approval` continua exigindo `kira approve <id>` do humano).
+- Cada degrau é emitido **uma vez por dia** (não repete a cada tick); um dia novo zera a
+  escada junto com o contador.
+- D12 (percentuais 50/75/90) é proposta desta spec: o mandato vigente é o teto de **50
+  chamadas LLM/dia** (não R$); mudar os degraus é decisão do dono.
+
 ## Integração com logs (Datadog, depois outros)
 
 - `setup` pergunta a fonte de log (`datadog` | `nenhum`).
