@@ -348,6 +348,19 @@ enum Command {
         #[command(subcommand)]
         action: KnowledgeAction,
     },
+    /// Wrapper do revisor externo rea (TE PR41): resolve o binário no PATH
+    /// (ou KIRA_REA_BIN) ANTES do spawn e imprime a saída sempre REDIGIDA e
+    /// capada em 8 KiB — output cru da ferramenta nunca chega ao terminal.
+    /// Read-only: sem daemon, sem LLM, sem escrita no board/repo.
+    #[command(
+        after_help = "Exemplos:\n  kira rea --help               # o próprio rea ensina os argumentos\n  kira rea --diff HEAD~1        # revisa o diff do último commit (args passthrough)\n\nSem o binário instalado, o KIRA diz o que fazer (\"instale o rea\") sem tentar executar."
+    )]
+    Rea {
+        /// Argumentos passthrough para o binário rea (flags com `-`/`--`
+        /// incluídas — nada é interpretado pelo KIRA)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Ciclo local do KIRA (PR15): um tick = ingest → digest (se trusted) →
     /// publish. Tudo LOCAL — nunca escreve no mundo (Azure/git remoto); sem
     /// daemon: roda em primeiro plano e sai. `--once` = um tick (CI)
@@ -651,6 +664,7 @@ async fn run(command: Command) -> Outcome {
         Command::Note { text, remove } => store_command(note_output(text, remove)),
         Command::Profile => store_command(profile_output()),
         Command::Scan { path } => scan_command(path.as_deref()),
+        Command::Rea { args } => rea_command(&args),
         Command::Ingest {
             path,
             json,
@@ -1012,6 +1026,12 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 .unwrap_or_default(),
             None,
         ),
+        Command::Rea { args } => {
+            // Os args passthrough entram na trilha como foram passados: a
+            // auditoria precisa saber o que o rea recebeu (e nada de segredo
+            // passa por aqui — o KIRA não pede segredo ao rea).
+            ("rea".to_string(), shellwords_join(args), None)
+        }
         Command::Ingest {
             path,
             json,
@@ -1269,6 +1289,12 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             ("loop".to_string(), args.trim().to_string(), model.clone())
         }
     }
+}
+
+/// Junta os args passthrough do `rea` para a trilha (um espaço entre eles:
+/// a trilha descreve a invocação, não re-parseia nada).
+fn shellwords_join(args: &[String]) -> String {
+    args.join(" ")
 }
 
 /// Args description for the `note` trail (no note text ends up doubled).
@@ -1587,6 +1613,22 @@ fn note_output(text: Option<String>, remove: Option<i64>) -> Result<String, Stor
 /// as the trail summary (stacks + counts).
 fn scan_command(path: Option<&Path>) -> Outcome {
     match scan::run(path) {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// `kira rea <args>` (TE PR41): wrapper read-only do revisor externo. A
+/// sessão entra na trilha como o scan faz — rodar uma revisão é trabalho
+/// medível; a trilha é local e fail-open (o erro nunca quebra o comando).
+fn rea_command(args: &[String]) -> Outcome {
+    match kira::rea::run(args) {
         Ok(text) => {
             print!("{text}");
             Outcome::success(text)
