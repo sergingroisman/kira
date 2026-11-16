@@ -116,9 +116,13 @@
       Trait em `src/llm/mod.rs` com `from_flag_and_env` (flag > env > default);
       `OllamaBackend` (localhost) é o default e `CopilotBackend` entrou no PR #34.
       BYOK HTTP continua como PR11b (registrado, fora desta fila).
-- [ ] **W2-bis** `kira triage --eval <dir>` + `tests/fixtures/triage_gold/`
+- [x] **W2-bis** `kira triage --eval <dir>` + `tests/fixtures/triage_gold/`
       (schema + leitor + % de acerto). Harness testado com fixtures sintéticas;
       **medição real espera os 20 bugs rotulados pelo dono**.
+      *Lote entregue (16/Nov, **PR #127**): 20 itens montados dos commits de correção
+      reais do KIRA (sintoma no `item.json`, causa raiz e arquivos no `gold.json`),
+      confirmados pelo dono; `tests/triage_gold_fixtures.rs` guarda a forma do lote.
+      Falta só a MEDIÇÃO (gate M2, precisa do Ollama vivo).*
 
 ### W2-FIX — correções do primeiro uso real (brief em `docs/kira-w2-fix.md`)
 
@@ -242,9 +246,14 @@
       `src/llm/copilot.rs`, binário resolvido por `KIRA_COPILOT_BIN`/PATH, erro
       acionável e **nunca** fallback silencioso para Ollama. O pin do SDK em
       preview fica no backlog (B2: policy Avanade); ollama-only segue válido.
-- [ ] **PR27** jail mínimo do `fix --apply` (ADR-0011, decisão do dono 10/Nov):
+- [x] **PR27** jail mínimo do `fix --apply` (ADR-0011, decisão do dono 10/Nov):
       confinamento por canonicalização (std) + rlimits em `cfg(unix)`; Windows
       sem rlimits no MVP. **Sem bwrap/Landlock.** Deny-list do PR3 é a camada 1.
+      *Entregue (16/Nov, **PR #128**): `src/guard/jail.rs` — canonicaliza DEPOIS do
+      join (pega symlink para fora), `run` com cwd preso à raiz + `env_clear`, e
+      `RLIMIT_CPU` obrigatório / `AS`+`NPROC` auxiliares em `pre_exec` (macOS
+      devolve EINVAL nos auxiliares: recusa deles não pode impedir o comando).
+      Consumidor `fix --apply` ainda não existe; par da guarda do PR18.*
 
 ### F4 — dashboard Ratatui (estilo jogo, base = statui MIT · ADR-0014)
 - [ ] **PR21** vendor da casca do statui: copiar `app/keymap/theme/fx/state` +
@@ -261,8 +270,9 @@
 - [ ] **PR26** criação de agendamento pela TUI (form) → grava no store.
 
 ### F5 — gate M2 (medição) — **bloqueado pelo dono**
-- [ ] 20 bugs fechados rotulados em `tests/fixtures/triage_gold/` → rodar
-      `kira triage --eval`, exigir ≥70%. Sem isso, nada de release.
+- [x] 20 bugs fechados rotulados em `tests/fixtures/triage_gold/` (**PR #127**,
+      confirmados pelo dono em 16/Nov) → **falta rodar** `kira triage --eval` com
+      Ollama vivo, exigir ≥70%. Sem a medição, nada de release.
 
 ## Bloqueios (precisam do dono)
 
