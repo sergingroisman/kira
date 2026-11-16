@@ -99,6 +99,12 @@ pub struct Snapshot {
     pub artifact_rows: Vec<ArtifactRow>,
     /// Causa quando não há artefato (store ausente ou ciclo nunca rodou).
     pub artifacts_note: Option<String>,
+    /// Caixa de correio (M4): posts do projeto com status de leitura.
+    /// Vem da mesma `posts` do projeto (project-scoped), então entra no
+    /// mesmo recorte read-only do `load_store` — invariante mantido.
+    pub mailbox_items: Vec<ArtifactRow>,
+    /// Causa quando não há item na caixa de correio.
+    pub mailbox_note: Option<String>,
 }
 
 /// Uma linha do painel de arquivos (PR23).
@@ -397,6 +403,33 @@ pub fn artifacts_lines(snapshot: &Snapshot) -> Vec<String> {
                 "  {when} · {} · {}",
                 row.command,
                 if row.ok { "ok" } else { "falhou" }
+            ));
+        }
+    }
+    lines
+}
+
+/// Linhas da caixa de correio (M4): posts com status de leitura e idade.
+#[must_use]
+pub fn mailbox_lines(snapshot: &Snapshot) -> Vec<String> {
+    let mut lines = vec!["correio".to_string()];
+    if snapshot.mailbox_items.is_empty() {
+        lines.push(format!(
+            "  — {}",
+            snapshot
+                .mailbox_note
+                .as_deref()
+                .unwrap_or("nenhum post no projeto")
+        ));
+    } else {
+        for row in &snapshot.mailbox_items {
+            let read = row.state == "delivered" || row.state == "sealed";
+            lines.push(format!(
+                "  {} {} · {} · {}",
+                if read { "✓" } else { "●" },
+                row.kind,
+                row.path.split('/').next_back().unwrap_or(&row.path),
+                row.age
             ));
         }
     }

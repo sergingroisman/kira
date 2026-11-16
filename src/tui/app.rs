@@ -49,7 +49,7 @@ use crate::tui::widgets::sessions::SessionsWidget;
 use crate::tui::widgets::wiki::{WikiPageWidget, WikiWidget};
 
 /// Quantidade de fontes no ciclo de `Tab`/`1–4`.
-pub const SCREEN_COUNT: usize = 6;
+pub const SCREEN_COUNT: usize = 7;
 
 /// Passo de PgUp/PgDn no preview/lista (linhas por "página" de scroll).
 pub const SCROLL_PAGE_STEP: isize = 10;
@@ -102,6 +102,8 @@ pub enum Screen {
     Agenda,
     /// Arquivos escritos pelo KIRA + timeline do ciclo (PR23).
     Arquivos,
+    /// Caixa de correio dos posts (M4): leitura/preview.
+    Correio,
 }
 
 impl Screen {
@@ -114,6 +116,7 @@ impl Screen {
             Screen::Wiki => 3,
             Screen::Agenda => 4,
             Screen::Arquivos => 5,
+            Screen::Correio => 6,
         }
     }
 
@@ -125,6 +128,7 @@ impl Screen {
             3 => Screen::Wiki,
             4 => Screen::Agenda,
             5 => Screen::Arquivos,
+            6 => Screen::Correio,
             _ => Screen::Resumo,
         }
     }
@@ -335,8 +339,8 @@ pub fn max_selected_for(
         Screen::Sessoes => sessions_len.max(1) - 1,
         Screen::Wiki => wiki_len.max(1) - 1,
         Screen::Resumo => 0,
-        // Agenda e Arquivos são leitura de painel: sem lista navegável.
-        Screen::Agenda | Screen::Arquivos => 0,
+        // Agenda, Arquivos e Correio são leitura de painel: sem lista navegável.
+        Screen::Agenda | Screen::Arquivos | Screen::Correio => 0,
     }
 }
 
@@ -346,7 +350,7 @@ fn screen_has_rows(screen: &AppState) -> bool {
         Screen::Achados => screen.findings_len > 0,
         Screen::Sessoes => screen.sessions_len > 0,
         Screen::Wiki => screen.wiki_len > 0,
-        Screen::Resumo | Screen::Agenda | Screen::Arquivos => false,
+        Screen::Resumo | Screen::Agenda | Screen::Arquivos | Screen::Correio => false,
     }
 }
 
@@ -428,7 +432,7 @@ pub fn apply_outcome(screen: &mut AppState, outcome: Outcome) {
                     Screen::Wiki => screen.wiki_selected = apply_move(screen.wiki_selected, offset),
                     // Resumo, Agenda e Arquivos não são listas: ↑/↓ não
                     // inventam seleção.
-                    Screen::Resumo | Screen::Agenda | Screen::Arquivos => {}
+                    Screen::Resumo | Screen::Agenda | Screen::Arquivos | Screen::Correio => {}
                 }
             }
         }
@@ -628,7 +632,7 @@ fn selection_key(snapshot: &Snapshot, state_screen: &AppState) -> Option<state::
                 .get(state_screen.wiki_selected)
                 .map(|page| state::SelectionKey::Wiki(page.slug.clone()))
         }
-        Screen::Resumo | Screen::Agenda | Screen::Arquivos => None,
+        Screen::Resumo | Screen::Agenda | Screen::Arquivos | Screen::Correio => None,
     }
 }
 
@@ -792,6 +796,7 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
         KeyCode::Char('4') => Outcome::GoScreen(Screen::Wiki),
         KeyCode::Char('5') => Outcome::GoScreen(Screen::Agenda),
         KeyCode::Char('6') => Outcome::GoScreen(Screen::Arquivos),
+        KeyCode::Char('7') => Outcome::GoScreen(Screen::Correio),
         KeyCode::Char('l') if key.modifiers.contains(Mods::CONTROL) => Outcome::Redraw,
         _ => match keymap::map(key) {
             Some(Key::Quit) => Outcome::Quit,
@@ -1027,6 +1032,7 @@ pub fn degraded_lines(snapshot: &Snapshot, screen: Screen) -> Vec<String> {
         Screen::Sessoes => lines.extend(state::sessions_lines(snapshot)),
         Screen::Wiki => lines.extend(state::wiki_lines(snapshot)),
         Screen::Agenda => lines.extend(state::agenda_lines(snapshot)),
+        Screen::Correio => lines.extend(state::mailbox_lines(snapshot)),
         Screen::Arquivos => lines.extend(state::artifacts_lines(snapshot)),
     }
     lines
@@ -1284,6 +1290,22 @@ fn render_screen(
                 Paragraph::new(lines)
                     .block(crate::tui::widgets::panel::block(
                         "6 Arquivos · o que o KIRA escreveu",
+                        true,
+                        palette,
+                    ))
+                    .wrap(Wrap { trim: false }),
+                primary,
+            );
+        }
+        Screen::Correio => {
+            let lines: Vec<Line> = state::mailbox_lines(snapshot)
+                .into_iter()
+                .map(Line::from)
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(crate::tui::widgets::panel::block(
+                        "7 Correio · posts da caixa de correio",
                         true,
                         palette,
                     ))
@@ -1715,20 +1737,63 @@ mod tests {
             Outcome::GoScreen(Screen::Wiki)
         );
         assert_eq!(
+            decide(&state, plain(KeyCode::Char('5'))),
+            Outcome::GoScreen(Screen::Agenda)
+        );
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('6'))),
+            Outcome::GoScreen(Screen::Arquivos)
+        );
+        assert_eq!(
+            decide(&state, plain(KeyCode::Char('7'))),
+            Outcome::GoScreen(Screen::Correio)
+        );
+        assert_eq!(
             decide(&state, plain(KeyCode::Char('1'))),
             Outcome::GoScreen(Screen::Resumo)
         );
     }
 
     #[test]
-    fn tab_cycles_the_six_screens_with_wrap() {
+    fn debug_next_screen() {
+        let result = next_screen(Screen::Correio, 1);
+        eprintln!("DEBUG: next_screen(Correio, 1) = {:?}", result);
+        eprintln!("DEBUG: Correio.index() = {:?}", Screen::Correio.index());
+        eprintln!("DEBUG: from_index(0) = {:?}", Screen::from_index(0));
+        eprintln!("DEBUG: from_index(6) = {:?}", Screen::from_index(6));
+    }
+
+    #[test]
+    fn tab_cycles_the_seven_screens_with_wrap() {
+        eprintln!("DEBUG: Agenda.index() = {:?}", Screen::Agenda.index());
+        eprintln!(
+            "DEBUG: next_screen(Agenda, 1) = {:?}",
+            next_screen(Screen::Agenda, 1)
+        );
+        eprintln!(
+            "DEBUG: next_screen(Arquivos, 1) = {:?}",
+            next_screen(Screen::Arquivos, 1)
+        );
+        eprintln!(
+            "DEBUG: next_screen(Correio, 1) = {:?}",
+            next_screen(Screen::Correio, 1)
+        );
+        eprintln!(
+            "DEBUG: next_screen(Resumo, -1) = {:?}",
+            next_screen(Screen::Resumo, -1)
+        );
+        eprintln!("DEBUG: Resumo.index() = {:?}", Screen::Resumo.index());
+        eprintln!("DEBUG: (-1i32).rem_euclid(7) = {:?}", (-1i32).rem_euclid(7));
+
         assert_eq!(next_screen(Screen::Resumo, 1), Screen::Achados);
+        assert_eq!(next_screen(Screen::Sessoes, 1), Screen::Wiki);
         assert_eq!(next_screen(Screen::Wiki, 1), Screen::Agenda);
         assert_eq!(next_screen(Screen::Agenda, 1), Screen::Arquivos);
-        assert_eq!(next_screen(Screen::Arquivos, 1), Screen::Resumo);
-        assert_eq!(next_screen(Screen::Resumo, -1), Screen::Arquivos);
+        assert_eq!(next_screen(Screen::Arquivos, 1), Screen::Correio);
+        assert_eq!(next_screen(Screen::Correio, 1), Screen::Resumo);
+        assert_eq!(next_screen(Screen::Resumo, -1), Screen::Correio);
         assert_eq!(
-            next_screen(Screen::Resumo, 6),
+            next_screen(Screen::Resumo, 7),
             Screen::Resumo,
             "volta cheia"
         );
