@@ -147,15 +147,23 @@
       drafts, wiki e a fila `posts` byte-idênticos (a trilha de sessões cresce
       de propósito — é auditoria, não estado do ciclo). Sem trust o digest é
       pulado com nota acionável, ciclo segue exit 0.*
-- [ ] **PR16** modo agendado + `kira schedule add|list|rm` (CLI) e criação de
+- [x] **PR16** modo agendado + `kira schedule add|list|rm` (CLI) e criação de
       agendamento pela TUI, com opt-in e aviso de que só roda com o KIRA vivo.
-- [ ] **PR17** budget `max_llm_calls_per_day = 50` + política de falha:
+      *Entregue (16/Nov, **PR #124**): CLI + store (schema v15, `schedule`) + `kira loop --scheduled`.
+      A criação pela TUI é o **PR26** (F4) — item separado, não entrou aqui.*
+- [x] **PR17** budget `max_llm_calls_per_day = 50` + política de falha:
       stale-ok, 429 → 5 min de silêncio, cache atômico.
       *Contador+enforcement já entregues no P0 (`llm_calls` v9, teto
       checado antes de cada chamada, linha no doctor); falta a política
       de quota/stale e o gauge do dashboard.*
-- [ ] **PR18** `kira approve <id>` + `awaiting_approval` no ciclo (guarda da
+      *Entregue a política (16/Nov, **PR #126**): `provider_state` (schema v17), 429 ⇒ silêncio
+      de 5 min (ou `retry-after`), digest adia a fase, triage devolve `LlmSilenced`, `doctor`
+      mostra `[stale]`, rascunho escrito atomicamente. O **gauge do dashboard** é F4 (PR24).*
+- [x] **PR18** `kira approve <id>` + `awaiting_approval` no ciclo (guarda da
       autonomia) — **pré-requisito de qualquer escrita autônoma**.
+      *Entregue (16/Nov, **PR #125**): `approvals` (schema v16), guarda fail-closed
+      (`approvals::require_approved`) que confere ação + alvo, `kira approve/approvals`.
+      O consumidor real é o **PR27** (`fix --apply`), que TEM de chamar a guarda.*
 - [ ] **PR19** `kira audit --weekly` (sem blog).
 
 ### M — onboarding: ingestão → digestão → emissão (ADR-0038, 12–13/Nov/2026)
