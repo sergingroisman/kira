@@ -224,6 +224,14 @@ possa discordar do primeiro. `kira loop --scheduled` roda só as fases vencidas;
 fase sem cadência declarada continua no default do ciclo (agendar restringe, não
 desliga) e um agendamento desligado impede a fase de rodar.
 
+O **429 tem política** (PR17): um rate limit cala aquele backend por 5 minutos
+(ou o `retry-after` do servidor, se pedir mais) e o estado vive no store
+(`provider_state`, schema v17) porque `loop`, `digest` e `triage` são processos
+distintos. O digest **adia** a fase em vez de insistir, o `triage` devolve erro
+acionável, e o `doctor` mostra `em silêncio por mais N min — último sucesso há X
+[stale]`: o dado antigo continua visível e rotulado, que é o `stale-ok`. O
+silêncio é por backend — Ollama local calado não cala o Foundry.
+
 O **círculo de aprovação** (PR18) é a outra ponta da mesma régua: escrita no
 mundo (board, repo do projeto, publicação remota) nasce como pedido `pending` na
 tabela `approvals` (schema v16) e só `kira approve <id>` a destrava. A guarda
