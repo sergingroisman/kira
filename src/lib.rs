@@ -6,6 +6,7 @@
 
 pub mod ado;
 pub mod approvals;
+pub mod audit;
 pub mod binresolve;
 pub mod board;
 pub mod capabilities;
