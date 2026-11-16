@@ -1766,13 +1766,25 @@ mod tests {
     #[test]
     fn tab_cycles_the_seven_screens_with_wrap() {
         eprintln!("DEBUG: Agenda.index() = {:?}", Screen::Agenda.index());
-        eprintln!("DEBUG: next_screen(Agenda, 1) = {:?}", next_screen(Screen::Agenda, 1));
-        eprintln!("DEBUG: next_screen(Arquivos, 1) = {:?}", next_screen(Screen::Arquivos, 1));
-        eprintln!("DEBUG: next_screen(Correio, 1) = {:?}", next_screen(Screen::Correio, 1));
-        eprintln!("DEBUG: next_screen(Resumo, -1) = {:?}", next_screen(Screen::Resumo, -1));
+        eprintln!(
+            "DEBUG: next_screen(Agenda, 1) = {:?}",
+            next_screen(Screen::Agenda, 1)
+        );
+        eprintln!(
+            "DEBUG: next_screen(Arquivos, 1) = {:?}",
+            next_screen(Screen::Arquivos, 1)
+        );
+        eprintln!(
+            "DEBUG: next_screen(Correio, 1) = {:?}",
+            next_screen(Screen::Correio, 1)
+        );
+        eprintln!(
+            "DEBUG: next_screen(Resumo, -1) = {:?}",
+            next_screen(Screen::Resumo, -1)
+        );
         eprintln!("DEBUG: Resumo.index() = {:?}", Screen::Resumo.index());
         eprintln!("DEBUG: (-1i32).rem_euclid(7) = {:?}", (-1i32).rem_euclid(7));
-        
+
         assert_eq!(next_screen(Screen::Resumo, 1), Screen::Achados);
         assert_eq!(next_screen(Screen::Sessoes, 1), Screen::Wiki);
         assert_eq!(next_screen(Screen::Wiki, 1), Screen::Agenda);
