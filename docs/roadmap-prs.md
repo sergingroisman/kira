@@ -120,7 +120,7 @@ Não bateu? **Pare e conserte o context packer.** Sem isso não se pinta a nave.
 | PR | Objetivo | Patch |
 |---|---|---|
 | PR15 | `kira loop` (modo do binário, sem daemon) + teste de **2 ciclos seguidos com saída-estado idêntica** | critério anti "PR inócuo em loop" |
-| PR16 | Modo agendado + registro opt-in (Task Scheduler) | só depois do modo existir — senão falha em silêncio |
+| PR16 | Modo agendado + registro opt-in (Task Scheduler) | ✅ entregue (**PR #124**, mergeado 16/Nov) — `kira schedule add|list|rm|enable|disable` + `kira loop --scheduled`: cron interno SEM daemon (schema **v15**, tabela `schedule`). Próximo tick é DERIVADO de `last_run_at` + `every_seconds`, nunca gravado (`scheduler::is_due`); agendar RESTRINGE e não desliga (fase sem cadência declarada segue no default do ciclo; `disabled` impede a fase de rodar); falha de fase NÃO marca o run; piso de cadência 60s; ingest continua todo tick (é o detector de mudança) e só o `scan` dentro dele entra na cadência. `--scheduled` é opt-in e sem agendamento declarado avisa. e2e de 6 casos hermético (sem rede/LLM). TUI de criação = **PR26** e painel = **PR24** (F4), fora deste item | |
 | PR17 | Flywheel de autonomia (budget `max_llm_calls_per_day = 50`) | budget checado **antes** de cada transição |
 | PR18 | `kira audit --weekly` | **blog saiu**; vira ROADMAP "a confirmar com o dono" |
 

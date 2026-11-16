@@ -217,6 +217,13 @@ o stderr da ferramenta legível). Override por env (`KIRA_SCAN_*_BIN`,
 contrato do usuário — inexistente cai no mesmo "instale o X". Ferramenta
 ausente e ferramenta que falhou são erros distintos.
 
+O `kira schedule` segue a mesma régua de "o estado tem uma fonte só": a tabela
+`schedule` (schema v15) guarda a cadência e o último run, e o próximo tick é
+**derivado** (`last_run_at` + `every_seconds`) — nunca um segundo campo que
+possa discordar do primeiro. `kira loop --scheduled` roda só as fases vencidas;
+fase sem cadência declarada continua no default do ciclo (agendar restringe, não
+desliga) e um agendamento desligado impede a fase de rodar.
+
 O `kira rea` é o caso onde a regra é visível no output: a ferramenta imprime o
 que quiser (é dado não-confiável), então o wrapper redige linha a linha e corta
 a saída num teto de **8 KiB** (`OUTPUT_CAP_BYTES`, em char boundary — acento e
@@ -257,5 +264,5 @@ Envs novas só entram com justificativa no PR — regra do AGENTS.md.
 
 `inspect`, `doctor`, `triage`, `setup`, `connect`, `scan`, `ingest`, `trust`,
 `digest`, `publish`, `skills`, `model`, `context`, `dashboard`, `loop`,
-`history`, `note`, `profile`, `wiki`, `rea`, `pr draft`. Cada um com o contrato
+`history`, `note`, `profile`, `wiki`, `rea`, `schedule`, `pr draft`. Cada um com o contrato
 detalhado no README do repo; a jornada de uso está em [[getting-started]].
