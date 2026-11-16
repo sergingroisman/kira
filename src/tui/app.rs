@@ -49,7 +49,7 @@ use crate::tui::widgets::sessions::SessionsWidget;
 use crate::tui::widgets::wiki::{WikiPageWidget, WikiWidget};
 
 /// Quantidade de fontes no ciclo de `Tab`/`1–4`.
-pub const SCREEN_COUNT: usize = 5;
+pub const SCREEN_COUNT: usize = 6;
 
 /// Passo de PgUp/PgDn no preview/lista (linhas por "página" de scroll).
 pub const SCROLL_PAGE_STEP: isize = 10;
@@ -100,6 +100,8 @@ pub enum Screen {
     Wiki,
     /// Agendamentos do ciclo e orçamento do dia (PR24).
     Agenda,
+    /// Arquivos escritos pelo KIRA + timeline do ciclo (PR23).
+    Arquivos,
 }
 
 impl Screen {
@@ -111,6 +113,7 @@ impl Screen {
             Screen::Sessoes => 2,
             Screen::Wiki => 3,
             Screen::Agenda => 4,
+            Screen::Arquivos => 5,
         }
     }
 
@@ -121,6 +124,7 @@ impl Screen {
             2 => Screen::Sessoes,
             3 => Screen::Wiki,
             4 => Screen::Agenda,
+            5 => Screen::Arquivos,
             _ => Screen::Resumo,
         }
     }
@@ -331,8 +335,8 @@ pub fn max_selected_for(
         Screen::Sessoes => sessions_len.max(1) - 1,
         Screen::Wiki => wiki_len.max(1) - 1,
         Screen::Resumo => 0,
-        // A Agenda é leitura de painel: sem lista navegável (Esc/Tab bastam).
-        Screen::Agenda => 0,
+        // Agenda e Arquivos são leitura de painel: sem lista navegável.
+        Screen::Agenda | Screen::Arquivos => 0,
     }
 }
 
@@ -342,7 +346,7 @@ fn screen_has_rows(screen: &AppState) -> bool {
         Screen::Achados => screen.findings_len > 0,
         Screen::Sessoes => screen.sessions_len > 0,
         Screen::Wiki => screen.wiki_len > 0,
-        Screen::Resumo | Screen::Agenda => false,
+        Screen::Resumo | Screen::Agenda | Screen::Arquivos => false,
     }
 }
 
@@ -422,8 +426,9 @@ pub fn apply_outcome(screen: &mut AppState, outcome: Outcome) {
                         screen.sessions_selected = apply_move(screen.sessions_selected, offset)
                     }
                     Screen::Wiki => screen.wiki_selected = apply_move(screen.wiki_selected, offset),
-                    // Resumo e Agenda não são listas: ↑/↓ não inventam seleção.
-                    Screen::Resumo | Screen::Agenda => {}
+                    // Resumo, Agenda e Arquivos não são listas: ↑/↓ não
+                    // inventam seleção.
+                    Screen::Resumo | Screen::Agenda | Screen::Arquivos => {}
                 }
             }
         }
@@ -623,7 +628,7 @@ fn selection_key(snapshot: &Snapshot, state_screen: &AppState) -> Option<state::
                 .get(state_screen.wiki_selected)
                 .map(|page| state::SelectionKey::Wiki(page.slug.clone()))
         }
-        Screen::Resumo | Screen::Agenda => None,
+        Screen::Resumo | Screen::Agenda | Screen::Arquivos => None,
     }
 }
 
@@ -786,6 +791,7 @@ pub fn decide(state: &AppState, key: KeyEvent) -> Outcome {
         KeyCode::Char('3') => Outcome::GoScreen(Screen::Sessoes),
         KeyCode::Char('4') => Outcome::GoScreen(Screen::Wiki),
         KeyCode::Char('5') => Outcome::GoScreen(Screen::Agenda),
+        KeyCode::Char('6') => Outcome::GoScreen(Screen::Arquivos),
         KeyCode::Char('l') if key.modifiers.contains(Mods::CONTROL) => Outcome::Redraw,
         _ => match keymap::map(key) {
             Some(Key::Quit) => Outcome::Quit,
@@ -1021,6 +1027,7 @@ pub fn degraded_lines(snapshot: &Snapshot, screen: Screen) -> Vec<String> {
         Screen::Sessoes => lines.extend(state::sessions_lines(snapshot)),
         Screen::Wiki => lines.extend(state::wiki_lines(snapshot)),
         Screen::Agenda => lines.extend(state::agenda_lines(snapshot)),
+        Screen::Arquivos => lines.extend(state::artifacts_lines(snapshot)),
     }
     lines
 }
@@ -1261,6 +1268,22 @@ fn render_screen(
                 Paragraph::new(lines)
                     .block(crate::tui::widgets::panel::block(
                         "5 Agenda · agendamentos e orçamento",
+                        true,
+                        palette,
+                    ))
+                    .wrap(Wrap { trim: false }),
+                primary,
+            );
+        }
+        Screen::Arquivos => {
+            let lines: Vec<Line> = state::artifacts_lines(snapshot)
+                .into_iter()
+                .map(Line::from)
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(crate::tui::widgets::panel::block(
+                        "6 Arquivos · o que o KIRA escreveu",
                         true,
                         palette,
                     ))
@@ -1698,13 +1721,14 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_the_five_screens_with_wrap() {
+    fn tab_cycles_the_six_screens_with_wrap() {
         assert_eq!(next_screen(Screen::Resumo, 1), Screen::Achados);
         assert_eq!(next_screen(Screen::Wiki, 1), Screen::Agenda);
-        assert_eq!(next_screen(Screen::Agenda, 1), Screen::Resumo);
-        assert_eq!(next_screen(Screen::Resumo, -1), Screen::Agenda);
+        assert_eq!(next_screen(Screen::Agenda, 1), Screen::Arquivos);
+        assert_eq!(next_screen(Screen::Arquivos, 1), Screen::Resumo);
+        assert_eq!(next_screen(Screen::Resumo, -1), Screen::Arquivos);
         assert_eq!(
-            next_screen(Screen::Resumo, 5),
+            next_screen(Screen::Resumo, 6),
             Screen::Resumo,
             "volta cheia"
         );
