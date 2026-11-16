@@ -168,7 +168,10 @@
       *Entregue (16/Nov, **PR #125**): `approvals` (schema v16), guarda fail-closed
       (`approvals::require_approved`) que confere ação + alvo, `kira approve/approvals`.
       O consumidor real é o **PR27** (`fix --apply`), que TEM de chamar a guarda.*
-- [ ] **PR19** `kira audit --weekly` (sem blog).
+- [x] **PR19** `kira audit --weekly` (sem blog).
+      *Entregue (16/Nov, **PR #129**): `src/audit.rs` + `kira audit [--days N]` — janela explícita
+      com data, falhas antes do volume, aprovações pendentes em voz alta, fila de posts e
+      orçamento; leitura pura do store (sem LLM, sem rede, sem publicação).*
 
 ### M — onboarding: ingestão → digestão → emissão (ADR-0038, 12–13/Nov/2026)
 
@@ -209,11 +212,15 @@
   `source_hash`/`published_hash`; `doctor` reporta ingestão, trust, fila e posts desatualizados.
   **Aceite:** publicar duas vezes é idempotente; `doctor` lista post velho quando o repo muda;
   nunca sobrescreve wiki escrito pelo dev sem `--force`.
-- [ ] **M6** etapa Ingestão no wizard (`src/setup/wizard.rs` + `src/setup.rs`). `Step` vira
+- [x] **M6** etapa Ingestão no wizard (`src/setup/wizard.rs` + `src/setup.rs`). `Step` vira
   `Ambiente, Projeto, Ingestao, Ia, Resumo`; a etapa só MOSTRA preview read-only e coleta
   `Enter = ingerir / n = pular`; efeito todo em `setup::run` (ADR-0034). `--skip` aceita
   `pat|ia|ingest`; resumo troca o próximo passo de `kira scan` para `kira connect azure`.
   **Aceite:** `setup_e2e` com `--yes` (digest criado) e `--skip ingest` (nada criado).
+      *Entregue (16/Nov, **PR #130**): etapa `Ingestão` (Enter ingere / `n` pula, preview read-only),
+      efeito no motor (`run_scan = false`), `--skip ingest`, `--yes` ingere sem perguntar; resumo
+      ganhou a linha `ingestão:` e o próximo passo virou `kira connect azure`. Aceite provado com
+      binário real: `--yes` cria `.kira/facts.md` + inventário; `--skip ingest` não cria nada.*
 - [x] **M7** dívida de qualidade que já estava no plano antigo: **P1 BOM** (`src/scan/decode.rs`
   com UTF-8/UTF-16 LE/BE nos call sites de `node.rs`/`dotnet.rs` + fixture) e **P5 `.gitignore`**
   (`src/context/gitignore.rs`, subset gitwildmatch, aninhado, sem dependência).
@@ -224,11 +231,16 @@
   gitwildmatch subset (negação, ancoragem, dir-only, `**`, ancestral excluído
   não re-incluível) honrado no `reindex` e no `grep`; 18 testes novos
   (6 decode + 12 matcher) + 2 de integração.*
-- [ ] **M8** docs da onda M: `docs/ux-setup-jornada.md` (trilha real de 5 etapas),
+- [x] **M8** docs da onda M: `docs/ux-setup-jornada.md` (trilha real de 5 etapas),
   `docs/kira-jornadas.md` (remover a promessa de "parse tolerante BOM/UTF-16" até M7;
   registrar ingest/digest/emit/trust), `docs/gitingest-vale-trazer.md` (P1/P3/P4/P5),
   `docs/roadmap-prs.md`.
   **Aceite:** nenhum doc promete comportamento que o código não tem.
+      *Entregue (16/Nov, **PR #131**): `kira-jornadas.md` na nomenclatura canônica (adeus
+      `codex`/`lens`/`scribe`/`watch`/`judge`/`read`) com as jornadas da onda M;
+      `ux-setup-jornada.md` com a trilha real `Ambiente → Projeto → Ingestão → IA → Resumo`
+      (as etapas "Azure"/"Acesso" saíram no ADR-0030); `gitingest-vale-trazer.md` com P1/P5
+      entregues e P3/P4 abertos.*
 
 ### F3 — provedores e hardware
 - [x] **PR20** tuning local: detecção de VRAM/backend, escolha de modelo por
