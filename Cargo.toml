@@ -59,6 +59,14 @@ ratatui = { version = "0.29", features = ["crossterm"] }
 # incompatible at compile time.
 crossterm = "0.28"
 
+# ADR-0011 (PR27): rlimits do jail (`setrlimit`) — a única forma portátil em
+# Rust de aplicar teto de CPU/memória/processos em processo filho. Já presente
+# na árvore transitiva (rusqlite/azure), mesma versão do lock: declarada só em
+# unix porque é lá que `setrlimit` existe (Windows fica com o confinamento por
+# canonicalização, sem rlimits no MVP).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Direct read of the store DB inside the `kira context` e2e (ADR-0021 redaction
 # proof: the index rows on disk must not carry secrets). Same exact version

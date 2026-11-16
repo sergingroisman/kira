@@ -69,6 +69,17 @@ pub enum GuardError {
         source: std::io::Error,
     },
 
+    /// PR27: o processo do jail não pôde ser executado (binário ausente, sem
+    /// permissão). O comando NÃO rodou — nunca "rodou sem jail".
+    #[error(
+        "não foi possível executar '{program}' dentro do jail ({source}) — confira se o binário existe e tem permissão de execução"
+    )]
+    SpawnFailed {
+        program: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The project root itself could not be resolved.
     #[error(
         "não foi possível resolver a raiz do projeto '{root}' ({source}) — confirme que o diretório existe e \
