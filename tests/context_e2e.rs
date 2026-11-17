@@ -726,7 +726,12 @@ fn the_three_golden_packs_are_reproducible_per_profile() {
         let roots = if canonical == root {
             vec![root.clone()]
         } else {
-            vec![root, canonical]
+            // A CANÔNICA primeiro: o `replace` da raiz curta (`/var/.../proj`)
+            // quebra o caminho canônico em `/private<ROOT>` e aí a substituição
+            // canônica (`/private/var/.../proj`) não casa mais com nada — foi
+            // exatamente o que o 2º ciclo de CI no macOS provou. A mais
+            // específica primeiro, a direta depois.
+            vec![canonical, root]
         };
         let normalized = normalize_golden(&first.1, &roots);
         let golden_path = std::path::Path::new(manifest)
