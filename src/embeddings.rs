@@ -89,12 +89,25 @@ struct EmbedResponse {
 /// Cliente de embeddings via Ollama (`/api/embed`).
 ///
 /// A chave é resolvida UMA vez na construção e a validação URL × chave (OC-1)
-/// acontece aí — nunca no meio de um request. `Debug` nunca mostra a chave.
-#[derive(Debug)]
+/// acontece aí — nunca no meio de um request.
+///
+/// `Debug` é MANUAL de propósito (SEC-01): o `derive` imprimiria o valor da
+/// chave em qualquer emissão de debug/tracing do cliente ou de quem o contém.
+/// O que aparece é a PRESENÇA (`api_key_present`), nunca o valor.
 pub struct EmbeddingClient {
     base_url: String,
     model_tag: String,
     api_key: Option<String>,
+}
+
+impl std::fmt::Debug for EmbeddingClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingClient")
+            .field("base_url", &self.base_url)
+            .field("model_tag", &self.model_tag)
+            .field("api_key_present", &self.api_key.is_some())
+            .finish()
+    }
 }
 
 impl EmbeddingClient {
@@ -355,13 +368,27 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// O fluxo é `add_example` × N → `fit` (UM embedding por exemplo, cacheado) →
 /// `classify` (UM embedding por texto). Sem `fit` não classifica — o erro diz
 /// o que fazer (fail-closed, nada de label vazio fingindo decisão).
-#[derive(Debug)]
 pub struct Classifier {
     client: EmbeddingClient,
     /// Exemplos por label (texto cru, esperando o `fit`).
     examples: HashMap<String, Vec<String>>,
     /// Centroides cacheados por label, produzidos pelo `fit`.
     centroids: HashMap<String, Vec<f32>>,
+}
+
+impl std::fmt::Debug for Classifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Texto dos exemplos FORA do Debug de propósito: `add_example` recebe
+        // texto cru do dono e pode carregar segredo colado; o Debug mostra só
+        // contagens (SEC-01).
+        let example_count: usize = self.examples.values().map(Vec::len).sum();
+        f.debug_struct("Classifier")
+            .field("client", &self.client)
+            .field("labels", &self.examples.keys().count())
+            .field("example_count", &example_count)
+            .field("centroids_loaded", &self.centroids.len())
+            .finish()
+    }
 }
 
 impl Classifier {
@@ -619,18 +646,43 @@ mod tests {
     }
 
     #[test]
-    fn debug_never_contains_the_key_value() {
-        // Chave FALSA de teste (literal aqui é seguro — o contrato é a máscara).
-        let backend = EmbeddingClient::for_config(EmbeddingConfig {
-            model: EmbeddingModel::default(),
-            base_url: "https://ollama.com".into(),
-        });
-        // Sem env em jogo, a construção com URL não-local falha OU devolve
-        // cliente sem chave — nenhum caminho imprime um valor de chave.
-        if let Ok(client) = backend {
-            let rendered = format!("{client:?}");
-            assert!(!rendered.contains("api_key: Some(\""), "{rendered}");
-        }
+    fn debug_never_leaks_the_key_even_when_the_client_has_one() {
+        // Canário REAL no campo: o teste antigo só rodava o caminho em que a
+        // construção falhava (sem env), então não provava nada sobre um
+        // cliente com chave (SEC-01). Aqui o campo é construído direto — o
+        // valor tem que ser impossível de achar em qualquer `{:?}`.
+        const CANARY: &str = "canary-s3cr3t-never-print";
+        let client = EmbeddingClient {
+            base_url: "http://localhost:11434".into(),
+            model_tag: "gemma2:2b".into(),
+            api_key: Some(CANARY.to_string()),
+        };
+        let rendered = format!("{client:?}");
+        assert!(
+            !rendered.contains(CANARY),
+            "segredo no Debug do cliente: {rendered}"
+        );
+        assert!(rendered.contains("api_key_present: true"), "{rendered}");
+    }
+
+    #[test]
+    fn classifier_debug_does_not_leak_the_client_key_nor_example_text() {
+        const CANARY: &str = "canary-s3cr3t-never-print";
+        let client = EmbeddingClient {
+            base_url: "http://localhost:11434".into(),
+            model_tag: "gemma2:2b".into(),
+            api_key: Some(CANARY.to_string()),
+        };
+        let mut classifier = Classifier::new(client);
+        classifier.add_example("bug", "token expirou");
+        // Centroide depois do add_example (que limpa o cache de fit).
+        classifier.centroids.insert("bug".into(), vec![1.0, 0.0]);
+        let rendered = format!("{classifier:?}");
+        assert!(!rendered.contains(CANARY), "segredo no Debug: {rendered}");
+        assert!(
+            !rendered.contains("token expirou"),
+            "texto de exemplo no Debug: {rendered}"
+        );
     }
 
     #[test]
