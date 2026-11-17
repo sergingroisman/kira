@@ -19,6 +19,7 @@ struct Sandbox {
     cwd: PathBuf,
     store: PathBuf,
     /// Onde o shim grava a linha de args que recebeu.
+    #[allow(dead_code)] // só os e2e de um SO o leem; os outros alvos o veiam ocioso
     shim_log: PathBuf,
 }
 

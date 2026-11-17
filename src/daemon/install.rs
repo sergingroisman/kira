@@ -24,6 +24,9 @@
 //!    (bloqueio B5 do plano) — aqui a prova é a linha gerada e o shim.
 
 use std::path::{Path, PathBuf};
+// O `Command` só existe onde há agendador nativo para spawnar — no Linux o
+// import viria morto e `-D warnings` reprova o gate (prova: CI ubuntu).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::process::Command;
 
 use crate::store;
@@ -270,7 +273,8 @@ fn uninstall_macos(root: &Path) -> Result<String, InstallError> {
     let plist = dir.join(format!("{task}.plist"));
     if !plist.exists() {
         return Ok(format!(
-            "nada a remover — o plist {plist} não existe (nunca instalado, ou já removido)"
+            "nada a remover — o plist {} não existe (nunca instalado, ou já removido)",
+            plist.display()
         ));
     }
     let launchctl = resolve_platform_tool("launchctl", LAUNCHCTL_BIN_ENV)?;
@@ -281,7 +285,8 @@ fn uninstall_macos(root: &Path) -> Result<String, InstallError> {
             program: "launchctl",
             code: result.code,
             hint: format!(
-                " (o plist {plist} ficou gravado; remova à mão se quiser forçar{})",
+                " (o plist {} ficou gravado; remova à mão se quiser forçar{})",
+                plist.display(),
                 result.hint_suffix()
             ),
         });
@@ -291,14 +296,18 @@ fn uninstall_macos(root: &Path) -> Result<String, InstallError> {
         source,
     })?;
     Ok(format!(
-        "tarefa {task} descarregada e plist removido ({plist})"
+        "tarefa {task} descarregada e plist removido ({})",
+        plist.display()
     ))
 }
 
 // ---------------------------------------------------------------------------
-// Peças compartilhadas
+// Peças compartilhadas — só onde há agendador nativo (Windows/macOS): no
+// Linux os caminhos que as usam nem existem, e `dead_code` sob `-D warnings`
+// é reprovação de gate (a prova é o CI do ubuntu-latest).
 // ---------------------------------------------------------------------------
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 /// Binário atual + raiz canônica para display (a tarefa roda em cwd do SO —
 /// os dois caminhos precisam ser absolutos e sem o prefixo `\\?\`).
 fn exe_and_root_display(root: &Path) -> Result<(String, String), InstallError> {
@@ -327,6 +336,7 @@ fn launch_agents_dir() -> Result<PathBuf, InstallError> {
 
 /// Resolve a ferramenta do ANTES do spawn (mesmo contrato do scan): override
 /// de env é contrato do usuário (arquivo inexistente = ausente), depois PATH.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn resolve_platform_tool(
     program: &'static str,
     override_env: &str,
@@ -344,7 +354,9 @@ fn resolve_platform_tool(
 }
 
 /// Roda a ferramenta e EXIGE exit 0 — falha vira erro compacto com a dica da
-/// primeira linha de stderr (nunca o corpo cru).
+/// primeira linha de stderr (nunca o corpo cru). Só o Windows usa (o macOS
+/// decide com `run_tool_code` direto, porque o unload tem recuperação própria).
+#[cfg(target_os = "windows")]
 fn run_tool(bin: &Path, program: &'static str, args: &[String]) -> Result<Outcome, InstallError> {
     let outcome = run_tool_code(bin, args);
     if outcome.code != 0 {
@@ -358,11 +370,13 @@ fn run_tool(bin: &Path, program: &'static str, args: &[String]) -> Result<Outcom
 }
 
 /// Uma linha capturada do agendador: exit code + dica compacta.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct Outcome {
     code: i32,
     hint: String,
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl Outcome {
     /// ` (dica: …)` quando há primeira linha de stderr; vazio quando não.
     fn hint_suffix(&self) -> String {
@@ -377,6 +391,7 @@ impl Outcome {
 /// Spawna a ferramenta resolvida (caminho COMPLETO, nunca o nome nu) e
 /// captura exit + dica. `.cmd`/`.bat` no Windows vão pelo wrapper `cmd /C`
 /// (mesma conduta do scan — o shim do e2e é um script).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn run_tool_code(bin: &Path, args: &[String]) -> Outcome {
     let mut command = command_for(bin, args);
     match command.output() {
@@ -398,6 +413,7 @@ fn run_tool_code(bin: &Path, args: &[String]) -> Outcome {
 /// Command sobre um binário resolvido: `.cmd`/`.bat` no Windows via
 /// `cmd /C chcp 65001 …` (o std não executa script; o chcp mantém UTF-8) —
 /// espelho do `command_from_resolved` do scan, usando a MESMA `shellline`.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn command_for(bin: &Path, args: &[String]) -> Command {
     let via_cmd = cfg!(windows) && crate::binresolve::is_cmd_script(&bin.to_string_lossy());
     if via_cmd {
