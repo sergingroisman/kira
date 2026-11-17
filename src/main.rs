@@ -406,6 +406,27 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Previsão do volume de achados (FC-02): engine determinística da casa
+    /// (tendência + banda p10/p90) + backtest MAE contra 3 baselines —
+    /// previsão com erro MEDIDO, nunca forecast fingido. Sem LLM e sem rede
+    /// (ADR-0016, camada 3: cálculo em Rust). A série vem do store (FC-01).
+    #[command(
+        after_help = "Exemplos:\n  kira forecast\n  kira forecast --field critical --horizon 4\n  kira forecast --json\n\nO insumo é a série que cada `kira scan` grava no store; sem pelo menos 2 pontos não há previsão honesta."
+    )]
+    Forecast {
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Campo da série: total | critical | high | medium | low | other
+        #[arg(long, default_value = "total")]
+        field: String,
+        /// Quantos scans à frente prever (1..=365)
+        #[arg(long, default_value_t = 4)]
+        horizon: usize,
+        /// Saída estruturada para automação
+        #[arg(long)]
+        json: bool,
+    },
     /// Ciclo local do KIRA (PR15): um tick = ingest → digest (se trusted) →
     /// publish. Tudo LOCAL — nunca escreve no mundo (Azure/git remoto); sem
     /// daemon: roda em primeiro plano e sai. `--once` = um tick (CI)
@@ -819,6 +840,12 @@ async fn run(command: Command) -> Outcome {
                 force,
             } => model_admit_command(&tag, sha256.as_deref(), probes_ok, force),
         },
+        Command::Forecast {
+            path,
+            field,
+            horizon,
+            json,
+        } => forecast_command(path.as_deref(), &field, horizon, json),
         Command::Loop {
             once,
             ticks,
@@ -963,6 +990,170 @@ async fn connect_azure_command(yes: bool) -> Outcome {
             "connect azure: conexão não concluída — veja a saída"
         }
         .to_string(),
+        economy: None,
+    }
+}
+
+/// FC-02: `kira forecast` — previsão do volume de achados com a engine
+/// determinística da casa + backtest MAE contra 3 baselines. O insumo é a
+/// série que o FC-01 grava no store a cada `kira scan`. Cálculo em Rust, zero
+/// LLM, zero rede — o comando é consulta e NÃO grava sessão (mesma regra do
+/// `history`/`note`/`profile`).
+fn forecast_command(path: Option<&Path>, field: &str, horizon: usize, json: bool) -> Outcome {
+    let pick = match field.trim().to_ascii_lowercase().as_str() {
+        "total" => |c: &store::FindingsCounts| c.total as f64,
+        "critical" => |c: &store::FindingsCounts| c.critical as f64,
+        "high" => |c: &store::FindingsCounts| c.high as f64,
+        "medium" => |c: &store::FindingsCounts| c.medium as f64,
+        "low" => |c: &store::FindingsCounts| c.low as f64,
+        "other" => |c: &store::FindingsCounts| c.other as f64,
+        other => {
+            let message = format!(
+                "campo '{other}' não existe — use: total | critical | high | medium | low | other"
+            );
+            eprintln!("erro: {message}");
+            return Outcome::failure(message);
+        }
+    };
+    let Some(root) = path
+        .map_or_else(store::detect_project_root, |p| Some(p.to_path_buf()))
+        .filter(|root| root.is_dir())
+    else {
+        let message =
+            "não foi possível determinar o projeto atual — rode dentro da raiz do repositório"
+                .to_string();
+        eprintln!("erro: {message}");
+        return Outcome::failure(message);
+    };
+    let Ok(project_id) = store::project_id_for_root(&root) else {
+        let message = "raiz ilegível para o store — rode `kira scan` antes de prever".to_string();
+        eprintln!("erro: {message}");
+        return Outcome::failure(message);
+    };
+    let store = match Store::open_default() {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("erro: {err}");
+            return Outcome::failure(err.to_string());
+        }
+    };
+    let rows = match store.read_findings_series(&project_id, 0) {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("erro: {err}");
+            return Outcome::failure(err.to_string());
+        }
+    };
+    let points: Vec<kira::forecast::TimePoint> = rows
+        .iter()
+        .map(|row| kira::forecast::TimePoint {
+            timestamp: row.scanned_at.clone(),
+            value: pick(&row.counts),
+            metadata: std::collections::HashMap::new(),
+        })
+        .collect();
+    let series = kira::forecast::TimeSeries {
+        points,
+        // A série é POR SCAN (cadência do dono), não por dia: os timestamps
+        // futuros não são calendário — o horizonte é "próximos N scans" e a
+        // linha de datas não é impressa.
+        frequency_days: 1,
+        metadata: std::collections::HashMap::new(),
+    };
+    let prediction = match kira::forecast::forecast(&series, horizon) {
+        Ok(prediction) => prediction,
+        Err(err) => {
+            print_error(&err);
+            return Outcome::failure(err.to_string());
+        }
+    };
+    // Holdout do backtest: o horizonte, limitado ao que a série comporta
+    // (treino ≥ 3). Série curta demais = backtest ausente e NOTA honesta.
+    let holdout = horizon.min(series.points.len().saturating_sub(3)).max(1);
+    let backtest_rows = kira::forecast::backtest(&series, holdout);
+    if json {
+        let mut report = serde_json::json!({
+            "field": field,
+            "series_points": series.points.len(),
+            "horizon": horizon,
+            "predictions": prediction.predictions,
+            "lower_p10": prediction.lower,
+            "upper_p90": prediction.upper,
+            "backtest_holdout": holdout,
+            "backtest": backtest_rows,
+            "best_baseline": backtest_rows
+                .as_deref()
+                .and_then(kira::forecast::best_baseline)
+                .map(|row| row.name.clone()),
+            "note": "engine determinística da casa (ADR-0016, camada 3); augurs/Timestral só entram depois de vencer estas baselines no backtest (plano do MVP, FC-03)"
+        });
+        report["timestamps"] = serde_json::json!(prediction.timestamps);
+        let text = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+        println!("{text}");
+        return Outcome {
+            code: ExitCode::SUCCESS,
+            ok: true,
+            records: false,
+            summary: format!("forecast: {field}, {horizon} scan(s) à frente"),
+            economy: None,
+        };
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "série: {} ponto(s) de scan (campo: {}) — insumo gravado por `kira scan` (FC-01)\n",
+        series.points.len(),
+        field
+    ));
+    out.push_str(&format!(
+        "previsão para os próximos {horizon} scan(s): {}\n",
+        prediction
+            .predictions
+            .iter()
+            .map(|v| format!("{v:.1}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    ));
+    out.push_str(&format!(
+        "banda p10–p90 (heurística): {}\n",
+        prediction
+            .lower
+            .iter()
+            .zip(&prediction.upper)
+            .map(|(lo, hi)| format!("{lo:.1}..{hi:.1}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    ));
+    match backtest_rows {
+        Some(rows) => {
+            out.push_str(&format!(
+                "backtest (últimos {holdout} ponto(s) reservados, MAE):\n"
+            ));
+            for row in &rows {
+                out.push_str(&format!("  {:<14} MAE {:.2}\n", row.name, row.mae));
+            }
+            if let Some(best) = kira::forecast::best_baseline(&rows) {
+                out.push_str(&format!(
+                    "melhor baseline: {} (MAE {:.2}) — a previsão carrega o erro medido dela\n",
+                    best.name, best.mae
+                ));
+            }
+        }
+        None => {
+            out.push_str(&format!(
+                "backtest: série curta demais para treino honesto (precisa de ≥ {} pontos) — previsão SEM erro medido\n",
+                holdout + 3
+            ));
+        }
+    }
+    out.push_str(
+        "nota: engine determinística da casa (ADR-0016, camada 3); augurs/Timestral só entram depois de vencer estas baselines no backtest (plano do MVP, FC-03)\n",
+    );
+    print!("{out}");
+    Outcome {
+        code: ExitCode::SUCCESS,
+        ok: true,
+        records: false,
+        summary: format!("forecast: {field}, {horizon} scan(s) à frente"),
         economy: None,
     }
 }
@@ -1387,6 +1578,21 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                 ("model".to_string(), args, None)
             }
         },
+        Command::Forecast {
+            path,
+            field,
+            horizon,
+            json,
+        } => {
+            let mut args = format!("--field {field} --horizon {horizon}");
+            if *json {
+                args.push_str(" --json");
+            }
+            if let Some(path) = path {
+                args.push_str(&format!(" --path {}", path.display()));
+            }
+            ("forecast".to_string(), args, None)
+        }
         Command::Loop {
             once,
             ticks,
