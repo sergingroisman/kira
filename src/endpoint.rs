@@ -8,6 +8,8 @@
 //! Regra do OC-1: URL não-local É egresso — o prompt sai da máquina (o cloud
 //! processa; não treina com ele, porém ele SAI). Aviso, nunca erro silencioso.
 
+use url::{Host, Url};
+
 /// Env que aponta o servidor Ollama (sempre existiu; a constante mora aqui
 /// para `doctor` e `llm` lerem o MESMO nome de um único dono).
 pub const OLLAMA_URL_ENV: &str = "KIRA_OLLAMA_URL";
@@ -29,34 +31,38 @@ fn env_or_default(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// True quando o request NUNCA sai da máquina: `localhost`, `127.x.x.x` ou
-/// `::1` (IPv6 entre colchetes, com ou sem porta). Qualquer outro host é
-/// não-local — inclusive URL sem esquema, porque chute é proibido aqui:
-/// não-parseável = não-local = exigir chave é o lado seguro.
+/// True quando o request NUNCA sai da máquina — e só para URLs http/https
+/// cujo host é loopback DE VERDADE: endereço IP verificado por
+/// [`std::net::IpAddr::is_loopback`] (cobre o 127.0.0.0/8 inteiro e `::1`),
+/// ou o domínio EXATO `localhost`.
+///
+/// SEC-02: o parser manual de antes casava `host.starts_with("127.")`, e um
+/// DOMÍNIO tipo `127.attacker.example` passava por local — suprimia o aviso
+/// de egresso e dispensava a chave num destino remoto. Parser de verdade (a
+/// crate `url`, já transitiva via azure_core) fecha a classe: prefixo textual
+/// não prova endereço, userinfo (`user@host`) nunca é "a própria máquina" e
+/// qualquer coisa não-parseável é não-local (o lado seguro).
 #[must_use]
 pub fn is_local_url(base_url: &str) -> bool {
-    let rest = match base_url.find("://") {
-        Some(pos) => &base_url[pos + 3..],
-        None => base_url,
+    let Ok(parsed) = Url::parse(base_url) else {
+        // Sem esquema/ilegível: chute é proibido — não-local = exigir chave.
+        return false;
     };
-    // Porta e caminho fora: host é o que vem antes do primeiro `/` (e a porta
-    // antes do primeiro `:` — exceto IPv6, que vem entre colchetes).
-    let host = match rest.find('/') {
-        Some(pos) => &rest[..pos],
-        None => rest,
-    };
-    let host = match host.strip_prefix('[') {
-        Some(stripped) => match stripped.find(']') {
-            Some(end) => &stripped[..end],
-            None => stripped,
-        },
-        None => match host.find(':') {
-            Some(pos) => &host[..pos],
-            None => host,
-        },
-    };
-    let host = host.trim().to_ascii_lowercase();
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    // Userinfo: quem manda no host é o dono da credencial — nunca é local.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    match parsed.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        // Domínio EXATO: `localhost.evil.com` e `127.attacker.example` são
+        // domínios de terceiros, não loopback.
+        Some(Host::Domain(domain)) => domain == "localhost",
+        None => false,
+    }
 }
 
 /// True quando a tag aponta para um modelo servido PELO CLOUD do Ollama
@@ -111,6 +117,12 @@ mod tests {
             "http://meu-servidor.local:11434",
             "ollama.com", // sem esquema: não-parseável = não-local (lado seguro)
             "",
+            // SEC-02: os casos que o prefixo textual aceitava e eram REMOTOS.
+            "http://127.attacker.example", // começa com "127." e NÃO é IP
+            "http://localhost.evil.com",   // contém localhost, é domínio alheio
+            "http://user@127.0.0.1:11434", // userinfo: quem manda é a credencial
+            "ftp://127.0.0.1:11434",       // esquema que o KIRA nunca usa
+            "http://[::ffff:127.0.0.1]:11434", // v4-mapeado: is_loopback só cobre ::1
         ] {
             assert!(!is_local_url(url), "{url:?} NÃO deveria ser local");
         }
