@@ -636,8 +636,14 @@ fn an_invalid_profile_fails_with_the_actionable_list() {
 /// calculados sobre os caminhos ABSOLUTOS crus do pack, e o root do sandbox
 /// tem comprimento diferente por runner (VPS ≠ CI). Conteúdo continua byte a
 /// byte; a monotonicidade dos caps é coberta pelo teste dos três estados.
-fn normalize_golden(output: &str, root: &str) -> String {
-    let mut out = output.replace(root, "<ROOT>");
+fn normalize_golden(output: &str, roots: &[String]) -> String {
+    // Uma raiz por forma em que o store pode imprimir o caminho do projeto:
+    // a direta (como o sandbox criou) e a canônica (`/private/var/...` no
+    // macOS). No Windows/Linux as duas coincidem e o loop é no-op.
+    let mut out = output.to_string();
+    for root in roots {
+        out = out.replace(root, "<ROOT>");
+    }
     // cursor avança para não re-achar o `updated_at=<STAMP>` que acabou de
     // entrar: antes, o loop re-findava a própria substituição e o `break`
     // deixava a 2ª ocorrência crua (bugs/p1 divergia do dourado).
@@ -705,10 +711,24 @@ fn the_three_golden_packs_are_reproducible_per_profile() {
         assert_eq!(first.1, second.1, "mesmo estado ⇒ mesmo pack ({profile})");
 
         let root = sandbox.cwd.to_string_lossy().replace('\\', "/");
+        // O store CANONICALIZA a raiz do projeto — no macOS o temp chega por
+        // atalho (`/var/folders/...`) e o caminho real é `/private/var/...`:
+        // o pack imprime o canônico, então trocar só o `root` deixava um
+        // `/private` sobrando e o dourado divergia SÓ no macOS (o e2e-desktop
+        // não rodava em PR, então nenhum PR teria pego). Substituir as duas
+        // formas devolve a comparação byte a byte nos 3 SOs.
+        let canonical = std::fs::canonicalize(&sandbox.cwd)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| root.clone());
         // O excerpt da wiki começa no header da página, e o header carrega o
         // carimbo da ESCRITA (`updated_at=<agora>`) — dado de relógio, não de
-        // pack. Normaliza a raiz temporária e o carimbo; o resto é byte a byte.
-        let normalized = normalize_golden(&first.1, &root);
+        // pack. Normaliza as raízes e o carimbo; o resto é byte a byte.
+        let roots = if canonical == root {
+            vec![root.clone()]
+        } else {
+            vec![root, canonical]
+        };
+        let normalized = normalize_golden(&first.1, &roots);
         let golden_path = std::path::Path::new(manifest)
             .join("tests/fixtures/context/profile")
             .join(format!("{profile}.json"));
