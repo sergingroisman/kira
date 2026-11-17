@@ -8,8 +8,11 @@ name: CI
 # Estratégia:
 # - `unit`: os três SOs, só `--lib`. Pega regressão de lógica e é rápido.
 # - `e2e-linux`: sempre. É onde os e2e encontram bug de I/O e de processo.
-# - `e2e-desktop`: Windows e macOS APENAS no push para main (ou sob demanda): o Windows
-#   valida o que o Linux não pega (caminho/PATHEXT/cmd), mas custa caro por PR.
+# - `e2e-desktop`: macOS em TODOS os eventos (push, PR e sob demanda). Era só
+#   no push, e isso escondeu uma divergência de dourado (17/Nov/2026): o PR
+#   ficava verde e o merge deixava a main vermelha — nenhum PR teria pego. O
+#   Windows valida o que o Linux não pega (caminho/PATHEXT/cmd) e segue
+#   desligado por timeout (27–31 min), reativar quando resolver.
 # - `timeout-minutes` em todos: falhar em 20 min é melhor que pendurar a fila por 40.
 
 on:
@@ -84,7 +87,8 @@ jobs:
 
   e2e-desktop:
     name: e2e (${{ matrix.os }})
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Sem `if`: rodar também em PR é o que impede o "PR verde, main vermelha"
+    # (a divergência de dourado no macOS só existia no commit de merge).
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -105,4 +109,7 @@ jobs:
           shared-key: e2e-desktop
 
       - name: E2E tests
-        run: cargo test --tests
+        # --no-fail-fast: `cargo test --tests` para no PRIMEIRO binário que
+        # falha e esconde o resto — um ciclo de CI por bug é caro demais, e
+        # este é o job de runner caro (macOS): vale mostrar tudo de uma vez.
+        run: cargo test --tests --no-fail-fast
