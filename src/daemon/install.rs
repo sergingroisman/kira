@@ -1,42 +1,42 @@
-//! `kira daemon install|uninstall` (DAEMON-02) — coloca o daemon no
-//! agendador NATIVO do SO: Task Scheduler no Windows (`schtasks`), launchd no
-//! macOS (plist em `~/Library/LaunchAgents`). Sem dependência nova e sem
-//! serviço nosso: a tarefa é só um convite para o SO spawnar o MESMO binário
-//! (`kira daemon run --path <raiz>`) — o lock por projeto (DAEMON-01) e a
-//! cadência da tabela `schedule` continuam sendo a fonte de verdade.
+//! `kira daemon install|uninstall` (DAEMON-02) — coloca o daemon para acordar
+//! sozinho no login/boot: pasta Inicializar (Startup) do usuário no Windows,
+//! launchd no macOS (plist `RunAtLoad` em `~/Library/LaunchAgents`). Sem
+//! dependência nova e sem serviço nosso: a entrada é só um convite para o SO
+//! spawnar o MESMO binário (`kira daemon run --path <raiz>`) — o lock por
+//! projeto (DAEMON-01) e a cadência da tabela `schedule` continuam sendo a
+//! fonte de verdade.
 //!
 //! Contratos que o módulo prova:
 //!
 //! 1. **Nome determinístico por projeto.** `kira-<nome>-<8 hex>` — a mesma
-//!    raiz gera sempre a mesma tarefa; instalar de novo SOBRESCREVE, nunca
-//!    duplica (o `schtasks /F` e a reescrita do plist são idempotentes).
+//!    raiz gera sempre o mesmo atalho; instalar de novo SOBRESCREVE, nunca
+//!    duplica (a reescrita do .cmd e do plist é idempotente).
 //! 2. **O filho é o próprio binário atual** (`current_exe`), com `--path`
 //!    absoluto — nada de shell na linha e NENHUM segredo nela (o daemon
 //!    não precisa de PAT: o ciclo é local).
-//! 3. **Ferramenta do SO resolvida no PATH antes do spawn** (mesmo contrato
-//!    do scan, ADR no cabeçalho de `binresolve.rs`): override
-//!    `KIRA_SCHTASKS_BIN` / `KIRA_LAUNCHCTL_BIN` (envs novas com justificativa
-//!    no PR — os e2e precisam apontar shims sem tocar no agendador real do
-//!    dono), depois busca no PATH; ausência NUNCA spawna.
+//! 3. **Windows sem spawn** (ADR-0045): install/uninstall são pura escrita/
+//!    remoção de arquivo na pasta Inicializar — o EDR do hardware do dono
+//!    bloqueia `schtasks /Create` vindo de pai não-aprovado (provado
+//!    empiricamente, inclusive em terminal admin), e enrolar schtasks em
+//!    batch para escapar da inspeção é tática de malware. No macOS o
+//!    `launchctl` segue resolvido no PATH antes do spawn (override
+//!    `KIRA_LAUNCHCTL_BIN` para os e2e); ausência NUNCA spawna.
 //! 4. **Nunca parse de texto localizado do OS**: a decisão usa exit code; a
 //!    dica de erro é só a primeira linha de stderr, compacta (`binresolve`).
-//!    A validação real de Task Scheduler/launchd é no hardware do dono
-//!    (bloqueio B5 do plano) — aqui a prova é a linha gerada e o shim.
+//!    A validação real (login do dono, launchd do M1) é o bloqueio B5 do
+//!    plano — aqui a prova é o conteúdo dos arquivos (funções puras).
 
 use std::path::Path;
 // `PathBuf` só aparece nos caminhos com agendador nativo — no Linux o import
 // viria morto e `-D warnings` reprova o gate (prova: CI ubuntu).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::path::PathBuf;
-// O `Command` só existe onde há agendador nativo para spawnar — no Linux o
-// import viria morto e `-D warnings` reprova o gate (prova: CI ubuntu).
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+// O `Command` só existe onde há ferramenta do SO para spawnar (launchctl) —
+// no Windows o install é escrita de arquivo, sem spawn.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use crate::store;
-
-/// Override do binário `schtasks` (Windows) — e2e aponta um shim.
-pub const SCHTASKS_BIN_ENV: &str = "KIRA_SCHTASKS_BIN";
 
 /// Override do binário `launchctl` (macOS) — e2e aponta um shim.
 pub const LAUNCHCTL_BIN_ENV: &str = "KIRA_LAUNCHCTL_BIN";
@@ -156,42 +156,43 @@ pub fn uninstall(root: &Path) -> Result<String, InstallError> {
 }
 
 // ---------------------------------------------------------------------------
-// Windows — schtasks
+// Windows — pasta Inicializar (Startup) do usuário
+//
+// POR QUE NÃO `schtasks` (ADR-0045): o EDR do hardware do dono bloqueia no
+// CreateProcess o `schtasks /Create` vindo de pai não-aprovado — provado
+// empiricamente em 17/Nov/2026 (probe→`/?` ok, probe→`/Create` negado,
+// kira→`/Create` negado, linha visível de schtasks dentro de `cmd` negada) —
+// e a validaçăo em terminal ADMIN falhou do mesmo jeito. Enrolar o schtasks
+// dentro de batch para escapar da inspeção de linha é tática de malware —
+// o KIRA não faz isso. A pasta Inicializar é o equivalente em espaço de
+// usuário do gatilho ONLOGON: acorda no login, sem privilégio, sem spawn
+// (install/uninstall são pura escrita/remoção de arquivo), visível e
+// removível pelo dono. Sem watchdog: se o processo morrer, volta no próximo
+// login — o `kira daemon status` mostra o lock órfão e `--force` recupera.
 // ---------------------------------------------------------------------------
-
-/// A linha `/TR` do Task Scheduler: `"{exe}" daemon run --path "{root}"`.
-/// Pura e testada SEM shim — o e2e captura a forma mangled do wrapper `cmd`
-/// (aspas internas viram apóstrofo no log), então o valor exato é provado
-/// aqui, que é o caminho REAL (schtasks.exe spawna direto, sem wrapper).
-#[cfg(target_os = "windows")]
-fn schtasks_tr(exe: &str, root: &str) -> String {
-    format!("\"{exe}\" daemon run --path \"{root}\"")
-}
 
 #[cfg(target_os = "windows")]
 fn install_windows(root: &Path) -> Result<InstallReport, InstallError> {
     let task = task_name(root)?;
     let (exe, root_display) = exe_and_root_display(root)?;
-    // /TR recebe UMA string; o comando interno carrega as próprias aspas —
-    // caminhos com espaço ficam um token só do lado do Task Scheduler.
-    let tr = schtasks_tr(&exe, &root_display);
-    let schtasks = resolve_platform_tool("schtasks", SCHTASKS_BIN_ENV)?;
-    let args = [
-        "/Create".to_string(),
-        "/TN".to_string(),
-        task.clone(),
-        "/TR".to_string(),
-        tr,
-        "/SC".to_string(),
-        "ONLOGON".to_string(),
-        "/F".to_string(),
-    ];
-    run_tool(&schtasks, "schtasks", &args)?;
+    let dir = startup_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|source| InstallError::Write {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    let shortcut = dir.join(format!("{task}.cmd"));
+    let content = startup_cmd_content(&task, &exe, &root_display);
+    std::fs::write(&shortcut, content).map_err(|source| InstallError::Write {
+        path: shortcut.display().to_string(),
+        source,
+    })?;
     Ok(InstallReport {
-        task,
+        task: task.clone(),
         detail: format!(
-            "tarefa criada no Task Scheduler (ONLOGON, sobrescreve): \"{}\" daemon run --path \"{}\"",
-            exe, root_display
+            "atalho gravado na pasta Inicializar (roda no próximo login, sobrescreve): {} — \"{}\" daemon run --path \"{}\"",
+            shortcut.display(),
+            exe,
+            root_display
         ),
     })
 }
@@ -199,29 +200,60 @@ fn install_windows(root: &Path) -> Result<InstallReport, InstallError> {
 #[cfg(target_os = "windows")]
 fn uninstall_windows(root: &Path) -> Result<String, InstallError> {
     let task = task_name(root)?;
-    let schtasks = resolve_platform_tool("schtasks", SCHTASKS_BIN_ENV)?;
-    // Query primeiro: exit code decide (nunca o texto localizado). Exit != 0
-    // é tratado como "não instalada" — e a dica do stderr vai junto para o
-    // caso raro de o query falhar por OUTRA razão (o dono lê e decide).
-    let query = run_tool_code(
-        &schtasks,
-        &["/Query".to_string(), "/TN".to_string(), task.clone()],
-    );
-    if query.code != 0 {
-        return Ok(format!(
-            "nada a remover — a tarefa {task} não está no agendador (query devolveu exit {}{})",
-            query.code,
-            query.hint_suffix()
-        ));
+    let dir = startup_dir()?;
+    let shortcut = dir.join(format!("{task}.cmd"));
+    match std::fs::remove_file(&shortcut) {
+        Ok(()) => Ok(format!(
+            "atalho {task} removido da pasta Inicializar ({})",
+            shortcut.display()
+        )),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(format!(
+            "nada a remover — o atalho {} não existe (nunca instalado, ou já removido)",
+            shortcut.display()
+        )),
+        Err(source) => Err(InstallError::Write {
+            path: shortcut.display().to_string(),
+            source,
+        }),
     }
-    let delete = [
-        "/Delete".to_string(),
-        "/TN".to_string(),
-        task.clone(),
-        "/F".to_string(),
-    ];
-    run_tool(&schtasks, "schtasks", &delete)?;
-    Ok(format!("tarefa {task} removida do Task Scheduler"))
+}
+
+/// Pasta Inicializar do USUÁRIO (nunca a comum de todos os usuários — o
+/// install não pede elevação): `%APPDATA%\Microsoft\Windows\Start Menu\
+/// Programs\Startup`. O override de env (`APPDATA`) é o seam dos e2e.
+#[cfg(target_os = "windows")]
+fn startup_dir() -> Result<PathBuf, InstallError> {
+    let appdata = std::env::var_os("APPDATA")
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            InstallError::Root(
+                "sem %APPDATA% — não há onde registrar o start automático".to_string(),
+            )
+        })?;
+    Ok(PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup"))
+}
+
+/// Conteúdo do atalho: puro e determinístico (mesma raiz ⇒ mesmo arquivo).
+/// `start "título" /MIN` abre o console MINIMIZADO — honestidade visual:
+/// o dono VÊ que o KIRA está vivo (persona §7: nada de atividade invisível).
+/// Um daemon já vivo é recusado pelo lock (DAEMON-01) e o console fecha.
+#[cfg(target_os = "windows")]
+fn startup_cmd_content(task: &str, exe: &str, root: &str) -> String {
+    // Comentário ASCII de propósito: batch é lido no code page OEM do console,
+    // e bytes UTF-8 fora de ASCII viram mojibake lá (a linha `start` já é
+    // ASCII pura — caminhos e argumentos não podem ser manglados).
+    format!(
+        "@echo off\r\n\
+         rem KIRA - daemon do projeto {root}\r\n\
+         rem gravado por `kira daemon install`; remover com `kira daemon uninstall`\r\n\
+         start \"kira daemon {task}\" /MIN \"{exe}\" daemon run --path \"{root}\"\r\n"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -306,9 +338,9 @@ fn uninstall_macos(root: &Path) -> Result<String, InstallError> {
 }
 
 // ---------------------------------------------------------------------------
-// Peças compartilhadas — só onde há agendador nativo (Windows/macOS): no
-// Linux os caminhos que as usam nem existem, e `dead_code` sob `-D warnings`
-// é reprovação de gate (a prova é o CI do ubuntu-latest).
+// Peças compartilhadas — só onde há o que spawnar (launchctl no macOS). O
+// Windows do install é escrita de arquivo; no Linux os caminhos que as usam
+// nem existem, e `dead_code` sob `-D warnings` reprova o gate (CI ubuntu).
 // ---------------------------------------------------------------------------
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -340,7 +372,8 @@ fn launch_agents_dir() -> Result<PathBuf, InstallError> {
 
 /// Resolve a ferramenta do ANTES do spawn (mesmo contrato do scan): override
 /// de env é contrato do usuário (arquivo inexistente = ausente), depois PATH.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+/// Só o macOS usa (o launchctl); o Windows do install é escrita de arquivo.
+#[cfg(target_os = "macos")]
 fn resolve_platform_tool(
     program: &'static str,
     override_env: &str,
@@ -357,30 +390,14 @@ fn resolve_platform_tool(
         .ok_or(InstallError::ToolMissing { program })
 }
 
-/// Roda a ferramenta e EXIGE exit 0 — falha vira erro compacto com a dica da
-/// primeira linha de stderr (nunca o corpo cru). Só o Windows usa (o macOS
-/// decide com `run_tool_code` direto, porque o unload tem recuperação própria).
-#[cfg(target_os = "windows")]
-fn run_tool(bin: &Path, program: &'static str, args: &[String]) -> Result<Outcome, InstallError> {
-    let outcome = run_tool_code(bin, args);
-    if outcome.code != 0 {
-        return Err(InstallError::ToolFailed {
-            program,
-            code: outcome.code,
-            hint: outcome.hint_suffix(),
-        });
-    }
-    Ok(outcome)
-}
-
-/// Uma linha capturada do agendador: exit code + dica compacta.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+/// Uma linha capturada da ferramenta: exit code + dica compacta.
+#[cfg(target_os = "macos")]
 struct Outcome {
     code: i32,
     hint: String,
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 impl Outcome {
     /// ` (dica: …)` quando há primeira linha de stderr; vazio quando não.
     fn hint_suffix(&self) -> String {
@@ -395,7 +412,7 @@ impl Outcome {
 /// Spawna a ferramenta resolvida (caminho COMPLETO, nunca o nome nu) e
 /// captura exit + dica. `.cmd`/`.bat` no Windows vão pelo wrapper `cmd /C`
 /// (mesma conduta do scan — o shim do e2e é um script).
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn run_tool_code(bin: &Path, args: &[String]) -> Outcome {
     let mut command = command_for(bin, args);
     match command.output() {
@@ -417,7 +434,9 @@ fn run_tool_code(bin: &Path, args: &[String]) -> Outcome {
 /// Command sobre um binário resolvido: `.cmd`/`.bat` no Windows via
 /// `cmd /C chcp 65001 …` (o std não executa script; o chcp mantém UTF-8) —
 /// espelho do `command_from_resolved` do scan, usando a MESMA `shellline`.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+/// Inalcançável no macOS (binários nunca são .cmd), mantido para o build
+/// honesto e as provas do caminho de spawn.
+#[cfg(target_os = "macos")]
 fn command_for(bin: &Path, args: &[String]) -> Command {
     let via_cmd = cfg!(windows) && crate::binresolve::is_cmd_script(&bin.to_string_lossy());
     if via_cmd {
@@ -559,17 +578,30 @@ mod tests {
         assert!(content.contains("c&lt;d&gt;"), "{content}");
     }
 
-    // A linha REAL do /TR (sem shim no meio): aspas de verdade nos caminhos,
-    // filho é o próprio binário com --path absoluto.
+    // O conteúdo REAL do atalho do Windows (sem shim no meio): o filho é o
+    // próprio binário com --path absoluto, console minimizado e título.
     #[cfg(target_os = "windows")]
     #[test]
-    fn schtasks_tr_has_the_exact_command_with_real_quotes() {
-        let tr = schtasks_tr(r"C:\tools\kira.exe", r"C:\Users\d\Meu Projeto\repo");
-        assert_eq!(
-            tr,
-            r#""C:\tools\kira.exe" daemon run --path "C:\Users\d\Meu Projeto\repo""#
+    fn startup_cmd_content_has_the_exact_command() {
+        let content = startup_cmd_content(
+            "kira-demo-1234abcd",
+            r"C:\tools\kira.exe",
+            r"C:\Users\d\Meu Projeto\repo",
         );
-        // Caminho com espaço fica um token só (aspas de verdade, nunca `\'`).
-        assert!(tr.contains(r#""C:\Users\d\Meu Projeto\repo""#), "{tr}");
+        assert!(
+            content.contains(
+                r#"start "kira daemon kira-demo-1234abcd" /MIN "C:\tools\kira.exe" daemon run --path "C:\Users\d\Meu Projeto\repo""#
+            ),
+            "{content}"
+        );
+        // Sem credencial no arquivo (o daemon é local).
+        assert!(
+            !content.to_lowercase().contains("azure_devops_pat")
+                && !content.to_lowercase().contains("token="),
+            "{content}"
+        );
+        // CRLF de script Windows + instrução de remoção para o dono.
+        assert!(content.contains("\r\n"), "{content}");
+        assert!(content.contains("kira daemon uninstall"), "{content}");
     }
 }

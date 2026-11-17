@@ -553,8 +553,10 @@ enum ScheduleAction {
 /// Ações do `kira daemon` (DAEMON-01).
 #[derive(Debug, clap::Subcommand)]
 enum DaemonAction {
-    /// Registra a tarefa que acorda o daemon no boot/login do SO (DAEMON-02):
-    /// Task Scheduler no Windows (`schtasks /SC ONLOGON`), launchd no macOS
+    /// Registra a entrada que acorda o daemon no login/boot do SO (DAEMON-02):
+    /// pasta Inicializar do usuário no Windows (ADR-0045 — o EDR do dono
+    /// bloqueia `schtasks /Create` de pai não-aprovado; Startup é o
+    /// equivalente ONLOGON sem privilégio e sem spawn) e launchd no macOS
     /// (plist RunAtLoad em `~/Library/LaunchAgents`). O filho é o PRÓPRIO
     /// binário (`kira daemon run --path <raiz>`); o lock e a cadência da
     /// tabela `schedule` continuam mandando. Instalar de novo sobrescreve.
@@ -563,8 +565,8 @@ enum DaemonAction {
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    /// Remove a tarefa do agendador (idempotente: tarefa ausente é "nada a
-    /// remover", nunca erro)
+    /// Remove a entrada (idempotente: entrada ausente é "nada a remover",
+    /// nunca erro)
     Uninstall {
         /// Raiz do projeto (default: detecta do diretório atual)
         #[arg(long)]
@@ -1137,9 +1139,10 @@ fn daemon_status_command(path: Option<&Path>) -> Outcome {
     }
 }
 
-/// DAEMON-02: `kira daemon install` — registra a tarefa no agendador nativo
-/// do SO (schtasks no Windows, launchd no macOS). O efeito é no agendador do
-/// SO (não no mundo remoto), mas é ESCRITA — fica na trilha como toda ação.
+/// DAEMON-02: `kira daemon install` — registra a entrada que acorda o daemon
+/// no login/boot do SO (pasta Inicializar no Windows, launchd no macOS). O
+/// efeito é local (não no mundo remoto), mas é ESCRITA — fica na trilha como
+/// toda ação.
 fn daemon_install_command(path: Option<&Path>) -> Outcome {
     let root = kira::r#loop::resolve_root(path);
     match kira::daemon::install::install(&root) {
@@ -1158,8 +1161,8 @@ fn daemon_install_command(path: Option<&Path>) -> Outcome {
     }
 }
 
-/// DAEMON-02: `kira daemon uninstall` — remove a tarefa do agendador.
-/// Idempotente: tarefa ausente é "nada a remover", sai 0 (mesma conduta do
+/// DAEMON-02: `kira daemon uninstall` — remove a entrada do login/boot.
+/// Idempotente: entrada ausente é "nada a remover", sai 0 (mesma conduta do
 /// `trust revoke`).
 fn daemon_uninstall_command(path: Option<&Path>) -> Outcome {
     let root = kira::r#loop::resolve_root(path);
