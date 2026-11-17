@@ -114,7 +114,7 @@ pub fn forecast(series: &TimeSeries, horizon: usize) -> Result<Forecast, Error> 
     let values: Vec<f64> = series.points.iter().map(|p| p.value).collect();
     if values.len() < 2 {
         return Err(Error::Forecast(format!(
-            "a série tem {} ponto(s) — o forecast precisa de pelo menos 2 (extraia mais histórico antes)",
+            "a série tem {} ponto(s) — o forecast precisa de pelo menos 2 (rode `kira scan` para colher o histórico antes)",
             values.len()
         )));
     }
@@ -210,8 +210,74 @@ fn detect_anomalies_values(
         .collect()
 }
 
-/// Previsão por média móvel (última janela constante).
+/// Uma linha do backtest: o erro médio absoluto de UMA baseline contra os
+/// pontos reservados. `mae` em unidades da própria série (achados).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BacktestRow {
+    /// Nome da baseline (`tendência`, `último valor`, `média móvel(3)`).
+    pub name: String,
+    /// Erro médio absoluto no holdout — o "erro medido" do forecast.
+    pub mae: f64,
+}
+
+/// Backtest temporal honesto (FC-02): reserva os ÚLTIMOS `holdout` pontos,
+/// treina cada baseline só com o resto e mede o MAE de cada uma contra os
+/// pontos reservados. `None` quando a série é curta demais para o treino
+/// (menos de 3 pontos de treino) — backtest fingido é forecast fingido.
+///
+/// O que isto NÃO é: garantia de cobertura probabilística (a banda p10/p90 é
+/// heurística, documentada em [`forecast`]) e não é validação cruzada — é
+/// uma janela temporal única, a mais simples que ainda diz a verdade.
 #[must_use]
+pub fn backtest(series: &TimeSeries, holdout: usize) -> Option<Vec<BacktestRow>> {
+    if holdout == 0 {
+        return None;
+    }
+    let values: Vec<f64> = series.points.iter().map(|p| p.value).collect();
+    let n = values.len();
+    if n < holdout + 3 {
+        return None;
+    }
+    let (train, test) = values.split_at(n - holdout);
+    let mae = |pred: &[f64]| -> f64 {
+        pred.iter()
+            .zip(test)
+            .map(|(p, t)| (p - t).abs())
+            .sum::<f64>()
+            / holdout as f64
+    };
+    let trend = forecast_linear_trend(train, holdout);
+    let last = vec![*train.last().unwrap_or(&0.0); holdout];
+    let window = 3.min(train.len().max(1));
+    let moving = forecast_moving_average(train, holdout, window);
+    Some(vec![
+        BacktestRow {
+            name: "tendência".to_string(),
+            mae: mae(&trend),
+        },
+        BacktestRow {
+            name: "último valor".to_string(),
+            mae: mae(&last),
+        },
+        BacktestRow {
+            name: format!("média móvel({window})"),
+            mae: mae(&moving),
+        },
+    ])
+}
+
+/// A melhor baseline do backtest (menor MAE) — o que o comando imprime como
+/// referência honesta: se uma média simples vence a tendência, o dev sabe.
+#[must_use]
+pub fn best_baseline(rows: &[BacktestRow]) -> Option<&BacktestRow> {
+    rows.iter().min_by(|a, b| {
+        a.mae
+            .partial_cmp(&b.mae)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+/// Previsão por média móvel (última janela constante).#[must_use]
 pub fn forecast_moving_average(series: &[f64], horizon: usize, window: usize) -> Vec<f64> {
     if series.is_empty() || window == 0 {
         return vec![0.0; horizon];
@@ -455,6 +521,37 @@ mod tests {
     fn anomalies_needs_enough_points() {
         let short = vec![10.0, 10.0, 100.0];
         assert!(detect_anomalies(&series(&short, "2026-11-16", 1), 2.0).is_empty());
+    }
+
+    #[test]
+    fn backtest_reserves_the_tail_and_measures_each_baseline() {
+        // Série 1..=8, holdout 2: treino 1..=6, teste [7, 8].
+        // tendência prevê 7, 8 → MAE 0.0; último valor prevê 6, 6 → MAE 1.5;
+        // média móvel(3) prevê 5, 5 → MAE 2.5. A melhor baseline é a tendência.
+        let s = series(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            "2026-11-16T00:00:00Z",
+            1,
+        );
+        let rows = backtest(&s, 2).expect("8 pontos comportam holdout 2");
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!((rows[0].mae - 0.0).abs() < 1e-9, "{rows:?}");
+        assert!((rows[1].mae - 1.5).abs() < 1e-9, "{rows:?}");
+        assert!((rows[2].mae - 2.5).abs() < 1e-9, "{rows:?}");
+        assert_eq!(
+            best_baseline(&rows).expect("3 linhas").name,
+            "tendência",
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn backtest_refuses_too_short_series_and_zero_holdout() {
+        // 2 pontos com holdout 1: sobra 1 ponto de "treino" — não é treino.
+        let s = series(&[1.0, 2.0], "2026-11-16T00:00:00Z", 1);
+        assert!(backtest(&s, 1).is_none(), "{s:?}");
+        let s4 = series(&[1.0, 2.0, 3.0, 4.0], "2026-11-16T00:00:00Z", 1);
+        assert!(backtest(&s4, 0).is_none(), "holdout 0 não é backtest");
     }
 
     #[test]

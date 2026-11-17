@@ -1401,11 +1401,11 @@ pub fn format_summary(
         text.push_str(&format!("  {f}\n"));
     }
     text.push('\n');
-    // CAP-01: `forecast` saiu da lista — `kira forecast` NÃO existe (o
-    // dispatcher não tem o subcomando); a engine é biblioteca testada. O
-    // `pr draft` fica porque é comando real e local. Quando o subcomando
-    // forecast entrar no MVP (plano, onda 2), ele volta para cá.
-    text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard\n");
+    // CAP-01 + FC-02: `forecast` VOLTOU para a lista porque agora é comando
+    // real (FC-02) — engine determinística da casa + backtest MAE contra 3
+    // baselines, sem LLM. O aceite honesto: a lista só contém o que tem
+    // subcomando e jornada fechada.
+    text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard · forecast\n");
     text.push_str("desativado:      judge de item do board · read (board) · publicar PR\n");
     text.push_str("ativar depois:   kira connect azure   (leitura de work items)\n");
     if ia.is_none() {
