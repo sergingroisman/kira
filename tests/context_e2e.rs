@@ -687,9 +687,7 @@ fn normalize_golden(output: &str, roots: &[String]) -> String {
         while let Some(rel) = out[cursor..].find(&needle) {
             let start = cursor + rel + needle.len();
             let digits = out[start..]
-                .find(|c: char| {
-                    !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
-                })
+                .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
                 .unwrap_or(out[start..].len());
             if digits > 0 {
                 out.replace_range(start..start + digits, "<R>");
