@@ -676,6 +676,27 @@ fn normalize_golden(output: &str, roots: &[String]) -> String {
             cursor = start + "<N>".len();
         }
     }
+    // O `rank` do bm25 é FLOAT computado pelo SQLite FTS5 e diverge no ÚLTIMO
+    // ULP entre plataformas (provado no CI do macOS, 17/Nov: …333e-7 contra
+    // …334e-7 — 4 ocorrências, TODAS nesse campo; a ORDEN dos excerpts é
+    // idêntica). É apresentação do float, não comportamento: normaliza para
+    // <R> e a comparação continua byte a byte em tudo que importa.
+    for field in ["rank"] {
+        let needle = format!("\"{field}\": ");
+        let mut cursor = 0;
+        while let Some(rel) = out[cursor..].find(&needle) {
+            let start = cursor + rel + needle.len();
+            let digits = out[start..]
+                .find(|c: char| {
+                    !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
+                })
+                .unwrap_or(out[start..].len());
+            if digits > 0 {
+                out.replace_range(start..start + digits, "<R>");
+            }
+            cursor = start + "<R>".len();
+        }
+    }
     out
 }
 
@@ -754,6 +775,11 @@ fn the_three_golden_packs_are_reproducible_per_profile() {
                 golden_path.display()
             )
         });
+        // O dourado comitado passa pela MESMA normalização: os floats do bm25
+        // divergem entre plataformas no último ULP (<R>) e os campos <N>/
+        // <STAMP> podem estar crus no arquivo. Normalizar os dois lados deixa
+        // a comparação puramente estrutural — byte a byte no que importa.
+        let golden = normalize_golden(&golden, &roots);
         assert_eq!(
             normalized, golden,
             "dourado do perfil {profile} divergiu — mudança de comportamento não autorizada"
