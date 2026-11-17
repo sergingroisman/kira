@@ -66,6 +66,28 @@ pub fn finalize(mut findings: Vec<Finding>) -> Vec<Finding> {
     findings
 }
 
+/// FC-01: contagens por severidade canônica (lowercase) + `other` — o insumo
+/// da série temporal que alimenta o `kira forecast` no store. Função pura.
+#[must_use]
+pub fn severity_counts(findings: &[Finding]) -> crate::store::FindingsCounts {
+    let mut counts = crate::store::FindingsCounts {
+        total: findings.len(),
+        ..Default::default()
+    };
+    for finding in findings {
+        match finding.severity.trim().to_ascii_lowercase().as_str() {
+            "critical" => counts.critical += 1,
+            "high" => counts.high += 1,
+            "medium" => counts.medium += 1,
+            "low" => counts.low += 1,
+            // Severidade crua fora das buckets (ex.: `Moderate`) conta em
+            // `other` — o dado entra na série, nunca some.
+            _ => counts.other += 1,
+        }
+    }
+    counts
+}
+
 /// Count lines by severity, each one with counts per tool, grouped by severity
 /// name (lowercased) — comparison only for display; the stored value is the
 /// raw severity.
@@ -175,6 +197,36 @@ mod tests {
         // Stable: the same data in another entry order yields the same list.
         let shuffled = finalize(vec![sorted[1].clone(), sorted[0].clone()]);
         assert_eq!(shuffled, sorted, "o conjunto de fingerprints é o mesmo");
+    }
+
+    #[test]
+    fn severity_counts_buckets_canonical_and_keeps_the_rest_in_other() {
+        let finding = |severity: &str| Finding {
+            tool: "audit".into(),
+            rule: "vulnerable".into(),
+            package: format!("pkg-{severity}"),
+            version: "1.0.0".into(),
+            severity: severity.into(),
+            path: ".".into(),
+            message: format!("msg {severity}"),
+            fingerprint: format!("f-{severity}"),
+        };
+        let counts = severity_counts(&[
+            finding("High"),
+            finding("critical"),
+            finding("CRITICAL"),
+            finding("medium"),
+            finding("low"),
+            finding("Moderate"),
+        ]);
+        assert_eq!(counts.total, 6, "{counts:?}");
+        assert_eq!(counts.critical, 2, "{counts:?}");
+        assert_eq!(counts.high, 1, "{counts:?}");
+        assert_eq!(counts.medium, 1, "{counts:?}");
+        assert_eq!(counts.low, 1, "{counts:?}");
+        // Severidade fora das buckets canônicas conta em `other` — o dado
+        // entra na série, nunca é descartado.
+        assert_eq!(counts.other, 1, "{counts:?}");
     }
 
     #[test]
