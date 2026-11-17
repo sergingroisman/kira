@@ -553,6 +553,23 @@ enum ScheduleAction {
 /// Ações do `kira daemon` (DAEMON-01).
 #[derive(Debug, clap::Subcommand)]
 enum DaemonAction {
+    /// Registra a tarefa que acorda o daemon no boot/login do SO (DAEMON-02):
+    /// Task Scheduler no Windows (`schtasks /SC ONLOGON`), launchd no macOS
+    /// (plist RunAtLoad em `~/Library/LaunchAgents`). O filho é o PRÓPRIO
+    /// binário (`kira daemon run --path <raiz>`); o lock e a cadência da
+    /// tabela `schedule` continuam mandando. Instalar de novo sobrescreve.
+    Install {
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Remove a tarefa do agendador (idempotente: tarefa ausente é "nada a
+    /// remover", nunca erro)
+    Uninstall {
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     /// Roda os ticks agendados até Ctrl+C (ou `--ticks`)
     Run {
         /// Raiz do projeto (default: detecta do diretório atual)
@@ -908,6 +925,8 @@ async fn run(command: Command) -> Outcome {
             } => model_admit_command(&tag, sha256.as_deref(), probes_ok, force),
         },
         Command::Daemon { action } => match action {
+            DaemonAction::Install { path } => daemon_install_command(path.as_deref()),
+            DaemonAction::Uninstall { path } => daemon_uninstall_command(path.as_deref()),
             DaemonAction::Run {
                 path,
                 model,
@@ -1115,6 +1134,45 @@ fn daemon_status_command(path: Option<&Path>) -> Outcome {
         records: false,
         summary: text.lines().next().unwrap_or_default().to_string(),
         economy: None,
+    }
+}
+
+/// DAEMON-02: `kira daemon install` — registra a tarefa no agendador nativo
+/// do SO (schtasks no Windows, launchd no macOS). O efeito é no agendador do
+/// SO (não no mundo remoto), mas é ESCRITA — fica na trilha como toda ação.
+fn daemon_install_command(path: Option<&Path>) -> Outcome {
+    let root = kira::r#loop::resolve_root(path);
+    match kira::daemon::install::install(&root) {
+        Ok(report) => {
+            let text = format!(
+                "daemon instalado: {}\n  {}\n  o daemon acorda no login/boot; a cadência é a tabela `schedule` (veja `kira schedule list`)\n  remover depois: kira daemon uninstall\n",
+                report.task, report.detail
+            );
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// DAEMON-02: `kira daemon uninstall` — remove a tarefa do agendador.
+/// Idempotente: tarefa ausente é "nada a remover", sai 0 (mesma conduta do
+/// `trust revoke`).
+fn daemon_uninstall_command(path: Option<&Path>) -> Outcome {
+    let root = kira::r#loop::resolve_root(path);
+    match kira::daemon::install::uninstall(&root) {
+        Ok(text) => {
+            let message = format!("{text}\n");
+            print!("{message}");
+            Outcome::success(message)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
     }
 }
 
@@ -1715,6 +1773,20 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             }
         },
         Command::Daemon { action } => match action {
+            DaemonAction::Install { path } => {
+                let args = path
+                    .as_ref()
+                    .map(|p| format!("install --path {}", p.display()))
+                    .unwrap_or_else(|| "install".to_string());
+                ("daemon install".to_string(), args, None)
+            }
+            DaemonAction::Uninstall { path } => {
+                let args = path
+                    .as_ref()
+                    .map(|p| format!("uninstall --path {}", p.display()))
+                    .unwrap_or_else(|| "uninstall".to_string());
+                ("daemon uninstall".to_string(), args, None)
+            }
             DaemonAction::Run {
                 path,
                 model,

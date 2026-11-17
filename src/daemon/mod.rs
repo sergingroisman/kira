@@ -25,6 +25,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod install;
+
 use crate::r#loop::{self, LoopOptions, TickReport};
 use crate::scheduler::{self, SchedulePlan};
 use crate::store::{self, ScheduleRow, Store};
