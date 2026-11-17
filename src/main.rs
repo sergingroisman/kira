@@ -1,5 +1,5 @@
 use std::error::Error as StdError;
-use std::io::{BufWriter, IsTerminal};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -39,6 +39,23 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Um comando, zero interação (START-01): detecta a raiz, roda o setup
+    /// não-interativo (defaults, sem NENHUMA pergunta), aceita o repositório
+    /// (`kira trust`), cria a agenda default (scan 30m, digest 2h) e roda o
+    /// primeiro tick do ciclo. Tudo LOCAL — nenhuma escrita no mundo.
+    /// Retomável: re-rodar `kira start` nunca duplica nada (o estado é o
+    /// próprio mundo — config.toml, .kira/trust.json e a tabela `schedule`).
+    #[command(
+        after_help = "Exemplos:\n  kira start\n  kira start --dry-run\n  kira start --path ./repo\n\nDepois do start o KIRA vive com `kira daemon run` — e `kira dashboard` mostra o resultado."
+    )]
+    Start {
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Mostra o plano (o que faria, o que já está pronto) e não executa nada
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print a readable summary of an Azure DevOps work item
     Inspect {
         /// Work item id
@@ -757,6 +774,7 @@ async fn main() -> ExitCode {
 
 async fn run(command: Command) -> Outcome {
     match command {
+        Command::Start { path, dry_run } => start_command(path.as_deref(), dry_run).await,
         Command::Inspect { id, project } => {
             // ADR-0030 #5/#6: a jornada de board só começa com a capacidade
             // conectada — a prova vem ANTES de resolver credencial ou rede.
@@ -1409,6 +1427,18 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             )
         }
         Command::Setup { .. } => ("setup".to_string(), String::new(), None),
+        Command::Start { path, dry_run } => {
+            // A trilha registra a invocação — a jornada de onboarding é auditável
+            // como qualquer outra (o que cada passo FEZ está no summary).
+            let mut args = String::new();
+            if *dry_run {
+                args.push_str("--dry-run ");
+            }
+            if let Some(path) = path {
+                args.push_str(&format!("--path {}", path.display()));
+            }
+            ("start".to_string(), args.trim().to_string(), None)
+        }
         Command::Connect { provider, .. } => ("connect".to_string(), provider.clone(), None),
         Command::History { last } => (
             "history".to_string(),
@@ -2599,6 +2629,234 @@ async fn loop_command(
             Outcome::failure(err.to_string())
         }
     }
+}
+
+/// START-01: `kira start` — a porta de entrada zero-toque (decisão 3 do dono,
+/// 17/Nov/2026): um comando e o KIRA fica vivo, sem UMA pergunta.
+///
+/// Orquestra os comandos EXISTENTES — o loop não reimplementa nada, e o start
+/// tampouco: setup não-interativo (`setup::run` com `--yes`, fonte única de
+/// efeitos do setup), aceite local (`trust::accept`), agenda default
+/// (`schedule_add`: scan 30m, digest 2h — plano item 11.1) e o primeiro tick
+/// (`kira::r#loop::run` com `once`, o mesmo `kira loop --once`).
+///
+/// O ESTADO DE RETOMADA é o próprio mundo — config.toml, `.kira/trust.json` e
+/// as linhas da tabela `schedule` (padrão onboarding-com-estado do openclaude,
+/// apêndice 10.1 do plano; ADR-0043): cada passo checa o estado real antes de
+/// agir, então re-rodar `kira start` nunca duplica agendamento nem refaz
+/// pergunta — o mesmo princípio do "próximo tick é derivado, nunca gravado"
+/// do scheduler. Sem espelho de estado no store: uma segunda fonte de verdade
+/// ia discordar do mundo cedo ou tarde.
+///
+/// A agenda default é só scan + digest: fase SEM cadência declarada roda no
+/// default do ciclo (`SchedulePlan::is_due`), então o publish continua vivo
+/// sem linha própria — declarar é o que restringe, e o publish a cada tick é
+/// barato (só publica rascunho novo; igual não reescreve).
+async fn start_command(path: Option<&Path>, dry_run: bool) -> Outcome {
+    let root = kira::r#loop::resolve_root(path);
+    let config_exists = credentials::config_path().is_some_and(|path| path.exists());
+    let trusted = trust::is_trusted(&root);
+    // Falha de leitura da agenda = lista vazia + decisão "criar" (fail-open no
+    // espírito do store): o `schedule add` real é quem reporta erro de
+    // verdade se GRAVAR falhar — e nesse caso o start para antes do tick.
+    let declared = start_declared_schedules();
+    let scan_declared = declared.iter().any(|action| action == "scan");
+    let digest_declared = declared.iter().any(|action| action == "digest");
+
+    // O PLANO é derivado do mundo (mesmo princípio do scheduler) — é o que o
+    // `--dry-run` imprime e o que o resumo confirma no fim.
+    let plan = [
+        format!("raiz: {}", root.display()),
+        format!(
+            "1. setup não-interativo: {}",
+            if config_exists {
+                "config.toml já existe — reconfere sem perguntar"
+            } else {
+                "cria config.toml com defaults (sem pergunta)"
+            }
+        ),
+        format!(
+            "2. confiança local: {}",
+            if trusted {
+                "já declarada (.kira/trust.json)"
+            } else {
+                "aceita o repositório (grava .kira/trust.json)"
+            }
+        ),
+        format!(
+            "3. agenda default: scan a cada 30m {}; digest a cada 2h {}",
+            if scan_declared {
+                "já declarada"
+            } else {
+                "cria"
+            },
+            if digest_declared {
+                "já declarada"
+            } else {
+                "cria"
+            }
+        ),
+        "4. primeiro tick: ingest → digest (se aceito) → publish (`kira loop --once`)".to_string(),
+        "5. depois: `kira daemon run` mantém o ciclo vivo até você parar".to_string(),
+    ];
+
+    if dry_run {
+        // Consulta pura: NÃO grava sessão (mesma regra de history/note/profile)
+        // e a leitura da agenda foi READ-ONLY — mostrar o plano nunca cria
+        // store.db como efeito colateral.
+        println!("plano do kira start (--dry-run — nada executado):");
+        for line in &plan {
+            println!("  {line}");
+        }
+        let summary = format!(
+            "start --dry-run: plano impresso em {} — nada executado",
+            root.display()
+        );
+        return Outcome {
+            code: ExitCode::SUCCESS,
+            ok: true,
+            records: false,
+            summary,
+            economy: None,
+        };
+    }
+
+    // PASSO 1 — setup não-interativo: a MESMA máquina de `kira setup --yes`
+    // (sem TTY nunca bloqueia; sem Ollama escolhe "nenhuma por agora" e
+    // imprime o pulado). A saída do setup é parte da jornada do start — vai
+    // ao stdout na ordem, bufferizada para o failure não ficar órfão.
+    let cred_store = match credentials::open_default_store() {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("erro: {err}");
+            return Outcome::failure(err.to_string());
+        }
+    };
+    let options = setup::SetupOptions {
+        org: None,
+        project: None,
+        reset: false,
+        pat: None,
+        interactive: false,
+        name: None,
+        yes: true,
+        backend: None,
+        skip: Vec::new(),
+        // M6: o ingest entra no setup (facts nasce aqui); `--yes` ingere sem
+        // perguntar. O scan NÃO roda dentro do setup — quem roda é o primeiro
+        // tick, que já o faz como fase agendável.
+        ingest: true,
+        embedding_model: None,
+        // Raiz do start (flag > detecção) — o setup mostra e usa esta.
+        project_root: Some(store::display_path(&root)),
+        foundry: None,
+        hidden_input: true,
+    };
+    let mut setup_output: Vec<u8> = Vec::new();
+    // Entrada vazia: em `--yes` o setup NUNCA lê stdin (nunca bloqueia) — o
+    // Cursor vazio é a prova disso (qualquer leitura aqui seria um bug).
+    let mut setup_input = std::io::Cursor::new(Vec::new());
+    let setup_code = setup::run(
+        &options,
+        cred_store.as_ref(),
+        credentials::config_path().as_deref(),
+        &setup::env_lookup,
+        &mut setup_input,
+        &mut setup_output,
+        &setup::default_board_factory,
+        &setup::real_ia_hooks(),
+    )
+    .await;
+    let _ = std::io::stdout().write_all(&setup_output);
+    if setup_code != ExitCode::SUCCESS {
+        let message = "o setup do start falhou — corrija o ponto acima e rode `kira start` de novo (o estado é retomável: nada será duplicado)".to_string();
+        eprintln!("erro: {message}");
+        return Outcome::failure(format!("setup falhou no start — {message}"));
+    }
+
+    // PASSO 2 — confiança local: o `kira trust` real (idempotente por caminho
+    // canônico — re-aceitar reescreve o MESMO hash; mover o repo pede aceite
+    // de novo, que é o comportamento seguro do ADR-0038).
+    if trusted {
+        println!(
+            "confiança: já declarada em {} (.kira/trust.json)",
+            root.display()
+        );
+    } else {
+        match trust::accept(&root) {
+            Ok(record) => println!(
+                "confiança: repositório aceito — {}\n  hash: {}",
+                record.root, record.hash
+            ),
+            Err(err) => {
+                eprintln!("erro: {err}");
+                let message = "o aceite local falhou — o digest recusa rodar sem ele; resolva e rode `kira start` de novo (nada será duplicado)".to_string();
+                eprintln!("erro: {message}");
+                return Outcome::failure(format!("trust falhou no start — {message}"));
+            }
+        }
+    }
+
+    // PASSO 3 — agenda default: o MESMO `kira schedule add` do CLI (o start
+    // não reimplementa). Dedupe por AÇÃO: uma linha existente da fase (mesmo
+    // desligada) é escolha do dono — o start não a sobrescreve nem duplica.
+    for (action, every) in [("scan", "30m"), ("digest", "2h")] {
+        let already = declared.iter().any(|declared| declared == action);
+        if already {
+            println!("agenda: {action} já declarado — nada criado (a cadência é sua)");
+            continue;
+        }
+        match schedule_add(action, every, false) {
+            Ok(text) => print!("{text}"),
+            Err(err) => {
+                eprintln!("erro: {err}");
+                let message = "a agenda default não foi criada — o daemon só ticka o que está declarado; rode `kira start` de novo (os passos anteriores não se repetem)".to_string();
+                eprintln!("erro: {message}");
+                return Outcome::failure(format!("schedule falhou no start — {message}"));
+            }
+        }
+    }
+
+    // PASSO 4 — primeiro tick: o MESMO `kira loop --once` (o start não
+    // reimplementa o ciclo). Sem Ollama, as falhas de post são CONTADAS
+    // (`digest_failed`) — o tick não morre por isso; o resumo abaixo reflete
+    // o que o tick imprimiu.
+    let mut tick_options = kira::r#loop::LoopOptions::at(root.clone());
+    if let Ok(lang) = std::env::var("KIRA_LANG") {
+        tick_options.lang = lang;
+    }
+    let tick_text = match kira::r#loop::run(&tick_options, true, 1).await {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("erro: {err}");
+            let message = "o primeiro tick falhou — o estado até aqui está gravado (config, trust, agenda); rode `kira loop --once` para continuar (ou `kira start` de novo: nada duplica)".to_string();
+            eprintln!("erro: {message}");
+            return Outcome::failure(format!("primeiro tick falhou no start — {message}"));
+        }
+    };
+    print!("{tick_text}");
+
+    // RESUMO — mesmo formato do setup: o que ficou de pé e o PRÓXIMO passo,
+    // nunca "configuração concluída".
+    let summary = format!(
+        "pronto: start concluído em {}\n  funciona agora: ciclo local (ingest → digest → publish) na cadência declarada\n  próximo passo:   kira daemon run   # o KIRA fica vivo até você parar (Ctrl+C)\n  veja também:     kira dashboard     # painel local do ciclo",
+        root.display()
+    );
+    println!("{summary}");
+    Outcome::success(summary)
+}
+
+/// As ações DECLARADAS na tabela `schedule` (ligadas ou não), para o dedupe do
+/// start. Leitura READ-ONLY (`open_readonly_at`, a mesma do dashboard): sem DB
+/// ainda ⇒ lista vazia — o primeiro start de verdade é quem cria. Falha de
+/// leitura em DB existente também vira lista vazia (fail-open): o erro real de
+/// escrita aparece no `schedule_add`, que é quem tem a palavra final.
+fn start_declared_schedules() -> Vec<String> {
+    store::db_path()
+        .and_then(|path| Store::open_readonly_at(&path).ok())
+        .and_then(|store| store.list_schedules().ok())
+        .map(|rows| rows.into_iter().map(|row| row.action).collect())
+        .unwrap_or_default()
 }
 
 /// `kira model pull <repo>` (HF-2, ADR-0040): baixa GGUF via `ollama pull`
