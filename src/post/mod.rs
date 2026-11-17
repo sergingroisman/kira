@@ -292,13 +292,16 @@ pub async fn run<B: LlmBackend>(
             Ok(None) => break,
             Err(err) => return Err(DigestError::Store(err.to_string())),
         };
-        let (system, prompt) = build_prompt(
+        let (system, prompt, fit_note) = build_prompt(
             &claimed.kind,
             &options.lang,
             &digest,
             &evidence,
             options.per_post_tokens,
         );
+        if let Some(note) = fit_note {
+            report.notes.push(note);
+        }
 
         // HF-5: tag do kind (resolvida no planejamento; kind fora do plano
         // resolve na hora, mesmo mecanismo). O `cache_key` da linha gravada
@@ -514,7 +517,7 @@ fn build_prompt(
     digest: &str,
     evidence: &str,
     per_post_tokens: u64,
-) -> (String, String) {
+) -> (String, String, Option<String>) {
     let project = digest
         .lines()
         .next()
@@ -538,7 +541,53 @@ fn build_prompt(
         "c4-container" => prompts::c4_container(lang, &project, &profile, evidence),
         _ => prompts::intro(lang, &project, &profile, &tree),
     };
-    (prompts::SYSTEM.to_string(), prompt)
+    let system = prompts::SYSTEM.to_string();
+    let (prompt, fit_note) = fit_prompt_to_window(&system, prompt);
+    (system, prompt, fit_note)
+}
+
+/// Encaixa o prompt NA JANELA REAL do modelo. O teto anterior (60k/90k chars
+/// de evidência) desconhecia `KIRA_NUM_CTX`: prompt maior que a janela é
+/// truncado EM SILÊNCIO pelo Ollama, o modelo perde as instruções do topo e
+/// responde vazio — provado no hardware do dono (17/Nov/2026: 6 posts com
+/// "resposta vazia do modelo" contra `num_ctx` 4096).
+///
+/// A reserva da resposta é 1/3 da janela (piso 256 tokens): o prompt E a
+/// resposta (incluindo o raciocínio do modelo) têm que caber juntos.
+/// Corte determinístico por LINHAS, do FIM — as instruções no topo
+/// sobrevivem, a evidência no fim é quem cede. A régua é a mesma da casa:
+/// 3 chars por token. `None` = nada foi cortado.
+fn fit_prompt_to_window(system: &str, prompt: String) -> (String, Option<String>) {
+    let num_ctx = u64::from(crate::config::num_ctx_from_env());
+    let answer_reserve = (num_ctx / 3).max(256);
+    let budget_chars = chars_for(num_ctx.saturating_sub(answer_reserve));
+    let used = system.chars().count() + prompt.chars().count();
+    if used <= budget_chars {
+        return (prompt, None);
+    }
+    // A nota de corte entra no próprio prompt — reservada antes do corte.
+    let note_reserve = 256usize;
+    let allowed = budget_chars
+        .saturating_sub(system.chars().count())
+        .saturating_sub(note_reserve);
+    let mut kept = String::with_capacity(allowed);
+    let mut kept_lines = 0usize;
+    let total_lines = prompt.lines().count();
+    for line in prompt.lines() {
+        // +1 pelo `\n` que `lines()` consome no separador.
+        if kept.chars().count() + line.chars().count() + 1 > allowed {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+        kept_lines += 1;
+    }
+    let dropped = total_lines - kept_lines;
+    let note = format!(
+        "prompt truncado para caber na janela do modelo (KIRA_NUM_CTX={num_ctx}): {dropped} linha(s) de evidência ficaram de fora — suba KIRA_NUM_CTX para levar mais"
+    );
+    kept.push_str("\n(sections were dropped to fit the model context window; the evidence above is what you may cite)\n");
+    (kept, Some(note))
 }
 
 fn chars_for(tokens: u64) -> usize {
@@ -759,11 +808,50 @@ mod tests {
     #[test]
     fn prompt_budget_caps_the_tree_that_goes_to_the_model() {
         let digest = "# Digest — demo\n\n## Árvore\n\n```text\nsrc/main.rs\n```\n\n## Perfil\n\n- arquivos: 1\n";
-        let (_, prompt) = build_prompt("intro", "pt-BR", digest, "", 10);
+        let (_, prompt, fit_note) = build_prompt("intro", "pt-BR", digest, "", 10);
         assert!(prompt.contains("src/main.rs"), "árvore precisa entrar");
         assert!(
             prompt.chars().count() < chars_for(10) + 2_000,
             "teto do post não respeitado"
+        );
+        // Prompt pequeno: nada é cortado (a nota de truncamento não existe).
+        assert!(fit_note.is_none(), "nada a cortar aqui: {fit_note:?}");
+    }
+
+    /// O teto REAL é a janela do modelo (`KIRA_NUM_CTX`): evidência que não
+    /// cabe é cortada POR LINHAS do fim, com nota honesta — nunca o Ollama
+    /// truncando em silêncio (provado no hardware do dono, 17/Nov/2026).
+    #[test]
+    fn prompt_is_fitted_to_the_model_window_with_a_honest_note() {
+        let digest = "# Digest — demo\n\n## Árvore\n\n```text\nsrc/main.rs\n```\n\n## Perfil\n\n- arquivos: 1\n";
+        // Evidência ENORME: o c4 levava 60k chars — hoje é a janela que manda.
+        let evidence = "## Arquivos-chave\n".to_string()
+            + &"src/big/file.rs:1 — linha longa de evidência\n".repeat(2_000);
+        let (system, prompt, fit_note) =
+            build_prompt("c4-container", "en", digest, evidence.as_str(), 10);
+        let note = fit_note.expect("corte esperado para evidência gigante");
+        assert!(note.contains("KIRA_NUM_CTX=4096"), "{note}");
+        assert!(
+            note.contains("linha(s) de evidência ficaram de fora"),
+            "{note}"
+        );
+        // O prompt final (system + prompt) cabe na janela menos a reserva.
+        let num_ctx = u64::from(crate::config::num_ctx_from_env());
+        let reserve = (num_ctx / 3).max(256);
+        let budget = chars_for(num_ctx.saturating_sub(reserve));
+        assert!(
+            system.chars().count() + prompt.chars().count() <= budget,
+            "prompt ainda transborda: {} > {budget}",
+            system.chars().count() + prompt.chars().count()
+        );
+        // As instruções do TOPO sobrevivem (o corte é do fim).
+        assert!(
+            prompt.contains("## Containers"),
+            "instruções do topo sobrevivem: {prompt}"
+        );
+        assert!(
+            prompt.contains("sections were dropped"),
+            "marca honesta no prompt: {prompt}"
         );
     }
 
