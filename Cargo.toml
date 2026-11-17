@@ -37,6 +37,12 @@ rusqlite = { version = "=0.41.1", features = ["bundled"] }
 # Direct dependency: the Ollama backend (src/llm/ollama.rs) performs its own
 # HTTP calls to localhost; before this it was only transitive via azure_core.
 reqwest = { version = "0.13", features = ["json"] }
+# Direct dependency: SEC-02 (endpoint.rs) parses the Ollama base URL with a
+# real parser instead of string prefix matching — `host.starts_with("127.")`
+# accepted a REMOTE domain like `127.attacker.example` as "local", silencing
+# the egress warning and dropping the key requirement. Same 2.5 line already
+# compiled transitively via azure_core, so the tree does not grow.
+url = "2"
 # Direct dependency: the privacy boundary (src/redact.rs) masks PATs, tokens,
 # e-mails and CPFs before any log, error or LLM prompt (AGENTS.md). Already a
 # transitive dependency of the Azure SDK at this exact version; declared so the
