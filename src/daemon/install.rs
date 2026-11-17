@@ -484,6 +484,9 @@ fn plist_content(label: &str, exe: &str, root: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Os testes rodam em TODOS os alvos; o import do topo é gated por
+    // agendador nativo, então o módulo de testes traz o próprio.
+    use std::path::PathBuf;
 
     fn sandbox(tag: &str) -> PathBuf {
         let dir =

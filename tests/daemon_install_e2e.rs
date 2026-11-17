@@ -413,7 +413,7 @@ mod linux_tests {
     #[test]
     fn install_on_linux_is_an_actionable_error() {
         let sandbox = Sandbox::new("linux-install");
-        let (code, stdout, stderr) = sandbox.run(&["daemon", "install"]);
+        let (code, _stdout, stderr) = sandbox.run(&["daemon", "install"]);
         assert_ne!(code, 0, "install fora do MVP tem que falhar");
         assert!(
             stderr.contains("não está implementado"),
