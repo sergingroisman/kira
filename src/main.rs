@@ -99,7 +99,7 @@ enum Command {
     },
     /// Configure the local-first setup: dev name → project root → IA backend
     #[command(
-        after_help = "Exemplos:\n  kira setup                # nome → projeto (raiz detectada) → backend de IA → resumo\n  kira setup --yes          # não-interativo: nunca bloqueia; sem Ollama escolhe \"nenhuma\" (e imprime o pulado)\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # atalho: valida e salva sem perguntas\n  kira setup --skip ia      # pula um passo (repetível: ia; 'pat' segue aceito como no-op)\n  kira setup --reset        # remove o PAT e a chave do Foundry do keyring; org/projeto/dev ficam\n\n  # A credencial do board nasce em `kira connect azure` (MVP-3), não aqui."
+        after_help = "Exemplos:\\n  kira setup                # nome → projeto (raiz detectada) → backend de IA → embeddings → forecast → resumo\\n  kira setup --yes          # não-interativo: nunca bloqueia; sem Ollama escolhe \\\"nenhuma\\\" (e imprime o pulado)\\n  kira setup --org minha-org --project MeuProjeto --pat <token>   # atalho: valida e salva sem perguntas\\n  kira setup --skip ia      # pula um passo (repetível: ia; 'pat' segue aceito como no-op)\\n  kira setup --reset        # remove o PAT e a chave do Foundry do keyring; org/projeto/dev ficam\\n  kira setup --embedding-model gemma2:7b \\n\\n  # A credencial do board nasce em `kira connect azure` (MVP-3), não aqui."
     )]
     Setup {
         /// Azure DevOps organization (atalho para quem já tem — nunca é
@@ -137,6 +137,9 @@ enum Command {
         /// shown by `kira doctor` — never sent to any LLM prompt)
         #[arg(long)]
         name: Option<String>,
+        /// Modelo de embeddings (Gemma 2): gemma2:2b | gemma2:7b
+        #[arg(long, value_parser = ["gemma2:2b", "gemma2:7b"])]
+        embedding_model: Option<String>,
         /// Força o wizard de texto (sem tela cheia) — para CI, terminal
         /// restrito ou quem prefere linha a linha
         #[arg(long)]
@@ -731,9 +734,22 @@ async fn run(command: Command) -> Outcome {
             backend,
             skip,
             name,
+            embedding_model,
             plain,
         } => Outcome {
-            code: setup_command(org, project, reset, pat, yes, backend, skip, name, plain).await,
+            code: setup_command(
+                org,
+                project,
+                reset,
+                pat,
+                yes,
+                backend,
+                skip,
+                name,
+                embedding_model,
+                plain,
+            )
+            .await,
             ok: true,
             records: false,
             summary: String::new(),
@@ -3329,6 +3345,7 @@ async fn setup_command(
     backend: Option<String>,
     skip: Vec<String>,
     name: Option<String>,
+    embedding_model: Option<String>,
     plain: bool,
 ) -> ExitCode {
     // Fail fast (before the user creates a token) when there is nowhere to
@@ -3358,6 +3375,9 @@ async fn setup_command(
         // `--yes` ingere sem perguntar. O wizard de tela cheia sobrescreve com
         // a decisão da própria etapa.
         ingest: true,
+        // Modelo de embedding (PR25); o forecast NÃO tem escolha de modelo —
+        // a engine é estatística e o Timestral é runtime nativo futuro (ADR-0042).
+        embedding_model,
         // Raiz do projeto DETECTADA (mesma regra do store): entra no passo
         // "projeto" do fluxo local-first.
         project_root: store::detect_project_root().map(|root| store::display_path(&root)),
@@ -3376,6 +3396,7 @@ async fn setup_command(
         || options.project.is_some()
         || options.pat.is_some()
         || options.backend.is_some()
+        || options.embedding_model.is_some()
         || !options.skip.is_empty()
         || options.yes;
     let stdout_tty = std::io::stdout().is_terminal();

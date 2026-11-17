@@ -301,10 +301,11 @@ async fn run_setup(
         yes,
         backend,
         skip: skip.iter().map(|item| (*item).to_string()).collect(),
+        ingest: false,
+        embedding_model: None,
         project_root,
         // M6: a ingestão tem testes próprios (binary-level, abaixo); o helper
         // in-process exercita o fluxo de TEXTO, sem escrever `.kira/`.
-        ingest: false,
         foundry: None,
         hidden_input: false,
     };

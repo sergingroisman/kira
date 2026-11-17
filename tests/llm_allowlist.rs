@@ -29,13 +29,24 @@ const COMPOSITION_ROOT: &str = "main.rs";
 /// vocabulário `TRIAGE_FILES_UNKNOWN` (o mesmo consumo do `eval.rs`) para
 /// classificar âncora vazia/`não identificado` como AUSENTE — o módulo é
 /// cálculo puro (camada 3, ADR-0016), sem backend e sem chamada.
-const ALLOWED_EXACT: [&str; 4] = ["triage.rs", "eval.rs", "setup.rs", "context/evidence.rs"];
+/// `embeddings.rs` entra por ADR-0042: embeddings via `/api/embed` do Ollama
+/// (Gemma 2) — o vetor de sentido SÓ o modelo produz (não há parser/CLI que
+/// transforme texto em vetor); é a decisão com o modelo que o módulo existe
+/// para fazer, justificada no call site. O `forecast.rs` do ADR-0042 é
+/// estatística pura e NÃO entra — camada 3 de propósito.
+const ALLOWED_EXACT: [&str; 5] = [
+    "triage.rs",
+    "eval.rs",
+    "setup.rs",
+    "context/evidence.rs",
+    "embeddings.rs",
+];
 const ALLOWED_PREFIXES: [&str; 3] = ["llm/", "loop/", "post/"];
 
 /// Modules allowed *and* required to justify each decision with the model.
 /// `wiki/` joins this list when it starts consolidating with an LLM (PR30).
 /// Entradas aqui são **arquivos** (o teste lê o fonte), não prefixos.
-const MUST_JUSTIFY: [&str; 3] = ["triage.rs", "eval.rs", "post/mod.rs"];
+const MUST_JUSTIFY: [&str; 4] = ["triage.rs", "eval.rs", "post/mod.rs", "embeddings.rs"];
 
 const JUSTIFICATION: &str = "// LLM porque:";
 

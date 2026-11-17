@@ -33,6 +33,7 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::pin::Pin;
 use std::process::ExitCode;
+use std::str::FromStr;
 
 /// Wizard de tela cheia (ADR-0025 + layout do opencode): coleta as respostas e
 /// devolve `SetupOptions` para o motor de texto abaixo executar.
@@ -45,6 +46,7 @@ use crate::credentials::{
     ORG_ENV, PAT_ENV, PROJECT_ENV,
 };
 use crate::doctor;
+use crate::embeddings::EmbeddingModel;
 use crate::error::Error;
 use crate::llm::LlmBackend;
 use crate::llm::foundry;
@@ -93,6 +95,8 @@ pub struct SetupOptions {
     /// M6: a etapa de ingestão roda no fim do `setup` (preview read-only +
     /// consentimento). `--skip ingest` desliga; `--yes` ingere sem perguntar.
     pub ingest: bool,
+    /// Embedding model (Gemma 2 2B/7B). `--embedding-model` override.
+    pub embedding_model: Option<String>,
     /// Raiz do projeto detectada, injetada pelo binário real
     /// (`store::detect_project_root`); testes fixam o valor. `None` faz o
     /// motor detectar pelo cwd.
@@ -649,6 +653,65 @@ pub async fn run(
     }
 
     // ------------------------------------------------------------------
+    // Passo embedding model (PR25): escolhe modelo de embeddings (Gemma 2).
+    // Só roda se o backend for Ollama (embeddings locais).
+    // Default: gemma2:2b (menor, rápido). `--embedding-model` override.
+    // ------------------------------------------------------------------
+    let embedding_summary = if options.interactive && !options.yes {
+        if let Some(backend) = options.backend.as_deref() {
+            if backend.trim().eq_ignore_ascii_case("ollama") {
+                let ollama_models = (ia_hooks.ollama_models)();
+                if ollama_models.is_some() {
+                    let model = match ask_embedding_model(input, output, &options.embedding_model) {
+                        Ok(m) => m,
+                        Err(e) => return e,
+                    };
+                    Some(format!("embeddings: {model}"))
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "Ollama não encontrado — embeddings pulados (rode `ollama pull gemma2:2b`)."
+                    );
+                    None
+                }
+            } else {
+                let _ = writeln!(
+                    output,
+                    "Backend não é Ollama — embeddings pulados (só Ollama suportado)."
+                );
+                None
+            }
+        } else if let Some(model) = &options.embedding_model {
+            // Não-interativo: usa o valor passado
+            if EmbeddingModel::from_str(model).is_ok() {
+                Some(format!("embeddings: {model}"))
+            } else {
+                let _ = writeln!(
+                    output,
+                    "modelo de embedding inválido '{model}' — use gemma2:2b ou gemma2:7b. Pulando."
+                );
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // ------------------------------------------------------------------
+    // Passo forecast (PR28): NÃO há escolha de modelo. O Timestral é
+    // PyTorch/safetensors — não é GGUF do Ollama e nenhum endpoint do Ollama
+    // produz quantis de série temporal; prometer "pull timestral" seria
+    // instrução mentirosa. A engine da casa é ESTATÍSTICA (determinística,
+    // sem rede) e entra no resumo como informação fixa; o sidecar Python do
+    // Timestral é o futuro documentado (ADR-0042).
+    // ------------------------------------------------------------------
+    let forecast_summary: Option<&'static str> = Some(
+        "forecast: engine estatística (tendência + z-score) — sem LLM; Timestral é sidecar futuro (ADR-0042)",
+    );
+
+    // ------------------------------------------------------------------
     // Passo rea (TE PR41, D11): teaching-only. A aula vem ANTES da pergunta
     // (ADR-0025: o setup ensina, nunca executa por baixo) e NADA é gravado —
     // não existe chave de config para o rea; se o binário está no PATH (ou
@@ -676,6 +739,8 @@ pub async fn run(
             ia_summary.as_deref(),
             &store_line,
             ingest_summary.as_deref(),
+            embedding_summary.as_deref(),
+            forecast_summary,
         )
     );
     ExitCode::SUCCESS
@@ -1296,6 +1361,8 @@ pub fn format_summary(
     ia: Option<&str>,
     store_path: &str,
     ingest: Option<&str>,
+    embeddings: Option<&str>,
+    forecast: Option<&str>,
 ) -> String {
     let mut text = String::new();
     text.push_str("pronto:\n");
@@ -1309,8 +1376,15 @@ pub fn format_summary(
         "  ingestão: {}\n",
         ingest.unwrap_or("pulada — rode `kira ingest`")
     ));
+    // Embeddings e forecasting
+    if let Some(e) = embeddings {
+        text.push_str(&format!("  {e}\n"));
+    }
+    if let Some(f) = forecast {
+        text.push_str(&format!("  {f}\n"));
+    }
     text.push('\n');
-    text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard\n");
+    text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard · forecast\n");
     text.push_str("desativado:      judge de item do board · read (board) · publicar PR\n");
     text.push_str("ativar depois:   kira connect azure   (leitura de work items)\n");
     if ia.is_none() {
@@ -1395,6 +1469,59 @@ fn ask_dev_name(default: &str, input: &mut dyn BufRead, output: &mut dyn Write) 
             },
         }
     }
+}
+
+/// Pergunta o modelo de embedding (Gemma 2 2B/7B). Só em modo interativo.
+fn ask_embedding_model(
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    flag: &Option<String>,
+) -> Result<String, ExitCode> {
+    let default = "gemma2:2b";
+    let options = [
+        (
+            "1",
+            "gemma2:2b",
+            "Gemma 2 2B — ~1.6 GB, rápido, boa qualidade (recomendado)",
+        ),
+        (
+            "2",
+            "gemma2:7b",
+            "Gemma 2 7B — ~4.8 GB, melhor qualidade, mais lento",
+        ),
+    ];
+
+    let model = if let Some(flag) = flag {
+        flag.clone()
+    } else {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "=== Modelo de Embeddings (Gemma 2) ===");
+        let _ = writeln!(output, "O modelo roda local via Ollama (CPU/GPU).");
+        let _ = writeln!(output);
+        for (key, tag, desc) in &options {
+            let mark = if *tag == default { " (default)" } else { "" };
+            let _ = writeln!(output, "  {key}) {tag}{mark} — {desc}");
+        }
+        let _ = write!(output, "Escolha [1-2] (Enter = {default}): ");
+        let _ = output.flush();
+        match read_line(input) {
+            None => default.to_string(),
+            Some(line) if line.is_empty() => default.to_string(),
+            Some(line) => match line.trim() {
+                "1" => "gemma2:2b".to_string(),
+                "2" => "gemma2:7b".to_string(),
+                other if other == "gemma2:2b" || other == "gemma2:7b" => other.to_string(),
+                other => {
+                    let _ = writeln!(
+                        output,
+                        "opção inválida '{other}' — use 1, 2, gemma2:2b ou gemma2:7b."
+                    );
+                    return Err(ExitCode::FAILURE);
+                }
+            },
+        }
+    };
+    Ok(model)
 }
 
 /// Env que aponta o Azure DevOps para OUTRO endpoint (`KIRA_ADO_URL`).
@@ -1988,6 +2115,8 @@ mod tests {
             Some("ollama (qwen3.5:4b)"),
             "/home/x/.config/kira/store.db",
             Some("ingestão: 12 arquivo(s)"),
+            None,
+            None,
         );
         assert!(text.starts_with("pronto:\n  dev: Sergin\n"), "{text}");
         assert!(text.contains("  ia:  ollama (qwen3.5:4b)"));
@@ -2015,7 +2144,7 @@ mod tests {
 
     #[test]
     fn summary_without_ia_marks_none_and_the_activation_command() {
-        let text = format_summary("dev", None, "store.db", None);
+        let text = format_summary("dev", None, "store.db", None, None, None);
         assert!(text.contains("  ia:  nenhuma"), "{text}");
         assert!(
             text.contains("                 kira setup --backend ollama"),

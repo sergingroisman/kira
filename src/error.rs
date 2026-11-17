@@ -396,6 +396,15 @@ pub enum Error {
     /// schema/example — the gate never measures with fake data.
     #[error("{0}")]
     Eval(String),
+
+    /// Embedding pipeline error (PR25).
+    #[error("erro no pipeline de embeddings: {0}")]
+    Embedding(String),
+
+    /// Forecast engine error (PR28): série curta ou horizonte inválido — a
+    /// engine estatística nunca devolve previsão fingida.
+    #[error("erro no forecast: {0}")]
+    Forecast(String),
 }
 
 #[cfg(test)]
