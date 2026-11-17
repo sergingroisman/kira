@@ -110,7 +110,18 @@ fn patterns() -> &'static Patterns {
 /// mesma entrada, mesma saída) e é idempotente por construção — o que sai
 /// não volta e o que fica já não contém nada do conjunto.
 fn strip_invisibles(text: &str) -> String {
-    text.chars().filter(|c| !INVISIBLES.contains(c)).collect()
+    text.chars()
+        .filter(|c| !INVISIBLES.contains(c) && !is_tag_or_selector(*c))
+        .collect()
+}
+
+/// Seletores de variação (`U+FE00`–`U+FE0F`) e caracteres de tag
+/// (`U+E0000`–`U+E007F`): zero-width por definição — a mesma família de
+/// bypass do ADR-0024 R1, mapeada no scrub do `ai-memory` (17/Nov/2026).
+/// Um token conhecido (`ghp_…`) com um seletor de emoji no meio casava os
+/// regex por metade e cruzava a fronteira inteiro.
+fn is_tag_or_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0000}'..='\u{E007F}')
 }
 
 /// Masks credentials, e-mails and CPFs in `text`.
@@ -209,6 +220,27 @@ mod tests {
         ] {
             let out = redact(&format!("chave {token} fim"));
             assert!(!out.contains(token), "{token} vazou: {out}");
+        }
+    }
+
+    #[test]
+    fn masks_known_token_shape_split_by_tag_and_selector_chars() {
+        // Extensão do ADR-0024 R1 (SEC-03): seletores de variação e tag chars
+        // de emoji são zero-width como o zero-width space do probe original —
+        // `ghp_…` com um deles no meio não pode escapar do shape conhecido.
+        let ghp = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        let (head, tail) = ghp.split_at(10);
+        for (name, split) in [
+            ("selector", format!("{head}\u{FE0F}{tail}")),
+            ("emoji tag", format!("{head}\u{E0067}{tail}")),
+            ("language tag", format!("{head}\u{E0001}{tail}")),
+        ] {
+            let out = redact(&format!("chave {split} fim"));
+            // Depois do strip, o shape volta a ser contíguo e o shape
+            // conhecido é substituído INTEIRO: nenhuma metade sobrevive.
+            assert!(!out.contains(head), "{name}: cabeça vazou: {out}");
+            assert!(!out.contains(tail), "{name}: cauda vazou: {out}");
+            assert!(out.contains(MASKED), "{name}: máscara aplicada: {out}");
         }
     }
 
