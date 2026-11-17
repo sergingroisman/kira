@@ -406,6 +406,17 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Modo infinito do ciclo (DAEMON-01): fica vivo e roda os ticks
+    /// AGENDADOS (`kira schedule`) até Ctrl+C — o "rodar enquanto eu durmo".
+    /// Lock em `.kira/daemon.lock`: um daemon por projeto; `--force` quebra
+    /// lock órfão. Sem agendamento nenhum, recusa (nada a fazer ≠ trabalho).
+    #[command(
+        after_help = "Exemplos:\n  kira daemon run                      # roda até Ctrl+C (parada gracça, lock liberado)\n  kira daemon run --ticks 2            # teto de ticks (CI/teste)\n  kira daemon status                   # o que o lock diz\n  kira schedule add --action digest --every 2h   # a cadência é do agendamento"
+    )]
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Previsão do volume de achados (FC-02): engine determinística da casa
     /// (tendência + banda p10/p90) + backtest MAE contra 3 baselines —
     /// previsão com erro MEDIDO, nunca forecast fingido. Sem LLM e sem rede
@@ -519,6 +530,44 @@ enum ScheduleAction {
     Disable {
         /// Id mostrado por `kira schedule list`
         id: i64,
+    },
+}
+
+/// Ações do `kira daemon` (DAEMON-01).
+#[derive(Debug, clap::Subcommand)]
+enum DaemonAction {
+    /// Roda os ticks agendados até Ctrl+C (ou `--ticks`)
+    Run {
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Tag do modelo do digest (default: KIRA_MODEL/qwen3.5:4b)
+        #[arg(long)]
+        model: Option<String>,
+        /// Idioma dos posts (default: KIRA_LANG ou en)
+        #[arg(long)]
+        lang: Option<String>,
+        /// Pula o digest dentro do tick
+        #[arg(long)]
+        skip_digest: bool,
+        /// O ingest do tick não roda o scan
+        #[arg(long)]
+        skip_scan: bool,
+        /// Quebra o lock de um daemon morto (consentimento explícito)
+        #[arg(long)]
+        force: bool,
+        /// Teto de ticks por execução (CI/teste); sem ele roda até Ctrl+C
+        #[arg(long)]
+        ticks: Option<usize>,
+        /// Teto do sono entre checagens de agendamento, em segundos
+        #[arg(long, default_value_t = 3_600)]
+        max_wait: u64,
+    },
+    /// O que o lock diz: vivo, PID, desde quando
+    Status {
+        /// Raiz do projeto (default: detecta do diretório atual)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -840,6 +889,32 @@ async fn run(command: Command) -> Outcome {
                 force,
             } => model_admit_command(&tag, sha256.as_deref(), probes_ok, force),
         },
+        Command::Daemon { action } => match action {
+            DaemonAction::Run {
+                path,
+                model,
+                lang,
+                skip_digest,
+                skip_scan,
+                force,
+                ticks,
+                max_wait,
+            } => {
+                let root = kira::r#loop::resolve_root(path.as_deref());
+                let options = kira::daemon::DaemonOptions {
+                    model: model.clone(),
+                    lang: lang.clone(),
+                    skip_digest,
+                    skip_scan,
+                    max_wait_secs: max_wait,
+                    max_ticks: ticks,
+                    force_lock: force,
+                    ..kira::daemon::DaemonOptions::at(root)
+                };
+                daemon_run_command(options).await
+            }
+            DaemonAction::Status { path } => daemon_status_command(path.as_deref()),
+        },
         Command::Forecast {
             path,
             field,
@@ -990,6 +1065,37 @@ async fn connect_azure_command(yes: bool) -> Outcome {
             "connect azure: conexão não concluída — veja a saída"
         }
         .to_string(),
+        economy: None,
+    }
+}
+
+/// DAEMON-01: `kira daemon run` — o turno infinito. A saída é o modo texto
+/// do ciclo (tick + notas); o lock garante um daemon por projeto e a parada
+/// graciosa (Ctrl+C) libera o lock. Comando de execução: grava a trilha.
+async fn daemon_run_command(options: kira::daemon::DaemonOptions) -> Outcome {
+    match kira::daemon::run(&options).await {
+        Ok(text) => {
+            print!("{text}");
+            Outcome::success(text)
+        }
+        Err(err) => {
+            print_error(&err);
+            Outcome::failure(err.to_string())
+        }
+    }
+}
+
+/// DAEMON-01: `kira daemon status` — leitura pura do lock, sem spawn e sem
+/// rede; consulta não grava sessão.
+fn daemon_status_command(path: Option<&Path>) -> Outcome {
+    let root = kira::r#loop::resolve_root(path);
+    let text = kira::daemon::status(&root);
+    print!("{text}");
+    Outcome {
+        code: ExitCode::SUCCESS,
+        ok: true,
+        records: false,
+        summary: text.lines().next().unwrap_or_default().to_string(),
         economy: None,
     }
 }
@@ -1576,6 +1682,52 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
                     args.push_str(" --force");
                 }
                 ("model".to_string(), args, None)
+            }
+        },
+        Command::Daemon { action } => match action {
+            DaemonAction::Run {
+                path,
+                model,
+                lang,
+                skip_digest,
+                skip_scan,
+                force,
+                ticks,
+                max_wait,
+            } => {
+                let mut args = String::new();
+                if let Some(model) = model {
+                    args.push_str(&format!("--model {model} "));
+                }
+                if let Some(lang) = lang {
+                    args.push_str(&format!("--lang {lang} "));
+                }
+                if *skip_digest {
+                    args.push_str("--skip-digest ");
+                }
+                if *skip_scan {
+                    args.push_str("--skip-scan ");
+                }
+                if *force {
+                    args.push_str("--force ");
+                }
+                if let Some(ticks) = ticks {
+                    args.push_str(&format!("--ticks {ticks} "));
+                }
+                if *max_wait != 3_600 {
+                    args.push_str(&format!("--max-wait {max_wait} "));
+                }
+                if let Some(path) = path {
+                    args.push_str(&format!("--path {}", path.display()));
+                }
+                ("daemon run".to_string(), args.trim().to_string(), None)
+            }
+            DaemonAction::Status { path } => {
+                let args = path
+                    .as_ref()
+                    .map(|p| format!("status --path {}", p.display()))
+                    .unwrap_or_else(|| "status".to_string());
+                ("daemon status".to_string(), args, None)
             }
         },
         Command::Forecast {

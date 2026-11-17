@@ -13,6 +13,7 @@ pub mod capabilities;
 pub mod config;
 pub mod context;
 pub mod credentials;
+pub mod daemon;
 pub mod doctor;
 
 pub mod embeddings;
