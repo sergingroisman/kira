@@ -1,14 +1,16 @@
 //! E2E do `kira daemon install|uninstall` (DAEMON-02): o contrato no limite
-//! do CLI é uma tarefa determinística (`kira-<nome>-<8hex>`) cujo comando
+//! do CLI é uma entrada determinística (`kira-<nome>-<8hex>`) cujo comando
 //! interno é o PRÓPRIO binário (`daemon run --path <raiz>` — sem shell, sem
 //! segredo), instalação idempotente (sobrescreve, nunca duplica) e uninstall
-//! idempotente (tarefa ausente é "nada a remover", sai 0).
+//! idempotente (entrada ausente é "nada a remover", sai 0).
 //!
-//! Hermeticidade: a ferramenta do SO é resolvida pelo MESMO contrato do scan
-//! — a env de override (`KIRA_SCHTASKS_BIN` / `KIRA_LAUNCHCTL_BIN`) aponta um
-//! shim que LOGA os args e devolve exit controlável. Nenhum agendador real é
-//! tocado; a validação real (Task Scheduler/launchd) é no hardware do dono
-//! (bloqueio B5 do plano). Linux é fora do MVP: erro acionável, exit != 0.
+//! Hermeticidade: no Windows o install/uninstall é PURA ESCRITA/REMOÇÃO de
+//! arquivo na pasta Inicializar (ADR-0045) — os testes apontam `APPDATA`
+//! para o sandbox e NENHUM agendador é tocado. No macOS o `launchctl` segue
+//! resolvido pelo contrato do scan — a env de override
+//! (`KIRA_LAUNCHCTL_BIN`) aponta um shim que loga args e devolve exit
+//! controlável, e `HOME` manda o plist para o sandbox. Linux é fora do MVP:
+//! erro acionável, exit != 0.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Sandbox {
     cwd: PathBuf,
     store: PathBuf,
-    /// Onde o shim grava a linha de args que recebeu.
+    /// Onde o shim grava a linha de args que recebeu (só macOS usa).
     #[allow(dead_code)] // só os e2e de um SO o leem; os outros alvos o veiam ocioso
     shim_log: PathBuf,
 }
@@ -72,81 +74,54 @@ impl Sandbox {
         )
     }
 
-    #[allow(dead_code)] // idem: só os testes do macOS/Linux o usam
+    #[allow(dead_code)] // idem: só os testes do macOS o usam
     fn base(&self) -> &Path {
         self.cwd.parent().unwrap_or(self.cwd.as_path())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Shims (um por SO) — logam args e devolvem exit conforme KIRA_SHIM_QUERY.
-// ---------------------------------------------------------------------------
-
-/// Retorna o caminho do shim já gravado, pronto para a env de override.
-#[cfg(windows)]
-fn install_shim(sandbox: &Sandbox) -> PathBuf {
-    let shim = sandbox.base().join("agendador.cmd");
-    fs::write(
-        &shim,
-        "@echo off\r\necho %* >> \"%KIRA_SHIM_LOG%\"\r\nif \"%KIRA_SHIM_QUERY%\"==\"absente\" exit /b 1\r\nexit /b 0\r\n",
-    )
-    .expect("escrever shim .cmd");
-    shim
-}
-
-#[cfg(target_os = "macos")]
-fn install_shim(sandbox: &Sandbox) -> PathBuf {
-    let shim = sandbox.base().join("agendador.sh");
-    fs::write(
-        &shim,
-        "#!/bin/sh\necho \"$@\" >> \"$KIRA_SHIM_LOG\"\nif [ \"$KIRA_SHIM_QUERY\" = \"absente\" ]; then exit 1; fi\nexit 0\n",
-    )
-    .expect("escrever shim sh");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod shim");
-    }
-    shim
-}
-
-/// Log do shim: o que o agendador RECEBEU (args em ordem).
-#[allow(dead_code)] // só os e2e por SO o usam
-fn shim_calls(sandbox: &Sandbox) -> Vec<String> {
-    let text = fs::read_to_string(&sandbox.shim_log).unwrap_or_default();
-    text.lines().map(str::to_string).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Windows — Task Scheduler via schtasks
+// Windows — pasta Inicializar: PURA ESCRITA/REMOÇÃO de arquivo (ADR-0045)
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
 mod windows_tests {
     use super::*;
 
-    const OVERRIDE_ENV: &str = "KIRA_SCHTASKS_BIN";
+    /// O atalho do kira na pasta Inicializar do APPDATA do sandbox.
+    fn startup_shortcut(sandbox: &Sandbox) -> PathBuf {
+        let dir = sandbox
+            .base()
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup");
+        fs::read_dir(&dir)
+            .expect("Startup no APPDATA do sandbox")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with("kira-projeto-"))
+                    .unwrap_or(false)
+            })
+            .expect("atalho do kira na pasta Inicializar")
+    }
 
-    /// Roda o kira com o override do shim ativo (e `KIRA_SHIM_QUERY` opcional).
-    fn run_with_shim(
-        sandbox: &Sandbox,
-        shim: &Path,
-        query: Option<&str>,
-        args: &[&str],
-    ) -> (i32, String, String) {
+    /// Roda o kira com APPDATA apontado para o sandbox (o install escreve lá).
+    fn run_with_appdata(sandbox: &Sandbox, args: &[&str]) -> (i32, String, String) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kira"));
         command
             .args(args)
             .current_dir(&sandbox.cwd)
             .env("KIRA_STORE_DIR", &sandbox.store)
             .env("KIRA_SECRET_STORE", "off")
-            .env("KIRA_SHIM_LOG", &sandbox.shim_log)
-            .env(OVERRIDE_ENV, shim)
+            // O install do Windows não spawna NADA: APPDATA no sandbox isola.
+            .env("APPDATA", sandbox.base())
             .env_remove("AZURE_DEVOPS_PAT")
             .env_remove("AZURE_DEVOPS_ORG")
             .env_remove("AZURE_DEVOPS_PROJECT");
-        if let Some(query) = query {
-            command.env("KIRA_SHIM_QUERY", query);
-        }
         let output = command
             .output()
             .unwrap_or_else(|err| panic!("rodar kira {args:?}: {err}"));
@@ -158,10 +133,9 @@ mod windows_tests {
     }
 
     #[test]
-    fn install_creates_a_deterministic_task_with_the_same_binary() {
+    fn install_writes_the_startup_shortcut_with_the_same_binary() {
         let sandbox = Sandbox::new("win-install");
-        let shim = install_shim(&sandbox);
-        let (code, stdout, stderr) = run_with_shim(&sandbox, &shim, None, &["daemon", "install"]);
+        let (code, stdout, stderr) = run_with_appdata(&sandbox, &["daemon", "install"]);
         assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
         assert!(stdout.contains("daemon instalado"), "{stdout}");
         // Nome determinístico: kira-<nome>-<8 hex>.
@@ -173,107 +147,66 @@ mod windows_tests {
                     .trim()
                     .to_string()
             })
-            .expect("nome da tarefa no stdout");
+            .expect("nome no stdout");
         assert!(
             task.starts_with("kira-projeto-") && task.len() == "kira-projeto-".len() + 8,
             "{task}"
         );
-        // O que o agendador recebeu: /Create + /TN + /TR com o PRÓPRIO binário
-        // e o --path da raiz + /SC ONLOGON + /F (sobrescreve, nunca duplica).
-        let calls = shim_calls(&sandbox);
-        assert_eq!(calls.len(), 1, "uma chamada ao agendador: {calls:?}");
-        let call = &calls[0];
-        assert!(call.contains("/Create"), "{call}");
-        assert!(call.contains("/TN"), "{call}");
-        assert!(call.contains(&task), "{call}");
-        assert!(call.contains("/TR"), "{call}");
+        // O atalho nasceu no APPDATA do sandbox, com o FILHO CERTO dentro.
+        let shortcut = startup_shortcut(&sandbox);
+        let content = fs::read_to_string(&shortcut).expect("atalho legível");
+        assert!(content.contains("daemon run --path"), "{content}");
         assert!(
-            call.contains("daemon run --path"),
-            "o filho é o próprio kira: {call}"
+            content.contains("kira.exe"),
+            "o filho é o próprio binário: {content}"
         );
-        assert!(call.contains("ONLOGON"), "{call}");
-        assert!(call.contains("/F"), "{call}");
-        // Nenhum segredo na linha (o daemon não precisa de PAT). O `--path`
-        // contém "pat" — a checagem é por MARCA de credencial, não substring.
-        let call_lower = call.to_lowercase();
         assert!(
-            !call_lower.contains("azure_devops_pat") && !call_lower.contains("token="),
-            "a linha do agendador não carrega credencial: {call}"
+            content.contains("/MIN"),
+            "console minimizado (honesto): {content}"
         );
-        // O /TR interno tem aspas no caminho REAL, mas o shim `.cmd` captura
-        // a forma mangled do wrapper (aspas internas viram apóstrofo) — o
-        // valor exato é provado no teste unitário `schtasks_tr_*` (sem shim).
+        // Nenhum segredo no arquivo (o daemon é local).
+        let lower = content.to_lowercase();
         assert!(
-            call.contains("kira.exe") || call.contains("kira"),
-            "o filho é o próprio binário: {call}"
+            !lower.contains("azure_devops_pat") && !lower.contains("token="),
+            "atalho sem credencial: {content}"
         );
-        // Instalar de novo: MESMO nome, /F de novo — nunca duplica.
-        let _ = fs::remove_file(&sandbox.shim_log);
-        let (code2, stdout2, stderr2) =
-            run_with_shim(&sandbox, &shim, None, &["daemon", "install"]);
+        // Instalar de novo: sobrescreve (idempotente) — ainda UM arquivo.
+        let (code2, stdout2, stderr2) = run_with_appdata(&sandbox, &["daemon", "install"]);
         assert_eq!(code2, 0, "{stdout2}\n{stderr2}");
-        let calls2 = shim_calls(&sandbox);
-        assert!(
-            calls2.iter().all(|call| call.contains(&task)),
-            "mesmo nome nas duas instalações: {calls2:?}"
-        );
+        let after = fs::read_dir(shortcut.parent().expect("Startup"))
+            .expect("Startup")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("kira-projeto-")
+            })
+            .count();
+        assert_eq!(after, 1, "reinstalar sobrescreve, nunca duplica");
     }
 
     #[test]
-    fn uninstall_is_idempotent_and_deletes_the_task() {
+    fn uninstall_is_idempotent_and_removes_the_shortcut() {
         let sandbox = Sandbox::new("win-uninstall");
-        let shim = install_shim(&sandbox);
-        // Tarefa ausente (shim query devolve exit 1): "nada a remover", sai 0.
-        let (code, stdout, stderr) =
-            run_with_shim(&sandbox, &shim, Some("absente"), &["daemon", "uninstall"]);
+        // Entrada ausente: "nada a remover", sai 0 — sem erro e sem spawn.
+        let (code, stdout, stderr) = run_with_appdata(&sandbox, &["daemon", "uninstall"]);
         assert_eq!(code, 0, "{stdout}\n{stderr}");
         assert!(stdout.contains("nada a remover"), "{stdout}");
-        // O KIRA NUNCA decide por texto do OS: o query rodou antes do delete.
-        assert!(
-            shim_calls(&sandbox)
-                .iter()
-                .all(|call| call.contains("/Query")),
-            "query decide, delete não é chamado sem ele: {calls}",
-            calls = shim_calls(&sandbox).join(" | ")
-        );
-        // Tarefa presente (query exit 0): delete com /F, mensagem honesta.
-        let _ = fs::remove_file(&sandbox.shim_log);
-        let (code, stdout, stderr) = run_with_shim(&sandbox, &shim, None, &["daemon", "uninstall"]);
+        // O install cria o atalho REAL — é o par install/uninstall o contrato.
+        let (code, stdout, stderr) = run_with_appdata(&sandbox, &["daemon", "install"]);
         assert_eq!(code, 0, "{stdout}\n{stderr}");
-        assert!(stdout.contains("removida"), "{stdout}");
-        let calls = shim_calls(&sandbox);
-        assert!(
-            calls.iter().any(|call| call.contains("/Delete")),
-            "{calls:?}"
-        );
-        assert!(
-            calls.iter().any(|call| call.contains("/F")),
-            "delete com /F: {calls:?}"
-        );
-    }
-
-    #[test]
-    fn tool_failure_is_compact_and_actionable() {
-        let sandbox = Sandbox::new("win-falha");
-        // Shim que FALHA (exit 3) — o erro deve ser compacto, com dica da
-        // primeira linha de stderr, nunca corpo cru.
-        let shim = sandbox.base().join("agendador-falha.cmd");
-        fs::write(
-            &shim,
-            "@echo off\r\necho erro do agendador simulado 1>&2\r\nexit /b 3\r\n",
-        )
-        .expect("escrever shim falha");
-        let (code, stdout, stderr) = run_with_shim(&sandbox, &shim, None, &["daemon", "install"]);
-        assert_ne!(code, 0, "falha do agendador ⇒ exit != 0");
-        assert!(stdout.is_empty(), "erro não vai para stdout: {stdout}");
-        assert!(
-            stderr.contains("a ferramenta schtasks falhou (exit 3)"),
-            "{stderr}"
-        );
-        assert!(
-            stderr.contains("dica: erro do agendador simulado"),
-            "dica compacta: {stderr}"
-        );
+        let shortcut = startup_shortcut(&sandbox);
+        assert!(shortcut.exists(), "atalho instalado");
+        // Uninstall: arquivo removido, mensagem honesta.
+        let (code, stdout, stderr) = run_with_appdata(&sandbox, &["daemon", "uninstall"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains("removido"), "{stdout}");
+        assert!(!shortcut.exists(), "atalho removido do disco");
+        // Idempotência: uninstall DE NOVO = "nada a remover".
+        let (code, stdout, stderr) = run_with_appdata(&sandbox, &["daemon", "uninstall"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains("nada a remover"), "{stdout}");
     }
 }
 
@@ -286,6 +219,28 @@ mod macos_tests {
     use super::*;
 
     const OVERRIDE_ENV: &str = "KIRA_LAUNCHCTL_BIN";
+
+    /// Retorna o caminho do shim já gravado, pronto para a env de override:
+    /// loga os args e responde conforme KIRA_SHIM_QUERY (ausente ⇒ exit 1).
+    fn install_shim(sandbox: &Sandbox) -> PathBuf {
+        let shim = sandbox.base().join("agendador.sh");
+        fs::write(
+            &shim,
+            "#!/bin/sh\necho \"$@\" >> \"$KIRA_SHIM_LOG\"\nif [ \"$KIRA_SHIM_QUERY\" = \"absente\" ]; then exit 1; fi\nexit 0\n",
+        )
+        .expect("escrever shim sh");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("chmod shim");
+        }
+        shim
+    }
+
+    /// Log do shim: o que o launchctl RECEBEU (args em ordem).
+    fn shim_calls(sandbox: &Sandbox) -> Vec<String> {
+        let text = fs::read_to_string(&sandbox.shim_log).unwrap_or_default();
+        text.lines().map(str::to_string).collect()
+    }
 
     fn run_with_shim(
         sandbox: &Sandbox,
@@ -359,7 +314,7 @@ mod macos_tests {
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(calls[0].contains("load"), "{calls:?}");
         assert!(calls[0].contains("kira-projeto"), "{calls:?}");
-        // Idempotência: reinstalar reescreve e recarrega (2 chamadas, mesmo nome).
+        // Idempotência: reinstalar reescreve e recarrega.
         let (code2, stdout2, stderr2) =
             run_with_shim(&sandbox, &shim, None, &["daemon", "install"]);
         assert_eq!(code2, 0, "{stdout2}\n{stderr2}");
