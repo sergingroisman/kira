@@ -16,12 +16,14 @@
 //! `// LLM porque:` no call site dele — ADR-0016/0038). O loop em si não faz
 //! nenhuma pergunta de julgamento ao modelo.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::ingest::{self, IngestOptions};
 use crate::llm::ollama;
 use crate::post::{self, DigestError, DigestOptions};
 use crate::publish::{self, PublishOptions};
+use crate::scan::{Finding, read_findings_file};
 use crate::scheduler::{ScheduleAction, SchedulePlan};
 use crate::store::{self, Store};
 use crate::trust;
@@ -81,6 +83,12 @@ pub struct TickReport {
     pub digest_failed: usize,
     pub published: usize,
     pub publish_unchanged: usize,
+    /// LOOP-01: achados NOVOS neste tick (fingerprints que não estavam no
+    /// findings.json anterior).
+    pub findings_new: usize,
+    /// LOOP-01: achados que SUMIRAM (a ferramenta não reporta mais — resolvido
+    /// ou sumiu da ferramenta; o dev decide com o delta em mãos).
+    pub findings_resolved: usize,
     pub notes: Vec<String>,
 }
 
@@ -96,7 +104,7 @@ impl TickReport {
     /// Linha única do tick para stdout/trilha.
     #[must_use]
     pub fn line(&self) -> String {
-        format!(
+        let mut line = format!(
             "ingest: {} · digest: {} novo(s), {} cache, {} falha(s) · publish: {} publicado(s), {} igual(is)",
             if self.facts_changed {
                 "facts mudaram"
@@ -108,7 +116,47 @@ impl TickReport {
             self.digest_failed,
             self.published,
             self.publish_unchanged,
-        )
+        );
+        // LOOP-01: o delta de achados só entra quando EXISTE — linha estável
+        // quando nada mudou (o anti-PR-inócuo também é de TEXTO).
+        if self.findings_new > 0 || self.findings_resolved > 0 {
+            line.push_str(&format!(
+                " · achados: +{} novo(s), {} sumido(s)",
+                self.findings_new, self.findings_resolved
+            ));
+        }
+        line
+    }
+}
+
+/// LOOP-01: delta de achados entre dois estados do `findings.json` — o
+/// "diffs úteis" do ciclo (regime da pesquisa: volume de Markdown não é valor;
+/// o dev precisa ver O QUE mudou para decidir mais rápido). Função pura: os
+/// fingerprints vêm do próprio arquivo (ordem crescente garantida pelo
+/// `finalize` do scan), então o resultado é determinístico.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FindingsDelta {
+    /// Achados que entraram (ordem do arquivo = crescente por fingerprint).
+    pub new: Vec<Finding>,
+    /// Quantos saíram (resolvido, ou a ferramenta parou de reportar).
+    pub resolved: usize,
+}
+
+/// Compara os achados de antes e depois do tick por `fingerprint`.
+#[must_use]
+pub fn findings_delta(before: &[Finding], after: &[Finding]) -> FindingsDelta {
+    let before_ids: HashSet<&str> = before.iter().map(|f| f.fingerprint.as_str()).collect();
+    let after_ids: HashSet<&str> = after.iter().map(|f| f.fingerprint.as_str()).collect();
+    FindingsDelta {
+        new: after
+            .iter()
+            .filter(|f| !before_ids.contains(f.fingerprint.as_str()))
+            .cloned()
+            .collect(),
+        resolved: before
+            .iter()
+            .filter(|f| !after_ids.contains(f.fingerprint.as_str()))
+            .count(),
     }
 }
 
@@ -162,6 +210,10 @@ pub async fn tick(options: &LoopOptions) -> Result<TickReport, LoopError> {
     //    conteúdo do facts.md antes/depois — nunca por timestamp.
     let facts_path = root.join(".kira").join("facts.md");
     let facts_before = std::fs::read(&facts_path).ok();
+    // LOOP-01: snapshot do findings.json ANTES do ingest (o scan roda dentro
+    // dele). Fail-open: arquivo ausente/ilegível = delta zero com nota vazia —
+    // o ingest já relata o problema do arquivo no próprio report.
+    let findings_before = read_findings_file(root).ok().flatten().unwrap_or_default();
     let mut ingest_options = IngestOptions::at(root.clone());
     // O `scan` é a fase agendável mais barata: em modo agendado ele só entra
     // quando vence, mas o INGEST em si continua rodando (é o que descobre que
@@ -172,6 +224,18 @@ pub async fn tick(options: &LoopOptions) -> Result<TickReport, LoopError> {
     let facts_after = std::fs::read(&facts_path).ok();
     report.facts_changed = facts_before != facts_after;
     report.notes.extend(ingest.notes.iter().cloned());
+    // LOOP-01: o delta entra no report (contagem na linha, até 3 novos nas
+    // notas — listados na ordem do arquivo, que é determinística).
+    let findings_after = read_findings_file(root).ok().flatten().unwrap_or_default();
+    let delta = findings_delta(&findings_before, &findings_after);
+    report.findings_new = delta.new.len();
+    report.findings_resolved = delta.resolved;
+    for finding in delta.new.iter().take(3) {
+        report.notes.push(format!(
+            "achado novo: {}/{} ({})",
+            finding.tool, finding.package, finding.severity
+        ));
+    }
     if scan_due {
         mark(&scheduled, ScheduleAction::Scan)?;
     }
@@ -377,6 +441,58 @@ mod tests {
         assert!(line.contains("facts mudaram"), "{line}");
         assert!(line.contains("2 novo(s)"), "{line}");
         assert!(line.contains("2 publicado(s)"), "{line}");
+    }
+
+    fn finding(id: &str, package: &str) -> Finding {
+        Finding {
+            tool: "audit".into(),
+            rule: "vulnerable".into(),
+            package: package.into(),
+            version: "1.0.0".into(),
+            severity: "high".into(),
+            path: ".".into(),
+            message: format!("msg {package}"),
+            fingerprint: id.into(),
+        }
+    }
+
+    #[test]
+    fn findings_delta_reports_new_and_resolved_by_fingerprint() {
+        let before = [finding("a", "pkg-a"), finding("b", "pkg-b")];
+        let after = [finding("b", "pkg-b"), finding("c", "pkg-c")];
+        let delta = findings_delta(&before, &after);
+        assert_eq!(delta.resolved, 1, "um saiu (a)");
+        assert_eq!(
+            delta
+                .new
+                .iter()
+                .map(|f| f.fingerprint.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"],
+            "um entrou (c), na ordem do arquivo"
+        );
+        // Delta vazio quando nada muda — a linha do tick fica estável.
+        let idle = findings_delta(&before, &before);
+        assert!(idle.new.is_empty() && idle.resolved == 0, "{idle:?}");
+    }
+
+    #[test]
+    fn tick_line_includes_the_findings_delta_only_when_there_is_one() {
+        // Sem delta: a linha NÃO menciona achados (estável quando nada muda).
+        let silent = TickReport::default();
+        assert!(!silent.line().contains("achados:"), "{}", silent.line());
+        let with_delta = TickReport {
+            findings_new: 2,
+            findings_resolved: 1,
+            ..TickReport::default()
+        };
+        assert!(
+            with_delta
+                .line()
+                .contains("achados: +2 novo(s), 1 sumido(s)"),
+            "{}",
+            with_delta.line()
+        );
     }
 
     #[test]
