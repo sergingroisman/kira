@@ -673,7 +673,14 @@ pub async fn run(
                         Ok(m) => m,
                         Err(e) => return e,
                     };
-                    Some(format!("embeddings: {model}"))
+                    // CAP-01: honestidade de capacidade — a biblioteca de
+                    // embeddings existe (`src/embeddings.rs`), mas NÃO tem
+                    // consumidor na jornada (nada chama `EmbeddingIndex`
+                    // fora dos testes). O resumo marca experimental em vez
+                    // de fingir que o `setup` entregou uma jornada.
+                    Some(format!(
+                        "embeddings: {model} (experimental — biblioteca, sem consumidor na jornada)"
+                    ))
                 } else {
                     let _ = writeln!(
                         output,
@@ -691,7 +698,9 @@ pub async fn run(
         } else if let Some(model) = &options.embedding_model {
             // Não-interativo: usa o valor passado
             if EmbeddingModel::from_str(model).is_ok() {
-                Some(format!("embeddings: {model}"))
+                Some(format!(
+                    "embeddings: {model} (experimental — biblioteca, sem consumidor na jornada)"
+                ))
             } else {
                 let _ = writeln!(
                     output,
@@ -711,11 +720,12 @@ pub async fn run(
     // PyTorch/safetensors — não é GGUF do Ollama e nenhum endpoint do Ollama
     // produz quantis de série temporal; prometer "pull timestral" seria
     // instrução mentirosa. A engine da casa é ESTATÍSTICA (determinística,
-    // sem rede) e entra no resumo como informação fixa; o sidecar Python do
-    // Timestral é o futuro documentado (ADR-0042).
+    // sem rede) e é BIBLIOTECA — `forecast.rs` é consumido por testes e pelo
+    // módulo, não por um subcomando (CAP-01: sem jornada, marca experimental;
+    // o `kira forecast` do plano do MVP devolve a linha honesta).
     // ------------------------------------------------------------------
     let forecast_summary: Option<&'static str> = Some(
-        "forecast: engine estatística (tendência + z-score) — sem LLM; Timestral é sidecar futuro (ADR-0042)",
+        "forecast: engine determinística em biblioteca (experimental — sem comando ainda; ADR-0042)",
     );
 
     // ------------------------------------------------------------------
@@ -1391,7 +1401,11 @@ pub fn format_summary(
         text.push_str(&format!("  {f}\n"));
     }
     text.push('\n');
-    text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard · forecast\n");
+    // CAP-01: `forecast` saiu da lista — `kira forecast` NÃO existe (o
+    // dispatcher não tem o subcomando); a engine é biblioteca testada. O
+    // `pr draft` fica porque é comando real e local. Quando o subcomando
+    // forecast entrar no MVP (plano, onda 2), ele volta para cá.
+    text.push_str("funciona agora:  scan · wiki · context · pr draft · dashboard\n");
     text.push_str("desativado:      judge de item do board · read (board) · publicar PR\n");
     text.push_str("ativar depois:   kira connect azure   (leitura de work items)\n");
     if ia.is_none() {
