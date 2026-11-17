@@ -468,7 +468,14 @@ pub async fn run(
                         report.facts_path
                     );
                     let _ = writeln!(output, "{line}");
-                    ingest_summary = Some(line);
+                    // O resumo JÁ recebe o prefixo "  ingestão: " do
+                    // format_summary — guardar a linha com prefixo dupla
+                    // ("ingestão: ingestão: ...", visto pelo dono em 17/Nov).
+                    ingest_summary = Some(
+                        line.strip_prefix("ingestão: ")
+                            .map(str::to_string)
+                            .unwrap_or_else(|| line.clone()),
+                    );
                 }
                 Err(err) => {
                     // Falha de ingestão não derruba o setup: o dono roda

@@ -323,10 +323,19 @@ pub enum Error {
     /// The model answer carried none of the three triage section headers
     /// (W2-fix PR-F2). Silence here used to become three `—` with exit 0; an
     /// answer out of format is an error, not an empty result.
+    ///
+    /// `head` é o INÍCIO da resposta do modelo (redigida por [`crate::redact`],
+    /// sem quebras, truncada em 160 chars): o erro de formato sem mostrar o
+    /// que o modelo disse era ind diagnosticável — o dono não podia saber se
+    /// o modelo respondeu em inglês, com raciocínio fora de tag ou se perdeu
+    /// o formato (bug visto no --eval do dono, 17/Nov).
     #[error(
-        "resposta do modelo fora do formato das 3 seções (Causa raiz provável / Arquivos prováveis / Confiança) — rode `kira triage` de novo, troque o modelo com --model, ou confira `ollama ps` (o modelo precisa estar carregado)"
+        "resposta do modelo fora do formato das 3 seções (Causa raiz provável / Arquivos prováveis / Confiança) — rode `kira triage` de novo, troque o modelo com --model, ou confira `ollama ps` (o modelo precisa estar carregado) — início da resposta (redigido): \"{head}\""
     )]
-    LlmFormat,
+    LlmFormat {
+        /// Início da resposta, redigido e truncado — diagnóstico, não payload.
+        head: String,
+    },
 
     /// The Copilot CLI (`copilot`) was not found: neither the
     /// `KIRA_COPILOT_BIN` override pointed at an existing file nor was a
@@ -613,7 +622,12 @@ mod tests {
                 "LlmRequest",
                 Error::LlmRequest("conexão recusada".to_string()),
             ),
-            ("LlmFormat", Error::LlmFormat),
+            (
+                "LlmFormat",
+                Error::LlmFormat {
+                    head: "resposta de teste".to_string(),
+                },
+            ),
             ("CopilotMissing", Error::CopilotMissing),
             ("CopilotAuth", Error::CopilotAuth),
             (

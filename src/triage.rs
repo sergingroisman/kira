@@ -121,10 +121,51 @@ fn description_for_prompt(description: Option<&str>) -> String {
 /// recording an empty triage (and an empty wiki episode).
 pub fn format_triage(model_text: &str) -> Result<String, Error> {
     if section_headers_found(model_text) == 0 {
-        return Err(Error::LlmFormat);
+        return Err(Error::LlmFormat {
+            head: compact_head(model_text),
+        });
     }
     Ok(render_sections(model_text))
 }
+
+/// Normaliza a resposta crua do modelo ANTES da validação de formato:
+/// remove blocos de raciocínio `<think> … </think>` (modelos de raciocínio
+/// híbrido às vezes deixam o bloco vazar no `message.content`, dependendo da
+/// versão do Ollama). Só remove pares COMPLETOS — um `<think>` sem
+/// fechamento NÃO é cortado (cortar até o fim apagaria a resposta junto; o
+/// `LlmFormat` com o head mostra o caso em voz alta).
+#[must_use]
+pub fn strip_think_blocks(model_text: &str) -> String {
+    let mut out = model_text.to_string();
+    while let Some(start) = out.find(THINK_OPEN) {
+        let Some(close_at) = out[start + THINK_OPEN.len()..].find(THINK_CLOSE) else {
+            break; // aberto sem fechamento: não corta (ver doc acima)
+        };
+        let end = start + THINK_OPEN.len() + close_at + THINK_CLOSE.len();
+        let prefix = out[..start].trim_end().to_string();
+        let suffix = out[end..].trim_start().to_string();
+        out = format!("{prefix}\n{suffix}");
+    }
+    out.trim().to_string()
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Início compacto e REDIGIDO da resposta do modelo para o erro acionável
+/// ([`Error::LlmFormat`]): quebras viram " · ", 160 caracteres no máximo —
+/// diagnóstico em uma linha, nunca o payload inteiro, nunca um segredo.
+fn compact_head(model_text: &str) -> String {
+    let redacted = crate::redact::redact(model_text.trim());
+    let flat = redacted.replace('\n', " · ").replace('\r', " ");
+    let mut head: String = flat.chars().take(COMPACT_HEAD_CHARS).collect();
+    if flat.chars().count() > COMPACT_HEAD_CHARS {
+        head.push('…');
+    }
+    head
+}
+
+const COMPACT_HEAD_CHARS: usize = 160;
 
 /// Number of distinct fixed headers the model answer actually carries.
 ///
@@ -444,7 +485,7 @@ async fn triage_item(
     };
     Ok(TriageReport {
         item_id: item.id,
-        output: format_triage(&text)?,
+        output: format_triage(&strip_think_blocks(&text))?,
         context: pack,
         cache: None,
     })
@@ -860,18 +901,58 @@ mod tests {
             "A causa raiz provável é o TTL curto do token.",
         ] {
             match format_triage(model_text) {
-                Err(Error::LlmFormat) => {
-                    let message = Error::LlmFormat.to_string();
+                Err(Error::LlmFormat { head }) => {
+                    // O head carrega o INÍCIO da resposta redigida — sem ele o
+                    // erro de formato é ind diagnosticável (dono, 17/Nov).
+                    assert!(
+                        !head.is_empty() || model_text.trim().is_empty(),
+                        "head vazio para resposta não vazia: {model_text:?}"
+                    );
+                    let message = Error::LlmFormat { head }.to_string();
                     assert!(
                         message.contains("fora do formato das 3 seções"),
                         "{message}"
                     );
                     assert!(message.contains("--model"), "{message}");
                     assert!(message.contains("ollama ps"), "{message}");
+                    assert!(message.contains("início da resposta"), "{message}");
                 }
                 other => panic!("{model_text:?} deveria falhar com LlmFormat, veio {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn format_error_head_is_compacted_and_redacted() {
+        // Resposta com e-mail (redigido pela casa) e quebras: o head achatna,
+        // trunca e REDIGE — o e-mail cru nunca aparece, o texto comum sim.
+        let text = "o e-mail é fulano@exemplo.com e o motivo é TTL curto\n".repeat(30);
+        match format_triage(&text) {
+            Err(Error::LlmFormat { head }) => {
+                assert!(head.chars().count() <= 161, "head: {head}");
+                assert!(!head.contains('\n'), "head não tem quebra: {head}");
+                assert!(
+                    !head.contains("fulano@exemplo.com"),
+                    "e-mail cru NUNCA aparece no head: {head}"
+                );
+                assert!(head.contains("TTL curto"), "texto comum passa: {head}");
+            }
+            other => panic!("deveria falhar com LlmFormat, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_think_blocks_removes_complete_blocks_only() {
+        let answer =
+            "Causa raiz provável:\nTTL curto.\nArquivos prováveis:\nsrc/a.rs\nConfiança:\nalta";
+        // Bloco completo com quebra nas bordas: some, a resposta fica limpa.
+        let text = format!("{THINK_OPEN}\nraciocínio interno do modelo\n{THINK_CLOSE}\n{answer}");
+        assert_eq!(strip_think_blocks(&text), answer);
+        // Bloco sem fechamento: NÃO corta (cortar apagaria a resposta).
+        let unclosed = format!("{THINK_OPEN}\nraciocínio sem fim\n{answer}");
+        assert_eq!(strip_think_blocks(&unclosed), unclosed.trim());
+        // Sem bloco algum: idêntico.
+        assert_eq!(strip_think_blocks(answer), answer);
     }
 
     /// The complement of the rule above: a partially followed template is data.

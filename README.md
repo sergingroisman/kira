@@ -53,10 +53,15 @@ Modelo default do triage: `qwen3.5:4b` (~3,3 GB, Q4_K_M):
 
 ```powershell
 ollama pull qwen3.5:4b
+# embeddings (busca semântica/classificação, ADR-0042 — o setup pergunta):
+ollama pull gemma2:2b
 ```
 
 Trocável por env (`KIRA_MODEL`) ou por execução (`--model`). O triage roda
-100% na sua máquina: nada vai para nuvem. Para testar sem PAT:
+100% na sua máquina: nada vai para nuvem. **Fonte Nerd:** o dashboard usa
+glifos Nerd — instale uma (ex.: [nerdfonts.com](https://www.nerdfonts.com) →
+JetBrainsMono Nerd Font) e configure o terminal ANTES de `kira dashboard`,
+senão os ícones saem como caracteres quebrados. Para testar sem PAT:
 
 ```powershell
 kira triage --file tests\fixtures\work_item_4821.json
