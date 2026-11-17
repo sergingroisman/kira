@@ -9,8 +9,12 @@
 //! e instruem o modelo a responder no idioma pedido, com identificadores e caminhos
 //! preservados em inglês.
 
-/// Versão do contrato de prompt. Suba ao mudar qualquer texto abaixo.
-pub const PROMPT_VERSION: &str = "m3-v1";
+/// Versão do contrato de prompt. Suba ao mudar qualquer texto abaixo — ou ao
+/// mudar o COMPORTAMENTO efetivo do prompt: o prompt-fit (17/Nov/2026) corta
+/// evidência para caber na janela, e os rascunhos em cache gerados sob o
+/// regime de truncamento silencioso precisam regenerar (o dono viu "2 no
+/// cache" servidos do cache velho no primeiro reteste).
+pub const PROMPT_VERSION: &str = "m3-v2";
 
 /// Instrução de sistema comum aos posts: grounding, sem invenção, citação obrigatória.
 pub const SYSTEM: &str = "You are KIRA, a documentation agent for a software repository.
@@ -75,7 +79,9 @@ mod tests {
     #[test]
     fn prompts_are_english_and_pin_the_version() {
         assert!(SYSTEM.contains("Never invent"));
-        assert_eq!(PROMPT_VERSION, "m3-v1");
+        // m3-v2: o prompt-fit (ADR do digest, 17/Nov/2026) mudou o comportamento
+        // efetivo do prompt — o cache velho precisa regenerar.
+        assert_eq!(PROMPT_VERSION, "m3-v2");
     }
 
     #[test]
