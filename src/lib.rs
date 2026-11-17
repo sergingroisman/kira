@@ -15,9 +15,11 @@ pub mod context;
 pub mod credentials;
 pub mod doctor;
 
+pub mod embeddings;
 pub mod endpoint;
 pub mod error;
 pub mod eval;
+pub mod forecast;
 pub mod format;
 pub mod guard;
 pub mod html;

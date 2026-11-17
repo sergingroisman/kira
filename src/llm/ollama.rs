@@ -158,7 +158,9 @@ impl OllamaBackend {
 
 /// Valida o par URL × chave (OC-1, PURA): URL não-local sem chave é o erro
 /// acionável — nunca request anônimo que falha confuso. Local dispensa chave.
-fn require_key_for_url(base_url: &str, key: Option<&str>) -> Result<(), Error> {
+/// `pub(crate)` para o cliente de embeddings (`embeddings.rs`) aplicar a
+/// MESMA regra sem copiar a lógica (uma regra, um dono).
+pub(crate) fn require_key_for_url(base_url: &str, key: Option<&str>) -> Result<(), Error> {
     if is_local_url(base_url) || key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
         return Ok(());
     }
@@ -170,7 +172,8 @@ fn require_key_for_url(base_url: &str, key: Option<&str>) -> Result<(), Error> {
 /// Decide se a chave é anexada ao request (PURA): nunca em localhost — o
 /// server local autentica por conta própria (modo `signin`, OC-1 modo (a)),
 /// e o comportamento local tem que ficar idêntico ao de hoje (sem header).
-fn key_for_url(base_url: &str, key: Option<&str>) -> Option<String> {
+/// `pub(crate)`: compartilhada com `embeddings.rs` (mesma regra, um dono).
+pub(crate) fn key_for_url(base_url: &str, key: Option<&str>) -> Option<String> {
     if is_local_url(base_url) {
         return None;
     }
