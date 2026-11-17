@@ -370,26 +370,33 @@ mod macos_tests {
     fn uninstall_is_idempotent_and_unloads() {
         let sandbox = Sandbox::new("mac-uninstall");
         let shim = install_shim(&sandbox);
-        // Sem plist: "nada a remover", sai 0, launchctl NEM é chamado.
+        // O install cria o plist REAL — é o par install/uninstall que o
+        // contrato prova (nada de plist fake escrito à mão).
+        let (code, stdout, stderr) = run_with_shim(&sandbox, &shim, None, &["daemon", "install"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        let plist = plist_path(&sandbox);
+        assert!(plist.exists(), "plist instalado: {}", plist.display());
+        // Uninstall: unload + arquivo removido.
+        let _ = fs::remove_file(&sandbox.shim_log);
+        let (code, stdout, stderr) = run_with_shim(&sandbox, &shim, None, &["daemon", "uninstall"]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert!(stdout.contains("descarregada"), "{stdout}");
+        assert!(!plist.exists(), "plist removido do disco");
+        assert!(
+            shim_calls(&sandbox)
+                .iter()
+                .any(|call| call.contains("unload")),
+            "{calls:?}",
+            calls = shim_calls(&sandbox)
+        );
+        // Idempotência: uninstall DE NOVO = "nada a remover", launchctl nem roda.
+        let _ = fs::remove_file(&sandbox.shim_log);
         let (code, stdout, stderr) = run_with_shim(&sandbox, &shim, None, &["daemon", "uninstall"]);
         assert_eq!(code, 0, "{stdout}\n{stderr}");
         assert!(stdout.contains("nada a remover"), "{stdout}");
         assert!(
             shim_calls(&sandbox).is_empty(),
             "sem plist não há spawn do launchctl: {calls:?}",
-            calls = shim_calls(&sandbox)
-        );
-        // Com plist: unload + arquivo removido.
-        let plist = plist_path(&sandbox);
-        fs::create_dir_all(plist.parent().expect("parent")).expect("LaunchAgents");
-        fs::write(&plist, "<plist/>").expect("plist fake");
-        let (code, stdout, stderr) = run_with_shim(&sandbox, &shim, None, &["daemon", "uninstall"]);
-        assert_eq!(code, 0, "{stdout}\n{stderr}");
-        assert!(stdout.contains("descarregada"), "{stdout}");
-        assert!(!plist.exists(), "plist removido do disco");
-        assert!(
-            shim_calls(&sandbox)[0].contains("unload"),
-            "{calls:?}",
             calls = shim_calls(&sandbox)
         );
     }

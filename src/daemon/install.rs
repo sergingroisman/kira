@@ -23,7 +23,11 @@
 //!    A validação real de Task Scheduler/launchd é no hardware do dono
 //!    (bloqueio B5 do plano) — aqui a prova é a linha gerada e o shim.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// `PathBuf` só aparece nos caminhos com agendador nativo — no Linux o import
+// viria morto e `-D warnings` reprova o gate (prova: CI ubuntu).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use std::path::PathBuf;
 // O `Command` só existe onde há agendador nativo para spawnar — no Linux o
 // import viria morto e `-D warnings` reprova o gate (prova: CI ubuntu).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
