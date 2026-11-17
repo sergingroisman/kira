@@ -199,7 +199,7 @@
   `.kira/briefing.md`, `cache_key = (input_hash, prompt_version, model, lang)`.
   **Aceite:** segundo run não repete post; `--lang` diferente não reaproveita cache; budget
   estourado para com nota; sem ollama ⇒ erro acionável com exit != 0.
-- [ ] **M4** caixa de correio no dashboard (modo leitura). Painel com `não lido`, Markdown
+- [x] **M4** caixa de correio no dashboard (modo leitura). Painel com `não lido`, Markdown
   renderizado **nativo** — o renderizador JÁ EXISTE: `src/tui/markdown.rs`
   (`render(source, width) -> Vec<String>`, sem dependência, ADR-0013). **Não precisa de
   `tui-markdown`.** Falta: variante `Screen::Posts` + `posts_selected` no `AppState`, snapshot com
