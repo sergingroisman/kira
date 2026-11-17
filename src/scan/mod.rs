@@ -18,6 +18,7 @@ mod raw;
 
 pub use finding::Finding;
 pub use finding::severity_brief;
+pub use finding::severity_counts;
 pub use node::NodeAuditTool;
 
 use std::path::{Path, PathBuf};

@@ -47,7 +47,7 @@ pub const STORE_DIR_ENV: &str = "KIRA_STORE_DIR";
 /// no mundo passa por um pedido `pending` que só `kira approve` resolve.
 /// v17 (F2, PR17): `provider_state` — silêncio de 5 min após 429 e o último
 /// sucesso por backend (a base do `stale-ok`).
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// Stored session summaries are capped at this many characters.
 pub const SUMMARY_MAX_CHARS: usize = 2000;
@@ -1820,8 +1820,128 @@ fn migrate(conn: &Connection, path: &Path) -> Result<(), StoreError> {
         .map_err(schema_error)?;
     }
 
+    // v18 — FC-01: série temporal ESTRUTURADA de achados por scan. O
+    // `findings.json` é sobrescrito a cada execução e a trilha de sessões
+    // guarda a contagem como STRING de resumo — o forecast precisa de série
+    // numérica própria (o insumo do `kira forecast`, onda 2 do plano do MVP).
+    // Um INSERT por scan (mesmo zero achados: um 0 é dado, não ausência).
+    if current < 18 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS findings_series (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                scanned_at TEXT NOT NULL,
+                total INTEGER NOT NULL,
+                critical INTEGER NOT NULL DEFAULT 0,
+                high INTEGER NOT NULL DEFAULT 0,
+                medium INTEGER NOT NULL DEFAULT 0,
+                low INTEGER NOT NULL DEFAULT 0,
+                other INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_findings_series_project
+                ON findings_series(project_id, scanned_at);",
+        )
+        .map_err(schema_error)?;
+    }
+
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(schema_error)
+}
+
+/// Contagens por severidade de UM scan (FC-01): as buckets são as canônicas
+/// do exibidor em lowercase; qualquer severidade crua fora delas entra em
+/// `other` — nada é descartado. O insumo da série que alimenta o forecast.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FindingsCounts {
+    /// Total de achados do scan.
+    pub total: usize,
+    pub critical: usize,
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+    /// Severidade crua fora das buckets canônicas (ex.: `Moderate`) — contada,
+    /// nunca descartada.
+    pub other: usize,
+}
+
+/// Um ponto da série de achados: quando o scan rodou e o que ele achou.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesRow {
+    /// RFC 3339 UTC do momento do scan (o mesmo formato do store).
+    pub scanned_at: String,
+    pub counts: FindingsCounts,
+}
+
+impl Store {
+    /// FC-01: grava UM ponto da série de achados deste projeto. Um INSERT por
+    /// scan — mesmo com zero achados (um 0 é dado, não ausência).
+    pub fn record_findings_series(
+        &self,
+        project_id: &str,
+        counts: &FindingsCounts,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO findings_series
+                    (project_id, scanned_at, total, critical, high, medium, low, other)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    project_id,
+                    now_rfc3339_utc(),
+                    i64::try_from(counts.total).unwrap_or(i64::MAX),
+                    i64::try_from(counts.critical).unwrap_or(i64::MAX),
+                    i64::try_from(counts.high).unwrap_or(i64::MAX),
+                    i64::try_from(counts.medium).unwrap_or(i64::MAX),
+                    i64::try_from(counts.low).unwrap_or(i64::MAX),
+                    i64::try_from(counts.other).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(StoreError::Sql)?;
+        Ok(())
+    }
+
+    /// FC-01: lê a série de achados do projeto, MAIS ANTIGA primeiro (a ordem
+    /// do tempo, que é o que o forecast e o gráfico precisam). `last_n` =
+    /// quantos pontos MAIS RECENTES; 0 devolve tudo.
+    pub fn read_findings_series(
+        &self,
+        project_id: &str,
+        last_n: usize,
+    ) -> Result<Vec<SeriesRow>, StoreError> {
+        // DESC + LIMIT pega os últimos N; a inversão devolve a ordem do tempo.
+        let sql = if last_n == 0 {
+            "SELECT scanned_at, total, critical, high, medium, low, other
+             FROM findings_series WHERE project_id = ?1 ORDER BY id ASC"
+                .to_string()
+        } else {
+            format!(
+                "SELECT scanned_at, total, critical, high, medium, low, other
+                 FROM findings_series WHERE project_id = ?1 ORDER BY id DESC LIMIT {last_n}"
+            )
+        };
+        let mut statement = self.conn.prepare(&sql).map_err(StoreError::Sql)?;
+        let mut rows: Vec<SeriesRow> = statement
+            .query_map([project_id], |row| {
+                Ok(SeriesRow {
+                    scanned_at: row.get(0)?,
+                    counts: FindingsCounts {
+                        total: usize::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                        critical: usize::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                        high: usize::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        medium: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        low: usize::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                        other: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                    },
+                })
+            })
+            .map_err(StoreError::Sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sql)?;
+        if last_n > 0 {
+            rows.reverse();
+        }
+        Ok(rows)
+    }
 }
 
 /// One row of `repo_file`: what the indexer last saw on disk for this file.
@@ -2544,6 +2664,58 @@ mod tests {
             .unwrap_or_else(|err| panic!("economy_for_sessions: {err}"));
         assert!(absent.is_empty(), "sessão sem ledger não inventa dado");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FC-01: a série de achados é a memória NUMÉRICA que o `findings.json`
+    /// (sobrescrito) e a trilha (contagem em string) não dão — dois scans com
+    /// o mesmo total continuam sendo dois pontos. A leitura devolve a ordem
+    /// do tempo (o forecast e o gráfico precisam), isolada por projeto.
+    #[test]
+    fn findings_series_round_trip_is_ordered_oldest_first_and_scoped_by_project() {
+        let dir = temp_dir("findings-series");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("criar {dir:?}: {err}"));
+        let store = Store::open_in_dir(&dir).unwrap_or_else(|err| panic!("abrir: {err}"));
+        let counts = |total: usize, critical: usize| FindingsCounts {
+            total,
+            critical,
+            ..FindingsCounts::default()
+        };
+        store
+            .record_findings_series("p1", &counts(3, 1))
+            .unwrap_or_else(|err| panic!("gravar 1: {err}"));
+        store
+            .record_findings_series("p1", &counts(1, 0))
+            .unwrap_or_else(|err| panic!("gravar 2: {err}"));
+        store
+            .record_findings_series("p2", &counts(7, 2))
+            .unwrap_or_else(|err| panic!("gravar outro projeto: {err}"));
+
+        // Série do p1: 2 pontos, MAIS ANTIGA primeiro, isolada por projeto.
+        let all = store
+            .read_findings_series("p1", 0)
+            .unwrap_or_else(|err| panic!("ler tudo: {err}"));
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all[0].counts.total, 3, "{all:?}");
+        assert_eq!(all[0].counts.critical, 1, "{all:?}");
+        assert_eq!(all[1].counts.total, 1, "{all:?}");
+        // Timestamp RFC 3339 UTC (o mesmo formato do resto do store).
+        assert!(
+            all[0].scanned_at.ends_with('Z') && all[0].scanned_at.len() >= 20,
+            "{:?}",
+            all[0].scanned_at
+        );
+        // last_n pega os MAIS RECENTES e devolve na ordem do tempo.
+        let last = store
+            .read_findings_series("p1", 1)
+            .unwrap_or_else(|err| panic!("ler últimos: {err}"));
+        assert_eq!(last.len(), 1, "{last:?}");
+        assert_eq!(last[0].counts.total, 1, "{last:?}");
+        // Projeto isolado: p2 nunca mistura com p1.
+        let p2 = store
+            .read_findings_series("p2", 0)
+            .unwrap_or_else(|err| panic!("ler p2: {err}"));
+        assert_eq!(p2.len(), 1, "{p2:?}");
+        assert_eq!(p2[0].counts.total, 7, "{p2:?}");
     }
 
     /// Migração v13 → v14 (onda TE, PR38): o ledger da versão anterior ganha

@@ -1751,12 +1751,49 @@ fn scan_command(path: Option<&Path>) -> Outcome {
     match scan::run(path) {
         Ok(text) => {
             print!("{text}");
+            record_findings_series_after_scan(path);
             Outcome::success(text)
         }
         Err(err) => {
             print_error(&err);
             Outcome::failure(err.to_string())
         }
+    }
+}
+
+/// FC-01: grava UM ponto da série de achados no store após cada scan bem
+/// sucedido — o insumo numérico do `kira forecast` (o findings.json é
+/// sobrescrito a cada execução; a trilha guarda contagem como string).
+///
+/// FAIL-OPEN por contrato: erro de store é `aviso:` no stderr e o comando
+/// segue — o exit code e a saída do scan não mudam. Sem raiz detectável,
+/// nada a gravar para um projeto desconhecido: também fail-open.
+fn record_findings_series_after_scan(path: Option<&Path>) {
+    let Some(root) = path
+        .map_or_else(store::detect_project_root, |p| Some(p.to_path_buf()))
+        .filter(|root| root.is_dir())
+    else {
+        return;
+    };
+    let Ok(project_id) = store::project_id_for_root(&root) else {
+        return;
+    };
+    let findings = match scan::read_findings_file(&root) {
+        // Sem findings (stack nenhuma detectada): o ponto de série é ZERO —
+        // um 0 é dado, não ausência. Falha de leitura: a causa já foi dita
+        // pelo próprio scan; sem segunda conta.
+        Ok(Some(findings)) => findings,
+        Ok(None) => Vec::new(),
+        Err(_) => return,
+    };
+    let counts = scan::severity_counts(&findings);
+    match Store::open_default() {
+        Ok(store) => {
+            if let Err(err) = store.record_findings_series(&project_id, &counts) {
+                eprintln!("aviso: série de achados não foi gravada ({err})");
+            }
+        }
+        Err(err) => eprintln!("aviso: série de achados não foi gravada ({err})"),
     }
 }
 
