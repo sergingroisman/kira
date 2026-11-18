@@ -75,6 +75,10 @@ pub struct DigestOptions {
     pub pause_after: Option<usize>,
     /// Se true, devolve à fila o que está `picked` antes de começar.
     pub resume: bool,
+    /// Se true, devolve à fila o que está `failed` deste projeto (`--retry-failed`):
+    /// a válvula de recuperação — `failed` nunca é retentado no ciclo, então
+    /// a causa consertada precisa disto para valer.
+    pub retry_failed: bool,
 }
 
 impl DigestOptions {
@@ -88,6 +92,7 @@ impl DigestOptions {
             per_post_tokens: PER_POST_TOKENS,
             pause_after: None,
             resume: false,
+            retry_failed: false,
         }
     }
 }
@@ -164,6 +169,22 @@ pub async fn run<B: LlmBackend>(
         if released > 0 {
             report.notes.push(format!(
                 "{released} carta(s) retirada(s) devolvida(s) à fila"
+            ));
+        }
+    }
+    if options.retry_failed {
+        // A válvula de recuperação: `failed` nunca é retentado no ciclo
+        // (anti-rajada) — sem isto, post que falhou sob uma causa consertada
+        // ficaria preso para sempre. Por PROJETO (a fila é por projeto; o
+        // release global do resume é do turno inteiro de propósito).
+        let project_id = crate::store::project_id_for_root(root)
+            .map_err(|err| DigestError::Store(err.to_string()))?;
+        let requeued = store
+            .post_requeue_failed(&project_id)
+            .map_err(|err| DigestError::Store(err.to_string()))?;
+        if requeued > 0 {
+            report.notes.push(format!(
+                "{requeued} post(s) em falha devolvido(s) à fila (attempts zerados)"
             ));
         }
     }

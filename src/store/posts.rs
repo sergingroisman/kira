@@ -265,6 +265,23 @@ impl Store {
             .map_err(StoreError::Sql)
     }
 
+    /// Devolve à fila tudo que está `failed` DESTE projeto — o `--retry-failed`
+    /// (a válvula de recuperação): estado `failed` nunca é retentado no ciclo
+    /// (anti-rajada), então sem isto um post que falhou sob um prompt ruim
+    /// ficaria preso para sempre — mesmo depois de consertada a causa (prova:
+    /// o dono, 18/Nov/2026, com 2 posts falhados sob o prompt que transbordava
+    /// a janela). Zera os tentes: a contagem pertencia ao regime antigo.
+    /// Escrita LOCAL no store (trilha), nunca no mundo.
+    pub fn post_requeue_failed(&self, project_id: &str) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "UPDATE posts SET state = 'sealed', attempts = 0, draft_ttl = NULL \
+                 WHERE project_id = ?1 AND state = 'failed'",
+                params![project_id],
+            )
+            .map_err(StoreError::Sql)
+    }
+
     /// Marca o post como lido (caixa de correio do dashboard).
     pub fn post_mark_read(&self, id: &str) -> Result<(), StoreError> {
         self.conn
