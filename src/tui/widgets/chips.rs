@@ -98,15 +98,23 @@ pub fn session_line(
     Line::from(spans)
 }
 
-/// Linha da execução viva: `[exec] triage 4821  executando há 4s  ⠙`.
+/// Linha da execução viva: `[exec] triage 4821  pensando… · há 4s  ⠙`.
+///
+/// A fase (`phase`) é a do feed de atividade (TUI-01): texto REAL do
+/// evento, não frase genérica. Sem fase (`None`), a linha é a de antes.
 pub fn running_line(
     action_label: &str,
+    phase: Option<&str>,
     elapsed: &str,
     tick: u64,
     palette: Palette,
     glyphs: Glyphs,
 ) -> Line<'static> {
     let spinner = spinner::frame(tick, glyphs);
+    let desc = match phase {
+        Some(phase) => crate::tui::widgets::card::crop(&format!("{phase} · {elapsed}"), 46),
+        None => elapsed.to_string(),
+    };
     Line::from(vec![
         Span::styled(
             format!("{} ", ChipState::Running.label()),
@@ -118,7 +126,7 @@ pub fn running_line(
             format!("{:<16}", crate::tui::widgets::card::crop(action_label, 16)),
             Style::default().fg(palette.value),
         ),
-        Span::styled(format!("{elapsed} "), Style::default().fg(palette.footer)),
+        Span::styled(format!("{desc} "), Style::default().fg(palette.footer)),
         Span::styled(spinner.to_string(), Style::default().fg(palette.running)),
     ])
 }
@@ -202,6 +210,7 @@ mod tests {
         let palette = theme::mono();
         let text = flat(&running_line(
             "triage 4821",
+            None,
             "executando há 4s",
             3,
             palette,
@@ -213,6 +222,25 @@ mod tests {
         assert!(text.contains(spinner::UNICODE[3]), "{text}");
     }
 
+    /// A fase do feed de atividade entra no chip ANTES do tempo: é o que
+    /// o KIRA está fazendo, não só há quanto tempo.
+    #[test]
+    fn running_chip_carries_the_real_phase() {
+        let palette = theme::mono();
+        let text = flat(&running_line(
+            "scan",
+            Some("pesquisando stack…"),
+            "executando há 4s",
+            3,
+            palette,
+            Glyphs::default(),
+        ));
+        assert!(
+            text.contains("pesquisando stack… · executando há 4s"),
+            "{text}"
+        );
+    }
+
     /// Em ASCII, o chip `[exec]` também não pode vazar braille.
     #[test]
     fn ascii_running_chip_uses_the_ascii_spinner() {
@@ -221,6 +249,7 @@ mod tests {
         for tick in 0..12 {
             let text = flat(&running_line(
                 "scan",
+                Some("pesquisando stack…"),
                 "executando há 1s",
                 tick,
                 palette,

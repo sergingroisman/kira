@@ -36,7 +36,9 @@ use crate::tui::action::{
     self, Action as StepAction, ActionCtx, ConfirmState, ExecState, Request, RunEvent, Runner,
     TargetSheet,
 };
+use crate::tui::activity::{Activity, Entry};
 use crate::tui::chrome;
+use crate::tui::duck::{self, Duck};
 use crate::tui::glyph::Glyphs;
 use crate::tui::keymap::{self, Action as Key};
 use crate::tui::layout;
@@ -201,6 +203,10 @@ pub struct AppState {
     pub pending: Option<StepAction>,
     /// Execução em andamento (ou a última que terminou), para o overlay `o`.
     pub exec: Option<ExecState>,
+    /// Feed de atividade (TUI-01): fases REAIS do filho + estado do pato.
+    /// Vive aqui (estado de TELA) porque o texto vem do canal do runner —
+    /// nunca do disco nem do relógio.
+    pub activity: Activity,
     /// Overlay de execução aberto.
     pub exec_open: bool,
     /// Aviso de uma linha no rodapé (erro acionável, plano recusado).
@@ -236,6 +242,7 @@ impl Default for AppState {
             confirm: None,
             pending: None,
             exec: None,
+            activity: Activity::default(),
             exec_open: false,
             notice: None,
         }
@@ -591,8 +598,11 @@ fn drain_execution(
     while let Ok(event) = active.rx.try_recv() {
         finished |= matches!(&event, RunEvent::Exited { .. });
         if let Some(exec) = &mut state_screen.exec {
-            exec.apply(event);
+            exec.apply(event.clone());
         }
+        // O feed consome o MESMO evento (o canal do runner é a única
+        // fonte): fase nova só existe se o filho a escreveu.
+        state_screen.activity.on_event(&event);
     }
     if !finished {
         *runner = Some(active);
@@ -996,6 +1006,10 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
                                     Ok(spawned) => {
                                         let now = snapshot.now_secs.unwrap_or(0);
                                         state_screen.exec = Some(ExecState::new(action, now));
+                                        // Feed NOVO para o filho novo: a fase
+                                        // nasce do spawn (evento real), o
+                                        // histórico do filho anterior sai.
+                                        state_screen.activity = Activity::for_action(action);
                                         state_screen.exec_open = true;
                                         state_screen.notice = None;
                                         runner = Some(spawned);
@@ -1163,10 +1177,19 @@ pub fn render_frame_with(
     if screen.exec_open
         && let Some(exec) = &screen.exec
     {
+        // O seed do pato é o do projeto do snapshot (FNV-1a da raiz); sem
+        // projeto, o seed 0 desenha o pato padrão — nunca um aleatório.
+        let seed = snapshot
+            .project
+            .as_ref()
+            .map(|project| duck::seed_from_root(&project.root_path))
+            .unwrap_or(0);
         render_exec(
             frame,
             area,
             exec,
+            &screen.activity,
+            seed,
             snapshot.now_secs,
             screen.tick,
             palette,
@@ -1216,6 +1239,7 @@ fn render_screen(
                 snapshot,
                 Live {
                     exec: screen.exec.as_ref(),
+                    phase: screen.activity.phase(),
                     tick: screen.tick,
                 },
                 true,
@@ -1520,12 +1544,17 @@ fn render_target(
 
 /// Overlay `o`: a saída REAL do subprocesso, já sanitizada e redigida.
 ///
-/// Gramática igual ao resto da casca: painel com título, cabeçalho de stream
-/// (`═| stdout |══`), linhas do processo e a dica de teclas no fim.
+/// Gramática igual ao resto da casca: painel com título, faixa do mascote
+/// (o pato de borracha + as fases REAIS do feed, TUI-01), cabeçalho de
+/// stream (`═| stdout |══`), linhas do processo e a dica de teclas no fim.
+/// O mascote NUNCA cobre a saída: o log continua abaixo da faixa dele.
+#[allow(clippy::too_many_arguments)] // mesmo critério do `render_screen`
 fn render_exec(
     frame: &mut Frame,
     area: Rect,
     exec: &ExecState,
+    activity: &Activity,
+    seed: u64,
     now_secs: Option<i64>,
     tick: u64,
     palette: Palette,
@@ -1540,6 +1569,33 @@ fn render_exec(
         glyphs,
     );
     let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Faixa do mascote: pato à esquerda, fase + últimas entradas do feed
+    // à direita. A altura é a da arte (5 linhas) ou o que couber.
+    let strip_h = 5.min(inner.height);
+    let strip = Rect {
+        height: strip_h,
+        ..inner
+    };
+    let duck = Duck::new(activity.state, seed);
+    crate::tui::widgets::duck::render(frame.buffer_mut(), strip, duck, tick, palette);
+    if strip.width > 12 && strip.height > 0 {
+        let feed_area = Rect {
+            x: strip.x + 11,
+            width: strip.width - 11,
+            ..strip
+        };
+        frame.render_widget(feed_paragraph(activity, palette), feed_area);
+    }
+
+    // O log continua ABAIXO da faixa: saída do filho nunca fica sob o
+    // mascote (o overlay é o log; o pato é a soma de cima dele).
+    let log_area = Rect {
+        y: inner.y.saturating_add(strip_h),
+        height: inner.height.saturating_sub(strip_h),
+        ..inner
+    };
 
     let mut body: Vec<Line> = Vec::new();
     if exec.dropped > 0 {
@@ -1553,7 +1609,7 @@ fn render_exec(
         match line {
             action::LogLine::Stdout(text) => {
                 if current != Some(false) {
-                    body.push(exec_header("stdout", inner.width, palette, glyphs));
+                    body.push(exec_header("stdout", log_area.width, palette, glyphs));
                     current = Some(false);
                 }
                 body.push(Line::from(Span::styled(
@@ -1563,7 +1619,7 @@ fn render_exec(
             }
             action::LogLine::Stderr(text) => {
                 if current != Some(true) {
-                    body.push(exec_header("stderr", inner.width, palette, glyphs));
+                    body.push(exec_header("stderr", log_area.width, palette, glyphs));
                     current = Some(true);
                 }
                 body.push(Line::from(Span::styled(
@@ -1584,7 +1640,7 @@ fn render_exec(
         )));
     }
 
-    let height = usize::from(inner.height);
+    let height = usize::from(log_area.height);
     let scroll = if exec.follow {
         body.len().saturating_sub(height)
     } else {
@@ -1595,7 +1651,35 @@ fn render_exec(
         Style::default().fg(palette.help),
     )));
     let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
-    frame.render_widget(Paragraph::new(body).block(block).scroll((scroll, 0)), area);
+    frame.render_widget(Paragraph::new(body).scroll((scroll, 0)), log_area);
+}
+
+/// O lado direito da faixa do mascote: fase corrente + as últimas
+/// entradas do feed, cada uma no texto REAL (evidência, cortada por
+/// largura — nunca parafraseada).
+fn feed_paragraph(activity: &Activity, palette: Palette) -> Paragraph<'static> {
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(phase) = activity.phase() {
+        lines.push(Line::from(Span::styled(
+            format!("fase: {phase}"),
+            Style::default().fg(palette.running),
+        )));
+    }
+    // As 3 últimas, na ordem em que aconteceram (mais nova embaixo).
+    let tail: Vec<&Entry> = activity.entries.iter().rev().take(3).collect();
+    for entry in tail.into_iter().rev() {
+        lines.push(Line::from(Span::styled(
+            format!("· {}", crate::tui::widgets::card::crop(&entry.text, 58)),
+            Style::default().fg(palette.footer),
+        )));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "— nenhuma fase observada ainda",
+            Style::default().fg(palette.missing),
+        )));
+    }
+    Paragraph::new(lines).wrap(Wrap { trim: false })
 }
 
 /// `═| stdout |══…` na largura real do painel (mesma régua do inspetor).

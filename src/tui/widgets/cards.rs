@@ -26,11 +26,14 @@ use crate::tui::widgets::card;
 use crate::tui::widgets::chips;
 use crate::tui::widgets::{gauge, severity, trend};
 
-/// O que só existe na tela (não no snapshot): execução viva e o tick do spinner.
+/// O que só existe na tela (não no snapshot): execução viva, a fase REAL
+/// do feed de atividade (TUI-01) e o tick do spinner.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Live<'a> {
     /// Execução em andamento ou recém-terminada (`o` abre o log).
     pub exec: Option<&'a ExecState>,
+    /// Fase corrente do feed de atividade (`pesquisando stack…`).
+    pub phase: Option<&'a str>,
     /// Contador do loop, para o spinner não congelar.
     pub tick: u64,
 }
@@ -40,6 +43,7 @@ impl Live<'_> {
     pub const fn idle() -> Live<'static> {
         Live {
             exec: None,
+            phase: None,
             tick: 0,
         }
     }
@@ -210,8 +214,11 @@ fn sessoes(
             .now_secs
             .map(|now| (now - exec.started_unix).max(0))
             .unwrap_or(0);
+        // A fase vai NO chip: `pesquisando stack… · executando há 4s`.
+        // Texto do feed de atividade (evento real), nunca frase genérica.
         let line = chips::running_line(
             &action_label(exec.action),
+            live.phase,
             &format!(
                 "executando há {}",
                 state::format_duration_ms(elapsed_secs * 1_000)
