@@ -27,13 +27,16 @@ use crate::tui::widgets::chips;
 use crate::tui::widgets::{gauge, severity, trend};
 
 /// O que só existe na tela (não no snapshot): execução viva, a fase REAL
-/// do feed de atividade (TUI-01) e o tick do spinner.
+/// do feed de atividade (TUI-01), o relógio vivo e o tick do spinner.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Live<'a> {
     /// Execução em andamento ou recém-terminada (`o` abre o log).
     pub exec: Option<&'a ExecState>,
     /// Fase corrente do feed de atividade (`pesquisando stack…`).
     pub phase: Option<&'a str>,
+    /// Relógio VIVO da tela: o "executando há X" não pode congelar no
+    /// valor da abertura (o snapshot é a hora da leitura do disco).
+    pub now_secs: i64,
     /// Contador do loop, para o spinner não congelar.
     pub tick: u64,
 }
@@ -44,6 +47,7 @@ impl Live<'_> {
         Live {
             exec: None,
             phase: None,
+            now_secs: 0,
             tick: 0,
         }
     }
@@ -210,18 +214,16 @@ fn sessoes(
     let mut row = 0;
     // Execução viva primeiro: é o único estado que muda sozinho na tela.
     if let Some(exec) = live.exec.filter(|exec| exec.is_running()) {
-        let elapsed_secs = snapshot
-            .now_secs
-            .map(|now| (now - exec.started_unix).max(0))
-            .unwrap_or(0);
         // A fase vai NO chip: `pesquisando stack… · executando há 4s`.
-        // Texto do feed de atividade (evento real), nunca frase genérica.
+        // Texto do feed de atividade (evento real), nunca frase genérica;
+        // o tempo vem do relógio VIVO da tela (o snapshot é a hora em que
+        // o disco foi lido — usar ele congelava o cronômetro em 0ms).
         let line = chips::running_line(
             &action_label(exec.action),
             live.phase,
             &format!(
                 "executando há {}",
-                state::format_duration_ms(elapsed_secs * 1_000)
+                state::format_duration_ms((live.now_secs - exec.started_unix).max(0) * 1_000)
             ),
             live.tick,
             palette,

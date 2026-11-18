@@ -92,7 +92,18 @@ impl Activity {
             RunEvent::Note(_) => {}
             RunEvent::Line { text, .. } => on_line(self, text),
             RunEvent::Exited { code, .. } => match code {
-                Some(0) => self.record(DuckState::Idle, "concluído (exit 0)".to_string()),
+                Some(0) => {
+                    // Concluído FECHA o comando, não o alerta: um scan que
+                    // acabou de reportar critical continua pedindo atenção
+                    // (visto no hardware do dono — o "concluído (exit 0)"
+                    // apagava o alerta do resumo com 2 critical).
+                    let state = if self.state == DuckState::Alerta {
+                        DuckState::Alerta
+                    } else {
+                        DuckState::Idle
+                    };
+                    self.record(state, "concluído (exit 0)".to_string());
+                }
                 Some(code) => {
                     self.record(DuckState::Alerta, format!("falhou (exit {code})"));
                 }
@@ -283,6 +294,37 @@ mod tests {
             duration_ms: 1_200,
         });
         assert_eq!(killed.state, DuckState::Alerta);
+    }
+
+    /// O "concluído" fecha o COMANDO, não o alerta: critical que o filho
+    /// acabou de reportar continua pedindo atenção (hardware do dono).
+    #[test]
+    fn a_clean_exit_does_not_erase_a_critical_alert() {
+        let mut feed = Activity::for_action(Action::Scan);
+        feed.on_event(&line(
+            "kira scan em 'C:\\proj' — stacks: pnpm | achados: 38 (critical 2, high 13) | arquivo: C:\\proj\\.kira\\findings.json",
+        ));
+        assert_eq!(feed.state, DuckState::Alerta);
+        feed.on_event(&RunEvent::Exited {
+            code: Some(0),
+            duration_ms: 2_000,
+        });
+        assert_eq!(feed.state, DuckState::Alerta, "o critical continua lá");
+        assert!(
+            feed.phase().unwrap_or_default().contains("concluído"),
+            "o fechamento segue na trilha do feed: {:?}",
+            feed.current
+        );
+        // …mas um scan LIMPO (nenhum achado) volta ao repouso no exit 0.
+        let mut clean = Activity::for_action(Action::Scan);
+        clean.on_event(&line(
+            "kira scan em '/' — stacks: npm | achados: 0 (nenhum) | arquivo: /f",
+        ));
+        clean.on_event(&RunEvent::Exited {
+            code: Some(0),
+            duration_ms: 500,
+        });
+        assert_eq!(clean.state, DuckState::Idle);
     }
 
     /// Segredo na linha do filho nunca chega à tela do feed.

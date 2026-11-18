@@ -89,6 +89,16 @@ impl Drop for ScreenGuard {
     }
 }
 
+/// Segundos Unix do relógio do PROCESSO (a hora "agora" da tela). O
+/// snapshot guarda a hora em que o disco foi lido — não é "agora". Falha
+/// de relógio vira 0: o rótulo cai para "executando", nunca inventa idade.
+fn live_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Fonte de dados em foco (as quatro telas do dashboard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -156,6 +166,12 @@ pub struct AppState {
     /// Contador do loop de eventos: o spinner avança com ele, nunca dentro do
     /// widget (mesmo `tick` = mesmo frame, o desenho continua determinístico).
     pub tick: u64,
+    /// Relógio VIVO da sessão (segundos Unix, atualizado a cada volta do
+    /// loop). O `snapshot.now_secs` é a hora em que o disco foi lido — usar
+    /// ele para "executando há X" congela o cronômetro no valor de abertura
+    /// (bug visto no hardware do dono: "executando há 0ms" durante o scan
+    /// inteiro). Zero = sem relógio (o rótulo cai para "executando").
+    pub now_secs: i64,
     /// Inspetor 50–50 aberto na fonte atual.
     pub inspecting: bool,
     /// Seleção da tabela de achados (o ➤). UM POR TELA.
@@ -218,6 +234,7 @@ impl Default for AppState {
         Self {
             screen: Screen::Resumo,
             tick: 0,
+            now_secs: 0,
             inspecting: false,
             findings_selected: 0,
             severity_filter: None,
@@ -948,6 +965,8 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
 
         // Um tick por volta do loop: o spinner anda, o resto da tela não muda.
         state_screen.tick = state_screen.tick.wrapping_add(1);
+        // E o relógio VIVO: o "executando há X" tem que andar sem `r`.
+        state_screen.now_secs = live_now_secs();
 
         // Drena a execução em andamento (nunca bloqueia: `try_recv`).
         drain_execution(&mut state_screen, &mut runner, &mut snapshot);
@@ -1004,7 +1023,7 @@ pub fn run(initial: Snapshot, options: RunOptions) -> Result<(), String> {
                                 let action = confirm.plan.action;
                                 match Runner::spawn(confirm.plan) {
                                     Ok(spawned) => {
-                                        let now = snapshot.now_secs.unwrap_or(0);
+                                        let now = state_screen.now_secs;
                                         state_screen.exec = Some(ExecState::new(action, now));
                                         // Feed NOVO para o filho novo: a fase
                                         // nasce do spawn (evento real), o
@@ -1190,7 +1209,9 @@ pub fn render_frame_with(
             exec,
             &screen.activity,
             seed,
-            snapshot.now_secs,
+            // Relógio VIVO da tela (o snapshot guarda a hora da leitura do
+            // disco — usar ele congelava o "executando há X" em 0ms).
+            Some(screen.now_secs).filter(|secs| *secs > 0),
             screen.tick,
             palette,
             glyphs,
@@ -1240,6 +1261,7 @@ fn render_screen(
                 Live {
                     exec: screen.exec.as_ref(),
                     phase: screen.activity.phase(),
+                    now_secs: screen.now_secs,
                     tick: screen.tick,
                 },
                 true,
@@ -2482,6 +2504,29 @@ mod tests {
             decide(&state, plain(KeyCode::Char('G'))),
             Outcome::FollowExecution
         );
+    }
+
+    /// O "executando há X" vem do relógio VIVO da tela (bug do hardware:
+    /// com o snapshot, o cronômetro congelava em "há 0ms" durante o scan
+    /// inteiro — a tela só andava no `r` manual).
+    #[test]
+    fn running_elapsed_uses_the_live_clock_not_the_snapshot() {
+        let snapshot = snapshot_with_findings();
+        let mut exec = ExecState::new(StepAction::Scan, 1_000);
+        exec.apply(RunEvent::Started {
+            command: "kira scan".to_string(),
+        });
+        // snapshot "velho" (a hora da leitura do disco) == início do filho;
+        // o relógio VIVO da tela andou 4s — é ele que o rótulo usa.
+        let state = AppState {
+            exec: Some(exec),
+            exec_open: true,
+            now_secs: 1_004,
+            ..AppState::default()
+        };
+        let text = render_text(&state, &snapshot, 100, 30);
+        assert!(text.contains("executando há 4s"), "{text}");
+        assert!(!text.contains("0ms"), "{text}");
     }
 
     #[test]
