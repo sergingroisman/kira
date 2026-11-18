@@ -186,6 +186,24 @@ struct ChatRequest<'a> {
     messages: [Message<'a>; 2],
     stream: bool,
     options: Options,
+    /// `think` explícito (API do Ollama) — modelos de raciocínio (qwen3.5)
+    /// gastam a JANELA INTEIRA com o raciocínio quando o campo fica ausente:
+    /// provado no hardware do dono (18/Nov/2026) — 13.891 chars de think
+    /// espremeram a resposta final a 73 chars truncados ("# eishoku").
+    /// Padrão DESLIGADO: geração grounded em fatos não precisa de cadeia de
+    /// pensamento; `KIRA_THINK=on` religa para quem quiser (e sabe que a
+    /// janela precisa subir junto).
+    think: bool,
+}
+
+/// Lê o pensamento da env (PURA): `KIRA_THINK=on|1|true` religa. Default
+/// desligado — a janela do modelo é finita e o pensamento não respeita
+/// reserva nenhuma (prova acima).
+fn think_from_env() -> bool {
+    matches!(
+        std::env::var("KIRA_THINK").as_deref(),
+        Ok("on") | Ok("1") | Ok("true")
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +252,7 @@ impl LlmBackend for OllamaBackend {
                 num_ctx: num_ctx_from_env(),
                 temperature: DEFAULT_TEMPERATURE,
             },
+            think: think_from_env(),
         };
         let mut builder = client.post(url.as_str()).json(&request);
         // OC-1: Bearer só quando há chave resolvida (host não-local). Em
@@ -375,6 +394,10 @@ mod tests {
         assert!(request.contains("\"stream\":false"), "{request}");
         assert!(request.contains("\"num_ctx\":4096"), "{request}");
         assert!(request.contains("\"temperature\":0.2"), "{request}");
+        // O `think` é EXPLÍCITO e desligado por padrão: ausente = o template
+        // do modelo decide = qwen3.5 pensa até estourar a janela (prova no
+        // hardware do dono, 18/Nov/2026).
+        assert!(request.contains("\"think\":false"), "{request}");
     }
 
     #[tokio::test]
