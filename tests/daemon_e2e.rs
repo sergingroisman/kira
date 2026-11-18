@@ -63,7 +63,17 @@ fn daemon_without_any_schedule_refuses_instead_of_faking_work() {
     let sandbox = Sandbox::new("sem-agenda");
     let (code, stdout, stderr) = sandbox.run(&["daemon", "run", "--ticks", "1"]);
     assert_ne!(code, 0, "sem agenda o daemon não tem o que fazer: {stdout}");
-    assert!(stdout.is_empty(), "erro não vai para stdout: {stdout}");
+    // A saída é AO VIVO (emit): o cabeçalho "daemon vivo: PID…" vai para o
+    // stdout na hora — mas NENHUM tick acontece sem agenda, e o ERRO continua
+    // no stderr (o canal dos outros comandos).
+    assert!(
+        !stdout.contains("tick"),
+        "nada de tick sem agenda: {stdout}"
+    );
+    assert!(
+        stdout.contains("daemon vivo"),
+        "o cabeçalho ao vivo aparece: {stdout}"
+    );
     assert!(
         stderr.contains("sem agendamento declarado"),
         "acionável: {stderr}"

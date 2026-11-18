@@ -241,12 +241,15 @@ fn tick_line(number: usize, report: &TickReport) -> String {
 pub async fn run(options: &DaemonOptions) -> Result<String, DaemonError> {
     let lock = acquire_lock(&options.root, options.force_lock)?;
     let mut out = String::new();
-    out.push_str(&format!(
-        "daemon vivo: PID {} desde {} (lock {})\n",
-        lock.pid.unwrap_or(0),
-        lock.since.as_deref().unwrap_or("—"),
-        lock_path(&options.root).display()
-    ));
+    emit(
+        &mut out,
+        &format!(
+            "daemon vivo: PID {} desde {} (lock {})\n",
+            lock.pid.unwrap_or(0),
+            lock.since.as_deref().unwrap_or("—"),
+            lock_path(&options.root).display()
+        ),
+    );
 
     // As MESMAS opções do `kira loop`, mas SEMPRE agendado: o daemon não é
     // cadência própria, é o executor da cadência do dono.
@@ -305,7 +308,7 @@ async fn drive(
             // Nada venceu: dorme até o próximo vencimento (ou o teto de
             // cortesia, ou o Ctrl+C — o que vier primeiro).
             if sleep_or_interrupt(wait).await {
-                out.push_str("daemon parado com graça (Ctrl+C) — lock liberado\n");
+                emit(out, "daemon parado com graça (Ctrl+C) — lock liberado\n");
                 return Ok(());
             }
             continue;
@@ -314,24 +317,36 @@ async fn drive(
         let report = r#loop::tick(loop_options)
             .await
             .map_err(|err| DaemonError::Cycle(err.to_string()))?;
-        out.push_str(&tick_line(ticks, &report));
-        out.push('\n');
+        emit(out, &format!("{}\n", tick_line(ticks, &report)));
         for note in &report.notes {
-            out.push_str(&format!("  nota: {note}\n"));
+            emit(out, &format!("  nota: {note}\n"));
         }
         if let Some(max) = options.max_ticks
             && ticks >= max
         {
-            out.push_str(&format!(
-                "teto de {max} tick(s) atingido — daemon sai (o lock foi liberado)\n"
-            ));
+            emit(
+                out,
+                &format!("teto de {max} tick(s) atingido — daemon sai (o lock foi liberado)\n"),
+            );
             return Ok(());
         }
         if sleep_or_interrupt(rest_after_tick).await {
-            out.push_str("daemon parado com graça (Ctrl+C) — lock liberado\n");
+            emit(out, "daemon parado com graça (Ctrl+C) — lock liberado\n");
             return Ok(());
         }
     }
+}
+
+/// Saída AO VIVO: o modo texto é a saída canônica e o dono precisa ver cada
+/// tick NA HORA — o buffer até o exit escondia horas de trabalho atrás de um
+/// console preto (hardware do dono, 18/Nov/2026: "até agora não gerou nada"
+/// com o digest rodando em silêncio). Acumula em `out` para a trilha e imprime
+/// com flush imediato.
+fn emit(out: &mut String, line: &str) {
+    out.push_str(line);
+    use std::io::Write;
+    print!("{line}");
+    let _ = std::io::stdout().flush();
 }
 
 /// Dorme `secs` segundos; `true` quando o Ctrl+C chegou primeiro.

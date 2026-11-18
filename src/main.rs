@@ -243,6 +243,12 @@ enum Command {
         /// Release posts left claimed by a previous run before starting
         #[arg(long)]
         resume: bool,
+        /// Devolve à fila os posts em falha DESTE projeto e tenta de novo — a
+        /// válvula quando a CAUSA da falha já foi consertada (ex.: prompt que
+        /// transbordava a janela do modelo). Sem isto, `failed` fica preso
+        /// (o ciclo não retenta por design)
+        #[arg(long)]
+        retry_failed: bool,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -886,6 +892,7 @@ async fn run(command: Command) -> Outcome {
             budget,
             pause,
             resume,
+            retry_failed,
             json,
         } => {
             digest_command(
@@ -896,6 +903,7 @@ async fn run(command: Command) -> Outcome {
                 budget,
                 pause,
                 resume,
+                retry_failed,
                 json,
             )
             .await
@@ -1113,10 +1121,9 @@ async fn connect_azure_command(yes: bool) -> Outcome {
 /// graciosa (Ctrl+C) libera o lock. Comando de execução: grava a trilha.
 async fn daemon_run_command(options: kira::daemon::DaemonOptions) -> Outcome {
     match kira::daemon::run(&options).await {
-        Ok(text) => {
-            print!("{text}");
-            Outcome::success(text)
-        }
+        // A saída já foi AO VIVO (emit do daemon imprime cada tick na hora) —
+        // imprimir de novo duplicaria. O texto só alimenta a trilha.
+        Ok(text) => Outcome::success(text),
         Err(err) => {
             print_error(&err);
             Outcome::failure(err.to_string())
@@ -1587,6 +1594,7 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             budget,
             pause,
             resume,
+            retry_failed,
             json,
         } => {
             let mut args = String::new();
@@ -1598,6 +1606,11 @@ fn session_context(command: &Command) -> (String, String, Option<String>) {
             }
             if let Some(kind) = kind {
                 args.push_str(&format!(" --kind {kind}"));
+            }
+            // A válvula de recuperação entra na trilha: a auditoria precisa
+            // saber que os posts em falha foram devolvidos nesta execução.
+            if *retry_failed {
+                args.push_str(" --retry-failed");
             }
             if let Some(lang) = lang {
                 args.push_str(&format!(" --lang {lang}"));
@@ -3063,6 +3076,7 @@ async fn digest_command(
     budget: Option<u64>,
     pause: Option<usize>,
     resume: bool,
+    retry_failed: bool,
     json: bool,
 ) -> Outcome {
     let root = path.map_or_else(
@@ -3112,6 +3126,7 @@ async fn digest_command(
     }
     options.pause_after = pause;
     options.resume = resume;
+    options.retry_failed = retry_failed;
 
     // FÁBRICA de backend por (kind, tag): a DECISÃO de tag acontece dentro do
     // `post::run` (routing de especialistas, HF-5) — aqui só o wiring da URL.
