@@ -37,6 +37,8 @@ pub struct Palette {
     pub medium: Color,
     /// Severidade low.
     pub low: Color,
+    /// O mascote pato de borracha (TUI-01): a cor do desenho.
+    pub duck: Color,
     /// Texto de resultado `ok` (sucesso).
     pub ok: Color,
     /// Texto de resultado `falhou` (execução que falhou).
@@ -66,6 +68,9 @@ pub const fn colorful() -> Palette {
         high: Color::Yellow,
         medium: Color::Cyan,
         low: Color::DarkGray,
+        // O pato é borracha amarela — e em mono a cor some sem perder o
+        // desenho (o glifo é de 7 bits, nunca quadradinho).
+        duck: Color::Yellow,
         ok: Color::Green,
         failed: Color::Red,
         // Chip do statui: texto escuro sobre ciano (assinatura da casca).
@@ -95,6 +100,7 @@ pub const fn mono() -> Palette {
         high: Color::Reset,
         medium: Color::Reset,
         low: Color::Reset,
+        duck: Color::Reset,
         ok: Color::Reset,
         failed: Color::Reset,
         key_bg: Color::Reset,

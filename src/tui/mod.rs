@@ -17,9 +17,13 @@
 
 /// Camada de ação (ADR-0033): allowlist de argv, confirmação e execução.
 pub mod action;
+/// Feed de atividade (TUI-01): fases REAIS dos eventos do runner.
+pub mod activity;
 pub mod app;
 /// Chrome fixo: linha de status e abas de fonte (casca do statui).
 pub mod chrome;
+/// O mascote pato de borracha (TUI-01): estado + arte determinística.
+pub mod duck;
 /// Glifos do dashboard: Unicode (padrão) e ASCII (`KIRA_GLYPHS=ascii`).
 pub mod glyph;
 /// Grid do Resumo (PR-UX2): colunas por largura e altura de cada cartão.

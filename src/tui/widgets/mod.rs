@@ -5,6 +5,8 @@ pub mod card;
 pub mod cards;
 /// Chips de estado das sessões: `[ok]`, `[falhou]`, `[exec]` (PR-UX2).
 pub mod chips;
+/// O mascote pato de borracha: pixel art dirigido por evento real (TUI-01).
+pub mod duck;
 pub mod findings;
 pub mod footer;
 /// Barra de proporção (uso do índice) com glifo escolhido pelo modo.
